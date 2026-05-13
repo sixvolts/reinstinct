@@ -17,8 +17,8 @@ pub enum GgufError {
     #[error("unknown ggml tensor type: {0}")]
     UnknownGgmlType(u32),
 
-    #[error("unsupported ggml tensor type for this engine: {0:?} (supported: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, Q8_K)")]
-    UnsupportedGgmlType(crate::gguf::types::GgmlType),
+    #[error("tensor `{name}` has type {ty:?} which has no CPU dequant oracle yet (supported: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS)")]
+    UnsupportedGgmlTypeFor { name: String, ty: crate::gguf::types::GgmlType },
 
     #[error("unknown GGUF metadata value type: {0}")]
     UnknownValueType(u32),
