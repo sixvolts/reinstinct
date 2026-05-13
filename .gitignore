@@ -1,0 +1,26 @@
+# Rust
+/target
+Cargo.lock.bak
+**/*.rs.bk
+
+# Compiled HIP kernel cache (per-host, regenerated on demand)
+/.cache
+*.hsaco
+
+# GGUF model weights (multi-GB, never commit)
+*.gguf
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Per-user Claude Code settings (team-shared settings.json may be committed)
+.claude/settings.local.json
+
+# Profiling output
+*.csv
+perf.data*
+*.json.gz

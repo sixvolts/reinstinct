@@ -1,0 +1,32 @@
+[package]
+name = "reinstinct-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Custom HIP inference engine for AMD MI50/MI60 (gfx906)"
+license = "Apache-2.0"
+
+[dependencies]
+# Zero-copy weight access from GGUF files
+memmap2 = "0.9"
+# Safe casting between byte slices and POD block structs
+bytemuck = { version = "1.20", features = ["derive"] }
+# Runtime dlopen of libamdhip64.so / librocblas.so
+libloading = "0.8"
+# Library error types
+thiserror = "2.0"
+# Application-level error chaining (CLI / main)
+anyhow = "1.0"
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+# Source-hash for kernel cache invalidation
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dev]
+# Speed up debug builds; we rely on tests for correctness
+opt-level = 1
