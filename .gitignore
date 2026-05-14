@@ -24,3 +24,6 @@ Cargo.lock.bak
 *.csv
 perf.data*
 *.json.gz
+
+# Compiled golden-logits helper (built per-host via tests/golden/build.sh)
+/tests/golden/dump_logits
