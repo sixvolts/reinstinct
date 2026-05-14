@@ -34,6 +34,12 @@ const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.c
 const ROPE_SOURCE:              &str = include_str!("../../kernels/rope.cpp");
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 const ADD_INPLACE_SOURCE:       &str = include_str!("../../kernels/add_inplace.cpp");
+const CONV1D_STEP_SOURCE:           &str = include_str!("../../kernels/conv1d_step.cpp");
+const SILU_INPLACE_SOURCE:          &str = include_str!("../../kernels/silu_inplace.cpp");
+const L2NORM_MULTIHEAD_SOURCE:      &str = include_str!("../../kernels/l2norm_multihead.cpp");
+const GDN_DECAY_BETA_SOURCE:        &str = include_str!("../../kernels/gdn_decay_beta.cpp");
+const GDN_RECURRENT_STEP_SOURCE:    &str = include_str!("../../kernels/gdn_recurrent_step.cpp");
+const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
 
 /// FFN weights for a single transformer block, resident on device.
 pub struct GpuFfnWeights {
@@ -96,6 +102,89 @@ impl GpuFullAttnWeights {
     }
 }
 
+/// Linear-attention (GDN) block weights, resident on device.
+pub struct GpuLinAttnWeights {
+    pub attn_norm:   DeviceBuf<f32>,   // [hidden]
+    pub attn_qkv:    DeviceBuf<f32>,   // [hidden, conv_dim]
+    pub attn_gate:   DeviceBuf<f32>,   // [hidden, value_dim]
+    pub ssm_alpha:   DeviceBuf<f32>,   // [hidden, n_heads]
+    pub ssm_beta:    DeviceBuf<f32>,   // [hidden, n_heads]
+    pub ssm_a:       DeviceBuf<f32>,   // [n_heads]   (already -exp(A_log))
+    pub ssm_dt_bias: DeviceBuf<f32>,   // [n_heads]
+    pub ssm_conv1d:  DeviceBuf<f32>,   // [conv_dim, kernel]
+    pub ssm_norm:    DeviceBuf<f32>,   // [head_dim]
+    pub ssm_out:     DeviceBuf<f32>,   // [value_dim, hidden]
+}
+
+impl GpuLinAttnWeights {
+    pub fn from_cpu(w: &crate::cpu::qwen3_5::LinAttnWeights) -> Result<Self, String> {
+        Ok(Self {
+            attn_norm:   DeviceBuf::from_slice(&w.attn_norm)?,
+            attn_qkv:    DeviceBuf::from_slice(&w.attn_qkv)?,
+            attn_gate:   DeviceBuf::from_slice(&w.attn_gate)?,
+            ssm_alpha:   DeviceBuf::from_slice(&w.ssm_alpha)?,
+            ssm_beta:    DeviceBuf::from_slice(&w.ssm_beta)?,
+            ssm_a:       DeviceBuf::from_slice(&w.ssm_a)?,
+            ssm_dt_bias: DeviceBuf::from_slice(&w.ssm_dt_bias)?,
+            ssm_conv1d:  DeviceBuf::from_slice(&w.ssm_conv1d)?,
+            ssm_norm:    DeviceBuf::from_slice(&w.ssm_norm)?,
+            ssm_out:     DeviceBuf::from_slice(&w.ssm_out)?,
+        })
+    }
+}
+
+/// All weights for one linear-attention transformer block on the GPU
+/// (GDN attention + post-norm + FFN).
+pub struct GpuLinAttnBlock {
+    pub attn:      GpuLinAttnWeights,
+    pub post_norm: DeviceBuf<f32>,
+    pub ffn:       GpuFfnWeights,
+}
+
+impl GpuLinAttnBlock {
+    pub fn from_cpu(w: &crate::cpu::qwen3_5::LinAttnWeights) -> Result<Self, String> {
+        Ok(Self {
+            attn:      GpuLinAttnWeights::from_cpu(w)?,
+            post_norm: DeviceBuf::from_slice(&w.post_attention_norm)?,
+            ffn:       GpuFfnWeights::from_cpu(&w.ffn_gate, &w.ffn_up, &w.ffn_down)?,
+        })
+    }
+}
+
+/// Per-GDN-block recurrent + Conv1D state, resident on device.
+pub struct GpuLinAttnState {
+    pub recurrent: DeviceBuf<f32>,    // [n_heads, head_dim, head_dim]
+    pub conv_hist: DeviceBuf<f32>,    // [conv_dim, kernel-1]
+    pub n_heads:     usize,
+    pub head_dim:    usize,
+    pub conv_dim:    usize,
+    pub conv_kernel: usize,
+}
+
+impl GpuLinAttnState {
+    pub fn new(n_heads: usize, head_dim: usize, conv_dim: usize, conv_kernel: usize)
+        -> Result<Self, String>
+    {
+        let recurrent = DeviceBuf::new(n_heads * head_dim * head_dim)?;
+        let conv_hist = DeviceBuf::new(conv_dim * (conv_kernel - 1))?;
+        // Zero-initialise: hipMalloc returns uninitialised; populate from
+        // host zeros so the recurrent matrix and conv history start clean.
+        let zeros_r = vec![0.0f32; recurrent.len()];
+        recurrent.copy_from_host(&zeros_r)?;
+        let zeros_c = vec![0.0f32; conv_hist.len()];
+        conv_hist.copy_from_host(&zeros_c)?;
+        Ok(Self { recurrent, conv_hist, n_heads, head_dim, conv_dim, conv_kernel })
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        let zeros_r = vec![0.0f32; self.recurrent.len()];
+        self.recurrent.copy_from_host(&zeros_r)?;
+        let zeros_c = vec![0.0f32; self.conv_hist.len()];
+        self.conv_hist.copy_from_host(&zeros_c)?;
+        Ok(())
+    }
+}
+
 /// Per-block KV cache resident on device.
 pub struct GpuKvCache {
     pub k: DeviceBuf<f32>,     // [max_seq, n_kv_heads, head_dim]
@@ -138,6 +227,18 @@ pub struct GpuQwen35 {
     attn_concat: DeviceBuf<f32>,   // [q_dim]
     logits:      DeviceBuf<f32>,   // [vocab]
 
+    // GDN scratch buffers.
+    gdn_qkv:      DeviceBuf<f32>,  // [conv_dim]          mixed_qkv projection
+    gdn_conv_out: DeviceBuf<f32>,  // [conv_dim]          conv1d output (post-silu)
+    gdn_z:        DeviceBuf<f32>,  // [value_dim]         attn_gate projection
+    gdn_a:        DeviceBuf<f32>,  // [n_heads]           ssm_alpha projection
+    gdn_b:        DeviceBuf<f32>,  // [n_heads]           ssm_beta projection
+    gdn_q:        DeviceBuf<f32>,  // [value_dim]         L2-normed Q (scaled)
+    gdn_k:        DeviceBuf<f32>,  // [value_dim]         L2-normed K
+    gdn_decay:    DeviceBuf<f32>,  // [n_heads]
+    gdn_beta:     DeviceBuf<f32>,  // [n_heads]
+    gdn_core_out: DeviceBuf<f32>,  // [value_dim]         core attn out / normed_out
+
     // RoPE tables resident on device.
     rope_cos: DeviceBuf<f32>,      // [max_seq, rotary_dim]
     rope_sin: DeviceBuf<f32>,      // [max_seq, rotary_dim]
@@ -153,6 +254,12 @@ pub struct GpuQwen35 {
     rope_module:             Module,
     attn_step_module:        Module,
     add_inplace_module:      Module,
+    conv1d_step_module:           Module,
+    silu_inplace_module:          Module,
+    l2norm_multihead_module:      Module,
+    gdn_decay_beta_module:        Module,
+    gdn_recurrent_step_module:    Module,
+    rmsnorm_gated_multihead_module: Module,
 
     // Dimensions.
     hidden:     usize,
@@ -162,6 +269,12 @@ pub struct GpuQwen35 {
     n_kv_heads: usize,
     head_dim:   usize,
     rotary_dim: usize,
+    // GDN dims.
+    gdn_value_dim:   usize,
+    gdn_conv_dim:    usize,
+    gdn_n_heads:     usize,
+    gdn_head_dim:    usize,
+    gdn_conv_kernel: usize,
     rms_eps:    f32,
     #[allow(dead_code)]
     max_seq:    usize,
@@ -181,6 +294,13 @@ impl GpuQwen35 {
         let rotary_dim = cfg.rope_dim_count   as usize;
         let q_dim  = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
+        // GDN dims.
+        let gdn_value_dim   = cfg.gdn_value_dim   as usize;
+        let gdn_n_heads     = cfg.gdn_n_heads     as usize;
+        let gdn_head_dim    = cfg.gdn_head_dim    as usize;
+        let gdn_conv_kernel = cfg.gdn_conv_kernel as usize;
+        // conv_dim = 2 * key_dim + value_dim; in Qwen 3.5 0.8B key=value, so 3*value_dim.
+        let gdn_conv_dim    = 3 * gdn_value_dim;
 
         let token_embd  = DeviceBuf::from_slice(&model.weights.token_embd)?;
         let output_norm = DeviceBuf::from_slice(&model.weights.output_norm)?;
@@ -205,6 +325,17 @@ impl GpuQwen35 {
         let attn_concat = DeviceBuf::new(q_dim)?;
         let logits      = DeviceBuf::new(vocab)?;
 
+        let gdn_qkv      = DeviceBuf::new(gdn_conv_dim)?;
+        let gdn_conv_out = DeviceBuf::new(gdn_conv_dim)?;
+        let gdn_z        = DeviceBuf::new(gdn_value_dim)?;
+        let gdn_a        = DeviceBuf::new(gdn_n_heads)?;
+        let gdn_b        = DeviceBuf::new(gdn_n_heads)?;
+        let gdn_q        = DeviceBuf::new(gdn_value_dim)?;
+        let gdn_k        = DeviceBuf::new(gdn_value_dim)?;
+        let gdn_decay    = DeviceBuf::new(gdn_n_heads)?;
+        let gdn_beta     = DeviceBuf::new(gdn_n_heads)?;
+        let gdn_core_out = DeviceBuf::new(gdn_value_dim)?;
+
         // Build RoPE tables host-side once and upload.
         let rope = crate::cpu::rope::RopeCache::new(rotary_dim, max_seq, cfg.rope_freq_base);
         let mut cos = vec![0.0f32; max_seq * rotary_dim];
@@ -227,6 +358,12 @@ impl GpuQwen35 {
         let rope_hsaco              = cache.compile("rope",              ROPE_SOURCE)?;
         let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
+        let conv1d_step_hsaco            = cache.compile("conv1d_step",       CONV1D_STEP_SOURCE)?;
+        let silu_inplace_hsaco           = cache.compile("silu_inplace",      SILU_INPLACE_SOURCE)?;
+        let l2norm_multihead_hsaco       = cache.compile("l2norm_multihead",  L2NORM_MULTIHEAD_SOURCE)?;
+        let gdn_decay_beta_hsaco         = cache.compile("gdn_decay_beta",    GDN_DECAY_BETA_SOURCE)?;
+        let gdn_recurrent_step_hsaco     = cache.compile("gdn_recurrent_step", GDN_RECURRENT_STEP_SOURCE)?;
+        let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
 
         Ok(Self {
             token_embd, output_norm, output_proj,
@@ -243,7 +380,16 @@ impl GpuQwen35 {
             rope_module:              Module::load(&rope_hsaco)?,
             attn_step_module:         Module::load(&attn_step_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
+            conv1d_step_module:           Module::load(&conv1d_step_hsaco)?,
+            silu_inplace_module:          Module::load(&silu_inplace_hsaco)?,
+            l2norm_multihead_module:      Module::load(&l2norm_multihead_hsaco)?,
+            gdn_decay_beta_module:        Module::load(&gdn_decay_beta_hsaco)?,
+            gdn_recurrent_step_module:    Module::load(&gdn_recurrent_step_hsaco)?,
+            rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
+            gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
+            gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
+            gdn_decay, gdn_beta, gdn_core_out,
             rms_eps: cfg.rms_norm_eps,
             max_seq,
         })
@@ -412,6 +558,128 @@ impl GpuQwen35 {
         unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, None, &mut args) }
     }
 
+    fn launch_conv1d_step(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
+                          y: *mut c_void, n_channels: u32, kernel_size: u32)
+        -> Result<(), String>
+    {
+        let f = self.conv1d_step_module.function("conv1d_step_f32")?;
+        let block: u32 = 256;
+        let grid = (n_channels + block - 1) / block;
+        let mut xa = x_new; let mut wa = w; let mut ha = hist; let mut ya = y;
+        let mut nc = n_channels; let mut ks = kernel_size;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void,
+            &mut ha as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut ks as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_silu_inplace(&self, x: *mut c_void, n: u32) -> Result<(), String> {
+        let f = self.silu_inplace_module.function("silu_inplace_f32")?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut xa = x; let mut na = n;
+        let mut args: [*mut c_void; 2] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_l2norm_multihead(&self, x: *mut c_void, y: *mut c_void,
+                                n_heads: u32, head_dim: u32, eps: f32, scale: f32)
+        -> Result<(), String>
+    {
+        let f = self.l2norm_multihead_module.function("l2norm_multihead_f32")?;
+        let block: u32 = 128;
+        let mut xa = x; let mut ya = y; let mut nh = n_heads; let mut hd = head_dim;
+        let mut ea = eps; let mut sa = scale;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+        ];
+        let smem = block * std::mem::size_of::<f32>() as u32;
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
+    fn launch_gdn_decay_beta(&self, a: *mut c_void, b: *mut c_void,
+                             ssm_a: *mut c_void, dt_bias: *mut c_void,
+                             decay: *mut c_void, beta: *mut c_void, n_heads: u32)
+        -> Result<(), String>
+    {
+        let f = self.gdn_decay_beta_module.function("gdn_decay_beta_f32")?;
+        let block: u32 = 64;
+        let grid = (n_heads + block - 1) / block;
+        let mut aa = a; let mut bb = b; let mut sa = ssm_a; let mut da = dt_bias;
+        let mut dca = decay; let mut beta_a = beta; let mut nh = n_heads;
+        let mut args: [*mut c_void; 7] = [
+            &mut aa     as *mut _ as *mut c_void,
+            &mut bb     as *mut _ as *mut c_void,
+            &mut sa     as *mut _ as *mut c_void,
+            &mut da     as *mut _ as *mut c_void,
+            &mut dca    as *mut _ as *mut c_void,
+            &mut beta_a as *mut _ as *mut c_void,
+            &mut nh     as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_gdn_recurrent_step(&self,
+        q: *mut c_void, k: *mut c_void, v: *mut c_void,
+        decay: *mut c_void, beta: *mut c_void,
+        state: *mut c_void, out: *mut c_void,
+        n_heads: u32, head_dim: u32) -> Result<(), String>
+    {
+        let f = self.gdn_recurrent_step_module.function("gdn_recurrent_step_f32")?;
+        let block: u32 = head_dim;
+        let smem = 4 * head_dim * std::mem::size_of::<f32>() as u32;
+        let mut qa = q; let mut ka = k; let mut va = v;
+        let mut da = decay; let mut ba = beta;
+        let mut sa = state; let mut oa = out;
+        let mut nh = n_heads; let mut hd = head_dim;
+        let mut args: [*mut c_void; 9] = [
+            &mut qa as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void,
+            &mut da as *mut _ as *mut c_void,
+            &mut ba as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
+    fn launch_rmsnorm_gated_multihead(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
+                                      y: *mut c_void, n_heads: u32, head_dim: u32, eps: f32)
+        -> Result<(), String>
+    {
+        let f = self.rmsnorm_gated_multihead_module.function("rmsnorm_gated_multihead_f32")?;
+        let block: u32 = 128;
+        let mut xa = x; let mut za = z; let mut wa = w; let mut ya = y;
+        let mut nh = n_heads; let mut hd = head_dim; let mut ea = eps;
+        let mut args: [*mut c_void; 7] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut za as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void,
+        ];
+        let smem = block * std::mem::size_of::<f32>() as u32;
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
     fn launch_add_inplace(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
         let f = self.add_inplace_module.function("add_inplace_f32")?;
         let block: u32 = 256;
@@ -578,6 +846,124 @@ impl GpuQwen35 {
                              &weights.ffn)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
 
+        hip::Device(0).synchronize()?;
+        let mut out = vec![0.0f32; self.hidden];
+        self.hidden_a.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// Device-pointer linear-attention (GDN) step. Mirrors
+    /// `cpu::qwen3_5::linear_attention_step`. Reads `input_ptr` (preserved),
+    /// writes the post-projection output to `output_ptr`. Updates the
+    /// recurrent + conv state in `state`.
+    fn step_linear_attention(&self,
+        input_ptr: *mut c_void, output_ptr: *mut c_void,
+        weights: &GpuLinAttnWeights, state: &mut GpuLinAttnState,
+    ) -> Result<(), String>
+    {
+        let h_dim     = self.hidden        as u32;
+        let value_dim = self.gdn_value_dim as u32;
+        let conv_dim  = self.gdn_conv_dim  as u32;
+        let n_heads   = self.gdn_n_heads   as u32;
+        let head_dim  = self.gdn_head_dim  as u32;
+        let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
+
+        // 1) normed = rmsnorm(input, attn_norm) → output_ptr (used as scratch)
+        self.launch_rmsnorm(input_ptr, weights.attn_norm.raw_ptr(),
+                            output_ptr, h_dim, self.rms_eps)?;
+
+        // 2) Four projections off normed.
+        self.launch_matvec(weights.attn_qkv.raw_ptr(), output_ptr,
+                           self.gdn_qkv.raw_ptr(), h_dim, conv_dim)?;
+        self.launch_matvec(weights.attn_gate.raw_ptr(), output_ptr,
+                           self.gdn_z.raw_ptr(), h_dim, value_dim)?;
+        self.launch_matvec(weights.ssm_alpha.raw_ptr(), output_ptr,
+                           self.gdn_a.raw_ptr(), h_dim, n_heads)?;
+        self.launch_matvec(weights.ssm_beta.raw_ptr(), output_ptr,
+                           self.gdn_b.raw_ptr(), h_dim, n_heads)?;
+
+        // 3) Causal Conv1D + SiLU over mixed_qkv.
+        self.launch_conv1d_step(self.gdn_qkv.raw_ptr(), weights.ssm_conv1d.raw_ptr(),
+                                state.conv_hist.raw_ptr(), self.gdn_conv_out.raw_ptr(),
+                                conv_dim, self.gdn_conv_kernel as u32)?;
+        self.launch_silu_inplace(self.gdn_conv_out.raw_ptr(), conv_dim)?;
+
+        // 4) conv_out is laid out [Q | K | V], each [n_heads * head_dim] = value_dim.
+        //    Slice by pointer arithmetic — the data is contiguous.
+        let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
+        let q_in_ptr = unsafe { conv_out_ptr.add(0)                      } as *mut c_void;
+        let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_value_dim)     } as *mut c_void;
+        let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_value_dim) } as *mut c_void;
+
+        // 5) Per-head L2-norm of Q (with scale=1/√head_dim) and K (scale=1).
+        self.launch_l2norm_multihead(q_in_ptr, self.gdn_q.raw_ptr(),
+                                     n_heads, head_dim, 1e-6, q_scale)?;
+        self.launch_l2norm_multihead(k_in_ptr, self.gdn_k.raw_ptr(),
+                                     n_heads, head_dim, 1e-6, 1.0)?;
+
+        // 6) Per-head decay + beta.
+        self.launch_gdn_decay_beta(self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr(),
+                                   weights.ssm_a.raw_ptr(), weights.ssm_dt_bias.raw_ptr(),
+                                   self.gdn_decay.raw_ptr(), self.gdn_beta.raw_ptr(),
+                                   n_heads)?;
+
+        // 7) Recurrent gated delta-rule update (state in-place + emits core_out).
+        self.launch_gdn_recurrent_step(self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr,
+                                        self.gdn_decay.raw_ptr(), self.gdn_beta.raw_ptr(),
+                                        state.recurrent.raw_ptr(),
+                                        self.gdn_core_out.raw_ptr(),
+                                        n_heads, head_dim)?;
+
+        // 8) Per-head gated RMSNorm: core_out *= w * silu(z), in place.
+        self.launch_rmsnorm_gated_multihead(self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
+                                             weights.ssm_norm.raw_ptr(),
+                                             self.gdn_core_out.raw_ptr(),
+                                             n_heads, head_dim, self.rms_eps)?;
+
+        // 9) Project back to hidden.
+        self.launch_matvec(weights.ssm_out.raw_ptr(), self.gdn_core_out.raw_ptr(),
+                           output_ptr, value_dim, h_dim)?;
+        Ok(())
+    }
+
+    /// Run one decode step of the linear-attention (GDN) sub-layer.
+    /// `input` and the returned vector are hidden-sized.
+    pub fn apply_linear_attention(&self,
+        input: &[f32],
+        weights: &GpuLinAttnWeights,
+        state: &mut GpuLinAttnState,
+    ) -> Result<Vec<f32>, String>
+    {
+        assert_eq!(input.len(), self.hidden);
+        self.hidden_a.copy_from_host(input)?;
+        self.step_linear_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+                                    weights, state)?;
+        hip::Device(0).synchronize()?;
+        let mut out = vec![0.0f32; self.hidden];
+        self.hidden_b.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// One full transformer block (linear-attention variant): GDN +
+    /// residual + post-norm + FFN + residual. Mirrors
+    /// `cpu::qwen3_5::linear_attention_block`.
+    pub fn apply_linear_attention_block(&self,
+        input: &[f32],
+        weights: &GpuLinAttnBlock,
+        state: &mut GpuLinAttnState,
+    ) -> Result<Vec<f32>, String>
+    {
+        assert_eq!(input.len(), self.hidden);
+        let h_dim = self.hidden as u32;
+
+        self.hidden_a.copy_from_host(input)?;
+        self.step_linear_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+                                    &weights.attn, state)?;
+        self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), weights.post_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
+        self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &weights.ffn)?;
+        self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
         hip::Device(0).synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_a.copy_to_host(&mut out)?;
@@ -775,6 +1161,162 @@ mod tests {
             assert!(worst_violation <= 0.0,
                 "block {block_idx} ffn[{worst_at}]: gpu={} cpu={} diff exceeds abs={ABS_TOL:.1e} or rel={REL_TOL:.1e}",
                 gpu_out[worst_at], cpu_out[worst_at]);
+        }
+    }
+
+    #[test]
+    fn linear_attention_step_matches_cpu_for_real_block() {
+        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        let _dev = hip::Device::set(0).unwrap();
+        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let cache = match KernelCache::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
+        };
+
+        use crate::cpu::qwen3_5::{BlockWeights, LinAttnState as CpuLinAttnState,
+                                  linear_attention_step};
+
+        let g = GgufFile::open(&path).unwrap();
+        let m = Qwen35F32Model::load(&g).unwrap();
+        let cfg = &m.model.config;
+        let h = cfg.hidden_size as usize;
+
+        // Block 0 is LinearAttention in Qwen 3.5.
+        let block_idx = m.model.block_kinds.iter()
+            .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::LinearAttention))
+            .expect("model has at least one LinearAttention block");
+        let weights = match &m.weights.blocks[block_idx] {
+            BlockWeights::LinearAttention(w) => w,
+            _ => unreachable!(),
+        };
+        eprintln!("validating GDN step on block {block_idx}");
+
+        let conv_dim = 3 * cfg.gdn_value_dim as usize;
+        let mut cpu_state = CpuLinAttnState::new(
+            cfg.gdn_n_heads as usize,
+            cfg.gdn_head_dim as usize,
+            cfg.gdn_head_dim as usize,
+            conv_dim,
+            cfg.gdn_conv_kernel as usize,
+        );
+
+        let gpu = GpuQwen35::new(&m, &cache, 16).expect("new GpuQwen35");
+        let gpu_w = GpuLinAttnWeights::from_cpu(weights).expect("upload GDN weights");
+        let mut gpu_state = GpuLinAttnState::new(
+            cfg.gdn_n_heads     as usize,
+            cfg.gdn_head_dim    as usize,
+            conv_dim,
+            cfg.gdn_conv_kernel as usize,
+        ).expect("alloc gpu lin state");
+
+        let mut s: u64 = 0xCAFE_BABE_FACE;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+
+        for step in 0..4 {
+            let input: Vec<f32> = (0..h).map(|_| rng() * 2.0).collect();
+
+            let mut cpu_out = vec![0.0f32; h];
+            linear_attention_step(&input, weights, cfg, &mut cpu_state, &mut cpu_out);
+
+            let gpu_out = gpu.apply_linear_attention(&input, &gpu_w, &mut gpu_state)
+                .expect("gpu GDN");
+
+            const ABS_TOL: f32 = 1.0e-3;
+            const REL_TOL: f32 = 5.0e-3;
+            let mut max_abs = 0.0f32;
+            let mut worst_violation = 0.0f32;
+            let mut worst_at = 0usize;
+            for i in 0..h {
+                let d = (gpu_out[i] - cpu_out[i]).abs();
+                if d > max_abs { max_abs = d; }
+                let allowed = ABS_TOL.max(REL_TOL * cpu_out[i].abs());
+                let v = d - allowed;
+                if v > worst_violation { worst_violation = v; worst_at = i; }
+            }
+            eprintln!("GDN step {step}: max_abs={max_abs:.3e}, worst_violation={:.3e}",
+                worst_violation);
+            assert!(worst_violation <= 0.0,
+                "GDN step {step} idx {worst_at}: gpu={} cpu={} exceeds tol",
+                gpu_out[worst_at], cpu_out[worst_at]);
+        }
+    }
+
+    #[test]
+    fn linear_attention_block_matches_cpu_for_real_block() {
+        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        let _dev = hip::Device::set(0).unwrap();
+        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let cache = match KernelCache::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
+        };
+
+        use crate::cpu::qwen3_5::{BlockWeights, LinAttnState as CpuLinAttnState,
+                                  linear_attention_block};
+
+        let g = GgufFile::open(&path).unwrap();
+        let m = Qwen35F32Model::load(&g).unwrap();
+        let cfg = &m.model.config;
+        let h = cfg.hidden_size as usize;
+
+        let block_idx = m.model.block_kinds.iter()
+            .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::LinearAttention))
+            .expect("model has at least one LinearAttention block");
+        let weights = match &m.weights.blocks[block_idx] {
+            BlockWeights::LinearAttention(w) => w,
+            _ => unreachable!(),
+        };
+
+        let conv_dim = 3 * cfg.gdn_value_dim as usize;
+        let mut cpu_state = CpuLinAttnState::new(
+            cfg.gdn_n_heads as usize,
+            cfg.gdn_head_dim as usize,
+            cfg.gdn_head_dim as usize,
+            conv_dim,
+            cfg.gdn_conv_kernel as usize,
+        );
+
+        let gpu = GpuQwen35::new(&m, &cache, 16).expect("new GpuQwen35");
+        let gpu_block = GpuLinAttnBlock::from_cpu(weights).expect("upload GDN block");
+        let mut gpu_state = GpuLinAttnState::new(
+            cfg.gdn_n_heads     as usize,
+            cfg.gdn_head_dim    as usize,
+            conv_dim,
+            cfg.gdn_conv_kernel as usize,
+        ).expect("alloc gpu lin state");
+
+        let mut s: u64 = 0xC0FFEE_BABE_BEEF;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+
+        for step in 0..4 {
+            let input: Vec<f32> = (0..h).map(|_| rng() * 2.0).collect();
+
+            let mut cpu_state_out = input.clone();
+            linear_attention_block(&mut cpu_state_out, weights, cfg, &mut cpu_state);
+
+            let gpu_state_out = gpu.apply_linear_attention_block(&input, &gpu_block, &mut gpu_state)
+                .expect("gpu GDN block");
+
+            const ABS_TOL: f32 = 5.0e-3;
+            const REL_TOL: f32 = 5.0e-3;
+            let mut max_abs = 0.0f32;
+            let mut worst_violation = 0.0f32;
+            let mut worst_at = 0usize;
+            for i in 0..h {
+                let d = (gpu_state_out[i] - cpu_state_out[i]).abs();
+                if d > max_abs { max_abs = d; }
+                let allowed = ABS_TOL.max(REL_TOL * cpu_state_out[i].abs());
+                let v = d - allowed;
+                if v > worst_violation { worst_violation = v; worst_at = i; }
+            }
+            eprintln!("GDN block step {step}: max_abs={max_abs:.3e}, worst_violation={:.3e}",
+                worst_violation);
+            assert!(worst_violation <= 0.0,
+                "GDN block step {step} idx {worst_at}: gpu={} cpu={} exceeds tol",
+                gpu_state_out[worst_at], cpu_state_out[worst_at]);
         }
     }
 
