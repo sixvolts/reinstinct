@@ -154,6 +154,21 @@ impl<T: Copy> DeviceBuf<T> {
                "hipMemcpy D2H")
         }
     }
+
+    /// D2D copy: write all of `src` into `self` starting at element index
+    /// `dst_offset`. `dst_offset + src.len()` must be within `self.len()`.
+    pub fn copy_from_device_at(&self, src: &DeviceBuf<T>, dst_offset: usize) -> Result<()> {
+        assert!(dst_offset + src.len <= self.len,
+                "copy_from_device_at: dst_offset+src.len ({}) exceeds self.len ({})",
+                dst_offset + src.len, self.len);
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe {
+            let dst_ptr = self.ptr.add(dst_offset) as *mut c_void;
+            ck(api, (api.memcpy)(dst_ptr, src.ptr as *const c_void,
+                                  src.byte_len(), HipMemcpyKind::DeviceToDevice),
+               "hipMemcpy D2D")
+        }
+    }
 }
 
 impl<T> Drop for DeviceBuf<T> {

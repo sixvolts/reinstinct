@@ -35,6 +35,121 @@ const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 const SWIGLU_SOURCE: &str = include_str!("../../kernels/swiglu.cpp");
 const SWIGLU_KERNEL: &str = "swiglu_mul_f32";
 
+const ROPE_SOURCE: &str = include_str!("../../kernels/rope.cpp");
+const ROPE_KERNEL: &str = "rope_apply_f32";
+
+const ATTN_STEP_SOURCE: &str = include_str!("../../kernels/attn_step.cpp");
+const ATTN_STEP_KERNEL: &str = "attn_step_f32";
+
+/// Single-step GQA attention. Computes per-head softmax(Q·Kᵀ/√d) · V.
+///
+/// `k_cache` and `v_cache` are full pre-allocated caches of shape
+/// `[max_seq, n_kv_heads, head_dim]` flat. Only the first `total_len`
+/// positions are attended over.
+pub fn attn_step_f32(cache: &KernelCache,
+                     q: &[f32], k_cache: &[f32], v_cache: &[f32],
+                     n_heads: usize, n_kv_heads: usize, head_dim: usize,
+                     total_len: usize, scaling: f32) -> Result<Vec<f32>, String>
+{
+    assert_eq!(q.len(), n_heads * head_dim);
+    let kv_row = n_kv_heads * head_dim;
+    assert!(k_cache.len() >= total_len * kv_row);
+    assert!(v_cache.len() >= total_len * kv_row);
+    assert_eq!(n_heads % n_kv_heads, 0);
+
+    let hsaco = cache.compile("attn_step", ATTN_STEP_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function(ATTN_STEP_KERNEL)?;
+
+    let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
+    let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k_cache)?;
+    let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v_cache)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim)?;
+
+    let block: u32 = 256;
+    let grid: u32 = n_heads as u32;
+    let smem_bytes = ((head_dim + total_len) as u32 + block) * std::mem::size_of::<f32>() as u32;
+
+    let mut q_ptr = dq.raw_ptr();
+    let mut k_ptr = dk.raw_ptr();
+    let mut v_ptr = dv.raw_ptr();
+    let mut o_ptr = dy.raw_ptr();
+    let mut nh = n_heads as u32;
+    let mut nkv = n_kv_heads as u32;
+    let mut hd = head_dim as u32;
+    let mut tl = total_len as u32;
+    let mut sc = scaling;
+    let mut args: [*mut c_void; 9] = [
+        &mut q_ptr as *mut _ as *mut c_void,
+        &mut k_ptr as *mut _ as *mut c_void,
+        &mut v_ptr as *mut _ as *mut c_void,
+        &mut o_ptr as *mut _ as *mut c_void,
+        &mut nh    as *mut _ as *mut c_void,
+        &mut nkv   as *mut _ as *mut c_void,
+        &mut hd    as *mut _ as *mut c_void,
+        &mut tl    as *mut _ as *mut c_void,
+        &mut sc    as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem_bytes, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; n_heads * head_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Apply partial RoPE in place to `x` (multi-head layout). Returns the
+/// rotated buffer. `cos` and `sin` are full tables of shape
+/// `[max_seq, rotary_dim]`.
+pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
+                      head_dim: usize, rotary_dim: usize, n_heads: usize, pos: usize)
+    -> Result<Vec<f32>, String>
+{
+    assert_eq!(x.len(), n_heads * head_dim);
+    assert_eq!(cos.len(), sin.len());
+    assert_eq!(cos.len() % rotary_dim, 0);
+    let max_seq = cos.len() / rotary_dim;
+    assert!(pos < max_seq, "pos {pos} out of range max_seq {max_seq}");
+    assert!(rotary_dim <= head_dim);
+    assert!(rotary_dim % 2 == 0);
+
+    let hsaco = cache.compile("rope", ROPE_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function(ROPE_KERNEL)?;
+
+    let dx: DeviceBuf<f32>  = DeviceBuf::from_slice(x)?;
+    let dc: DeviceBuf<f32>  = DeviceBuf::from_slice(cos)?;
+    let ds: DeviceBuf<f32>  = DeviceBuf::from_slice(sin)?;
+
+    let half = (rotary_dim / 2) as u32;
+    let block: u32 = 64;
+    let grid_x = (half + block - 1) / block;
+    let grid_y = n_heads as u32;
+
+    let mut x_ptr = dx.raw_ptr();
+    let mut c_ptr = dc.raw_ptr();
+    let mut s_ptr = ds.raw_ptr();
+    let mut hd = head_dim as u32;
+    let mut rd = rotary_dim as u32;
+    let mut nh = n_heads as u32;
+    let mut p  = pos as u32;
+    let mut args: [*mut c_void; 7] = [
+        &mut x_ptr as *mut _ as *mut c_void,
+        &mut c_ptr as *mut _ as *mut c_void,
+        &mut s_ptr as *mut _ as *mut c_void,
+        &mut hd    as *mut _ as *mut c_void,
+        &mut rd    as *mut _ as *mut c_void,
+        &mut nh    as *mut _ as *mut c_void,
+        &mut p     as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid_x, grid_y, 1), (block, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; x.len()];
+    dx.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// `out[i] = silu(gate[i]) * up[i]` (Qwen / Llama FFN gate fusion).
 pub fn swiglu_mul_f32(cache: &KernelCache, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
     assert_eq!(gate.len(), up.len());
@@ -474,6 +589,119 @@ mod tests {
         check_rmsnorm(&cache, 2048, 1e-6, 0xDEAD_BEEF, 1e-5);
         check_rmsnorm(&cache, 4096, 1e-6, 0x1234_5678, 1e-5);
         check_rmsnorm(&cache, 6144, 1e-6, 0xCAFEBABE, 1e-5);
+    }
+
+    #[test]
+    fn attn_step_matches_cpu_oracle() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        // Qwen 3.5 0.8B full-attention shape: n_heads=8, n_kv_heads=2,
+        // head_dim=256. We don't need a real model for the kernel test —
+        // just verify per-head softmax(QKᵀ/√d)·V matches a CPU oracle.
+        let n_heads = 8usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 256usize;
+        let groups = n_heads / n_kv_heads;
+        let scaling = (head_dim as f32).powf(-0.5);
+
+        for &total_len in &[1usize, 4, 17, 64] {
+            let mut s: u64 = 0xA77E_C0DE ^ total_len as u64;
+            let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                               ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+            let q: Vec<f32>       = (0..n_heads * head_dim).map(|_| rng()).collect();
+            let k_cache: Vec<f32> = (0..total_len * n_kv_heads * head_dim).map(|_| rng()).collect();
+            let v_cache: Vec<f32> = (0..total_len * n_kv_heads * head_dim).map(|_| rng()).collect();
+
+            // CPU oracle.
+            let mut cpu = vec![0.0f32; n_heads * head_dim];
+            let mut scores = vec![0.0f32; total_len];
+            for h in 0..n_heads {
+                let kv_h = h / groups;
+                let q_h = &q[h * head_dim..(h + 1) * head_dim];
+                for t in 0..total_len {
+                    let off = (t * n_kv_heads + kv_h) * head_dim;
+                    let k_t = &k_cache[off..off + head_dim];
+                    let mut acc = 0.0f32;
+                    for d in 0..head_dim { acc += q_h[d] * k_t[d]; }
+                    scores[t] = acc * scaling;
+                }
+                crate::cpu::ops::softmax(&mut scores);
+                let head_out = &mut cpu[h * head_dim..(h + 1) * head_dim];
+                head_out.fill(0.0);
+                for t in 0..total_len {
+                    let off = (t * n_kv_heads + kv_h) * head_dim;
+                    let v_t = &v_cache[off..off + head_dim];
+                    let s = scores[t];
+                    for d in 0..head_dim { head_out[d] += s * v_t[d]; }
+                }
+            }
+
+            let gpu = attn_step_f32(&cache, &q, &k_cache, &v_cache,
+                n_heads, n_kv_heads, head_dim, total_len, scaling).expect("gpu attn");
+
+            const ABS_TOL: f32 = 5.0e-5;
+            const REL_TOL: f32 = 5.0e-4;
+            let mut max_abs = 0.0f32;
+            let mut worst_violation = 0.0f32;
+            let mut worst_at = 0usize;
+            for i in 0..gpu.len() {
+                let d = (gpu[i] - cpu[i]).abs();
+                if d > max_abs { max_abs = d; }
+                let allowed = ABS_TOL.max(REL_TOL * cpu[i].abs());
+                let v = d - allowed;
+                if v > worst_violation { worst_violation = v; worst_at = i; }
+            }
+            eprintln!("attn total_len={total_len}: max_abs={max_abs:.3e}, worst_violation={:.3e} at {worst_at}",
+                worst_violation);
+            assert!(worst_violation <= 0.0,
+                "attn total_len={total_len}: idx {worst_at} gpu={} cpu={} exceeds tol",
+                gpu[worst_at], cpu[worst_at]);
+        }
+    }
+
+    #[test]
+    fn rope_matches_cpu_per_head() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::cpu::rope::{RopeCache, apply_rope};
+
+        // Qwen 3.5 0.8B uses head_dim=256, rotary_dim=64, freq_base=10000.
+        let head_dim = 256usize;
+        let rotary_dim = 64usize;
+        let n_heads = 8usize;
+        let max_seq = 32usize;
+        let rope = RopeCache::new(rotary_dim, max_seq, 10000.0);
+
+        // Synthesize multi-head input.
+        let mut s: u64 = 0x515E_C0DE;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..n_heads * head_dim).map(|_| rng()).collect();
+
+        // Pull cos/sin tables out of the cache. Need to re-derive since
+        // RopeCache keeps them private; rebuild via the public get().
+        let mut cos = vec![0.0f32; max_seq * rotary_dim];
+        let mut sin = vec![0.0f32; max_seq * rotary_dim];
+        for pos in 0..max_seq {
+            let (c, s) = rope.get(pos);
+            cos[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(c);
+            sin[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(s);
+        }
+
+        for &pos in &[0usize, 1, 5, 17, 31] {
+            let mut cpu = x.clone();
+            for h in 0..n_heads {
+                apply_rope(&mut cpu[h * head_dim..(h + 1) * head_dim], &rope, pos);
+            }
+            let gpu = rope_apply_f32(&cache, &x, &cos, &sin, head_dim, rotary_dim, n_heads, pos)
+                .expect("gpu rope");
+
+            let mut max_abs = 0.0_f32;
+            for i in 0..gpu.len() {
+                let d = (gpu[i] - cpu[i]).abs();
+                if d > max_abs { max_abs = d; }
+            }
+            eprintln!("rope pos={pos}: max_abs={max_abs:.3e}");
+            assert!(max_abs < 1e-6, "rope pos={pos}: max_abs {max_abs:.3e}");
+        }
     }
 
     #[test]
