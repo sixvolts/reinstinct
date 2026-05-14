@@ -63,6 +63,14 @@ const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 
+const MATVEC_F32_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
+const MATVEC_Q4_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k_wave64.cpp");
+const MATVEC_Q5_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k_wave64.cpp");
+const MATVEC_Q6_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k_wave64.cpp");
+const MATVEC_Q8_0_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0_wave64.cpp");
+const MATVEC_IQ4_XS_WAVE64_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs_wave64.cpp");
+const MATVEC_F16_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f16_wave64.cpp");
+
 /// A weight tensor used as the W matrix in a `y = W·x` matvec, resident on
 /// device. Holds the raw on-disk byte stream + on-disk dtype, so the
 /// dispatcher can pick the right fused dequant+GEMV kernel per type.
@@ -417,6 +425,13 @@ pub struct GpuQwen35 {
     matvec_iq4_xs_module:  Module,
     matvec_f16_module:     Module,
     embed_lookup_q6_k_module: Module,
+    matvec_f32_wave64_module:    Module,
+    matvec_q4_k_wave64_module:   Module,
+    matvec_q5_k_wave64_module:   Module,
+    matvec_q6_k_wave64_module:   Module,
+    matvec_q8_0_wave64_module:   Module,
+    matvec_iq4_xs_wave64_module: Module,
+    matvec_f16_wave64_module:    Module,
 
     /// Per-layer transformer block weights, in schedule order.
     blocks: Vec<GpuBlock>,
@@ -533,6 +548,13 @@ impl GpuQwen35 {
         let matvec_iq4_xs_hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
+        let matvec_f32_wave64_hsaco    = cache.compile("matvec_f32_wave64",    MATVEC_F32_WAVE64_SOURCE)?;
+        let matvec_q4_k_wave64_hsaco   = cache.compile("matvec_q4_k_wave64",   MATVEC_Q4_K_WAVE64_SOURCE)?;
+        let matvec_q5_k_wave64_hsaco   = cache.compile("matvec_q5_k_wave64",   MATVEC_Q5_K_WAVE64_SOURCE)?;
+        let matvec_q6_k_wave64_hsaco   = cache.compile("matvec_q6_k_wave64",   MATVEC_Q6_K_WAVE64_SOURCE)?;
+        let matvec_q8_0_wave64_hsaco   = cache.compile("matvec_q8_0_wave64",   MATVEC_Q8_0_WAVE64_SOURCE)?;
+        let matvec_iq4_xs_wave64_hsaco = cache.compile("matvec_iq4_xs_wave64", MATVEC_IQ4_XS_WAVE64_SOURCE)?;
+        let matvec_f16_wave64_hsaco    = cache.compile("matvec_f16_wave64",    MATVEC_F16_WAVE64_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.model.block_kinds.len());
@@ -568,6 +590,13 @@ impl GpuQwen35 {
             matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
+            matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
+            matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
+            matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
+            matvec_q6_k_wave64_module:   Module::load(&matvec_q6_k_wave64_hsaco)?,
+            matvec_q8_0_wave64_module:   Module::load(&matvec_q8_0_wave64_hsaco)?,
+            matvec_iq4_xs_wave64_module: Module::load(&matvec_iq4_xs_wave64_hsaco)?,
+            matvec_f16_wave64_module:    Module::load(&matvec_f16_wave64_hsaco)?,
             blocks,
             stream: Stream::new()?,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
@@ -701,6 +730,26 @@ impl GpuQwen35 {
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
+    /// Wave-cooperative launcher: 64 threads (one wavefront) per output
+    /// row, no shared memory, reduction via __shfl_xor inside the kernel.
+    fn launch_matvec_wave64(&self, module: &Module, kname: &str,
+                            w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                            in_dim: u32, out_dim: u32) -> Result<(), String>
+    {
+        let f = module.function(kname)?;
+        let block: u32 = 64;
+        let mut wa = w; let mut xa = x; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut wa as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     /// Dispatch a matvec to the right kernel based on the weight's on-disk
     /// dtype. Output `y` always lands as fp32.
     fn launch_matvec_dispatch(&self, w: &GpuMatvecTensor,
@@ -710,19 +759,20 @@ impl GpuQwen35 {
         let out_d = w.out_dim;
         let wp    = w.data.raw_ptr();
         match w.dtype {
-            GgmlType::F32    => self.launch_matvec(wp, x, y, in_d, out_d),
-            GgmlType::Q8_0   => self.launch_matvec_q_kernel(&self.matvec_q8_0_module,
-                                    "matvec_q8_0_f32", wp, x, y, in_d, out_d),
-            GgmlType::Q4_K   => self.launch_matvec_q_kernel(&self.matvec_q4_k_module,
-                                    "matvec_q4_k_f32", wp, x, y, in_d, out_d),
-            GgmlType::Q5_K   => self.launch_matvec_q_kernel(&self.matvec_q5_k_module,
-                                    "matvec_q5_k_f32", wp, x, y, in_d, out_d),
-            GgmlType::Q6_K   => self.launch_matvec_q_kernel(&self.matvec_q6_k_module,
-                                    "matvec_q6_k_f32", wp, x, y, in_d, out_d),
-            GgmlType::IQ4_XS => self.launch_matvec_q_kernel(&self.matvec_iq4_xs_module,
-                                    "matvec_iq4_xs_f32", wp, x, y, in_d, out_d),
-            GgmlType::F16    => self.launch_matvec_q_kernel(&self.matvec_f16_module,
-                                    "matvec_f16_f32", wp, x, y, in_d, out_d),
+            GgmlType::F32    => self.launch_matvec_wave64(&self.matvec_f32_wave64_module,
+                                    "matvec_f32_wave64", wp, x, y, in_d, out_d),
+            GgmlType::Q8_0   => self.launch_matvec_wave64(&self.matvec_q8_0_wave64_module,
+                                    "matvec_q8_0_wave64_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q4_K   => self.launch_matvec_wave64(&self.matvec_q4_k_wave64_module,
+                                    "matvec_q4_k_wave64_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q5_K   => self.launch_matvec_wave64(&self.matvec_q5_k_wave64_module,
+                                    "matvec_q5_k_wave64_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q6_K   => self.launch_matvec_wave64(&self.matvec_q6_k_wave64_module,
+                                    "matvec_q6_k_wave64_f32", wp, x, y, in_d, out_d),
+            GgmlType::IQ4_XS => self.launch_matvec_wave64(&self.matvec_iq4_xs_wave64_module,
+                                    "matvec_iq4_xs_wave64_f32", wp, x, y, in_d, out_d),
+            GgmlType::F16    => self.launch_matvec_wave64(&self.matvec_f16_wave64_module,
+                                    "matvec_f16_wave64_f32", wp, x, y, in_d, out_d),
             other => Err(format!("matvec dispatch: no kernel for {:?}", other)),
         }
     }
