@@ -6,6 +6,7 @@
 //! correctness validation; the production HIP path will keep weights quantized
 //! in HBM and dequantize per-tile inside fused kernels.
 
+use crate::cpu::conv1d::Conv1dState;
 use crate::cpu::ops;
 use crate::cpu::rope::{apply_rope, RopeCache};
 use crate::gguf::{GgufError, GgufFile, TensorInfo};
@@ -308,6 +309,224 @@ pub fn full_attention_step(
         attn_concat[i] *= ops::sigmoid(gate[i]);
     }
     ops::matvec(&attn_concat, &weights.attn_output, q_dim, h_dim, out);
+}
+
+// ---- Linear-attention (Gated DeltaNet) block ------------------------------
+
+/// Per-layer state for a Gated-DeltaNet block.
+///
+/// Two pieces:
+/// - `recurrent`: the per-head outer-product memory matrix S of shape
+///   [n_heads, k_head_dim, v_head_dim] = [16, 128, 128] for Qwen 3.5 0.8B,
+///   stored fp32 per the model's `mamba_ssm_dtype: "float32"`.
+/// - `conv`: depthwise causal Conv1D ring buffer over the conv_dim
+///   (= 2*key_dim + value_dim = 6144) channels of mixed_qkv.
+pub struct LinAttnState {
+    recurrent: Vec<f32>,
+    pub conv: Conv1dState,
+    pub n_heads: usize,
+    pub k_head_dim: usize,
+    pub v_head_dim: usize,
+}
+
+impl LinAttnState {
+    pub fn new(
+        n_heads: usize, k_head_dim: usize, v_head_dim: usize,
+        conv_channels: usize, conv_kernel: usize,
+    ) -> Self {
+        Self {
+            recurrent: vec![0.0; n_heads * k_head_dim * v_head_dim],
+            conv: Conv1dState::new(conv_channels, conv_kernel),
+            n_heads, k_head_dim, v_head_dim,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for v in self.recurrent.iter_mut() { *v = 0.0; }
+        self.conv.reset();
+    }
+
+    /// Slice the per-head state matrix [k_head_dim, v_head_dim] for head `h`.
+    fn head_slice_mut(&mut self, h: usize) -> &mut [f32] {
+        let stride = self.k_head_dim * self.v_head_dim;
+        let off = h * stride;
+        &mut self.recurrent[off..off + stride]
+    }
+}
+
+/// One step of the Gated-DeltaNet block (the `linear_attention` block type).
+///
+/// Implements `Qwen3_5GatedDeltaNet.forward` for `seq_len == 1` (decode form),
+/// using `torch_recurrent_gated_delta_rule` semantics:
+///
+/// 1. project hidden → `mixed_qkv` [conv_dim], `z` [value_dim], `a` and `b` [n_heads]
+/// 2. depthwise causal Conv1D + SiLU on mixed_qkv
+/// 3. split mixed_qkv into Q | K | V (each [n_heads × head_dim])
+/// 4. l2-norm Q and K per-head, scale Q by 1/√head_dim
+/// 5. β = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
+/// 6. per head: state ← state·exp(g); kv_mem = state · k; δ = (v - kv_mem)·β;
+///    state += k ⊗ δ; out = state · q
+/// 7. apply RMSNormGated per head with z as the gate
+/// 8. project value_dim → hidden via ssm_out
+///
+/// `out` receives the block's contribution; caller adds residual.
+pub fn linear_attention_step(
+    hidden: &[f32],
+    weights: &LinAttnWeights,
+    config: &Qwen35Config,
+    state: &mut LinAttnState,
+    out: &mut [f32],
+) {
+    let h_dim = config.hidden_size as usize;
+    let n_heads = config.gdn_n_heads as usize;
+    let head_dim = config.gdn_head_dim as usize;     // 128 (k = v in Qwen 3.5)
+    let value_dim = config.gdn_value_dim as usize;   // 2048 = n_heads * head_dim
+    let conv_dim = 2 * value_dim + value_dim;        // 6144 = 2*key_dim + value_dim, key=value here
+    let scale = (head_dim as f32).powf(-0.5);
+
+    assert_eq!(hidden.len(), h_dim);
+    assert_eq!(out.len(), h_dim);
+    assert_eq!(state.n_heads, n_heads);
+    assert_eq!(state.k_head_dim, head_dim);
+    assert_eq!(state.v_head_dim, head_dim);
+
+    let mut normed = vec![0.0_f32; h_dim];
+    ops::rmsnorm(hidden, &weights.attn_norm, config.rms_norm_eps, &mut normed);
+
+    // Projections (single-token, so all are matvec).
+    let mut mixed_qkv = vec![0.0_f32; conv_dim];
+    let mut z = vec![0.0_f32; value_dim];
+    let mut a = vec![0.0_f32; n_heads];
+    let mut b = vec![0.0_f32; n_heads];
+    ops::matvec(&normed, &weights.attn_qkv,  h_dim, conv_dim,  &mut mixed_qkv);
+    ops::matvec(&normed, &weights.attn_gate, h_dim, value_dim, &mut z);
+    ops::matvec(&normed, &weights.ssm_alpha, h_dim, n_heads,   &mut a);
+    ops::matvec(&normed, &weights.ssm_beta,  h_dim, n_heads,   &mut b);
+
+    // Causal Conv1D + SiLU on mixed_qkv (per channel, kernel=4).
+    let mut conv_out = vec![0.0_f32; conv_dim];
+    state.conv.step(&mixed_qkv, &weights.ssm_conv1d, &mut conv_out);
+    for v in conv_out.iter_mut() { *v = ops::silu(*v); }
+
+    // Split into Q | K | V — each [n_heads * head_dim] = [2048].
+    let q_slice = &conv_out[0..value_dim];
+    let k_slice = &conv_out[value_dim..2 * value_dim];
+    let v_slice = &conv_out[2 * value_dim..3 * value_dim];
+
+    // Per-head L2-norm of Q and K, then Q-side scale.
+    let mut q = vec![0.0_f32; value_dim];
+    let mut k = vec![0.0_f32; value_dim];
+    let v: &[f32] = v_slice;
+    for h in 0..n_heads {
+        let off = h * head_dim;
+        ops::l2norm(&q_slice[off..off + head_dim], 1e-6, &mut q[off..off + head_dim]);
+        ops::l2norm(&k_slice[off..off + head_dim], 1e-6, &mut k[off..off + head_dim]);
+    }
+    for v in q.iter_mut() { *v *= scale; }
+
+    // Per-head decay and beta:
+    //   beta_h = sigmoid(b_h)
+    //   g_h = -exp(A_log_h) * softplus(a_h + dt_bias_h)
+    //   decay_h = exp(g_h)              (∈ (0, 1] since g_h ≤ 0)
+    let mut decay = vec![0.0_f32; n_heads];
+    let mut beta = vec![0.0_f32; n_heads];
+    for h in 0..n_heads {
+        let g = -weights.ssm_a[h].exp() * ops::softplus(a[h] + weights.ssm_dt_bias[h]);
+        decay[h] = g.exp();
+        beta[h] = ops::sigmoid(b[h]);
+    }
+
+    // Recurrent gated delta rule, per head, in place on state.
+    let mut core_attn_out = vec![0.0_f32; value_dim];
+    for h in 0..n_heads {
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        let k_h = &k[h * head_dim..(h + 1) * head_dim];
+        let v_h = &v[h * head_dim..(h + 1) * head_dim];
+        let decay_h = decay[h];
+        let beta_h = beta[h];
+        let s = state.head_slice_mut(h); // [k_head_dim, v_head_dim] flat row-major
+
+        // state *= decay
+        for x in s.iter_mut() { *x *= decay_h; }
+
+        // kv_mem[v] = sum_k state[k, v] * k_h[k]
+        let mut kv_mem = [0.0_f32; 256]; // assume head_dim ≤ 256
+        let kv_mem = &mut kv_mem[..head_dim];
+        kv_mem.fill(0.0);
+        for kk in 0..head_dim {
+            let kv = k_h[kk];
+            let row = &s[kk * head_dim..(kk + 1) * head_dim];
+            for vv in 0..head_dim {
+                kv_mem[vv] += row[vv] * kv;
+            }
+        }
+
+        // delta[v] = (v_h[v] - kv_mem[v]) * beta_h
+        let mut delta = [0.0_f32; 256];
+        let delta = &mut delta[..head_dim];
+        for vv in 0..head_dim {
+            delta[vv] = (v_h[vv] - kv_mem[vv]) * beta_h;
+        }
+
+        // state[k, v] += k_h[k] * delta[v]   (rank-1 outer product)
+        for kk in 0..head_dim {
+            let kv = k_h[kk];
+            let row = &mut s[kk * head_dim..(kk + 1) * head_dim];
+            for vv in 0..head_dim {
+                row[vv] += kv * delta[vv];
+            }
+        }
+
+        // out[h, v] = sum_k state[k, v] * q_h[k]
+        let head_out = &mut core_attn_out[h * head_dim..(h + 1) * head_dim];
+        head_out.fill(0.0);
+        for kk in 0..head_dim {
+            let qv = q_h[kk];
+            let row = &s[kk * head_dim..(kk + 1) * head_dim];
+            for vv in 0..head_dim {
+                head_out[vv] += row[vv] * qv;
+            }
+        }
+    }
+
+    // Per-head RMSNormGated with z as gate (`Qwen3_5RMSNormGated`):
+    //   out_h = (rmsnorm_no_shift(out_h) * weight) * silu(z_h)
+    let mut normed_out = vec![0.0_f32; value_dim];
+    for h in 0..n_heads {
+        let off = h * head_dim;
+        ops::rmsnorm_gated(
+            &core_attn_out[off..off + head_dim],
+            &z[off..off + head_dim],
+            &weights.ssm_norm,
+            config.rms_norm_eps,
+            &mut normed_out[off..off + head_dim],
+        );
+    }
+
+    // Project back to hidden_size.
+    ops::matvec(&normed_out, &weights.ssm_out, value_dim, h_dim, out);
+}
+
+/// Linear-attention (GDN) block: norm → GDN step → residual → norm → SwiGLU → residual.
+pub fn linear_attention_block(
+    hidden_inout: &mut [f32],
+    weights: &LinAttnWeights,
+    config: &Qwen35Config,
+    state: &mut LinAttnState,
+) {
+    let h = config.hidden_size as usize;
+    let f = config.ffn_size as usize;
+    assert_eq!(hidden_inout.len(), h);
+
+    let mut attn_out = vec![0.0_f32; h];
+    linear_attention_step(hidden_inout, weights, config, state, &mut attn_out);
+    ops::add_(hidden_inout, &attn_out);
+
+    let mut normed = vec![0.0_f32; h];
+    ops::rmsnorm(hidden_inout, &weights.post_attention_norm, config.rms_norm_eps, &mut normed);
+    let mut ffn_out = vec![0.0_f32; h];
+    swiglu_ffn(&normed, &weights.ffn_gate, &weights.ffn_up, &weights.ffn_down, h, f, &mut ffn_out);
+    ops::add_(hidden_inout, &ffn_out);
 }
 
 // ---- SwiGLU FFN (shared by both block types) ------------------------------
