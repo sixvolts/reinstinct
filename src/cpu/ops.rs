@@ -27,8 +27,15 @@ pub fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
 }
 
-/// In-place RMSNorm with the Qwen 3.5 `1 + weight` semantics.
-///   out = x * rsqrt(mean(x^2) + eps) * (1.0 + weight)
+/// In-place RMSNorm:
+///   out = x * rsqrt(mean(x^2) + eps) * weight
+///
+/// Important: Qwen 3.5's HF modeling code applies `(1.0 + weight)` because the
+/// PyTorch weight is initialized to 0. **In the GGUF, that `+1` has already been
+/// baked in** by `convert_hf_to_gguf.py` (`Qwen3NextModel.modify_tensors` does
+/// `data_torch = data_torch + 1` for all `*norm.weight` except
+/// `linear_attn.norm.weight`). So this kernel applies plain `weight` —
+/// applying `(1+weight)` here would double-shift.
 pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
     assert_eq!(weight.len(), n);
@@ -37,7 +44,7 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     for &v in x { sum_sq += v * v; }
     let rrms = (sum_sq / n as f32 + eps).sqrt().recip();
     for i in 0..n {
-        out[i] = x[i] * rrms * (1.0 + weight[i]);
+        out[i] = x[i] * rrms * weight[i];
     }
 }
 
@@ -158,11 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn rmsnorm_with_zero_weight_returns_unit_rms_input() {
-        // weight = 0 → effective scale = 1+0 = 1.
+    fn rmsnorm_with_unit_weight_returns_normalized_input() {
+        // weight = 1 → output = x / rms(x).
         // x = [3, 4]: mean(x^2) = (9+16)/2 = 12.5, rms = sqrt(12.5) ≈ 3.5355
         let x = vec![3.0, 4.0];
-        let w = vec![0.0, 0.0];
+        let w = vec![1.0, 1.0];
         let mut out = vec![0.0; 2];
         rmsnorm(&x, &w, 0.0, &mut out);
         let rms = 12.5_f32.sqrt();
@@ -171,13 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn rmsnorm_one_plus_weight_semantics() {
-        // weight = [1, -0.5] → effective scale = [2, 0.5]
+    fn rmsnorm_applies_per_dim_weight_directly() {
+        // weight = [2, 0.5], x = [1, 1] → mean(x^2)=1, rms=1, x/rms*w = [2, 0.5]
+        // (no `1 + w` shift — the convert step already baked +1 into the weight)
         let x = vec![1.0, 1.0];
-        let w = vec![1.0, -0.5];
+        let w = vec![2.0, 0.5];
         let mut out = vec![0.0; 2];
         rmsnorm(&x, &w, 0.0, &mut out);
-        // mean(x^2) = 1, rms = 1, x/rms = [1, 1], times (1+w) = [2, 0.5]
         assert!(approx_eq(out[0], 2.0, 1e-6));
         assert!(approx_eq(out[1], 0.5, 1e-6));
     }

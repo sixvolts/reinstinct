@@ -424,14 +424,17 @@ pub fn linear_attention_step(
     }
     for v in q.iter_mut() { *v *= scale; }
 
-    // Per-head decay and beta:
-    //   beta_h = sigmoid(b_h)
-    //   g_h = -exp(A_log_h) * softplus(a_h + dt_bias_h)
-    //   decay_h = exp(g_h)              (∈ (0, 1] since g_h ≤ 0)
+    // Per-head decay and beta. Note that `convert_hf_to_gguf.py` stores
+    // `ssm_a` as `-exp(A_log)` already (Qwen3NextModel.modify_tensors does
+    // `data_torch = -torch.exp(data_torch)` for `.A_log`), so we multiply
+    // ssm_a directly rather than re-applying `-exp`.
+    //   beta_h  = sigmoid(b_h)
+    //   g_h     = ssm_a_h * softplus(a_h + dt_bias_h)        (already negative)
+    //   decay_h = exp(g_h)                                    (∈ (0, 1])
     let mut decay = vec![0.0_f32; n_heads];
     let mut beta = vec![0.0_f32; n_heads];
     for h in 0..n_heads {
-        let g = -weights.ssm_a[h].exp() * ops::softplus(a[h] + weights.ssm_dt_bias[h]);
+        let g = weights.ssm_a[h] * ops::softplus(a[h] + weights.ssm_dt_bias[h]);
         decay[h] = g.exp();
         beta[h] = ops::sigmoid(b[h]);
     }
