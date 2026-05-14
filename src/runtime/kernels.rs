@@ -32,6 +32,42 @@ const MATVEC_Q5_K_KERNEL: &str = "matvec_q5_k_f32";
 const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
 const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 
+const SWIGLU_SOURCE: &str = include_str!("../../kernels/swiglu.cpp");
+const SWIGLU_KERNEL: &str = "swiglu_mul_f32";
+
+/// `out[i] = silu(gate[i]) * up[i]` (Qwen / Llama FFN gate fusion).
+pub fn swiglu_mul_f32(cache: &KernelCache, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
+    assert_eq!(gate.len(), up.len());
+    let n = gate.len();
+
+    let hsaco = cache.compile("swiglu", SWIGLU_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function(SWIGLU_KERNEL)?;
+
+    let dg: DeviceBuf<f32> = DeviceBuf::from_slice(gate)?;
+    let du: DeviceBuf<f32> = DeviceBuf::from_slice(up)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(n)?;
+
+    let block: u32 = 256;
+    let grid: u32 = (n as u32 + block - 1) / block;
+    let mut g_ptr = dg.raw_ptr();
+    let mut u_ptr = du.raw_ptr();
+    let mut y_ptr = dy.raw_ptr();
+    let mut n_arg = n as u32;
+    let mut args: [*mut c_void; 4] = [
+        &mut g_ptr  as *mut _ as *mut c_void,
+        &mut u_ptr  as *mut _ as *mut c_void,
+        &mut y_ptr  as *mut _ as *mut c_void,
+        &mut n_arg  as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; n];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// Fused IQ4_XS dequant + GEMV. 136 bytes per super-block; quants are
 /// 4-bit indices into a fixed 16-entry non-uniform codebook
 /// (KVALUES_IQ4NL), with per-sub-block 6-bit scale.
@@ -438,6 +474,29 @@ mod tests {
         check_rmsnorm(&cache, 2048, 1e-6, 0xDEAD_BEEF, 1e-5);
         check_rmsnorm(&cache, 4096, 1e-6, 0x1234_5678, 1e-5);
         check_rmsnorm(&cache, 6144, 1e-6, 0xCAFEBABE, 1e-5);
+    }
+
+    #[test]
+    fn swiglu_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let n = 4096;
+        let mut s: u64 = 0xCAFE_DEAD_BEEF;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let gate: Vec<f32> = (0..n).map(|_| rng() * 4.0).collect();   // wide range exercises silu
+        let up:   Vec<f32> = (0..n).map(|_| rng() * 4.0).collect();
+
+        let mut cpu = gate.clone();
+        crate::cpu::ops::swiglu_mul(&mut cpu, &up);
+
+        let gpu = swiglu_mul_f32(&cache, &gate, &up).expect("gpu swiglu");
+
+        for i in 0..n {
+            let d = (gpu[i] - cpu[i]).abs();
+            let r = d / cpu[i].abs().max(1e-6);
+            assert!(d < 1e-5 || r < 1e-5,
+                "swiglu[{i}]: gpu {} cpu {} diff {d:.3e}", gpu[i], cpu[i]);
+        }
     }
 
     #[test]
