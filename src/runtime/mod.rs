@@ -8,6 +8,7 @@
 //! change in any of these forces a recompile, but unchanged sources skip
 //! the ~1-2 s `hipcc` invocation.
 
+pub mod kernels;
 pub mod smoke;
 
 use std::path::{Path, PathBuf};
@@ -92,11 +93,17 @@ impl KernelCache {
         let out = self.cache_dir.join(format!("{stem}.hsaco"));
         if out.exists() { return Ok(out); }
 
-        let src_path = self.cache_dir.join(format!("{stem}.cpp"));
+        // Per-invocation tmp filenames so concurrent compiles of the same
+        // kernel don't collide. Whoever wins the rename publishes the
+        // .hsaco; the loser just discards its temp output.
+        let pid = std::process::id();
+        let tid = std::thread::current().id();
+        let unique = format!("{stem}.p{pid}.t{tid:?}");
+        let src_path = self.cache_dir.join(format!("{unique}.cpp"));
         std::fs::write(&src_path, source)
             .map_err(|e| format!("write kernel source {}: {e}", src_path.display()))?;
 
-        let tmp_out = self.cache_dir.join(format!("{stem}.hsaco.tmp"));
+        let tmp_out = self.cache_dir.join(format!("{unique}.hsaco.tmp"));
         let mut cmd = Command::new("hipcc");
         cmd.arg("--genco")
            .arg(format!("--offload-arch={}", self.arch))
@@ -107,6 +114,7 @@ impl KernelCache {
         let result = cmd.output()
             .map_err(|e| format!("invoke hipcc for {name}: {e}"))?;
         let elapsed_ms = started.elapsed().as_millis();
+        let _ = std::fs::remove_file(&src_path);
         if !result.status.success() {
             let _ = std::fs::remove_file(&tmp_out);
             return Err(format!(
@@ -115,9 +123,17 @@ impl KernelCache {
                 String::from_utf8_lossy(&result.stderr)));
         }
 
-        std::fs::rename(&tmp_out, &out)
-            .map_err(|e| format!("rename {} → {}: {e}", tmp_out.display(), out.display()))?;
-        eprintln!("kernel-cache: compiled {name} ({} ms) → {}", elapsed_ms, out.display());
+        // Race-tolerant publish: rename our tmp into place; if a peer beat
+        // us to it, the final file already exists and we just clean up.
+        match std::fs::rename(&tmp_out, &out) {
+            Ok(()) => {
+                eprintln!("kernel-cache: compiled {name} ({} ms) → {}", elapsed_ms, out.display());
+            }
+            Err(_) if out.exists() => {
+                let _ = std::fs::remove_file(&tmp_out);
+            }
+            Err(e) => return Err(format!("rename {} → {}: {e}", tmp_out.display(), out.display())),
+        }
         Ok(out)
     }
 }
