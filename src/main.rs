@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use reinstinct_engine::cpu::qwen3_5::Qwen35F32Model;
 use reinstinct_engine::gguf::{GgufFile, MetaValue};
 use reinstinct_engine::model::qwen3_5::{BlockKind, Qwen35Model};
 
@@ -25,13 +26,70 @@ enum Command {
     Model {
         path: PathBuf,
     },
+    /// Run the CPU forward pass on a single input token, print top-K logits.
+    Generate {
+        path: PathBuf,
+        /// Input token id. Defaults to the model's EOS token id from metadata.
+        #[arg(short, long)]
+        token: Option<u32>,
+        /// Number of top logits to print.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
         Command::Model { path } => model(&path),
+        Command::Generate { path, token, k } => generate(&path, token, k),
     }
+}
+
+fn generate(path: &std::path::Path, token: Option<u32>, k: usize) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let token = token.unwrap_or(cfg.eos_token_id);
+    println!("model         = {}", path.display());
+    println!("vocab         = {}", cfg.vocab_size);
+    println!("input token   = {token}");
+
+    let mut state = m.new_state(16);
+    let t0 = std::time::Instant::now();
+    let logits = m.forward_token(token, &mut state);
+    println!("forward took  = {:.2} s", t0.elapsed().as_secs_f32());
+
+    // Compute softmax probability for the top-k for context.
+    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let max_logit = indexed[0].1;
+    let mut sum_exp = 0.0_f64;
+    for &(_, v) in &logits.iter().enumerate().map(|(i, x)| (i, *x)).collect::<Vec<_>>() {
+        sum_exp += ((v - max_logit) as f64).exp();
+    }
+
+    println!("\n--- top {k} logits ---");
+    for &(i, v) in indexed.iter().take(k) {
+        let p = ((v - max_logit) as f64).exp() / sum_exp;
+        println!("  token {i:>6}  logit {v:>9.4}  p = {p:.4}");
+    }
+
+    let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut sum = 0.0_f64;
+    let mut sum_sq = 0.0_f64;
+    for &v in &logits {
+        if v < min { min = v; }
+        if v > max { max = v; }
+        sum += v as f64;
+        sum_sq += (v as f64) * (v as f64);
+    }
+    let n = logits.len() as f64;
+    let mean = (sum / n) as f32;
+    let std = ((sum_sq / n) - (mean as f64).powi(2)).sqrt() as f32;
+    println!("\nlogit stats   = min {min:.4}  max {max:.4}  mean {mean:.4}  std {std:.4}");
+    Ok(())
 }
 
 fn inspect(path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {

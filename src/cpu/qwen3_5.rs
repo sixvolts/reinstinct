@@ -507,6 +507,129 @@ pub fn linear_attention_step(
     ops::matvec(&normed_out, &weights.ssm_out, value_dim, h_dim, out);
 }
 
+// ---- End-to-end model state + forward -------------------------------------
+
+/// Per-prompt state for a Qwen 3.5 forward pass. Holds one slot per block:
+/// `kv_caches[i]` is `Some` iff block `i` is full-attention; `gdn_states[i]`
+/// is `Some` iff it's linear-attention. The shared `rope` table and `pos`
+/// counter are advanced once per token.
+pub struct Qwen35F32State {
+    pub kv_caches: Vec<Option<LayerKvCache>>,
+    pub gdn_states: Vec<Option<LinAttnState>>,
+    pub rope: RopeCache,
+    pub pos: usize,
+}
+
+impl Qwen35F32State {
+    pub fn new(config: &Qwen35Config, block_kinds: &[BlockKind], max_seq: usize) -> Self {
+        let conv_dim = 3 * config.gdn_value_dim as usize;
+        let mut kv_caches = Vec::with_capacity(block_kinds.len());
+        let mut gdn_states = Vec::with_capacity(block_kinds.len());
+        for &kind in block_kinds {
+            match kind {
+                BlockKind::FullAttention => {
+                    kv_caches.push(Some(LayerKvCache::new(
+                        max_seq,
+                        config.attn_n_kv_heads as usize,
+                        config.attn_head_dim as usize,
+                    )));
+                    gdn_states.push(None);
+                }
+                BlockKind::LinearAttention => {
+                    kv_caches.push(None);
+                    gdn_states.push(Some(LinAttnState::new(
+                        config.gdn_n_heads as usize,
+                        config.gdn_head_dim as usize,
+                        config.gdn_head_dim as usize,
+                        conv_dim,
+                        config.gdn_conv_kernel as usize,
+                    )));
+                }
+            }
+        }
+        let rope = RopeCache::new(
+            config.rope_dim_count as usize,
+            max_seq,
+            config.rope_freq_base,
+        );
+        Self { kv_caches, gdn_states, rope, pos: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        for c in self.kv_caches.iter_mut().flatten() { c.reset(); }
+        for s in self.gdn_states.iter_mut().flatten() { s.reset(); }
+        self.pos = 0;
+    }
+}
+
+/// Loaded Qwen 3.5 model: typed config + schedule + dequantized weights.
+pub struct Qwen35F32Model {
+    pub model: Qwen35Model,
+    pub weights: Qwen35F32Weights,
+}
+
+impl Qwen35F32Model {
+    pub fn load(gguf: &GgufFile) -> Result<Self, LoadError> {
+        let model = Qwen35Model::load(gguf)?;
+        let weights = Qwen35F32Weights::load(gguf, &model)?;
+        Ok(Self { model, weights })
+    }
+
+    pub fn new_state(&self, max_seq: usize) -> Qwen35F32State {
+        Qwen35F32State::new(&self.model.config, &self.model.block_kinds, max_seq)
+    }
+
+    /// Forward one token at the current `state.pos`. Advances `state.pos` by 1.
+    /// Returns the next-token logit vector of length `vocab_size`.
+    ///
+    /// Embedding lookup: `token_embd` has ggml shape `[hidden, vocab]`. With
+    /// the leftmost-fast convention, the row for token `v` is contiguous at
+    /// flat offset `v * hidden` for `hidden` floats — the natural embedding
+    /// row layout. The same tensor doubles as the output projection when
+    /// `tied_embeddings == true`.
+    pub fn forward_token(&self, token_id: u32, state: &mut Qwen35F32State) -> Vec<f32> {
+        let cfg = &self.model.config;
+        let h_dim = cfg.hidden_size as usize;
+        let v_dim = cfg.vocab_size as usize;
+
+        assert!((token_id as usize) < v_dim,
+            "token_id {} out of range [0, {})", token_id, v_dim);
+
+        // Embedding lookup.
+        let row_off = token_id as usize * h_dim;
+        let mut hidden = self.weights.token_embd[row_off..row_off + h_dim].to_vec();
+
+        // 24 blocks dispatched by kind.
+        for (i, &kind) in self.model.block_kinds.iter().enumerate() {
+            match (kind, &self.weights.blocks[i]) {
+                (BlockKind::FullAttention, BlockWeights::FullAttention(w)) => {
+                    let kv = state.kv_caches[i].as_mut()
+                        .expect("kv cache slot Some for full-attention block");
+                    full_attention_block(&mut hidden, w, cfg, kv, &state.rope, state.pos);
+                }
+                (BlockKind::LinearAttention, BlockWeights::LinearAttention(w)) => {
+                    let s = state.gdn_states[i].as_mut()
+                        .expect("gdn state slot Some for linear-attention block");
+                    linear_attention_block(&mut hidden, w, cfg, s);
+                }
+                _ => unreachable!("block kind mismatch — Qwen35Model::load validates this"),
+            }
+        }
+
+        // Final RMSNorm + tied (or untied) output projection.
+        let mut normed = vec![0.0_f32; h_dim];
+        ops::rmsnorm(&hidden, &self.weights.output_norm, cfg.rms_norm_eps, &mut normed);
+
+        let proj: &[f32] = self.weights.output.as_deref()
+            .unwrap_or(self.weights.token_embd.as_slice());
+        let mut logits = vec![0.0_f32; v_dim];
+        ops::matvec(&normed, proj, h_dim, v_dim, &mut logits);
+
+        state.pos += 1;
+        logits
+    }
+}
+
 /// Linear-attention (GDN) block: norm → GDN step → residual → norm → SwiGLU → residual.
 pub fn linear_attention_block(
     hidden_inout: &mut [f32],
