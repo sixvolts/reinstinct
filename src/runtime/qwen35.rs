@@ -21,6 +21,7 @@
 use std::ffi::c_void;
 
 use crate::cpu::qwen3_5::Qwen35F32Model;
+use crate::gguf::{GgufFile, GgmlType};
 use crate::hip::{self, DeviceBuf, Module};
 use super::KernelCache;
 
@@ -41,19 +42,76 @@ const GDN_DECAY_BETA_SOURCE:        &str = include_str!("../../kernels/gdn_decay
 const GDN_RECURRENT_STEP_SOURCE:    &str = include_str!("../../kernels/gdn_recurrent_step.cpp");
 const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
 
-/// FFN weights for a single transformer block, resident on device.
+const MATVEC_Q8_0_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0.cpp");
+const MATVEC_Q4_K_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k.cpp");
+const MATVEC_Q5_K_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k.cpp");
+const MATVEC_Q6_K_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k.cpp");
+const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
+const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
+
+/// A weight tensor used as the W matrix in a `y = W·x` matvec, resident on
+/// device. Holds the raw on-disk byte stream + on-disk dtype, so the
+/// dispatcher can pick the right fused dequant+GEMV kernel per type.
+///
+/// Shape convention follows GGUF: `shape = [in_dim, out_dim]`, flat layout
+/// `w[j * in_dim + i]` (row j is one output row of length in_dim).
+pub struct GpuMatvecTensor {
+    pub data:    DeviceBuf<u8>,
+    pub dtype:   GgmlType,
+    pub in_dim:  u32,
+    pub out_dim: u32,
+}
+
+impl GpuMatvecTensor {
+    /// Load the named tensor from `gguf` straight to device memory in its
+    /// on-disk form. Verifies the tensor is 2D and computes (in_dim, out_dim).
+    pub fn from_gguf(gguf: &GgufFile, name: &str) -> Result<Self, String> {
+        let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+        let bytes = gguf.tensor_data(name)
+            .map_err(|e| format!("read {name}: {e}"))?
+            .ok_or_else(|| format!("tensor {name} has no data"))?;
+        let shape = info.shape();
+        if shape.len() != 2 {
+            return Err(format!("tensor {name}: expected 2D, got {shape:?}"));
+        }
+        let in_dim  = shape[0] as u32;
+        let out_dim = shape[1] as u32;
+        Ok(Self {
+            data: DeviceBuf::from_slice(bytes)?,
+            dtype: info.ggml_type,
+            in_dim, out_dim,
+        })
+    }
+}
+
+/// Load an fp32 tensor straight from GGUF to device.
+fn load_fp32_tensor(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
+    let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+    if info.ggml_type != GgmlType::F32 {
+        return Err(format!("tensor {name}: expected F32, got {:?}", info.ggml_type));
+    }
+    let bytes = gguf.tensor_data(name)
+        .map_err(|e| format!("read {name}: {e}"))?
+        .ok_or_else(|| format!("tensor {name} has no data"))?;
+    let floats: &[f32] = bytemuck::cast_slice(bytes);
+    DeviceBuf::from_slice(floats)
+}
+
+/// FFN weights for a single transformer block, resident on device. Matvec
+/// weights are kept in their on-disk quantized form; the matvec dispatcher
+/// picks the right kernel per dtype.
 pub struct GpuFfnWeights {
-    pub gate: DeviceBuf<f32>,   // [hidden, ffn]
-    pub up:   DeviceBuf<f32>,   // [hidden, ffn]
-    pub down: DeviceBuf<f32>,   // [ffn,    hidden]
+    pub gate: GpuMatvecTensor,   // [hidden, ffn]
+    pub up:   GpuMatvecTensor,   // [hidden, ffn]
+    pub down: GpuMatvecTensor,   // [ffn,    hidden]
 }
 
 impl GpuFfnWeights {
-    pub fn from_cpu(gate: &[f32], up: &[f32], down: &[f32]) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32) -> Result<Self, String> {
         Ok(Self {
-            gate: DeviceBuf::from_slice(gate)?,
-            up:   DeviceBuf::from_slice(up)?,
-            down: DeviceBuf::from_slice(down)?,
+            gate: GpuMatvecTensor::from_gguf(gguf, &format!("blk.{layer}.ffn_gate.weight"))?,
+            up:   GpuMatvecTensor::from_gguf(gguf, &format!("blk.{layer}.ffn_up.weight"))?,
+            down: GpuMatvecTensor::from_gguf(gguf, &format!("blk.{layer}.ffn_down.weight"))?,
         })
     }
 }
@@ -68,67 +126,69 @@ pub struct GpuFullAttnBlock {
 }
 
 impl GpuFullAttnBlock {
-    pub fn from_cpu(w: &crate::cpu::qwen3_5::FullAttnWeights) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32) -> Result<Self, String> {
         Ok(Self {
-            attn:      GpuFullAttnWeights::from_cpu(w)?,
-            post_norm: DeviceBuf::from_slice(&w.post_attention_norm)?,
-            ffn:       GpuFfnWeights::from_cpu(&w.ffn_gate, &w.ffn_up, &w.ffn_down)?,
+            attn:      GpuFullAttnWeights::from_gguf(gguf, layer)?,
+            post_norm: load_fp32_tensor(gguf, &format!("blk.{layer}.post_attention_norm.weight"))?,
+            ffn:       GpuFfnWeights::from_gguf(gguf, layer)?,
         })
     }
 }
 
 /// Full-attention block weights for a single transformer block.
 pub struct GpuFullAttnWeights {
-    pub attn_norm:   DeviceBuf<f32>,   // [hidden]
-    pub attn_q:      DeviceBuf<f32>,   // [hidden, 2 * q_dim]   (Q | gate concat)
-    pub attn_k:      DeviceBuf<f32>,   // [hidden, kv_dim]
-    pub attn_v:      DeviceBuf<f32>,   // [hidden, kv_dim]
-    pub attn_q_norm: DeviceBuf<f32>,   // [head_dim]            (per-head)
-    pub attn_k_norm: DeviceBuf<f32>,   // [head_dim]
-    pub attn_output: DeviceBuf<f32>,   // [q_dim, hidden]
+    pub attn_norm:   DeviceBuf<f32>,    // [hidden]
+    pub attn_q:      GpuMatvecTensor,   // [hidden, 2 * q_dim]   (Q | gate concat)
+    pub attn_k:      GpuMatvecTensor,   // [hidden, kv_dim]
+    pub attn_v:      GpuMatvecTensor,   // [hidden, kv_dim]
+    pub attn_q_norm: DeviceBuf<f32>,    // [head_dim]            (per-head)
+    pub attn_k_norm: DeviceBuf<f32>,    // [head_dim]
+    pub attn_output: GpuMatvecTensor,   // [q_dim, hidden]
 }
 
 impl GpuFullAttnWeights {
-    pub fn from_cpu(w: &crate::cpu::qwen3_5::FullAttnWeights) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32) -> Result<Self, String> {
+        let pre = format!("blk.{layer}.");
         Ok(Self {
-            attn_norm:   DeviceBuf::from_slice(&w.attn_norm)?,
-            attn_q:      DeviceBuf::from_slice(&w.attn_q)?,
-            attn_k:      DeviceBuf::from_slice(&w.attn_k)?,
-            attn_v:      DeviceBuf::from_slice(&w.attn_v)?,
-            attn_q_norm: DeviceBuf::from_slice(&w.attn_q_norm)?,
-            attn_k_norm: DeviceBuf::from_slice(&w.attn_k_norm)?,
-            attn_output: DeviceBuf::from_slice(&w.attn_output)?,
+            attn_norm:   load_fp32_tensor(gguf, &format!("{pre}attn_norm.weight"))?,
+            attn_q:      GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_q.weight"))?,
+            attn_k:      GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_k.weight"))?,
+            attn_v:      GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_v.weight"))?,
+            attn_q_norm: load_fp32_tensor(gguf, &format!("{pre}attn_q_norm.weight"))?,
+            attn_k_norm: load_fp32_tensor(gguf, &format!("{pre}attn_k_norm.weight"))?,
+            attn_output: GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_output.weight"))?,
         })
     }
 }
 
 /// Linear-attention (GDN) block weights, resident on device.
 pub struct GpuLinAttnWeights {
-    pub attn_norm:   DeviceBuf<f32>,   // [hidden]
-    pub attn_qkv:    DeviceBuf<f32>,   // [hidden, conv_dim]
-    pub attn_gate:   DeviceBuf<f32>,   // [hidden, value_dim]
-    pub ssm_alpha:   DeviceBuf<f32>,   // [hidden, n_heads]
-    pub ssm_beta:    DeviceBuf<f32>,   // [hidden, n_heads]
-    pub ssm_a:       DeviceBuf<f32>,   // [n_heads]   (already -exp(A_log))
-    pub ssm_dt_bias: DeviceBuf<f32>,   // [n_heads]
-    pub ssm_conv1d:  DeviceBuf<f32>,   // [conv_dim, kernel]
-    pub ssm_norm:    DeviceBuf<f32>,   // [head_dim]
-    pub ssm_out:     DeviceBuf<f32>,   // [value_dim, hidden]
+    pub attn_norm:   DeviceBuf<f32>,    // [hidden]
+    pub attn_qkv:    GpuMatvecTensor,   // [hidden, conv_dim]
+    pub attn_gate:   GpuMatvecTensor,   // [hidden, value_dim]
+    pub ssm_alpha:   GpuMatvecTensor,   // [hidden, n_heads]
+    pub ssm_beta:    GpuMatvecTensor,   // [hidden, n_heads]
+    pub ssm_a:       DeviceBuf<f32>,    // [n_heads]   (already -exp(A_log))
+    pub ssm_dt_bias: DeviceBuf<f32>,    // [n_heads]
+    pub ssm_conv1d:  DeviceBuf<f32>,    // [conv_dim, kernel]
+    pub ssm_norm:    DeviceBuf<f32>,    // [head_dim]
+    pub ssm_out:     GpuMatvecTensor,   // [value_dim, hidden]
 }
 
 impl GpuLinAttnWeights {
-    pub fn from_cpu(w: &crate::cpu::qwen3_5::LinAttnWeights) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32) -> Result<Self, String> {
+        let pre = format!("blk.{layer}.");
         Ok(Self {
-            attn_norm:   DeviceBuf::from_slice(&w.attn_norm)?,
-            attn_qkv:    DeviceBuf::from_slice(&w.attn_qkv)?,
-            attn_gate:   DeviceBuf::from_slice(&w.attn_gate)?,
-            ssm_alpha:   DeviceBuf::from_slice(&w.ssm_alpha)?,
-            ssm_beta:    DeviceBuf::from_slice(&w.ssm_beta)?,
-            ssm_a:       DeviceBuf::from_slice(&w.ssm_a)?,
-            ssm_dt_bias: DeviceBuf::from_slice(&w.ssm_dt_bias)?,
-            ssm_conv1d:  DeviceBuf::from_slice(&w.ssm_conv1d)?,
-            ssm_norm:    DeviceBuf::from_slice(&w.ssm_norm)?,
-            ssm_out:     DeviceBuf::from_slice(&w.ssm_out)?,
+            attn_norm:   load_fp32_tensor(gguf, &format!("{pre}attn_norm.weight"))?,
+            attn_qkv:    GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_qkv.weight"))?,
+            attn_gate:   GpuMatvecTensor::from_gguf(gguf, &format!("{pre}attn_gate.weight"))?,
+            ssm_alpha:   GpuMatvecTensor::from_gguf(gguf, &format!("{pre}ssm_alpha.weight"))?,
+            ssm_beta:    GpuMatvecTensor::from_gguf(gguf, &format!("{pre}ssm_beta.weight"))?,
+            ssm_a:       load_fp32_tensor(gguf, &format!("{pre}ssm_a"))?,
+            ssm_dt_bias: load_fp32_tensor(gguf, &format!("{pre}ssm_dt.bias"))?,
+            ssm_conv1d:  load_fp32_tensor(gguf, &format!("{pre}ssm_conv1d.weight"))?,
+            ssm_norm:    load_fp32_tensor(gguf, &format!("{pre}ssm_norm.weight"))?,
+            ssm_out:     GpuMatvecTensor::from_gguf(gguf, &format!("{pre}ssm_out.weight"))?,
         })
     }
 }
@@ -142,11 +202,11 @@ pub struct GpuLinAttnBlock {
 }
 
 impl GpuLinAttnBlock {
-    pub fn from_cpu(w: &crate::cpu::qwen3_5::LinAttnWeights) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32) -> Result<Self, String> {
         Ok(Self {
-            attn:      GpuLinAttnWeights::from_cpu(w)?,
-            post_norm: DeviceBuf::from_slice(&w.post_attention_norm)?,
-            ffn:       GpuFfnWeights::from_cpu(&w.ffn_gate, &w.ffn_up, &w.ffn_down)?,
+            attn:      GpuLinAttnWeights::from_gguf(gguf, layer)?,
+            post_norm: load_fp32_tensor(gguf, &format!("blk.{layer}.post_attention_norm.weight"))?,
+            ffn:       GpuFfnWeights::from_gguf(gguf, layer)?,
         })
     }
 }
@@ -261,6 +321,13 @@ pub struct GpuQwen35 {
     gdn_recurrent_step_module:    Module,
     rmsnorm_gated_multihead_module: Module,
 
+    matvec_q8_0_module:    Module,
+    matvec_q4_k_module:    Module,
+    matvec_q5_k_module:    Module,
+    matvec_q6_k_module:    Module,
+    matvec_iq4_xs_module:  Module,
+    matvec_f16_module:     Module,
+
     // Dimensions.
     hidden:     usize,
     ffn:        usize,
@@ -364,6 +431,12 @@ impl GpuQwen35 {
         let gdn_decay_beta_hsaco         = cache.compile("gdn_decay_beta",    GDN_DECAY_BETA_SOURCE)?;
         let gdn_recurrent_step_hsaco     = cache.compile("gdn_recurrent_step", GDN_RECURRENT_STEP_SOURCE)?;
         let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
+        let matvec_q8_0_hsaco   = cache.compile("matvec_q8_0",   MATVEC_Q8_0_SOURCE)?;
+        let matvec_q4_k_hsaco   = cache.compile("matvec_q4_k",   MATVEC_Q4_K_SOURCE)?;
+        let matvec_q5_k_hsaco   = cache.compile("matvec_q5_k",   MATVEC_Q5_K_SOURCE)?;
+        let matvec_q6_k_hsaco   = cache.compile("matvec_q6_k",   MATVEC_Q6_K_SOURCE)?;
+        let matvec_iq4_xs_hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
+        let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
 
         Ok(Self {
             token_embd, output_norm, output_proj,
@@ -386,6 +459,12 @@ impl GpuQwen35 {
             gdn_decay_beta_module:        Module::load(&gdn_decay_beta_hsaco)?,
             gdn_recurrent_step_module:    Module::load(&gdn_recurrent_step_hsaco)?,
             rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
+            matvec_q8_0_module:   Module::load(&matvec_q8_0_hsaco)?,
+            matvec_q4_k_module:   Module::load(&matvec_q4_k_hsaco)?,
+            matvec_q5_k_module:   Module::load(&matvec_q5_k_hsaco)?,
+            matvec_q6_k_module:   Module::load(&matvec_q6_k_hsaco)?,
+            matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
+            matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
             gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
@@ -463,6 +542,54 @@ impl GpuQwen35 {
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
+    /// Per-quant-type matvec launchers — same signature as launch_matvec.
+    /// All five fused dequant+GEMV kernels share the (W bytes, x f32, y f32,
+    /// in_dim, out_dim) interface.
+    fn launch_matvec_q_kernel(&self, module: &Module, kname: &str,
+                              w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                              in_dim: u32, out_dim: u32) -> Result<(), String>
+    {
+        let f = module.function(kname)?;
+        let block: u32 = 256;
+        let mut wa = w; let mut xa = x; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut wa as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+        ];
+        let smem = block * std::mem::size_of::<f32>() as u32;
+        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
+    /// Dispatch a matvec to the right kernel based on the weight's on-disk
+    /// dtype. Output `y` always lands as fp32.
+    fn launch_matvec_dispatch(&self, w: &GpuMatvecTensor,
+                              x: *mut c_void, y: *mut c_void) -> Result<(), String>
+    {
+        let in_d  = w.in_dim;
+        let out_d = w.out_dim;
+        let wp    = w.data.raw_ptr();
+        match w.dtype {
+            GgmlType::F32    => self.launch_matvec(wp, x, y, in_d, out_d),
+            GgmlType::Q8_0   => self.launch_matvec_q_kernel(&self.matvec_q8_0_module,
+                                    "matvec_q8_0_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q4_K   => self.launch_matvec_q_kernel(&self.matvec_q4_k_module,
+                                    "matvec_q4_k_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q5_K   => self.launch_matvec_q_kernel(&self.matvec_q5_k_module,
+                                    "matvec_q5_k_f32", wp, x, y, in_d, out_d),
+            GgmlType::Q6_K   => self.launch_matvec_q_kernel(&self.matvec_q6_k_module,
+                                    "matvec_q6_k_f32", wp, x, y, in_d, out_d),
+            GgmlType::IQ4_XS => self.launch_matvec_q_kernel(&self.matvec_iq4_xs_module,
+                                    "matvec_iq4_xs_f32", wp, x, y, in_d, out_d),
+            GgmlType::F16    => self.launch_matvec_q_kernel(&self.matvec_f16_module,
+                                    "matvec_f16_f32", wp, x, y, in_d, out_d),
+            other => Err(format!("matvec dispatch: no kernel for {:?}", other)),
+        }
     }
 
     fn launch_swiglu(&self, gate: *mut c_void, up: *mut c_void, out: *mut c_void,
@@ -751,7 +878,6 @@ impl GpuQwen35 {
         assert!(kv_cache.len < kv_cache.max_seq, "KV cache full");
         let h_dim  = self.hidden as u32;
         let q_dim  = self.q_dim()  as u32;
-        let kv_dim = self.kv_dim() as u32;
         let pos = kv_cache.len;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
@@ -759,12 +885,9 @@ impl GpuQwen35 {
         //                      then final attn output overwrites it)
         self.launch_rmsnorm(input_ptr, weights.attn_norm.raw_ptr(),
                             output_ptr, h_dim, self.rms_eps)?;
-        self.launch_matvec(weights.attn_q.raw_ptr(), output_ptr,
-                           self.q_raw.raw_ptr(), h_dim, 2 * q_dim)?;
-        self.launch_matvec(weights.attn_k.raw_ptr(), output_ptr,
-                           self.k_raw.raw_ptr(), h_dim, kv_dim)?;
-        self.launch_matvec(weights.attn_v.raw_ptr(), output_ptr,
-                           self.v_raw.raw_ptr(), h_dim, kv_dim)?;
+        self.launch_matvec_dispatch(&weights.attn_q, output_ptr, self.q_raw.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.attn_k, output_ptr, self.k_raw.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.attn_v, output_ptr, self.v_raw.raw_ptr())?;
         self.launch_split_q_gate(self.q_raw.raw_ptr(), self.q_buf.raw_ptr(),
                                  self.gate_buf.raw_ptr(),
                                  self.n_heads as u32, self.head_dim as u32)?;
@@ -776,8 +899,6 @@ impl GpuQwen35 {
                                       self.k_norm.raw_ptr(),
                                       self.n_kv_heads as u32, self.head_dim as u32, self.rms_eps)?;
         self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32, pos as u32)?;
-        // KV cache push needs the matvec/rope writes to be visible on host
-        // before we issue the D2D memcpy (host call).
         hip::Device(0).synchronize()?;
         kv_cache.k.copy_from_device_at(&self.k_norm, pos * kv_cache.kv_dim)?;
         kv_cache.v.copy_from_device_at(&self.v_raw,  pos * kv_cache.kv_dim)?;
@@ -786,8 +907,7 @@ impl GpuQwen35 {
                               kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr(),
                               self.attn_concat.raw_ptr(), total_len, scaling)?;
         self.launch_sigmoid_mul(self.attn_concat.raw_ptr(), self.gate_buf.raw_ptr(), q_dim)?;
-        self.launch_matvec(weights.attn_output.raw_ptr(), self.attn_concat.raw_ptr(),
-                           output_ptr, q_dim, h_dim)?;
+        self.launch_matvec_dispatch(&weights.attn_output, self.attn_concat.raw_ptr(), output_ptr)?;
         kv_cache.len += 1;
         Ok(())
     }
@@ -799,16 +919,12 @@ impl GpuQwen35 {
         weights: &GpuFfnWeights,
     ) -> Result<(), String>
     {
-        let h = self.hidden as u32;
         let f = self.ffn as u32;
-        self.launch_matvec(weights.gate.raw_ptr(), input_ptr,
-                           self.ffn_a.raw_ptr(), h, f)?;
-        self.launch_matvec(weights.up.raw_ptr(), input_ptr,
-                           self.ffn_b.raw_ptr(), h, f)?;
+        self.launch_matvec_dispatch(&weights.gate, input_ptr, self.ffn_a.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.up,   input_ptr, self.ffn_b.raw_ptr())?;
         self.launch_swiglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                            self.ffn_a.raw_ptr(), f)?;
-        self.launch_matvec(weights.down.raw_ptr(), self.ffn_a.raw_ptr(),
-                           output_ptr, f, h)?;
+        self.launch_matvec_dispatch(&weights.down, self.ffn_a.raw_ptr(), output_ptr)?;
         Ok(())
     }
 
@@ -862,7 +978,6 @@ impl GpuQwen35 {
     ) -> Result<(), String>
     {
         let h_dim     = self.hidden        as u32;
-        let value_dim = self.gdn_value_dim as u32;
         let conv_dim  = self.gdn_conv_dim  as u32;
         let n_heads   = self.gdn_n_heads   as u32;
         let head_dim  = self.gdn_head_dim  as u32;
@@ -873,14 +988,10 @@ impl GpuQwen35 {
                             output_ptr, h_dim, self.rms_eps)?;
 
         // 2) Four projections off normed.
-        self.launch_matvec(weights.attn_qkv.raw_ptr(), output_ptr,
-                           self.gdn_qkv.raw_ptr(), h_dim, conv_dim)?;
-        self.launch_matvec(weights.attn_gate.raw_ptr(), output_ptr,
-                           self.gdn_z.raw_ptr(), h_dim, value_dim)?;
-        self.launch_matvec(weights.ssm_alpha.raw_ptr(), output_ptr,
-                           self.gdn_a.raw_ptr(), h_dim, n_heads)?;
-        self.launch_matvec(weights.ssm_beta.raw_ptr(), output_ptr,
-                           self.gdn_b.raw_ptr(), h_dim, n_heads)?;
+        self.launch_matvec_dispatch(&weights.attn_qkv,  output_ptr, self.gdn_qkv.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.attn_gate, output_ptr, self.gdn_z.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.ssm_alpha, output_ptr, self.gdn_a.raw_ptr())?;
+        self.launch_matvec_dispatch(&weights.ssm_beta,  output_ptr, self.gdn_b.raw_ptr())?;
 
         // 3) Causal Conv1D + SiLU over mixed_qkv.
         self.launch_conv1d_step(self.gdn_qkv.raw_ptr(), weights.ssm_conv1d.raw_ptr(),
@@ -921,8 +1032,7 @@ impl GpuQwen35 {
                                              n_heads, head_dim, self.rms_eps)?;
 
         // 9) Project back to hidden.
-        self.launch_matvec(weights.ssm_out.raw_ptr(), self.gdn_core_out.raw_ptr(),
-                           output_ptr, value_dim, h_dim)?;
+        self.launch_matvec_dispatch(&weights.ssm_out, self.gdn_core_out.raw_ptr(), output_ptr)?;
         Ok(())
     }
 
@@ -1139,7 +1249,7 @@ mod tests {
             crate::cpu::qwen3_5::swiglu_ffn(&input, gate_w, up_w, down_w, h, f, &mut cpu_out);
 
             // GPU.
-            let weights = GpuFfnWeights::from_cpu(gate_w, up_w, down_w).expect("alloc ffn weights");
+            let weights = GpuFfnWeights::from_gguf(&g, block_idx as u32).expect("alloc ffn weights");
             let gpu = GpuQwen35::new(&m, &cache, 32).expect("new GpuQwen35");
             let gpu_out = gpu.apply_swiglu_ffn(&input, &weights).expect("gpu ffn");
 
@@ -1202,7 +1312,7 @@ mod tests {
         );
 
         let gpu = GpuQwen35::new(&m, &cache, 16).expect("new GpuQwen35");
-        let gpu_w = GpuLinAttnWeights::from_cpu(weights).expect("upload GDN weights");
+        let gpu_w = GpuLinAttnWeights::from_gguf(&g, block_idx as u32).expect("upload GDN weights");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
             cfg.gdn_head_dim    as usize,
@@ -1279,7 +1389,7 @@ mod tests {
         );
 
         let gpu = GpuQwen35::new(&m, &cache, 16).expect("new GpuQwen35");
-        let gpu_block = GpuLinAttnBlock::from_cpu(weights).expect("upload GDN block");
+        let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32).expect("upload GDN block");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
             cfg.gdn_head_dim    as usize,
@@ -1356,7 +1466,7 @@ mod tests {
         let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
 
         let gpu = GpuQwen35::new(&m, &cache, max_seq).expect("new GpuQwen35");
-        let gpu_block = GpuFullAttnBlock::from_cpu(weights).expect("upload block");
+        let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32).expect("upload block");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
             cfg.attn_n_kv_heads as usize,
@@ -1438,7 +1548,7 @@ mod tests {
 
         // GPU side.
         let gpu = GpuQwen35::new(&m, &cache, max_seq).expect("new GpuQwen35");
-        let gpu_w = GpuFullAttnWeights::from_cpu(weights).expect("upload attn weights");
+        let gpu_w = GpuFullAttnWeights::from_gguf(&g, block_idx as u32).expect("upload attn weights");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
             cfg.attn_n_kv_heads as usize,
