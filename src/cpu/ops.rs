@@ -93,18 +93,42 @@ pub fn swiglu_mul(gate_out: &mut [f32], up_out: &[f32]) {
 /// `w` has ggml shape `[in_dim, out_dim]` (flat layout `w[j * in_dim + i]`),
 /// so each output `y[j]` reads a contiguous row of length `in_dim`.
 ///   y[j] = sum_i x[i] * w[j * in_dim + i]
+///
+/// Parallelized via rayon across output rows — each output is an independent
+/// dot product, so the work splits perfectly. For tiny matvecs (out_dim
+/// below `PAR_THRESHOLD`) we stay sequential to avoid scheduling overhead.
 pub fn matvec(x: &[f32], w: &[f32], in_dim: usize, out_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+
     assert_eq!(x.len(), in_dim);
     assert_eq!(w.len(), in_dim * out_dim);
     assert_eq!(y.len(), out_dim);
-    for j in 0..out_dim {
+
+    // Below this work threshold, the rayon spawn overhead is larger than
+    // the benefit of parallelism. The big matvecs (FFN, output projection)
+    // are well above; the tiny per-head GDN projections are well below.
+    const PAR_THRESHOLD: usize = 1 << 16; // 65k flops ≈ 8 KB read
+
+    if in_dim * out_dim < PAR_THRESHOLD {
+        for j in 0..out_dim {
+            let row = &w[j * in_dim..(j + 1) * in_dim];
+            let mut acc = 0.0_f32;
+            for i in 0..in_dim {
+                acc += x[i] * row[i];
+            }
+            y[j] = acc;
+        }
+        return;
+    }
+
+    y.par_iter_mut().enumerate().for_each(|(j, slot)| {
         let row = &w[j * in_dim..(j + 1) * in_dim];
         let mut acc = 0.0_f32;
         for i in 0..in_dim {
             acc += x[i] * row[i];
         }
-        y[j] = acc;
-    }
+        *slot = acc;
+    });
 }
 
 /// Numerically stable softmax in-place along the entire slice.

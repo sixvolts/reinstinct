@@ -346,12 +346,6 @@ impl LinAttnState {
         self.conv.reset();
     }
 
-    /// Slice the per-head state matrix [k_head_dim, v_head_dim] for head `h`.
-    fn head_slice_mut(&mut self, h: usize) -> &mut [f32] {
-        let stride = self.k_head_dim * self.v_head_dim;
-        let off = h * stride;
-        &mut self.recurrent[off..off + stride]
-    }
 }
 
 /// One step of the Gated-DeltaNet block (the `linear_attention` block type).
@@ -439,57 +433,65 @@ pub fn linear_attention_step(
         beta[h] = ops::sigmoid(b[h]);
     }
 
-    // Recurrent gated delta rule, per head, in place on state.
+    // Recurrent gated delta rule, parallel across heads. Each head owns a
+    // disjoint slice of the recurrent matrix and produces a disjoint chunk
+    // of core_attn_out, so the outer loop has no cross-head dependencies.
     let mut core_attn_out = vec![0.0_f32; value_dim];
-    for h in 0..n_heads {
-        let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        let k_h = &k[h * head_dim..(h + 1) * head_dim];
-        let v_h = &v[h * head_dim..(h + 1) * head_dim];
-        let decay_h = decay[h];
-        let beta_h = beta[h];
-        let s = state.head_slice_mut(h); // [k_head_dim, v_head_dim] flat row-major
+    {
+        use rayon::prelude::*;
+        let head_state_size = head_dim * head_dim;
+        state.recurrent
+            .par_chunks_exact_mut(head_state_size)
+            .zip(core_attn_out.par_chunks_exact_mut(head_dim))
+            .enumerate()
+            .for_each(|(h, (s, head_out))| {
+                let q_h = &q[h * head_dim..(h + 1) * head_dim];
+                let k_h = &k[h * head_dim..(h + 1) * head_dim];
+                let v_h = &v[h * head_dim..(h + 1) * head_dim];
+                let decay_h = decay[h];
+                let beta_h = beta[h];
 
-        // state *= decay
-        for x in s.iter_mut() { *x *= decay_h; }
+                // state *= decay
+                for x in s.iter_mut() { *x *= decay_h; }
 
-        // kv_mem[v] = sum_k state[k, v] * k_h[k]
-        let mut kv_mem = [0.0_f32; 256]; // assume head_dim ≤ 256
-        let kv_mem = &mut kv_mem[..head_dim];
-        kv_mem.fill(0.0);
-        for kk in 0..head_dim {
-            let kv = k_h[kk];
-            let row = &s[kk * head_dim..(kk + 1) * head_dim];
-            for vv in 0..head_dim {
-                kv_mem[vv] += row[vv] * kv;
-            }
-        }
+                // kv_mem[v] = sum_k state[k, v] * k_h[k]
+                let mut kv_mem = [0.0_f32; 256]; // assume head_dim ≤ 256
+                let kv_mem = &mut kv_mem[..head_dim];
+                kv_mem.fill(0.0);
+                for kk in 0..head_dim {
+                    let kv = k_h[kk];
+                    let row = &s[kk * head_dim..(kk + 1) * head_dim];
+                    for vv in 0..head_dim {
+                        kv_mem[vv] += row[vv] * kv;
+                    }
+                }
 
-        // delta[v] = (v_h[v] - kv_mem[v]) * beta_h
-        let mut delta = [0.0_f32; 256];
-        let delta = &mut delta[..head_dim];
-        for vv in 0..head_dim {
-            delta[vv] = (v_h[vv] - kv_mem[vv]) * beta_h;
-        }
+                // delta[v] = (v_h[v] - kv_mem[v]) * beta_h
+                let mut delta = [0.0_f32; 256];
+                let delta = &mut delta[..head_dim];
+                for vv in 0..head_dim {
+                    delta[vv] = (v_h[vv] - kv_mem[vv]) * beta_h;
+                }
 
-        // state[k, v] += k_h[k] * delta[v]   (rank-1 outer product)
-        for kk in 0..head_dim {
-            let kv = k_h[kk];
-            let row = &mut s[kk * head_dim..(kk + 1) * head_dim];
-            for vv in 0..head_dim {
-                row[vv] += kv * delta[vv];
-            }
-        }
+                // state[k, v] += k_h[k] * delta[v]   (rank-1 outer product)
+                for kk in 0..head_dim {
+                    let kv = k_h[kk];
+                    let row = &mut s[kk * head_dim..(kk + 1) * head_dim];
+                    for vv in 0..head_dim {
+                        row[vv] += kv * delta[vv];
+                    }
+                }
 
-        // out[h, v] = sum_k state[k, v] * q_h[k]
-        let head_out = &mut core_attn_out[h * head_dim..(h + 1) * head_dim];
-        head_out.fill(0.0);
-        for kk in 0..head_dim {
-            let qv = q_h[kk];
-            let row = &s[kk * head_dim..(kk + 1) * head_dim];
-            for vv in 0..head_dim {
-                head_out[vv] += row[vv] * qv;
-            }
-        }
+                // out[h, v] = sum_k state[k, v] * q_h[k]
+                head_out.fill(0.0);
+                for kk in 0..head_dim {
+                    let qv = q_h[kk];
+                    let row = &s[kk * head_dim..(kk + 1) * head_dim];
+                    for vv in 0..head_dim {
+                        head_out[vv] += row[vv] * qv;
+                    }
+                }
+            });
     }
 
     // Per-head RMSNormGated with z as gate (`Qwen3_5RMSNormGated`):
@@ -591,6 +593,14 @@ impl Qwen35F32Model {
     /// row layout. The same tensor doubles as the output projection when
     /// `tied_embeddings == true`.
     pub fn forward_token(&self, token_id: u32, state: &mut Qwen35F32State) -> Vec<f32> {
+        self.forward_token_traced(token_id, state, None)
+    }
+
+    /// Same as `forward_token` but optionally records per-stage timings into
+    /// `trace`. Pass `None` for the no-overhead path.
+    pub fn forward_token_traced(
+        &self, token_id: u32, state: &mut Qwen35F32State, mut trace: Option<&mut ForwardTrace>,
+    ) -> Vec<f32> {
         let cfg = &self.model.config;
         let h_dim = cfg.hidden_size as usize;
         let v_dim = cfg.vocab_size as usize;
@@ -599,11 +609,17 @@ impl Qwen35F32Model {
             "token_id {} out of range [0, {})", token_id, v_dim);
 
         // Embedding lookup.
+        let t0 = std::time::Instant::now();
         let row_off = token_id as usize * h_dim;
         let mut hidden = self.weights.token_embd[row_off..row_off + h_dim].to_vec();
+        if let Some(t) = trace.as_deref_mut() { t.embed_ns = t0.elapsed().as_nanos() as u64; }
 
         // 24 blocks dispatched by kind.
+        if let Some(t) = trace.as_deref_mut() {
+            t.block_ns.resize(self.model.block_kinds.len(), 0);
+        }
         for (i, &kind) in self.model.block_kinds.iter().enumerate() {
+            let tb = std::time::Instant::now();
             match (kind, &self.weights.blocks[i]) {
                 (BlockKind::FullAttention, BlockWeights::FullAttention(w)) => {
                     let kv = state.kv_caches[i].as_mut()
@@ -617,19 +633,42 @@ impl Qwen35F32Model {
                 }
                 _ => unreachable!("block kind mismatch — Qwen35Model::load validates this"),
             }
+            if let Some(t) = trace.as_deref_mut() { t.block_ns[i] = tb.elapsed().as_nanos() as u64; }
         }
 
         // Final RMSNorm + tied (or untied) output projection.
+        let tn = std::time::Instant::now();
         let mut normed = vec![0.0_f32; h_dim];
         ops::rmsnorm(&hidden, &self.weights.output_norm, cfg.rms_norm_eps, &mut normed);
+        if let Some(t) = trace.as_deref_mut() { t.output_norm_ns = tn.elapsed().as_nanos() as u64; }
 
+        let tp = std::time::Instant::now();
         let proj: &[f32] = self.weights.output.as_deref()
             .unwrap_or(self.weights.token_embd.as_slice());
         let mut logits = vec![0.0_f32; v_dim];
         ops::matvec(&normed, proj, h_dim, v_dim, &mut logits);
+        if let Some(t) = trace.as_deref_mut() { t.output_proj_ns = tp.elapsed().as_nanos() as u64; }
 
         state.pos += 1;
         logits
+    }
+}
+
+/// Per-stage timing record populated by `forward_token_traced`.
+#[derive(Debug, Default, Clone)]
+pub struct ForwardTrace {
+    pub embed_ns: u64,
+    pub block_ns: Vec<u64>,
+    pub output_norm_ns: u64,
+    pub output_proj_ns: u64,
+}
+
+impl ForwardTrace {
+    pub fn total_ns(&self) -> u64 {
+        self.embed_ns
+            + self.block_ns.iter().sum::<u64>()
+            + self.output_norm_ns
+            + self.output_proj_ns
     }
 }
 

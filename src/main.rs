@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use reinstinct_engine::cpu::qwen3_5::Qwen35F32Model;
+use reinstinct_engine::cpu::qwen3_5::{ForwardTrace, Qwen35F32Model};
 use reinstinct_engine::gguf::{GgufFile, MetaValue};
 use reinstinct_engine::model::qwen3_5::{BlockKind, Qwen35Model};
 
@@ -41,6 +41,14 @@ enum Command {
         path: PathBuf,
         tokens: Vec<u32>,
     },
+    /// Run forward N times, report per-stage timing breakdown.
+    Bench {
+        path: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 5)]
+        iters: usize,
+        #[arg(short, long)]
+        token: Option<u32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,7 +57,84 @@ fn main() -> anyhow::Result<()> {
         Command::Model { path } => model(&path),
         Command::Generate { path, token, k } => generate(&path, token, k),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
+        Command::Bench { path, iters, token } => bench(&path, iters, token),
     }
+}
+
+fn bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let token = token.unwrap_or(cfg.eos_token_id);
+    println!("model = {}", path.display());
+    println!("token = {token}, iterations = {iters}");
+
+    // Warm up once so loader / page cache effects don't dominate iter[0].
+    let mut state = m.new_state(iters + 4);
+    let _ = m.forward_token(token, &mut state);
+
+    let mut traces: Vec<ForwardTrace> = Vec::with_capacity(iters);
+    state.reset();
+    for _ in 0..iters {
+        let mut t = ForwardTrace::default();
+        let _ = m.forward_token_traced(token, &mut state, Some(&mut t));
+        traces.push(t);
+        state.reset();
+    }
+
+    // Aggregate.
+    let n_blocks = m.model.block_kinds.len();
+    let mut sum_embed = 0u64;
+    let mut sum_norm = 0u64;
+    let mut sum_proj = 0u64;
+    let mut sum_blocks_lin = 0u64;  // total ns over all linear-attn blocks
+    let mut sum_blocks_full = 0u64;
+    let mut count_lin = 0usize;
+    let mut count_full = 0usize;
+    let mut sum_per_block = vec![0u64; n_blocks];
+    for t in &traces {
+        sum_embed += t.embed_ns;
+        sum_norm += t.output_norm_ns;
+        sum_proj += t.output_proj_ns;
+        for (i, &b) in t.block_ns.iter().enumerate() {
+            sum_per_block[i] += b;
+            match m.model.block_kinds[i] {
+                BlockKind::LinearAttention => { sum_blocks_lin += b; count_lin += 1; }
+                BlockKind::FullAttention   => { sum_blocks_full += b; count_full += 1; }
+            }
+        }
+    }
+    let n = iters as u64;
+    let total: u64 = traces.iter().map(|t| t.total_ns()).sum();
+    let avg = total / n;
+    let pct = |x: u64| 100.0 * (x as f64) / (total as f64);
+
+    println!("\n--- per-iteration averages ---");
+    println!("  total           {:>9.3} ms", (avg as f64) / 1.0e6);
+    println!("  embed lookup    {:>9.3} ms ({:>4.1}%)",
+        (sum_embed / n) as f64 / 1.0e6, pct(sum_embed));
+    println!("  blocks (linear) {:>9.3} ms ({:>4.1}%)  -- {} blocks, {:.3} ms each",
+        (sum_blocks_lin / n) as f64 / 1.0e6, pct(sum_blocks_lin),
+        count_lin / iters,
+        if count_lin > 0 { (sum_blocks_lin as f64) / (count_lin as f64) / 1.0e6 } else { 0.0 });
+    println!("  blocks (full)   {:>9.3} ms ({:>4.1}%)  -- {} blocks, {:.3} ms each",
+        (sum_blocks_full / n) as f64 / 1.0e6, pct(sum_blocks_full),
+        count_full / iters,
+        if count_full > 0 { (sum_blocks_full as f64) / (count_full as f64) / 1.0e6 } else { 0.0 });
+    println!("  output_norm     {:>9.3} ms ({:>4.1}%)",
+        (sum_norm / n) as f64 / 1.0e6, pct(sum_norm));
+    println!("  output_proj     {:>9.3} ms ({:>4.1}%)",
+        (sum_proj / n) as f64 / 1.0e6, pct(sum_proj));
+
+    println!("\n--- per-block averages (ms) ---");
+    for (i, &s) in sum_per_block.iter().enumerate() {
+        let kind = match m.model.block_kinds[i] {
+            BlockKind::LinearAttention => "L",
+            BlockKind::FullAttention   => "F",
+        };
+        println!("  block {i:>2} {kind}  {:>7.3}", (s / n) as f64 / 1.0e6);
+    }
+    Ok(())
 }
 
 fn debug_embed(path: &std::path::Path, tokens: &[u32]) -> anyhow::Result<()> {

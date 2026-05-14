@@ -20,6 +20,8 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 # Source-hash for kernel cache invalidation
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Parallelism for the CPU oracle (matvec across output rows)
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3
