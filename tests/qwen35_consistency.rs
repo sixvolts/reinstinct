@@ -103,6 +103,30 @@ fn distinct_tokens_produce_distinct_logits() {
 }
 
 #[test]
+fn forward_tokens_matches_repeated_forward_token() {
+    let Some(p) = fixture_path() else { eprintln!("skipping"); return; };
+    let g = GgufFile::open(&p).unwrap();
+    let m = Qwen35F32Model::load(&g).unwrap();
+    let prompt = [198u32, 100, 248046, 1, 2];
+
+    let mut s_one = m.new_state(8);
+    let logits_batch = m.forward_tokens(&prompt, &mut s_one);
+
+    let mut s_step = m.new_state(8);
+    let mut logits_step = Vec::new();
+    for &t in &prompt {
+        logits_step = m.forward_token(t, &mut s_step);
+    }
+
+    assert_eq!(s_one.pos, s_step.pos);
+    for i in 0..logits_batch.len() {
+        assert_eq!(logits_batch[i].to_bits(), logits_step[i].to_bits(),
+            "forward_tokens vs forward_token loop diverged at index {i}: {} vs {}",
+            logits_batch[i], logits_step[i]);
+    }
+}
+
+#[test]
 fn second_token_differs_from_first_due_to_state() {
     let Some(p) = fixture_path() else { eprintln!("skipping"); return; };
     let g = GgufFile::open(&p).unwrap();

@@ -26,12 +26,17 @@ enum Command {
     Model {
         path: PathBuf,
     },
-    /// Run the CPU forward pass on a single input token, print top-K logits.
+    /// Run the CPU forward pass on one or more input tokens, print top-K logits.
     Generate {
         path: PathBuf,
         /// Input token id. Defaults to the model's EOS token id from metadata.
+        /// Ignored if --tokens is provided.
         #[arg(short, long)]
         token: Option<u32>,
+        /// Comma-separated list of token ids to feed in order. Logits are
+        /// printed for the LAST position. Overrides --token.
+        #[arg(long, value_delimiter = ',')]
+        tokens: Option<Vec<u32>>,
         /// Number of top logits to print.
         #[arg(short, long, default_value_t = 10)]
         k: usize,
@@ -55,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
         Command::Model { path } => model(&path),
-        Command::Generate { path, token, k } => generate(&path, token, k),
+        Command::Generate { path, token, tokens, k } => generate(&path, token, tokens, k),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
     }
@@ -158,19 +163,19 @@ fn debug_embed(path: &std::path::Path, tokens: &[u32]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate(path: &std::path::Path, token: Option<u32>, k: usize) -> anyhow::Result<()> {
+fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>, k: usize) -> anyhow::Result<()> {
     let g = GgufFile::open(path)?;
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
-    let token = token.unwrap_or(cfg.eos_token_id);
+    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![token.unwrap_or(cfg.eos_token_id)]);
     println!("model         = {}", path.display());
     println!("vocab         = {}", cfg.vocab_size);
-    println!("input token   = {token}");
+    println!("input tokens  = {prompt:?}");
 
-    let mut state = m.new_state(16);
+    let mut state = m.new_state(prompt.len() + 8);
     let t0 = std::time::Instant::now();
-    let logits = m.forward_token(token, &mut state);
-    println!("forward took  = {:.2} s", t0.elapsed().as_secs_f32());
+    let logits = m.forward_tokens(&prompt, &mut state);
+    println!("forward took  = {:.2} s ({} tokens)", t0.elapsed().as_secs_f32(), prompt.len());
 
     // Compute softmax probability for the top-k for context.
     let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();

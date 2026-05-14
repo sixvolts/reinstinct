@@ -584,6 +584,24 @@ impl Qwen35F32Model {
         Qwen35F32State::new(&self.model.config, &self.model.block_kinds, max_seq)
     }
 
+    /// Run a multi-token prompt through the model, advancing `state.pos` and
+    /// accumulating KV / GDN state per token. Returns logits for the LAST
+    /// token only (next-token prediction).
+    ///
+    /// Currently implemented as a tight loop of `forward_token`. A future
+    /// optimization would batch the per-block matvecs across all N tokens
+    /// (one matmul instead of N matvecs), but the per-token state update
+    /// (rank-1 GDN, KV append) is inherently sequential, so the speedup
+    /// is bounded by how much of each block is matvec vs state work.
+    pub fn forward_tokens(&self, tokens: &[u32], state: &mut Qwen35F32State) -> Vec<f32> {
+        assert!(!tokens.is_empty(), "forward_tokens needs at least one token");
+        let mut last = Vec::new();
+        for &t in tokens {
+            last = self.forward_token(t, state);
+        }
+        last
+    }
+
     /// Forward one token at the current `state.pos`. Advances `state.pos` by 1.
     /// Returns the next-token logit vector of length `vocab_size`.
     ///
