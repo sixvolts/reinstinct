@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use reinstinct_engine::gguf::{GgufFile, MetaValue};
+use reinstinct_engine::model::qwen3_5::{BlockKind, Qwen35Model};
 
 #[derive(Parser, Debug)]
 #[command(name = "reinstinct-engine", version, about)]
@@ -20,11 +21,16 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Detect architecture and parse as a typed model (currently: qwen35 only).
+    Model {
+        path: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
+        Command::Model { path } => model(&path),
     }
 }
 
@@ -79,6 +85,67 @@ fn inspect(path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn model(path: &std::path::Path) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    println!("file = {}", path.display());
+    println!("arch = {arch}");
+
+    match arch {
+        "qwen35" => {
+            let m = Qwen35Model::load(&g)?;
+            print_qwen35(&m);
+        }
+        other => {
+            anyhow::bail!("no typed loader for architecture {other:?} yet");
+        }
+    }
+    Ok(())
+}
+
+fn print_qwen35(m: &Qwen35Model) {
+    let c = &m.config;
+    println!("\n--- config ---");
+    println!("  blocks            = {}", c.block_count);
+    println!("  hidden            = {}", c.hidden_size);
+    println!("  ffn               = {}", c.ffn_size);
+    println!("  vocab             = {}", c.vocab_size);
+    println!("  context           = {}", c.context_length);
+    println!("  rms_eps           = {:.2e}", c.rms_norm_eps);
+    println!("  tied_embeddings   = {}", c.tied_embeddings);
+    println!("  full attn:");
+    println!("    n_heads         = {}", c.attn_n_heads);
+    println!("    n_kv_heads      = {}", c.attn_n_kv_heads);
+    println!("    head_dim        = {}", c.attn_head_dim);
+    println!("  linear attn (GDN):");
+    println!("    value_dim       = {}", c.gdn_value_dim);
+    println!("    n_heads         = {}", c.gdn_n_heads);
+    println!("    head_dim        = {}", c.gdn_head_dim);
+    println!("    conv_kernel     = {}", c.gdn_conv_kernel);
+    println!("  rope:");
+    println!("    freq_base       = {}", c.rope_freq_base);
+    println!("    rotated dims    = {} of {}", c.rope_dim_count, c.attn_head_dim);
+    println!("    mrope sections  = {:?}", c.rope_dim_sections);
+    println!("  layer schedule    = full attention every {} blocks", c.full_attention_interval);
+
+    println!("\n--- block schedule ---");
+    for (i, &k) in m.block_kinds.iter().enumerate() {
+        let tag = match k {
+            BlockKind::LinearAttention => "L",
+            BlockKind::FullAttention   => "F",
+        };
+        print!("  {i:2}:{tag}");
+        if (i + 1) % 8 == 0 { println!(); }
+    }
+    if m.block_kinds.len() % 8 != 0 { println!(); }
+
+    let n_full = m.block_kinds.iter().filter(|k| **k == BlockKind::FullAttention).count();
+    let n_lin  = m.block_kinds.len() - n_full;
+    println!("\n  total = {} linear, {} full", n_lin, n_full);
 }
 
 fn short_value(v: &MetaValue) -> String {

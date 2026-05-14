@@ -47,11 +47,20 @@ impl MetaValue {
         })
     }
 
+    /// Coerce to u32 from any integer variant (signed or unsigned) when the
+    /// value fits and is non-negative. GGUF metadata mixes signed/unsigned
+    /// even for "obviously unsigned" things like RoPE dimension sections,
+    /// so accepting both keeps callers from caring.
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U8(v)  => Some(*v as u32),
             Self::U16(v) => Some(*v as u32),
             Self::U32(v) => Some(*v),
+            Self::U64(v) => u32::try_from(*v).ok(),
+            Self::I8(v)  => u32::try_from(*v).ok(),
+            Self::I16(v) => u32::try_from(*v).ok(),
+            Self::I32(v) => u32::try_from(*v).ok(),
+            Self::I64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -62,6 +71,10 @@ impl MetaValue {
             Self::U16(v) => Some(*v as u64),
             Self::U32(v) => Some(*v as u64),
             Self::U64(v) => Some(*v),
+            Self::I8(v)  => u64::try_from(*v).ok(),
+            Self::I16(v) => u64::try_from(*v).ok(),
+            Self::I32(v) => u64::try_from(*v).ok(),
+            Self::I64(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -69,6 +82,21 @@ impl MetaValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::F32(v) => Some(*v),
+            Self::F64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<(GgufValueType, &[MetaValue])> {
+        match self {
+            Self::Array { element_type, values } => Some((*element_type, values.as_slice())),
             _ => None,
         }
     }
