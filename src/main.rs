@@ -36,6 +36,11 @@ enum Command {
         #[arg(short, long, default_value_t = 10)]
         k: usize,
     },
+    /// Dump diagnostic stats for the embedding row of one or more tokens.
+    DebugEmbed {
+        path: PathBuf,
+        tokens: Vec<u32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,7 +48,29 @@ fn main() -> anyhow::Result<()> {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
         Command::Model { path } => model(&path),
         Command::Generate { path, token, k } => generate(&path, token, k),
+        Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
     }
+}
+
+fn debug_embed(path: &std::path::Path, tokens: &[u32]) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let h = m.model.config.hidden_size as usize;
+    println!("hidden_size = {h}, vocab = {}", m.model.config.vocab_size);
+    for &tok in tokens {
+        let off = tok as usize * h;
+        let row = &m.weights.token_embd[off..off + h];
+        let rms: f32 = (row.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+        let max = row.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
+        let head: Vec<f32> = row[..6].to_vec();
+        let tail: Vec<f32> = row[h - 6..].to_vec();
+        println!("\ntoken {tok:>6}:");
+        println!("  rms        = {rms:.6}");
+        println!("  max|x|     = {max:.6}");
+        println!("  first 6    = {head:?}");
+        println!("  last 6     = {tail:?}");
+    }
+    Ok(())
 }
 
 fn generate(path: &std::path::Path, token: Option<u32>, k: usize) -> anyhow::Result<()> {
