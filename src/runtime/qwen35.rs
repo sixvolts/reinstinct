@@ -22,8 +22,20 @@ use std::ffi::c_void;
 
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{self, DeviceBuf, Graph, GraphExec, Module, Stream};
+use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
+
+/// Per-stage GPU timing breakdown for one `forward_token` call,
+/// measured with HIP events (so each `*_ms` is genuine GPU time
+/// on `self.stream`, not host wall-clock).
+#[derive(Debug, Default, Clone)]
+pub struct GpuForwardTrace {
+    pub embed_ms:        f32,
+    pub block_ms:        Vec<f32>,   // one entry per layer, schedule order
+    pub output_norm_ms:  f32,
+    pub output_proj_ms:  f32,
+    pub total_ms:        f32,        // sum from before embed to after output_proj
+}
 use super::KernelCache;
 
 const EMBED_LOOKUP_SOURCE:      &str = include_str!("../../kernels/embed_lookup.cpp");
@@ -1073,6 +1085,71 @@ impl GpuQwen35 {
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
+    }
+
+    /// Like `forward_token` but records per-stage GPU times via HIP
+    /// events. Adds ~N+3 events per call, plus one elapsed_time query
+    /// per stage at the end — small overhead but not free, so reserve
+    /// for diagnostics, not the inner loop.
+    pub fn forward_token_traced(&self, token: u32, state: &mut Qwen35GpuState)
+        -> Result<(Vec<f32>, GpuForwardTrace), String>
+    {
+        assert_eq!(state.block_states.len(), self.blocks.len());
+        let n_blocks = self.blocks.len();
+        // Checkpoints: e0 before embed, e1 after embed = before block 0,
+        // e[i+2] after block i, e[n+2] after output_norm, e[n+3] after output_proj.
+        let events: Vec<Event> = (0..n_blocks + 4)
+            .map(|_| Event::new())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        events[0].record(&self.stream)?;
+        self.launch_embed_lookup(self.token_embd.raw_ptr(), self.hidden_a.raw_ptr(),
+                                 token, self.hidden as u32)?;
+        events[1].record(&self.stream)?;
+
+        for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
+            match (block, st) {
+                (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
+                    self.step_full_attention_block_dev(
+                        self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, kv)?;
+                }
+                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
+                    self.step_linear_attention_block_dev(
+                        self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, s)?;
+                }
+                _ => return Err("block kind mismatch".into()),
+            }
+            events[i + 2].record(&self.stream)?;
+        }
+
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
+        events[n_blocks + 2].record(&self.stream)?;
+
+        self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
+                           self.logits.raw_ptr(),
+                           self.hidden as u32, self.vocab as u32)?;
+        events[n_blocks + 3].record(&self.stream)?;
+
+        // Sync on the *last* event (finishes the chain) before reading.
+        events[n_blocks + 3].synchronize()?;
+        state.pos += 1;
+
+        let mut block_ms = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
+            block_ms.push(Event::elapsed_time(&events[i + 1], &events[i + 2])?);
+        }
+        let trace = GpuForwardTrace {
+            embed_ms:       Event::elapsed_time(&events[0],            &events[1])?,
+            block_ms,
+            output_norm_ms: Event::elapsed_time(&events[n_blocks + 1], &events[n_blocks + 2])?,
+            output_proj_ms: Event::elapsed_time(&events[n_blocks + 2], &events[n_blocks + 3])?,
+            total_ms:       Event::elapsed_time(&events[0],            &events[n_blocks + 3])?,
+        };
+
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok((out, trace))
     }
 
     /// On-device portion of `forward_token`: every kernel launch and

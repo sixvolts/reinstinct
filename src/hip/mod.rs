@@ -9,7 +9,7 @@ use std::ffi::{CString, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr::null_mut;
 
-use sys::{Hip, HipDevice, HipError, HipFunction, HipGraph, HipGraphExec, HipMemcpyKind,
+use sys::{Hip, HipDevice, HipError, HipEvent, HipFunction, HipGraph, HipGraphExec, HipMemcpyKind,
           HipModule, HipStream, HipStreamCaptureMode, hip};
 
 /// Result type for the safe HIP API. The error message has already been
@@ -197,6 +197,53 @@ impl<T> Drop for DeviceBuf<T> {
             if let Ok(api) = hip() {
                 unsafe { let _ = (api.free)(self.ptr as *mut c_void); }
             }
+        }
+    }
+}
+
+/// HIP event for stream-side timing (RAII).
+///
+/// Pattern:
+///   let start = Event::new()?;  let stop = Event::new()?;
+///   start.record(&stream)?;
+///   ... kernel launches on stream ...
+///   stop.record(&stream)?;
+///   stop.synchronize()?;
+///   let ms = Event::elapsed_time(&start, &stop)?;
+pub struct Event { raw: HipEvent }
+
+impl Event {
+    pub fn new() -> Result<Self> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut e: HipEvent = null_mut();
+        unsafe { ck(api, (api.event_create)(&mut e), "hipEventCreate")?; }
+        Ok(Event { raw: e })
+    }
+
+    pub fn record(&self, stream: &Stream) -> Result<()> {
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe { ck(api, (api.event_record)(self.raw, stream.raw), "hipEventRecord") }
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe { ck(api, (api.event_synchronize)(self.raw), "hipEventSynchronize") }
+    }
+
+    /// Elapsed time in milliseconds between two recorded events.
+    pub fn elapsed_time(start: &Event, stop: &Event) -> Result<f32> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut ms: f32 = 0.0;
+        unsafe { ck(api, (api.event_elapsed_time)(&mut ms, start.raw, stop.raw),
+                   "hipEventElapsedTime")?; }
+        Ok(ms)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Ok(api) = hip() { unsafe { let _ = (api.event_destroy)(self.raw); } }
         }
     }
 }

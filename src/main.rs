@@ -91,6 +91,7 @@ fn main() -> anyhow::Result<()> {
 fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
     use reinstinct_engine::hip;
     use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+    use reinstinct_engine::model::qwen3_5::BlockKind;
 
     let n = hip::device_count().map_err(anyhow::Error::msg)?;
     if n == 0 { anyhow::bail!("no HIP device"); }
@@ -132,6 +133,50 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     println!("  mean    {mean:>8.3} ms");
     println!("  min     {min:>8.3} ms");
     println!("  max     {max:>8.3} ms");
+
+    // Per-stage breakdown via HIP events. Run a few traced iterations
+    // and average to smooth out single-shot noise; report the per-stage
+    // and per-block-kind contributions.
+    state.reset().map_err(anyhow::Error::msg)?;
+    let trace_iters = 5usize;
+    let mut sum_embed = 0.0_f32;
+    let mut sum_norm  = 0.0_f32;
+    let mut sum_proj  = 0.0_f32;
+    let mut sum_block = vec![0.0_f32; m.model.block_kinds.len()];
+    let mut sum_total = 0.0_f32;
+    for _ in 0..trace_iters {
+        let (_logits, t) = gpu.forward_token_traced(token, &mut state).map_err(anyhow::Error::msg)?;
+        sum_embed += t.embed_ms;
+        sum_norm  += t.output_norm_ms;
+        sum_proj  += t.output_proj_ms;
+        for (acc, v) in sum_block.iter_mut().zip(t.block_ms.iter()) { *acc += *v; }
+        sum_total += t.total_ms;
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    let n = trace_iters as f32;
+    let total = sum_total / n;
+    let embed = sum_embed / n;
+    let norm  = sum_norm / n;
+    let proj  = sum_proj / n;
+    let mut sum_lin  = 0.0_f32; let mut count_lin  = 0usize;
+    let mut sum_full = 0.0_f32; let mut count_full = 0usize;
+    for (acc, &kind) in sum_block.iter().zip(m.model.block_kinds.iter()) {
+        let avg = acc / n;
+        match kind {
+            BlockKind::LinearAttention => { sum_lin += avg; count_lin += 1; }
+            BlockKind::FullAttention   => { sum_full += avg; count_full += 1; }
+        }
+    }
+    let pct = |x: f32| 100.0 * x / total;
+    println!("\n--- per-stage GPU breakdown ({} traced iters, hipEvent ms) ---", trace_iters);
+    println!("  total           {total:>8.3} ms  (event sum)");
+    println!("  embed           {embed:>8.3} ms ({:>4.1}%)", pct(embed));
+    println!("  blocks (linear) {sum_lin:>8.3} ms ({:>4.1}%)  -- {count_lin} blocks, {:.3} ms each",
+        pct(sum_lin), if count_lin > 0 { sum_lin / count_lin as f32 } else { 0.0 });
+    println!("  blocks (full)   {sum_full:>8.3} ms ({:>4.1}%)  -- {count_full} blocks, {:.3} ms each",
+        pct(sum_full), if count_full > 0 { sum_full / count_full as f32 } else { 0.0 });
+    println!("  output_norm     {norm:>8.3} ms ({:>4.1}%)", pct(norm));
+    println!("  output_proj     {proj:>8.3} ms ({:>4.1}%)", pct(proj));
 
     // HIP graph capture: capture the full forward chain once at pos=0
     // for this token, then time hipGraphLaunch + sync + D2H per call.

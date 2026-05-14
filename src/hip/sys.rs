@@ -25,12 +25,14 @@ pub type HipDevice = i32;
 #[repr(C)] pub struct HipGraphRaw     { _private: [u8; 0] }
 #[repr(C)] pub struct HipGraphExecRaw { _private: [u8; 0] }
 #[repr(C)] pub struct HipGraphNodeRaw { _private: [u8; 0] }
+#[repr(C)] pub struct HipEventRaw     { _private: [u8; 0] }
 pub type HipStream    = *mut HipStreamRaw;
 pub type HipModule    = *mut HipModuleRaw;
 pub type HipFunction  = *mut HipFunctionRaw;
 pub type HipGraph     = *mut HipGraphRaw;
 pub type HipGraphExec = *mut HipGraphExecRaw;
 pub type HipGraphNode = *mut HipGraphNodeRaw;
+pub type HipEvent     = *mut HipEventRaw;
 
 #[repr(i32)]
 #[derive(Copy, Clone, Debug)]
@@ -85,6 +87,12 @@ pub struct Hip {
     pub graph_launch:         unsafe extern "C" fn(HipGraphExec, HipStream) -> HipError,
     pub graph_destroy:        unsafe extern "C" fn(HipGraph) -> HipError,
     pub graph_exec_destroy:   unsafe extern "C" fn(HipGraphExec) -> HipError,
+
+    pub event_create:         unsafe extern "C" fn(*mut HipEvent) -> HipError,
+    pub event_record:         unsafe extern "C" fn(HipEvent, HipStream) -> HipError,
+    pub event_synchronize:    unsafe extern "C" fn(HipEvent) -> HipError,
+    pub event_elapsed_time:   unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipError,
+    pub event_destroy:        unsafe extern "C" fn(HipEvent) -> HipError,
 }
 
 // SAFETY: `Hip` is immutable after construction; all entry points are reentrant.
@@ -159,6 +167,11 @@ pub fn hip() -> Result<&'static Hip, &'static str> {
             graph_launch:         sym!(b"hipGraphLaunch"),
             graph_destroy:        sym!(b"hipGraphDestroy"),
             graph_exec_destroy:   sym!(b"hipGraphExecDestroy"),
+            event_create:         sym!(b"hipEventCreate"),
+            event_record:         sym!(b"hipEventRecord"),
+            event_synchronize:    sym!(b"hipEventSynchronize"),
+            event_elapsed_time:   sym!(b"hipEventElapsedTime"),
+            event_destroy:        sym!(b"hipEventDestroy"),
             _lib: lib,
         })
     });
