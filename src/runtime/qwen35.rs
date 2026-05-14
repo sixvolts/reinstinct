@@ -24,13 +24,17 @@ use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::hip::{self, DeviceBuf, Module};
 use super::KernelCache;
 
-const EMBED_LOOKUP_SOURCE: &str = include_str!("../../kernels/embed_lookup.cpp");
-const RMSNORM_SOURCE:      &str = include_str!("../../kernels/rmsnorm.cpp");
-const MATVEC_SOURCE:       &str = include_str!("../../kernels/matvec.cpp");
-const SWIGLU_SOURCE:       &str = include_str!("../../kernels/swiglu.cpp");
+const EMBED_LOOKUP_SOURCE:      &str = include_str!("../../kernels/embed_lookup.cpp");
+const RMSNORM_SOURCE:           &str = include_str!("../../kernels/rmsnorm.cpp");
+const MATVEC_SOURCE:            &str = include_str!("../../kernels/matvec.cpp");
+const SWIGLU_SOURCE:            &str = include_str!("../../kernels/swiglu.cpp");
+const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
+const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.cpp");
+const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.cpp");
+const ROPE_SOURCE:              &str = include_str!("../../kernels/rope.cpp");
+const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 
 /// FFN weights for a single transformer block, resident on device.
-/// One of these per block in the eventual full GPU model.
 pub struct GpuFfnWeights {
     pub gate: DeviceBuf<f32>,   // [hidden, ffn]
     pub up:   DeviceBuf<f32>,   // [hidden, ffn]
@@ -47,6 +51,52 @@ impl GpuFfnWeights {
     }
 }
 
+/// Full-attention block weights for a single transformer block.
+pub struct GpuFullAttnWeights {
+    pub attn_norm:   DeviceBuf<f32>,   // [hidden]
+    pub attn_q:      DeviceBuf<f32>,   // [hidden, 2 * q_dim]   (Q | gate concat)
+    pub attn_k:      DeviceBuf<f32>,   // [hidden, kv_dim]
+    pub attn_v:      DeviceBuf<f32>,   // [hidden, kv_dim]
+    pub attn_q_norm: DeviceBuf<f32>,   // [head_dim]            (per-head)
+    pub attn_k_norm: DeviceBuf<f32>,   // [head_dim]
+    pub attn_output: DeviceBuf<f32>,   // [q_dim, hidden]
+}
+
+impl GpuFullAttnWeights {
+    pub fn from_cpu(w: &crate::cpu::qwen3_5::FullAttnWeights) -> Result<Self, String> {
+        Ok(Self {
+            attn_norm:   DeviceBuf::from_slice(&w.attn_norm)?,
+            attn_q:      DeviceBuf::from_slice(&w.attn_q)?,
+            attn_k:      DeviceBuf::from_slice(&w.attn_k)?,
+            attn_v:      DeviceBuf::from_slice(&w.attn_v)?,
+            attn_q_norm: DeviceBuf::from_slice(&w.attn_q_norm)?,
+            attn_k_norm: DeviceBuf::from_slice(&w.attn_k_norm)?,
+            attn_output: DeviceBuf::from_slice(&w.attn_output)?,
+        })
+    }
+}
+
+/// Per-block KV cache resident on device.
+pub struct GpuKvCache {
+    pub k: DeviceBuf<f32>,     // [max_seq, n_kv_heads, head_dim]
+    pub v: DeviceBuf<f32>,     // [max_seq, n_kv_heads, head_dim]
+    pub max_seq: usize,
+    pub kv_dim: usize,         // n_kv_heads * head_dim — bytes per slot
+    pub len:    usize,         // populated positions [0, len)
+}
+
+impl GpuKvCache {
+    pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Result<Self, String> {
+        let kv_dim = n_kv_heads * head_dim;
+        Ok(Self {
+            k: DeviceBuf::new(max_seq * kv_dim)?,
+            v: DeviceBuf::new(max_seq * kv_dim)?,
+            max_seq, kv_dim, len: 0,
+        })
+    }
+    pub fn reset(&mut self) { self.len = 0; }
+}
+
 pub struct GpuQwen35 {
     // Resident weights.
     token_embd: DeviceBuf<f32>,           // [vocab, hidden]
@@ -55,31 +105,61 @@ pub struct GpuQwen35 {
     output_proj: Option<DeviceBuf<f32>>,  // [vocab, hidden]
 
     // Per-call activation scratch (persistent across calls; overwritten each call).
-    hidden_a: DeviceBuf<f32>,
-    hidden_b: DeviceBuf<f32>,
-    ffn_a:    DeviceBuf<f32>,   // [ffn] gate proj output / swiglu output
-    ffn_b:    DeviceBuf<f32>,   // [ffn] up proj output
-    logits:   DeviceBuf<f32>,
+    hidden_a:    DeviceBuf<f32>,   // [hidden]
+    hidden_b:    DeviceBuf<f32>,   // [hidden]
+    ffn_a:       DeviceBuf<f32>,   // [ffn]
+    ffn_b:       DeviceBuf<f32>,   // [ffn]
+    q_raw:       DeviceBuf<f32>,   // [2 * q_dim]
+    q_buf:       DeviceBuf<f32>,   // [q_dim]
+    gate_buf:    DeviceBuf<f32>,   // [q_dim]
+    k_raw:       DeviceBuf<f32>,   // [kv_dim]
+    v_raw:       DeviceBuf<f32>,   // [kv_dim]
+    k_norm:      DeviceBuf<f32>,   // [kv_dim]
+    attn_concat: DeviceBuf<f32>,   // [q_dim]
+    logits:      DeviceBuf<f32>,   // [vocab]
+
+    // RoPE tables resident on device.
+    rope_cos: DeviceBuf<f32>,      // [max_seq, rotary_dim]
+    rope_sin: DeviceBuf<f32>,      // [max_seq, rotary_dim]
 
     // Compiled kernel modules — keep alive for the lifetime of self.
-    embed_module:   Module,
-    rmsnorm_module: Module,
-    matvec_module:  Module,
-    swiglu_module:  Module,
+    embed_module:            Module,
+    rmsnorm_module:          Module,
+    matvec_module:           Module,
+    swiglu_module:           Module,
+    rmsnorm_multihead_module: Module,
+    split_q_gate_module:     Module,
+    sigmoid_mul_module:      Module,
+    rope_module:             Module,
+    attn_step_module:        Module,
 
     // Dimensions.
-    hidden:  usize,
-    ffn:     usize,
-    vocab:   usize,
-    rms_eps: f32,
+    hidden:     usize,
+    ffn:        usize,
+    vocab:      usize,
+    n_heads:    usize,
+    n_kv_heads: usize,
+    head_dim:   usize,
+    rotary_dim: usize,
+    rms_eps:    f32,
+    #[allow(dead_code)]
+    max_seq:    usize,
 }
 
 impl GpuQwen35 {
-    pub fn new(model: &Qwen35F32Model, cache: &KernelCache) -> Result<Self, String> {
+    pub fn new(model: &Qwen35F32Model, cache: &KernelCache, max_seq: usize)
+        -> Result<Self, String>
+    {
         let cfg = &model.model.config;
-        let hidden = cfg.hidden_size as usize;
-        let ffn    = cfg.ffn_size   as usize;
-        let vocab  = cfg.vocab_size as usize;
+        let hidden     = cfg.hidden_size      as usize;
+        let ffn        = cfg.ffn_size         as usize;
+        let vocab      = cfg.vocab_size       as usize;
+        let n_heads    = cfg.attn_n_heads     as usize;
+        let n_kv_heads = cfg.attn_n_kv_heads  as usize;
+        let head_dim   = cfg.attn_head_dim    as usize;
+        let rotary_dim = cfg.rope_dim_count   as usize;
+        let q_dim  = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
 
         let token_embd  = DeviceBuf::from_slice(&model.weights.token_embd)?;
         let output_norm = DeviceBuf::from_slice(&model.weights.output_norm)?;
@@ -91,27 +171,65 @@ impl GpuQwen35 {
             Some(DeviceBuf::from_slice(w)?)
         };
 
-        let hidden_a = DeviceBuf::new(hidden)?;
-        let hidden_b = DeviceBuf::new(hidden)?;
-        let ffn_a    = DeviceBuf::new(ffn)?;
-        let ffn_b    = DeviceBuf::new(ffn)?;
-        let logits   = DeviceBuf::new(vocab)?;
+        let hidden_a    = DeviceBuf::new(hidden)?;
+        let hidden_b    = DeviceBuf::new(hidden)?;
+        let ffn_a       = DeviceBuf::new(ffn)?;
+        let ffn_b       = DeviceBuf::new(ffn)?;
+        let q_raw       = DeviceBuf::new(2 * q_dim)?;
+        let q_buf       = DeviceBuf::new(q_dim)?;
+        let gate_buf    = DeviceBuf::new(q_dim)?;
+        let k_raw       = DeviceBuf::new(kv_dim)?;
+        let v_raw       = DeviceBuf::new(kv_dim)?;
+        let k_norm      = DeviceBuf::new(kv_dim)?;
+        let attn_concat = DeviceBuf::new(q_dim)?;
+        let logits      = DeviceBuf::new(vocab)?;
 
-        let embed_hsaco   = cache.compile("embed_lookup", EMBED_LOOKUP_SOURCE)?;
-        let rmsnorm_hsaco = cache.compile("rmsnorm",      RMSNORM_SOURCE)?;
-        let matvec_hsaco  = cache.compile("matvec",       MATVEC_SOURCE)?;
-        let swiglu_hsaco  = cache.compile("swiglu",       SWIGLU_SOURCE)?;
+        // Build RoPE tables host-side once and upload.
+        let rope = crate::cpu::rope::RopeCache::new(rotary_dim, max_seq, cfg.rope_freq_base);
+        let mut cos = vec![0.0f32; max_seq * rotary_dim];
+        let mut sin = vec![0.0f32; max_seq * rotary_dim];
+        for pos in 0..max_seq {
+            let (c, s) = rope.get(pos);
+            cos[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(c);
+            sin[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(s);
+        }
+        let rope_cos = DeviceBuf::from_slice(&cos)?;
+        let rope_sin = DeviceBuf::from_slice(&sin)?;
+
+        let embed_hsaco             = cache.compile("embed_lookup",      EMBED_LOOKUP_SOURCE)?;
+        let rmsnorm_hsaco           = cache.compile("rmsnorm",           RMSNORM_SOURCE)?;
+        let matvec_hsaco            = cache.compile("matvec",            MATVEC_SOURCE)?;
+        let swiglu_hsaco            = cache.compile("swiglu",            SWIGLU_SOURCE)?;
+        let rmsnorm_multihead_hsaco = cache.compile("rmsnorm_multihead", RMSNORM_MULTIHEAD_SOURCE)?;
+        let split_q_gate_hsaco      = cache.compile("split_q_gate",      SPLIT_Q_GATE_SOURCE)?;
+        let sigmoid_mul_hsaco       = cache.compile("sigmoid_mul",       SIGMOID_MUL_SOURCE)?;
+        let rope_hsaco              = cache.compile("rope",              ROPE_SOURCE)?;
+        let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
 
         Ok(Self {
             token_embd, output_norm, output_proj,
-            hidden_a, hidden_b, ffn_a, ffn_b, logits,
-            embed_module:   Module::load(&embed_hsaco)?,
-            rmsnorm_module: Module::load(&rmsnorm_hsaco)?,
-            matvec_module:  Module::load(&matvec_hsaco)?,
-            swiglu_module:  Module::load(&swiglu_hsaco)?,
-            hidden, ffn, vocab, rms_eps: cfg.rms_norm_eps,
+            hidden_a, hidden_b, ffn_a, ffn_b,
+            q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
+            rope_cos, rope_sin,
+            embed_module:             Module::load(&embed_hsaco)?,
+            rmsnorm_module:           Module::load(&rmsnorm_hsaco)?,
+            matvec_module:            Module::load(&matvec_hsaco)?,
+            swiglu_module:            Module::load(&swiglu_hsaco)?,
+            rmsnorm_multihead_module: Module::load(&rmsnorm_multihead_hsaco)?,
+            split_q_gate_module:      Module::load(&split_q_gate_hsaco)?,
+            sigmoid_mul_module:       Module::load(&sigmoid_mul_hsaco)?,
+            rope_module:              Module::load(&rope_hsaco)?,
+            attn_step_module:         Module::load(&attn_step_hsaco)?,
+            hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
+            rms_eps: cfg.rms_norm_eps,
+            max_seq,
         })
     }
+
+    /// q_dim = n_heads * head_dim
+    pub fn q_dim(&self) -> usize { self.n_heads * self.head_dim }
+    /// kv_dim = n_kv_heads * head_dim
+    pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
 
     fn output_proj_ptr(&self) -> *mut c_void {
         match &self.output_proj {
@@ -194,6 +312,111 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
     }
 
+    fn launch_rmsnorm_multihead(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
+                                n_heads: u32, head_dim: u32, eps: f32) -> Result<(), String>
+    {
+        let f = self.rmsnorm_multihead_module.function("rmsnorm_multihead_f32")?;
+        let block: u32 = 256;
+        let mut xa = x; let mut wa = w; let mut ya = y;
+        let mut nh = n_heads; let mut hd = head_dim; let mut ea = eps;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void,
+        ];
+        let smem = block * std::mem::size_of::<f32>() as u32;
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
+    fn launch_split_q_gate(&self, q_raw: *mut c_void, q: *mut c_void, gate: *mut c_void,
+                           n_heads: u32, head_dim: u32) -> Result<(), String>
+    {
+        let f = self.split_q_gate_module.function("split_q_gate_f32")?;
+        let block: u32 = 256;
+        let total = n_heads * head_dim;
+        let grid = (total + block - 1) / block;
+        let mut qra = q_raw; let mut qa = q; let mut ga = gate;
+        let mut nh = n_heads; let mut hd = head_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut qra as *mut _ as *mut c_void,
+            &mut qa  as *mut _ as *mut c_void,
+            &mut ga  as *mut _ as *mut c_void,
+            &mut nh  as *mut _ as *mut c_void,
+            &mut hd  as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_sigmoid_mul(&self, x: *mut c_void, gate: *mut c_void, n: u32)
+        -> Result<(), String>
+    {
+        let f = self.sigmoid_mul_module.function("sigmoid_mul_inplace_f32")?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut xa = x; let mut ga = gate; let mut na = n;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut ga as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_rope(&self, x: *mut c_void, n_heads: u32, pos: u32) -> Result<(), String> {
+        let f = self.rope_module.function("rope_apply_f32")?;
+        let half = (self.rotary_dim / 2) as u32;
+        let block: u32 = 64;
+        let grid_x = (half + block - 1) / block;
+        let mut xa = x;
+        let mut ca = self.rope_cos.raw_ptr();
+        let mut sa = self.rope_sin.raw_ptr();
+        let mut hd = self.head_dim   as u32;
+        let mut rd = self.rotary_dim as u32;
+        let mut nh = n_heads;
+        let mut p  = pos;
+        let mut args: [*mut c_void; 7] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut p  as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, None, &mut args) }
+    }
+
+    fn launch_attn_step(&self, q: *mut c_void, k_cache: *mut c_void, v_cache: *mut c_void,
+                        out: *mut c_void, total_len: u32, scaling: f32) -> Result<(), String>
+    {
+        let f = self.attn_step_module.function("attn_step_f32")?;
+        let block: u32 = 256;
+        let grid: u32 = self.n_heads as u32;
+        let head_dim = self.head_dim as u32;
+        let smem = ((head_dim + total_len) + block) * std::mem::size_of::<f32>() as u32;
+        let mut qa = q; let mut ka = k_cache; let mut va = v_cache; let mut oa = out;
+        let mut nh = self.n_heads as u32;
+        let mut nkv = self.n_kv_heads as u32;
+        let mut hd = head_dim;
+        let mut tl = total_len;
+        let mut sc = scaling;
+        let mut args: [*mut c_void; 9] = [
+            &mut qa as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut tl as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem, None, &mut args) }
+    }
+
     /// embed → output_norm → output_proj. Returns vocab-length logits.
     /// Composition is artificial (norm doesn't belong here in real
     /// forward), but every kernel and every device pointer in the
@@ -209,6 +432,96 @@ impl GpuQwen35 {
         hip::Device(0).synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// Run one decode step of the full-attention block (matches
+    /// `cpu::qwen3_5::full_attention_step`).
+    ///
+    ///   normed     = rmsnorm(input, attn_norm)
+    ///   q_raw,k,v  = matvec(normed, {attn_q (2× width), attn_k, attn_v})
+    ///   q, gate    = split per-head q_raw into Q + gate
+    ///   q          = rmsnorm_per_head(q,      attn_q_norm); rope(q, pos)
+    ///   k          = rmsnorm_per_head(k_raw,  attn_k_norm); rope(k, pos)
+    ///   kv_cache.push(k, v) at position `cache_len`
+    ///   attn       = attn_step(q, K_cache[0..len+1], V_cache[0..len+1])
+    ///   attn      *= sigmoid(gate)
+    ///   out        = matvec(attn, attn_output)
+    ///
+    /// Returns the hidden-sized output as a Vec<f32>. Increments
+    /// `kv_cache.len` by 1.
+    pub fn apply_full_attention(&self,
+        input: &[f32],
+        weights: &GpuFullAttnWeights,
+        kv_cache: &mut GpuKvCache,
+    ) -> Result<Vec<f32>, String>
+    {
+        assert_eq!(input.len(), self.hidden, "input must be hidden-sized");
+        assert!(kv_cache.len < kv_cache.max_seq, "KV cache full");
+        let h_dim  = self.hidden as u32;
+        let q_dim  = self.q_dim()  as u32;
+        let kv_dim = self.kv_dim() as u32;
+        let pos = kv_cache.len;
+        let scaling = (self.head_dim as f32).powf(-0.5);
+
+        // 0) H2D the input.
+        self.hidden_a.copy_from_host(input)?;
+
+        // 1) normed = rmsnorm(input, attn_norm)  →  hidden_b
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), weights.attn_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
+
+        // 2) q_raw = matvec(normed, attn_q, h, 2*q_dim)
+        self.launch_matvec(weights.attn_q.raw_ptr(), self.hidden_b.raw_ptr(),
+                           self.q_raw.raw_ptr(), h_dim, 2 * q_dim)?;
+        //    k_raw = matvec(normed, attn_k, h, kv_dim)
+        self.launch_matvec(weights.attn_k.raw_ptr(), self.hidden_b.raw_ptr(),
+                           self.k_raw.raw_ptr(), h_dim, kv_dim)?;
+        //    v_raw = matvec(normed, attn_v, h, kv_dim)
+        self.launch_matvec(weights.attn_v.raw_ptr(), self.hidden_b.raw_ptr(),
+                           self.v_raw.raw_ptr(), h_dim, kv_dim)?;
+
+        // 3) split q_raw → q_buf, gate_buf
+        self.launch_split_q_gate(self.q_raw.raw_ptr(), self.q_buf.raw_ptr(),
+                                 self.gate_buf.raw_ptr(),
+                                 self.n_heads as u32, self.head_dim as u32)?;
+
+        // 4) per-head Q-norm in place; then RoPE on q_buf
+        self.launch_rmsnorm_multihead(self.q_buf.raw_ptr(), weights.attn_q_norm.raw_ptr(),
+                                      self.q_buf.raw_ptr(),
+                                      self.n_heads as u32, self.head_dim as u32, self.rms_eps)?;
+        self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, pos as u32)?;
+
+        // 5) per-kv-head K-norm into k_norm; RoPE on k_norm
+        self.launch_rmsnorm_multihead(self.k_raw.raw_ptr(), weights.attn_k_norm.raw_ptr(),
+                                      self.k_norm.raw_ptr(),
+                                      self.n_kv_heads as u32, self.head_dim as u32, self.rms_eps)?;
+        self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32, pos as u32)?;
+
+        // 6) Push (k_norm, v_raw) into the cache at slot `pos`.
+        //    Sync first so the matvec/RoPE writes are visible to the D2D copies.
+        hip::Device(0).synchronize()?;
+        kv_cache.k.copy_from_device_at(&self.k_norm, pos * kv_cache.kv_dim)?;
+        kv_cache.v.copy_from_device_at(&self.v_raw,  pos * kv_cache.kv_dim)?;
+
+        // 7) attn_step over total_len = pos + 1 → attn_concat
+        let total_len = (pos + 1) as u32;
+        self.launch_attn_step(self.q_buf.raw_ptr(),
+                              kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr(),
+                              self.attn_concat.raw_ptr(), total_len, scaling)?;
+
+        // 8) attn_concat *= sigmoid(gate_buf)  in place
+        self.launch_sigmoid_mul(self.attn_concat.raw_ptr(), self.gate_buf.raw_ptr(), q_dim)?;
+
+        // 9) out = matvec(attn_concat, attn_output, q_dim → hidden)
+        self.launch_matvec(weights.attn_output.raw_ptr(), self.attn_concat.raw_ptr(),
+                           self.hidden_b.raw_ptr(), q_dim, h_dim)?;
+
+        hip::Device(0).synchronize()?;
+        kv_cache.len += 1;
+
+        let mut out = vec![0.0f32; self.hidden];
+        self.hidden_b.copy_to_host(&mut out)?;
         Ok(out)
     }
 
@@ -277,7 +590,7 @@ mod tests {
         let hidden = cfg.hidden_size as usize;
         let vocab  = cfg.vocab_size as usize;
 
-        let gpu = GpuQwen35::new(&m, &cache).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m, &cache, 32).expect("new GpuQwen35");
 
         // Test on a couple of tokens including EOS and a mid-vocab.
         for &token in &[cfg.eos_token_id, 100u32, 50_000u32] {
@@ -362,7 +675,7 @@ mod tests {
 
             // GPU.
             let weights = GpuFfnWeights::from_cpu(gate_w, up_w, down_w).expect("alloc ffn weights");
-            let gpu = GpuQwen35::new(&m, &cache).expect("new GpuQwen35");
+            let gpu = GpuQwen35::new(&m, &cache, 32).expect("new GpuQwen35");
             let gpu_out = gpu.apply_swiglu_ffn(&input, &weights).expect("gpu ffn");
 
             // Compare with combined abs+rel tolerance.
@@ -387,6 +700,95 @@ mod tests {
     }
 
     #[test]
+    fn full_attention_step_matches_cpu_for_real_block() {
+        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        let _dev = hip::Device::set(0).unwrap();
+        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let cache = match KernelCache::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
+        };
+
+        use crate::cpu::qwen3_5::{BlockWeights, LayerKvCache, full_attention_step};
+        use crate::cpu::rope::RopeCache;
+
+        let g = GgufFile::open(&path).unwrap();
+        let m = Qwen35F32Model::load(&g).unwrap();
+        let cfg = &m.model.config;
+        let h = cfg.hidden_size as usize;
+
+        // Find the first FullAttention block (Qwen 3.5 pattern: L,L,L,F,...).
+        let block_idx = m.model.block_kinds.iter()
+            .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::FullAttention))
+            .expect("model has at least one FullAttention block");
+        let weights = match &m.weights.blocks[block_idx] {
+            BlockWeights::FullAttention(w) => w,
+            _ => unreachable!(),
+        };
+        eprintln!("validating block {block_idx} (FullAttention)");
+
+        let max_seq = 16usize;
+
+        // CPU side.
+        let mut layer_kv = LayerKvCache::new(
+            max_seq,
+            cfg.attn_n_kv_heads as usize,
+            cfg.attn_head_dim   as usize,
+        );
+        let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
+
+        // GPU side.
+        let gpu = GpuQwen35::new(&m, &cache, max_seq).expect("new GpuQwen35");
+        let gpu_w = GpuFullAttnWeights::from_cpu(weights).expect("upload attn weights");
+        let mut gpu_kv = GpuKvCache::new(
+            max_seq,
+            cfg.attn_n_kv_heads as usize,
+            cfg.attn_head_dim   as usize,
+        ).expect("alloc gpu kv");
+
+        // Drive both sides with the same sequence of inputs to verify KV
+        // accumulates correctly. Realistic magnitudes: rmsnorm output is
+        // O(1), so we feed inputs that look like post-residual hidden states.
+        let mut s: u64 = 0xA77E_FACE_CAFE;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+
+        let n_steps = 4usize;
+        for step in 0..n_steps {
+            let input: Vec<f32> = (0..h).map(|_| rng() * 2.0).collect();
+
+            // CPU oracle.
+            let mut cpu_out = vec![0.0f32; h];
+            full_attention_step(&input, weights, cfg, &mut layer_kv, &rope, step, &mut cpu_out);
+
+            // GPU.
+            let gpu_out = gpu.apply_full_attention(&input, &gpu_w, &mut gpu_kv)
+                .expect("gpu apply_full_attention");
+
+            // Compare.
+            const ABS_TOL: f32 = 1.0e-3;
+            const REL_TOL: f32 = 5.0e-3;
+            let mut max_abs = 0.0f32;
+            let mut worst_violation = 0.0f32;
+            let mut worst_at = 0usize;
+            for i in 0..h {
+                let d = (gpu_out[i] - cpu_out[i]).abs();
+                if d > max_abs { max_abs = d; }
+                let allowed = ABS_TOL.max(REL_TOL * cpu_out[i].abs());
+                let v = d - allowed;
+                if v > worst_violation { worst_violation = v; worst_at = i; }
+            }
+            eprintln!("step {step} (cache_len before push = {step}): max_abs={max_abs:.3e}, worst_violation={:.3e}",
+                worst_violation);
+            assert!(worst_violation <= 0.0,
+                "step {step} idx {worst_at}: gpu={} cpu={} exceeds tol",
+                gpu_out[worst_at], cpu_out[worst_at]);
+            assert_eq!(gpu_kv.len, layer_kv.len(),
+                "step {step}: GPU kv len {} doesn't match CPU {}", gpu_kv.len, layer_kv.len());
+        }
+    }
+
+    #[test]
     fn embed_norm_proj_is_deterministic() {
         if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
         let _dev = hip::Device::set(0).unwrap();
@@ -398,7 +800,7 @@ mod tests {
 
         let g = GgufFile::open(&path).unwrap();
         let m = Qwen35F32Model::load(&g).unwrap();
-        let gpu = GpuQwen35::new(&m, &cache).unwrap();
+        let gpu = GpuQwen35::new(&m, &cache, 32).unwrap();
         let token = m.model.config.eos_token_id;
 
         let a = gpu.embed_norm_proj(token).unwrap();
