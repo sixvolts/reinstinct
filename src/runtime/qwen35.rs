@@ -61,6 +61,7 @@ const MATVEC_Q5_K_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k.cpp")
 const MATVEC_Q6_K_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k.cpp");
 const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
+const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 
 /// A weight tensor used as the W matrix in a `y = W·x` matvec, resident on
 /// device. Holds the raw on-disk byte stream + on-disk dtype, so the
@@ -356,10 +357,10 @@ impl GpuKvCache {
 
 pub struct GpuQwen35 {
     // Resident weights.
-    token_embd: DeviceBuf<f32>,           // [vocab, hidden]
-    output_norm: DeviceBuf<f32>,          // [hidden]
+    token_embd: GpuMatvecTensor,           // [hidden, vocab] (GGUF shape order)
+    output_norm: DeviceBuf<f32>,           // [hidden]
     /// `None` when `tied_embeddings` — `output_proj` reuses `token_embd`.
-    output_proj: Option<DeviceBuf<f32>>,  // [vocab, hidden]
+    output_proj: Option<GpuMatvecTensor>,  // [hidden, vocab]
 
     // Per-call activation scratch (persistent across calls; overwritten each call).
     hidden_a:    DeviceBuf<f32>,   // [hidden]
@@ -415,6 +416,7 @@ pub struct GpuQwen35 {
     matvec_q6_k_module:    Module,
     matvec_iq4_xs_module:  Module,
     matvec_f16_module:     Module,
+    embed_lookup_q6_k_module: Module,
 
     /// Per-layer transformer block weights, in schedule order.
     blocks: Vec<GpuBlock>,
@@ -464,14 +466,12 @@ impl GpuQwen35 {
         // conv_dim = 2 * key_dim + value_dim; in Qwen 3.5 0.8B key=value, so 3*value_dim.
         let gdn_conv_dim    = 3 * gdn_value_dim;
 
-        let token_embd  = DeviceBuf::from_slice(&model.weights.token_embd)?;
-        let output_norm = DeviceBuf::from_slice(&model.weights.output_norm)?;
+        let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
+        let output_norm = load_fp32_tensor(gguf, "output_norm.weight")?;
         let output_proj = if cfg.tied_embeddings {
             None
         } else {
-            let w = model.weights.output.as_ref()
-                .ok_or("tied_embeddings=false but output.weight is missing")?;
-            Some(DeviceBuf::from_slice(w)?)
+            Some(GpuMatvecTensor::from_gguf(gguf, "output.weight")?)
         };
 
         let hidden_a    = DeviceBuf::new(hidden)?;
@@ -532,6 +532,7 @@ impl GpuQwen35 {
         let matvec_q6_k_hsaco   = cache.compile("matvec_q6_k",   MATVEC_Q6_K_SOURCE)?;
         let matvec_iq4_xs_hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
+        let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.model.block_kinds.len());
@@ -566,6 +567,7 @@ impl GpuQwen35 {
             matvec_q6_k_module:   Module::load(&matvec_q6_k_hsaco)?,
             matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
+            embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
             blocks,
             stream: Stream::new()?,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
@@ -582,11 +584,10 @@ impl GpuQwen35 {
     /// kv_dim = n_kv_heads * head_dim
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
 
-    fn output_proj_ptr(&self) -> *mut c_void {
-        match &self.output_proj {
-            Some(buf) => buf.raw_ptr(),
-            None      => self.token_embd.raw_ptr(),
-        }
+    /// The matvec tensor used for the final output projection. Same as
+    /// `output_proj` if separate; falls back to `token_embd` if tied.
+    fn output_proj_tensor(&self) -> &GpuMatvecTensor {
+        self.output_proj.as_ref().unwrap_or(&self.token_embd)
     }
 
     // ---- Per-op launchers ---------------------------------------------------
@@ -609,6 +610,37 @@ impl GpuQwen35 {
             &mut nn  as *mut _ as *mut c_void,
         ];
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_embed_lookup_q6_k(&self, table: *mut c_void, out: *mut c_void,
+                                token: u32, hidden: u32) -> Result<(), String>
+    {
+        let f = self.embed_lookup_q6_k_module.function("embed_lookup_q6_k_f32")?;
+        // One HIP block per Q6_K super-block (256 weights), 256 threads each.
+        let block: u32 = 256;
+        let grid = hidden / 256;
+        let mut t = table; let mut o = out; let mut row = token; let mut h = hidden;
+        let mut args: [*mut c_void; 4] = [
+            &mut t   as *mut _ as *mut c_void,
+            &mut o   as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void,
+            &mut h   as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Gather one row from `table` (shape `[hidden, vocab]` in GGUF order)
+    /// and write the dequantised fp32 row into `out`. Dispatches by the
+    /// table's on-disk dtype.
+    fn launch_embed_lookup_dispatch(&self, table: &GpuMatvecTensor, out: *mut c_void,
+                                    token: u32) -> Result<(), String>
+    {
+        let hidden = table.in_dim;  // first dim of [hidden, vocab]
+        match table.dtype {
+            GgmlType::F32  => self.launch_embed_lookup(table.data.raw_ptr(), out, token, hidden),
+            GgmlType::Q6_K => self.launch_embed_lookup_q6_k(table.data.raw_ptr(), out, token, hidden),
+            other => Err(format!("embed_lookup: no kernel for {:?}", other)),
+        }
     }
 
     fn launch_rmsnorm(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
@@ -956,13 +988,11 @@ impl GpuQwen35 {
     /// forward), but every kernel and every device pointer in the
     /// pipeline is exercised.
     pub fn embed_norm_proj(&self, token: u32) -> Result<Vec<f32>, String> {
-        self.launch_embed_lookup(self.token_embd.raw_ptr(), self.hidden_a.raw_ptr(),
-                                 token, self.hidden as u32)?;
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
-        self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
-                           self.logits.raw_ptr(),
-                           self.hidden as u32, self.vocab as u32)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
@@ -1103,8 +1133,7 @@ impl GpuQwen35 {
             .collect::<Result<Vec<_>, _>>()?;
 
         events[0].record(&self.stream)?;
-        self.launch_embed_lookup(self.token_embd.raw_ptr(), self.hidden_a.raw_ptr(),
-                                 token, self.hidden as u32)?;
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         events[1].record(&self.stream)?;
 
         for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
@@ -1126,9 +1155,8 @@ impl GpuQwen35 {
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
         events[n_blocks + 2].record(&self.stream)?;
 
-        self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
-                           self.logits.raw_ptr(),
-                           self.hidden as u32, self.vocab as u32)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
         events[n_blocks + 3].record(&self.stream)?;
 
         // Sync on the *last* event (finishes the chain) before reading.
@@ -1160,8 +1188,7 @@ impl GpuQwen35 {
         -> Result<(), String>
     {
         assert_eq!(state.block_states.len(), self.blocks.len());
-        self.launch_embed_lookup(self.token_embd.raw_ptr(), self.hidden_a.raw_ptr(),
-                                 token, self.hidden as u32)?;
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
@@ -1177,9 +1204,8 @@ impl GpuQwen35 {
         }
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
-        self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
-                           self.logits.raw_ptr(),
-                           self.hidden as u32, self.vocab as u32)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
         Ok(())
     }
 
