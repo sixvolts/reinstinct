@@ -17,6 +17,56 @@ const EMBED_LOOKUP_KERNEL: &str = "embed_lookup_f32";
 const MATVEC_SOURCE: &str = include_str!("../../kernels/matvec.cpp");
 const MATVEC_KERNEL: &str = "matvec_f32";
 
+const MATVEC_Q8_0_SOURCE: &str = include_str!("../../kernels/matvec_q8_0.cpp");
+const MATVEC_Q8_0_KERNEL: &str = "matvec_q8_0_f32";
+
+/// Fused Q8_0 dequant + GEMV. `w_bytes` is the raw on-disk Q8_0 byte
+/// stream (34 bytes per block, in_dim/32 blocks per row, out_dim rows).
+///
+/// Returns y of length out_dim.
+pub fn matvec_q8_0_f32(cache: &KernelCache, w_bytes: &[u8], x: &[f32],
+                       in_dim: usize, out_dim: usize) -> Result<Vec<f32>, String>
+{
+    use crate::quant::q8_0::{BLOCK_SIZE, BYTES_PER_BLOCK};
+    assert_eq!(in_dim % BLOCK_SIZE, 0, "in_dim must be a multiple of {}", BLOCK_SIZE);
+    let n_blocks = in_dim / BLOCK_SIZE;
+    let expect_bytes = out_dim * n_blocks * BYTES_PER_BLOCK;
+    assert_eq!(w_bytes.len(), expect_bytes,
+        "w_bytes len {} != expected {} ({}*{}*{})",
+        w_bytes.len(), expect_bytes, out_dim, n_blocks, BYTES_PER_BLOCK);
+    assert_eq!(x.len(), in_dim);
+
+    let hsaco = cache.compile("matvec_q8_0", MATVEC_Q8_0_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function(MATVEC_Q8_0_KERNEL)?;
+
+    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(w_bytes)?;
+    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim)?;
+
+    let block: u32 = 256;
+    let grid: u32 = out_dim as u32;
+    let mut w_ptr = dw.raw_ptr();
+    let mut x_ptr = dx.raw_ptr();
+    let mut y_ptr = dy.raw_ptr();
+    let mut in_arg = in_dim as u32;
+    let mut out_arg = out_dim as u32;
+    let mut args: [*mut c_void; 5] = [
+        &mut w_ptr   as *mut _ as *mut c_void,
+        &mut x_ptr   as *mut _ as *mut c_void,
+        &mut y_ptr   as *mut _ as *mut c_void,
+        &mut in_arg  as *mut _ as *mut c_void,
+        &mut out_arg as *mut _ as *mut c_void,
+    ];
+    let smem_bytes = block * std::mem::size_of::<f32>() as u32;
+    unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem_bytes, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; out_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// `y = W·x` where W is row-major `[out_dim, in_dim]` fp32.
 ///
 /// One block per output row, parallel reduction across `in_dim`. Reduction
@@ -193,6 +243,60 @@ mod tests {
         check_rmsnorm(&cache, 2048, 1e-6, 0xDEAD_BEEF, 1e-5);
         check_rmsnorm(&cache, 4096, 1e-6, 0x1234_5678, 1e-5);
         check_rmsnorm(&cache, 6144, 1e-6, 0xCAFEBABE, 1e-5);
+    }
+
+    #[test]
+    fn matvec_q8_0_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q8_0::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        // Synthesise a Q8_0 weight buffer with deterministic varying scales
+        // and qs, then validate GPU matvec against (dequant + CPU matvec).
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let n_blocks_per_row = in_dim / BLOCK_SIZE;
+        let total_blocks = out_dim * n_blocks_per_row;
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+
+        let mut s: u64 = 0xC0FFEE_BEEF;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let scale = ((blk % 17) as f32 - 8.0) * 0.005;  // ~ ±0.04
+            w_bytes[off..off+2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+            for i in 0..32 { w_bytes[off + 2 + i] = rng_u8(); }
+        }
+
+        let mut x_seed: u64 = 0xDEADBEEF;
+        let mut x_rng = || { x_seed = x_seed.wrapping_mul(6364136223846793005)
+                                            .wrapping_add(1442695040888963407);
+                             ((x_seed >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        // CPU oracle: dequant W, then matvec.
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::q8_0::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        let gpu = matvec_q8_0_f32(&cache, &w_bytes, &x, in_dim, out_dim).expect("gpu q8_0 matvec");
+
+        let mut max_abs = 0.0_f32;
+        let mut max_rel = 0.0_f32;
+        for j in 0..out_dim {
+            let d = (gpu[j] - cpu[j]).abs();
+            let r = d / cpu[j].abs().max(1e-8);
+            if d > max_abs { max_abs = d; }
+            if r > max_rel { max_rel = r; }
+        }
+        eprintln!("matvec_q8_0 {out_dim}x{in_dim}: max_abs={max_abs:.3e} max_rel={max_rel:.3e}");
+        assert!(max_rel < 5e-4,
+            "matvec_q8_0 max_rel {max_rel:.3e} exceeds 5e-4");
     }
 
     #[test]
