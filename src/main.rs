@@ -127,11 +127,45 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     let mean    = times_us.iter().sum::<u64>() as f64 / times_us.len() as f64 / 1000.0;
     let min     = times_us[0] as f64 / 1000.0;
     let max     = *times_us.last().unwrap() as f64 / 1000.0;
-    println!("\n--- GPU forward_token, {iters} iterations ---");
+    println!("\n--- GPU forward_token (direct), {iters} iterations ---");
     println!("  median  {median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / median);
     println!("  mean    {mean:>8.3} ms");
     println!("  min     {min:>8.3} ms");
     println!("  max     {max:>8.3} ms");
+
+    // HIP graph capture: capture the full forward chain once at pos=0
+    // for this token, then time hipGraphLaunch + sync + D2H per call.
+    // The bench resets state between iters so capturing at pos=0 is
+    // valid for every iteration here.
+    state.reset().map_err(anyhow::Error::msg)?;
+    let t_cap = std::time::Instant::now();
+    let exec = gpu.capture_forward_graph(token, &mut state).map_err(anyhow::Error::msg)?;
+    println!("\nHIP graph capture + instantiate took {:.3} ms",
+        t_cap.elapsed().as_secs_f64() * 1000.0);
+    state.reset().map_err(anyhow::Error::msg)?;
+    let _ = gpu.forward_token_via_graph(&exec, &mut state).map_err(anyhow::Error::msg)?;  // warmup
+    state.reset().map_err(anyhow::Error::msg)?;
+
+    let mut g_times_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let _ = gpu.forward_token_via_graph(&exec, &mut state).map_err(anyhow::Error::msg)?;
+        g_times_us.push(t.elapsed().as_micros() as u64);
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    g_times_us.sort_unstable();
+    let g_median = g_times_us[g_times_us.len() / 2] as f64 / 1000.0;
+    let g_mean   = g_times_us.iter().sum::<u64>() as f64 / g_times_us.len() as f64 / 1000.0;
+    let g_min    = g_times_us[0] as f64 / 1000.0;
+    let g_max    = *g_times_us.last().unwrap() as f64 / 1000.0;
+    println!("\n--- GPU forward_token (HIP graph), {iters} iterations ---");
+    println!("  median  {g_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / g_median);
+    println!("  mean    {g_mean:>8.3} ms");
+    println!("  min     {g_min:>8.3} ms");
+    println!("  max     {g_max:>8.3} ms");
+    let graph_speedup = median / g_median;
+    let label = if graph_speedup >= 1.0 { "speedup over direct" } else { "slowdown vs direct" };
+    println!("  graph: {graph_speedup:.2}× {label}");
 
     // CPU baseline for direct comparison.
     println!("\n--- CPU forward_token, {iters} iterations ---");

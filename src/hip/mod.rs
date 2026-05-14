@@ -9,7 +9,8 @@ use std::ffi::{CString, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr::null_mut;
 
-use sys::{Hip, HipDevice, HipError, HipFunction, HipMemcpyKind, HipModule, HipStream, hip};
+use sys::{Hip, HipDevice, HipError, HipFunction, HipGraph, HipGraphExec, HipMemcpyKind,
+          HipModule, HipStream, HipStreamCaptureMode, hip};
 
 /// Result type for the safe HIP API. The error message has already been
 /// rendered via `hipGetErrorString` (or describes a load failure).
@@ -169,6 +170,25 @@ impl<T: Copy> DeviceBuf<T> {
                "hipMemcpy D2D")
         }
     }
+
+    /// Async D2D copy on `stream` — required for HIP graph capture, where
+    /// blocking memcpy on the null stream cannot be captured. Ordering
+    /// against preceding kernel launches on the same stream is preserved
+    /// by stream semantics.
+    pub fn copy_from_device_at_async(&self, src: &DeviceBuf<T>, dst_offset: usize, stream: &Stream)
+        -> Result<()>
+    {
+        assert!(dst_offset + src.len <= self.len,
+                "copy_from_device_at_async: dst_offset+src.len ({}) exceeds self.len ({})",
+                dst_offset + src.len, self.len);
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe {
+            let dst_ptr = self.ptr.add(dst_offset) as *mut c_void;
+            ck(api, (api.memcpy_async)(dst_ptr, src.ptr as *const c_void,
+                                        src.byte_len(), HipMemcpyKind::DeviceToDevice, stream.raw),
+               "hipMemcpyAsync D2D")
+        }
+    }
 }
 
 impl<T> Drop for DeviceBuf<T> {
@@ -177,6 +197,63 @@ impl<T> Drop for DeviceBuf<T> {
             if let Ok(api) = hip() {
                 unsafe { let _ = (api.free)(self.ptr as *mut c_void); }
             }
+        }
+    }
+}
+
+/// Captured HIP graph (RAII). Created by ending a stream capture.
+pub struct Graph { raw: HipGraph }
+
+impl Graph {
+    /// Capture all HIP operations issued on `stream` between
+    /// `Graph::begin_capture(...)` and `Graph::end_capture(...)`.
+    /// Mode `Global` is the standard choice for our use case.
+    pub fn begin_capture(stream: &Stream, mode: HipStreamCaptureMode) -> Result<()> {
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe { ck(api, (api.stream_begin_capture)(stream.raw, mode), "hipStreamBeginCapture") }
+    }
+
+    /// End capture on `stream` and return the captured graph.
+    pub fn end_capture(stream: &Stream) -> Result<Self> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut g: HipGraph = null_mut();
+        unsafe { ck(api, (api.stream_end_capture)(stream.raw, &mut g), "hipStreamEndCapture")?; }
+        Ok(Graph { raw: g })
+    }
+
+    pub fn instantiate(&self) -> Result<GraphExec> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut e: HipGraphExec = null_mut();
+        unsafe { ck(api, (api.graph_instantiate)(&mut e, self.raw, null_mut(), null_mut(), 0),
+                   "hipGraphInstantiate")?; }
+        Ok(GraphExec { raw: e })
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Ok(api) = hip() { unsafe { let _ = (api.graph_destroy)(self.raw); } }
+        }
+    }
+}
+
+/// Instantiated executable HIP graph (RAII).
+pub struct GraphExec { raw: HipGraphExec }
+
+impl GraphExec {
+    /// Submit the captured chain to `stream`. The submission is async —
+    /// caller must sync the stream (or the device) before reading results.
+    pub fn launch(&self, stream: &Stream) -> Result<()> {
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe { ck(api, (api.graph_launch)(self.raw, stream.raw), "hipGraphLaunch") }
+    }
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Ok(api) = hip() { unsafe { let _ = (api.graph_exec_destroy)(self.raw); } }
         }
     }
 }

@@ -19,12 +19,26 @@ impl HipError {
 
 pub type HipDevice = i32;
 
-#[repr(C)] pub struct HipStreamRaw   { _private: [u8; 0] }
-#[repr(C)] pub struct HipModuleRaw   { _private: [u8; 0] }
-#[repr(C)] pub struct HipFunctionRaw { _private: [u8; 0] }
-pub type HipStream   = *mut HipStreamRaw;
-pub type HipModule   = *mut HipModuleRaw;
-pub type HipFunction = *mut HipFunctionRaw;
+#[repr(C)] pub struct HipStreamRaw    { _private: [u8; 0] }
+#[repr(C)] pub struct HipModuleRaw    { _private: [u8; 0] }
+#[repr(C)] pub struct HipFunctionRaw  { _private: [u8; 0] }
+#[repr(C)] pub struct HipGraphRaw     { _private: [u8; 0] }
+#[repr(C)] pub struct HipGraphExecRaw { _private: [u8; 0] }
+#[repr(C)] pub struct HipGraphNodeRaw { _private: [u8; 0] }
+pub type HipStream    = *mut HipStreamRaw;
+pub type HipModule    = *mut HipModuleRaw;
+pub type HipFunction  = *mut HipFunctionRaw;
+pub type HipGraph     = *mut HipGraphRaw;
+pub type HipGraphExec = *mut HipGraphExecRaw;
+pub type HipGraphNode = *mut HipGraphNodeRaw;
+
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+pub enum HipStreamCaptureMode {
+    Global      = 0,
+    ThreadLocal = 1,
+    Relaxed     = 2,
+}
 
 #[repr(i32)]
 #[derive(Copy, Clone, Debug)]
@@ -50,6 +64,7 @@ pub struct Hip {
     pub malloc:              unsafe extern "C" fn(*mut *mut c_void, usize) -> HipError,
     pub free:                unsafe extern "C" fn(*mut c_void) -> HipError,
     pub memcpy:              unsafe extern "C" fn(*mut c_void, *const c_void, usize, HipMemcpyKind) -> HipError,
+    pub memcpy_async:        unsafe extern "C" fn(*mut c_void, *const c_void, usize, HipMemcpyKind, HipStream) -> HipError,
 
     pub stream_create:       unsafe extern "C" fn(*mut HipStream) -> HipError,
     pub stream_destroy:      unsafe extern "C" fn(HipStream) -> HipError,
@@ -62,6 +77,14 @@ pub struct Hip {
     pub module_launch_kernel: unsafe extern "C" fn(
         HipFunction, u32, u32, u32, u32, u32, u32, u32, HipStream,
         *mut *mut c_void, *mut *mut c_void) -> HipError,
+
+    pub stream_begin_capture: unsafe extern "C" fn(HipStream, HipStreamCaptureMode) -> HipError,
+    pub stream_end_capture:   unsafe extern "C" fn(HipStream, *mut HipGraph) -> HipError,
+    pub graph_instantiate:    unsafe extern "C" fn(*mut HipGraphExec, HipGraph,
+                                                    *mut HipGraphNode, *mut c_char, usize) -> HipError,
+    pub graph_launch:         unsafe extern "C" fn(HipGraphExec, HipStream) -> HipError,
+    pub graph_destroy:        unsafe extern "C" fn(HipGraph) -> HipError,
+    pub graph_exec_destroy:   unsafe extern "C" fn(HipGraphExec) -> HipError,
 }
 
 // SAFETY: `Hip` is immutable after construction; all entry points are reentrant.
@@ -121,6 +144,7 @@ pub fn hip() -> Result<&'static Hip, &'static str> {
             malloc:               sym!(b"hipMalloc"),
             free:                 sym!(b"hipFree"),
             memcpy:               sym!(b"hipMemcpy"),
+            memcpy_async:         sym!(b"hipMemcpyAsync"),
             stream_create:        sym!(b"hipStreamCreate"),
             stream_destroy:       sym!(b"hipStreamDestroy"),
             stream_synchronize:   sym!(b"hipStreamSynchronize"),
@@ -129,6 +153,12 @@ pub fn hip() -> Result<&'static Hip, &'static str> {
             module_unload:        sym!(b"hipModuleUnload"),
             module_get_function:  sym!(b"hipModuleGetFunction"),
             module_launch_kernel: sym!(b"hipModuleLaunchKernel"),
+            stream_begin_capture: sym!(b"hipStreamBeginCapture"),
+            stream_end_capture:   sym!(b"hipStreamEndCapture"),
+            graph_instantiate:    sym!(b"hipGraphInstantiate"),
+            graph_launch:         sym!(b"hipGraphLaunch"),
+            graph_destroy:        sym!(b"hipGraphDestroy"),
+            graph_exec_destroy:   sym!(b"hipGraphExecDestroy"),
             _lib: lib,
         })
     });

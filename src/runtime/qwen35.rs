@@ -22,7 +22,8 @@ use std::ffi::c_void;
 
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{self, DeviceBuf, Module};
+use crate::hip::{self, DeviceBuf, Graph, GraphExec, Module, Stream};
+use crate::hip::sys::HipStreamCaptureMode;
 use super::KernelCache;
 
 const EMBED_LOOKUP_SOURCE:      &str = include_str!("../../kernels/embed_lookup.cpp");
@@ -406,6 +407,10 @@ pub struct GpuQwen35 {
     /// Per-layer transformer block weights, in schedule order.
     blocks: Vec<GpuBlock>,
 
+    /// Stream all kernel launches and async memcpys flow through. Owning
+    /// one stream lets us capture the whole forward chain into a HIP graph.
+    stream: Stream,
+
     // Dimensions.
     hidden:     usize,
     ffn:        usize,
@@ -550,6 +555,7 @@ impl GpuQwen35 {
             matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             blocks,
+            stream: Stream::new()?,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
             gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
@@ -590,7 +596,7 @@ impl GpuQwen35 {
             &mut row as *mut _ as *mut c_void,
             &mut nn  as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_rmsnorm(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
@@ -608,7 +614,7 @@ impl GpuQwen35 {
             &mut ea as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((1, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((1, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_matvec(&self, w: *mut c_void, x: *mut c_void, y: *mut c_void,
@@ -626,7 +632,7 @@ impl GpuQwen35 {
             &mut oa as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     /// Per-quant-type matvec launchers — same signature as launch_matvec.
@@ -648,7 +654,7 @@ impl GpuQwen35 {
             &mut oa as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     /// Dispatch a matvec to the right kernel based on the weight's on-disk
@@ -690,7 +696,7 @@ impl GpuQwen35 {
             &mut oa as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_rmsnorm_multihead(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
@@ -709,7 +715,7 @@ impl GpuQwen35 {
             &mut ea as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_split_q_gate(&self, q_raw: *mut c_void, q: *mut c_void, gate: *mut c_void,
@@ -728,7 +734,7 @@ impl GpuQwen35 {
             &mut nh  as *mut _ as *mut c_void,
             &mut hd  as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_sigmoid_mul(&self, x: *mut c_void, gate: *mut c_void, n: u32)
@@ -743,7 +749,7 @@ impl GpuQwen35 {
             &mut ga as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_rope(&self, x: *mut c_void, n_heads: u32, pos: u32) -> Result<(), String> {
@@ -767,7 +773,7 @@ impl GpuQwen35 {
             &mut nh as *mut _ as *mut c_void,
             &mut p  as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_conv1d_step(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
@@ -787,7 +793,7 @@ impl GpuQwen35 {
             &mut nc as *mut _ as *mut c_void,
             &mut ks as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_silu_inplace(&self, x: *mut c_void, n: u32) -> Result<(), String> {
@@ -799,7 +805,7 @@ impl GpuQwen35 {
             &mut xa as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_l2norm_multihead(&self, x: *mut c_void, y: *mut c_void,
@@ -819,7 +825,7 @@ impl GpuQwen35 {
             &mut sa as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_gdn_decay_beta(&self, a: *mut c_void, b: *mut c_void,
@@ -841,7 +847,7 @@ impl GpuQwen35 {
             &mut beta_a as *mut _ as *mut c_void,
             &mut nh     as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_gdn_recurrent_step(&self,
@@ -868,7 +874,7 @@ impl GpuQwen35 {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_rmsnorm_gated_multihead(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
@@ -889,7 +895,7 @@ impl GpuQwen35 {
             &mut ea as *mut _ as *mut c_void,
         ];
         let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_add_inplace(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
@@ -902,7 +908,7 @@ impl GpuQwen35 {
             &mut ya as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_attn_step(&self, q: *mut c_void, k_cache: *mut c_void, v_cache: *mut c_void,
@@ -930,7 +936,7 @@ impl GpuQwen35 {
             &mut tl as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem, None, &mut args) }
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     /// embed → output_norm → output_proj. Returns vocab-length logits.
@@ -945,7 +951,7 @@ impl GpuQwen35 {
         self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
                            self.logits.raw_ptr(),
                            self.hidden as u32, self.vocab as u32)?;
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
@@ -984,9 +990,10 @@ impl GpuQwen35 {
                                       self.k_norm.raw_ptr(),
                                       self.n_kv_heads as u32, self.head_dim as u32, self.rms_eps)?;
         self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32, pos as u32)?;
-        hip::Device(0).synchronize()?;
-        kv_cache.k.copy_from_device_at(&self.k_norm, pos * kv_cache.kv_dim)?;
-        kv_cache.v.copy_from_device_at(&self.v_raw,  pos * kv_cache.kv_dim)?;
+        // Async D2D push on the same stream — no host sync needed; ordering
+        // against preceding kernel launches is preserved by stream semantics.
+        kv_cache.k.copy_from_device_at_async(&self.k_norm, pos * kv_cache.kv_dim, &self.stream)?;
+        kv_cache.v.copy_from_device_at_async(&self.v_raw,  pos * kv_cache.kv_dim, &self.stream)?;
         let total_len = (pos + 1) as u32;
         self.launch_attn_step(self.q_buf.raw_ptr(),
                               kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr(),
@@ -1060,15 +1067,24 @@ impl GpuQwen35 {
     pub fn forward_token(&self, token: u32, state: &mut Qwen35GpuState)
         -> Result<Vec<f32>, String>
     {
-        assert_eq!(state.block_states.len(), self.blocks.len(),
-            "state has {} blocks, model has {}",
-            state.block_states.len(), self.blocks.len());
+        self.enqueue_forward_token(token, state)?;
+        self.stream.synchronize()?;
+        state.pos += 1;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
 
-        // 1. Embed lookup → hidden_a
+    /// On-device portion of `forward_token`: every kernel launch and
+    /// every async memcpy is enqueued to `self.stream` with no host
+    /// syncs in between. Used both for direct execution (followed by
+    /// stream-sync + D2H of `self.logits`) and for HIP graph capture.
+    fn enqueue_forward_token(&self, token: u32, state: &mut Qwen35GpuState)
+        -> Result<(), String>
+    {
+        assert_eq!(state.block_states.len(), self.blocks.len());
         self.launch_embed_lookup(self.token_embd.raw_ptr(), self.hidden_a.raw_ptr(),
                                  token, self.hidden as u32)?;
-
-        // 2. Run every block in schedule order.
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
@@ -1082,15 +1098,52 @@ impl GpuQwen35 {
                 _ => return Err("block kind mismatch between weights and state".into()),
             }
         }
-
-        // 3. Output norm + projection.
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
         self.launch_matvec(self.output_proj_ptr(), self.hidden_b.raw_ptr(),
                            self.logits.raw_ptr(),
                            self.hidden as u32, self.vocab as u32)?;
+        Ok(())
+    }
 
-        hip::Device(0).synchronize()?;
+    /// Capture the on-device portion of `forward_token(token, state)`
+    /// into a HIP graph and return an executable handle.
+    ///
+    /// **The captured graph encodes the specific `token` and the
+    /// state's position at capture time** — re-launching it advances
+    /// the recorded slot, not whatever position `state` currently has.
+    /// In particular, scalar kernel args (token id, RoPE pos, attn
+    /// total_len) and KV cache write offsets are baked in.
+    ///
+    /// For benchmarking single-step decode latency this is fine;
+    /// production multi-token decode needs parametric capture
+    /// (`hipGraphExecKernelNodeSetParams` + memcpy node updates),
+    /// which lives in a follow-up.
+    pub fn capture_forward_graph(&self, token: u32, state: &mut Qwen35GpuState)
+        -> Result<GraphExec, String>
+    {
+        Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
+        if let Err(e) = self.enqueue_forward_token(token, state) {
+            // Make a best-effort attempt to leave the stream in a sane state.
+            let _ = Graph::end_capture(&self.stream);
+            return Err(e);
+        }
+        let graph = Graph::end_capture(&self.stream)?;
+        let exec = graph.instantiate()?;
+        // graph (the topology) is free to drop once instantiated; the
+        // GraphExec keeps the executable copy.
+        drop(graph);
+        Ok(exec)
+    }
+
+    /// Launch a previously-captured forward graph and return logits.
+    /// `state.pos` is bumped by 1 — but mutating internal positions
+    /// inside the graph is the caller's contract (see capture warning).
+    pub fn forward_token_via_graph(&self, exec: &GraphExec, state: &mut Qwen35GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        exec.launch(&self.stream)?;
+        self.stream.synchronize()?;
         state.pos += 1;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
@@ -1145,7 +1198,7 @@ impl GpuQwen35 {
                              &weights.ffn)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
 
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_a.copy_to_host(&mut out)?;
         Ok(out)
@@ -1231,7 +1284,7 @@ impl GpuQwen35 {
         self.hidden_a.copy_from_host(input)?;
         self.step_linear_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
                                     weights, state)?;
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_b.copy_to_host(&mut out)?;
         Ok(out)
@@ -1257,7 +1310,7 @@ impl GpuQwen35 {
                             self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
         self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &weights.ffn)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_a.copy_to_host(&mut out)?;
         Ok(out)
@@ -1288,7 +1341,7 @@ impl GpuQwen35 {
         self.hidden_a.copy_from_host(input)?;
         self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
                                  weights, kv_cache)?;
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_b.copy_to_host(&mut out)?;
         Ok(out)
@@ -1309,7 +1362,7 @@ impl GpuQwen35 {
         assert_eq!(input.len(), self.hidden, "input must be hidden-sized");
         self.hidden_a.copy_from_host(input)?;
         self.step_swiglu_ffn(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), weights)?;
-        hip::Device(0).synchronize()?;
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_b.copy_to_host(&mut out)?;
         Ok(out)
