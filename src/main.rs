@@ -26,7 +26,7 @@ enum Command {
     Model {
         path: PathBuf,
     },
-    /// Run the CPU forward pass on one or more input tokens, print top-K logits.
+    /// Run the forward pass on one or more input tokens, print top-K logits.
     Generate {
         path: PathBuf,
         /// Input token id. Defaults to the model's EOS token id from metadata.
@@ -40,6 +40,9 @@ enum Command {
         /// Number of top logits to print.
         #[arg(short, long, default_value_t = 10)]
         k: usize,
+        /// Run on the GPU (HIP) instead of the CPU oracle.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Dump diagnostic stats for the embedding row of one or more tokens.
     DebugEmbed {
@@ -63,17 +66,92 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         iters: usize,
     },
+    /// Time `forward_token` on the GPU and compare to the CPU baseline.
+    GpuBench {
+        path: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        iters: usize,
+        #[arg(short, long)]
+        token: Option<u32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
         Command::Model { path } => model(&path),
-        Command::Generate { path, token, tokens, k } => generate(&path, token, tokens, k),
+        Command::Generate { path, token, tokens, k, gpu } => generate(&path, token, tokens, k, gpu),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
+        Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
     }
+}
+
+fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
+    use reinstinct_engine::hip;
+    use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+
+    let n = hip::device_count().map_err(anyhow::Error::msg)?;
+    if n == 0 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let token = token.unwrap_or(cfg.eos_token_id);
+
+    println!("model = {}", path.display());
+    println!("token = {token}, iterations = {iters}");
+    println!("loading weights to device...");
+    let t0 = std::time::Instant::now();
+    let gpu = GpuQwen35::new(&m, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
+    println!("  load took {:.2} s", t0.elapsed().as_secs_f64());
+
+    let mut state = Qwen35GpuState::new(&m, iters + 4).map_err(anyhow::Error::msg)?;
+
+    // Warm up once (compiles + caches paged-in, etc.)
+    let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
+    state.reset().map_err(anyhow::Error::msg)?;
+
+    let mut times_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
+        times_us.push(t.elapsed().as_micros() as u64);
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    times_us.sort_unstable();
+    let median  = times_us[times_us.len() / 2] as f64 / 1000.0;
+    let mean    = times_us.iter().sum::<u64>() as f64 / times_us.len() as f64 / 1000.0;
+    let min     = times_us[0] as f64 / 1000.0;
+    let max     = *times_us.last().unwrap() as f64 / 1000.0;
+    println!("\n--- GPU forward_token, {iters} iterations ---");
+    println!("  median  {median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / median);
+    println!("  mean    {mean:>8.3} ms");
+    println!("  min     {min:>8.3} ms");
+    println!("  max     {max:>8.3} ms");
+
+    // CPU baseline for direct comparison.
+    println!("\n--- CPU forward_token, {iters} iterations ---");
+    let mut cpu_state = m.new_state(iters + 4);
+    let _ = m.forward_token(token, &mut cpu_state);  // warmup
+    cpu_state.reset();
+    let mut cpu_times_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let _ = m.forward_token(token, &mut cpu_state);
+        cpu_times_us.push(t.elapsed().as_micros() as u64);
+        cpu_state.reset();
+    }
+    cpu_times_us.sort_unstable();
+    let cpu_median = cpu_times_us[cpu_times_us.len() / 2] as f64 / 1000.0;
+    println!("  median  {cpu_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / cpu_median);
+    let speedup = cpu_median / median;
+    let label = if speedup >= 1.0 { "speedup" } else { "slowdown" };
+    println!("\nGPU vs CPU: {speedup:.2}× {label} (median)");
+    Ok(())
 }
 
 fn hip_info(mb: usize, iters: usize) -> anyhow::Result<()> {
@@ -222,19 +300,43 @@ fn debug_embed(path: &std::path::Path, tokens: &[u32]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>, k: usize) -> anyhow::Result<()> {
+fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>, k: usize, gpu: bool) -> anyhow::Result<()> {
     let g = GgufFile::open(path)?;
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
     let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![token.unwrap_or(cfg.eos_token_id)]);
     println!("model         = {}", path.display());
     println!("vocab         = {}", cfg.vocab_size);
+    println!("backend       = {}", if gpu { "GPU (HIP)" } else { "CPU" });
     println!("input tokens  = {prompt:?}");
 
-    let mut state = m.new_state(prompt.len() + 8);
-    let t0 = std::time::Instant::now();
-    let logits = m.forward_tokens(&prompt, &mut state);
-    println!("forward took  = {:.2} s ({} tokens)", t0.elapsed().as_secs_f32(), prompt.len());
+    let logits: Vec<f32> = if gpu {
+        use reinstinct_engine::hip;
+        use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+        let n = hip::device_count().map_err(anyhow::Error::msg)?;
+        if n == 0 { anyhow::bail!("no HIP device"); }
+        let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let max_seq = prompt.len() + 8;
+        let t_load = std::time::Instant::now();
+        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        println!("weights load  = {:.2} s", t_load.elapsed().as_secs_f32());
+        let mut state = Qwen35GpuState::new(&m, max_seq).map_err(anyhow::Error::msg)?;
+        let t0 = std::time::Instant::now();
+        let l = gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        println!("forward took  = {:.3} s ({} tokens, {:.1} ms/token)",
+            t0.elapsed().as_secs_f32(), prompt.len(),
+            t0.elapsed().as_secs_f64() * 1000.0 / prompt.len() as f64);
+        l
+    } else {
+        let mut state = m.new_state(prompt.len() + 8);
+        let t0 = std::time::Instant::now();
+        let l = m.forward_tokens(&prompt, &mut state);
+        println!("forward took  = {:.3} s ({} tokens, {:.1} ms/token)",
+            t0.elapsed().as_secs_f32(), prompt.len(),
+            t0.elapsed().as_secs_f64() * 1000.0 / prompt.len() as f64);
+        l
+    };
 
     // Compute softmax probability for the top-k for context.
     let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
