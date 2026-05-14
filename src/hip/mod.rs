@@ -4,6 +4,7 @@
 //! ROCm 5.7 / 6.x / 7.x runtime that exposes `libamdhip64.so`.
 
 pub mod sys;
+pub mod rocblas;
 
 use std::ffi::{CString, c_char, c_void};
 use std::marker::PhantomData;
