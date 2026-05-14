@@ -54,6 +54,15 @@ enum Command {
         #[arg(short, long)]
         token: Option<u32>,
     },
+    /// Print HIP devices, VRAM, and time a host↔device round-trip.
+    HipInfo {
+        /// MB per copy direction in the bandwidth probe.
+        #[arg(long, default_value_t = 64)]
+        mb: usize,
+        /// Round-trip iterations to average bandwidth over.
+        #[arg(long, default_value_t = 8)]
+        iters: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -63,7 +72,57 @@ fn main() -> anyhow::Result<()> {
         Command::Generate { path, token, tokens, k } => generate(&path, token, tokens, k),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
+        Command::HipInfo { mb, iters } => hip_info(mb, iters),
     }
+}
+
+fn hip_info(mb: usize, iters: usize) -> anyhow::Result<()> {
+    use reinstinct_engine::hip;
+    let n = hip::device_count().map_err(anyhow::Error::msg)?;
+    println!("HIP devices = {n}");
+    if n == 0 { return Ok(()); }
+
+    for d in 0..n {
+        let name  = hip::device_name(d).map_err(anyhow::Error::msg)?;
+        let total = hip::device_total_mem(d).map_err(anyhow::Error::msg)?;
+        println!("  [{d}] {name}  total VRAM = {:.2} GB", total as f64 / (1u64 << 30) as f64);
+    }
+
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let (free, total) = hip::mem_info().map_err(anyhow::Error::msg)?;
+    println!("\ndevice 0: {:.2} / {:.2} GB free",
+        free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
+
+    let n_elems = (mb * (1 << 20)) / std::mem::size_of::<f32>();
+    let host: Vec<f32> = (0..n_elems).map(|i| (i as f32) * 1.0e-3).collect();
+    let mut back = vec![0.0f32; n_elems];
+    println!("\nbandwidth probe: {} MB per direction, {} iters", mb, iters);
+
+    let buf = hip::DeviceBuf::from_slice(&host).map_err(anyhow::Error::msg)?;
+    // Verify correctness on first round.
+    buf.copy_to_host(&mut back).map_err(anyhow::Error::msg)?;
+    for i in 0..n_elems {
+        if host[i].to_bits() != back[i].to_bits() {
+            anyhow::bail!("round-trip mismatch at {i}");
+        }
+    }
+
+    let bytes = (mb << 20) as f64;
+    let mut h2d_total = 0.0_f64;
+    let mut d2h_total = 0.0_f64;
+    for _ in 0..iters {
+        let t0 = std::time::Instant::now();
+        buf.copy_from_host(&host).map_err(anyhow::Error::msg)?;
+        h2d_total += t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        buf.copy_to_host(&mut back).map_err(anyhow::Error::msg)?;
+        d2h_total += t1.elapsed().as_secs_f64();
+    }
+    let h2d = bytes / (h2d_total / iters as f64) / 1e9;
+    let d2h = bytes / (d2h_total / iters as f64) / 1e9;
+    println!("  H2D  {h2d:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * h2d_total / iters as f64);
+    println!("  D2H  {d2h:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * d2h_total / iters as f64);
+    Ok(())
 }
 
 fn bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
