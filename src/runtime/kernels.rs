@@ -36,6 +36,7 @@ const QUANTIZE_Q8_SOURCE:   &str = include_str!("../../kernels/quantize_q8.cpp")
 const MATVEC_Q4_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
+const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 
 /// Quantize an f32 activation to int8 q8 blocks on the GPU, then run a
 /// K-quant dp4a matvec. Used by the dp4a correctness tests. The q8
@@ -1436,6 +1437,45 @@ mod tests {
         let e = rel_l2(&gpu, &cpu);
         eprintln!("matvec_q6_k_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
         assert!(e < DP4A_REL_L2_MAX, "q6_k dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
+    #[test]
+    fn matvec_q8_0_dp4a_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q8_0::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0xD8A8_0004;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let d = ((blk % 19) as f32 - 9.0) * 0.004;
+            w_bytes[off..off+2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 0..32 { w_bytes[off + 2 + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x4812_C0DE;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::q8_0::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        let gpu = matvec_kquant_dp4a(&cache, "matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC,
+            "matvec_q8_0_dp4a_f32", &w_bytes, &x, in_dim, out_dim).expect("q8_0 dp4a");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_q8_0_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX, "q8_0 dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
     #[test]

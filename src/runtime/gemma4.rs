@@ -40,6 +40,11 @@ const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_window
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp");
+const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
+// MoE kernel sources.
+const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+const MOE_TOPK_SRC:          &str = include_str!("../../kernels/moe_topk.cpp");
+const AXPY_SRC:              &str = include_str!("../../kernels/axpy.cpp");
 
 /// Load an fp32 GGUF tensor straight to device.
 fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
@@ -51,6 +56,64 @@ fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
         .ok_or_else(|| format!("{name}: no data"))?;
     let floats: &[f32] = bytemuck::cast_slice(bytes);
     DeviceBuf::from_slice(floats)
+}
+
+/// A 3D expert-weight tensor `[in_dim, out_dim, n_expert]` resident on
+/// device in its on-disk quantized form. Each expert is a contiguous
+/// `[in_dim, out_dim]` matrix; `expert_ptr` offsets into the slab.
+pub struct ExpertTensor {
+    data:  DeviceBuf<u8>,
+    dtype: GgmlType,
+    in_dim:  u32,
+    out_dim: u32,
+    bytes_per_expert: usize,
+}
+
+impl ExpertTensor {
+    fn from_gguf(gguf: &GgufFile, name: &str) -> Result<Self, String> {
+        let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+        let bytes = gguf.tensor_data(name)
+            .map_err(|e| format!("read {name}: {e}"))?
+            .ok_or_else(|| format!("tensor {name} has no data"))?;
+        let shape = info.shape();
+        if shape.len() != 3 {
+            return Err(format!("expert tensor {name}: expected 3D, got {shape:?}"));
+        }
+        let in_dim   = shape[0] as u32;
+        let out_dim  = shape[1] as u32;
+        let n_expert = shape[2] as usize;
+        Ok(Self {
+            bytes_per_expert: bytes.len() / n_expert,
+            data: DeviceBuf::from_slice(bytes)?,
+            dtype: info.ggml_type,
+            in_dim, out_dim,
+        })
+    }
+
+    /// Device pointer to expert `e`'s `[in_dim, out_dim]` matrix.
+    fn expert_ptr(&self, e: usize) -> *mut c_void {
+        unsafe {
+            (self.data.raw_ptr() as *mut u8).add(e * self.bytes_per_expert) as *mut c_void
+        }
+    }
+}
+
+/// MoE-layer weights: the routed-expert branch that runs alongside the
+/// shared MLP. Present only on MoE models (the 26B-A4B).
+pub struct MoeBlock {
+    post_ffw_norm_1: DeviceBuf<f32>,
+    pre_ffw_norm_2:  DeviceBuf<f32>,
+    post_ffw_norm_2: DeviceBuf<f32>,
+    /// Router projection, F32 [hidden, n_expert].
+    gate_inp:    GpuMatvecTensor,
+    /// Router input scale, F32 [hidden].
+    gate_inp_s:  DeviceBuf<f32>,
+    /// Fused gate+up experts, [hidden, 2·expert_ff, n_expert].
+    gate_up_exps: ExpertTensor,
+    /// Down experts, [expert_ff, hidden, n_expert].
+    down_exps:    ExpertTensor,
+    /// Per-expert down-output scalar, host-side [n_expert].
+    down_exps_s:  Vec<f32>,
 }
 
 /// All weights for one Gemma 4 transformer block on device.
@@ -73,12 +136,30 @@ pub struct GpuGemma4Block {
     kind:     AttnKind,
     head_dim: usize,
     n_kv:     usize,
+    /// `Some` on MoE layers — the routed-expert branch.
+    moe:      Option<MoeBlock>,
 }
 
 impl GpuGemma4Block {
     fn from_gguf(gguf: &GgufFile, layer: u32, kind: AttnKind,
-                 head_dim: usize, n_kv: usize) -> Result<Self, String> {
+                 head_dim: usize, n_kv: usize, moe: bool) -> Result<Self, String> {
         let p = format!("blk.{layer}.");
+        let moe_block = if moe {
+            // Per-expert down scalar — read to host.
+            let s_bytes = gguf.tensor_data(&format!("{p}ffn_down_exps.scale"))
+                .map_err(|e| e.to_string())?.ok_or("ffn_down_exps.scale no data")?;
+            let down_exps_s: Vec<f32> = bytemuck::cast_slice::<u8, f32>(s_bytes).to_vec();
+            Some(MoeBlock {
+                post_ffw_norm_1: load_fp32(gguf, &format!("{p}post_ffw_norm_1.weight"))?,
+                pre_ffw_norm_2:  load_fp32(gguf, &format!("{p}pre_ffw_norm_2.weight"))?,
+                post_ffw_norm_2: load_fp32(gguf, &format!("{p}post_ffw_norm_2.weight"))?,
+                gate_inp:    GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_gate_inp.weight"))?,
+                gate_inp_s:  load_fp32(gguf, &format!("{p}ffn_gate_inp.scale"))?,
+                gate_up_exps: ExpertTensor::from_gguf(gguf, &format!("{p}ffn_gate_up_exps.weight"))?,
+                down_exps:    ExpertTensor::from_gguf(gguf, &format!("{p}ffn_down_exps.weight"))?,
+                down_exps_s,
+            })
+        } else { None };
         let attn_v = if kind == AttnKind::Sliding {
             Some(GpuMatvecTensor::from_gguf(gguf, &format!("{p}attn_v.weight"))?)
         } else { None };
@@ -106,6 +187,7 @@ impl GpuGemma4Block {
             ffn_down:       GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_down.weight"))?,
             post_ffw_norm:  load_fp32(gguf, &format!("{p}post_ffw_norm.weight"))?,
             layer_output_scale, kind, head_dim, n_kv,
+            moe: moe_block,
         })
     }
 }
@@ -181,6 +263,15 @@ pub struct GpuGemma4 {
     /// All-ones weight for the plain (unweighted) V RMSNorm.
     ones:        DeviceBuf<f32>,
 
+    // MoE scratch (allocated for all models; tiny when unused).
+    moe_logits:  DeviceBuf<f32>,   // [n_expert]
+    moe_ids:     DeviceBuf<i32>,   // [n_expert_used]
+    moe_weights: DeviceBuf<f32>,   // [n_expert_used]
+    moe_in:      DeviceBuf<f32>,   // [hidden] — routed-expert input
+    moe_acc:     DeviceBuf<f32>,   // [hidden] — expert mixture accumulator
+    cur_mlp:     DeviceBuf<f32>,   // [hidden] — shared-MLP result, kept live
+    expert_down: DeviceBuf<f32>,   // [hidden] — one expert's down output
+
     // Kernel modules.
     m_rmsnorm:   Module,
     m_rmsnorm_mh: Module,
@@ -192,6 +283,7 @@ pub struct GpuGemma4 {
     m_attn_win:  Module,
     m_embed_q5k: Module,
     m_embed_q6k: Module,
+    m_embed_q8_0: Module,
     m_embed_f32: Module,
     m_mv_f32:    Module,
     m_mv_q4k:    Module,
@@ -203,6 +295,9 @@ pub struct GpuGemma4 {
     m_mv_q4k_dp4a: Module,
     m_mv_q5k_dp4a: Module,
     m_mv_q6k_dp4a: Module,
+    m_mv_q8_0_dp4a: Module,
+    m_moe_topk:  Module,
+    m_axpy:      Module,
     /// Scratch for the int8-quantized activation feeding the dp4a matvec.
     xq8: DeviceBuf<u8>,
 
@@ -218,6 +313,10 @@ pub struct GpuGemma4 {
     sliding_window: usize,
     rope_dim_swa:  usize,
     rope_dim_full: usize,
+    // MoE dimensions (0 on dense models).
+    n_expert:      usize,
+    n_expert_used: usize,
+    expert_ff:     usize,
 }
 
 impl GpuGemma4 {
@@ -236,13 +335,14 @@ impl GpuGemma4 {
         let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
         let output_norm = load_fp32(gguf, "output_norm.weight")?;
 
+        let moe = cfg.is_moe();
         let mut blocks = Vec::with_capacity(cfg.block_count as usize);
         for layer in 0..cfg.block_count {
             let kind = cfg.attn_kinds[layer as usize];
             blocks.push(GpuGemma4Block::from_gguf(
                 gguf, layer, kind,
                 cfg.head_dim(layer as usize) as usize,
-                cfg.kv_heads[layer as usize] as usize)?);
+                cfg.kv_heads[layer as usize] as usize, moe)?);
         }
 
         // RoPE tables for both kinds.
@@ -302,6 +402,7 @@ impl GpuGemma4 {
             m_attn_win:   ld("attn_step_window", ATTN_WINDOW_SRC)?,
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
             m_embed_q6k:  ld("embed_lookup_q6_k", EMBED_Q6K_SRC)?,
+            m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
             m_embed_f32:  ld("embed_lookup", EMBED_F32_SRC)?,
             m_mv_f32:     ld("matvec_f32_wave64", MATVEC_F32_W_SRC)?,
             m_mv_q4k:     ld("matvec_q4_k_rowblock", MATVEC_Q4K_W_SRC)?,
@@ -313,6 +414,16 @@ impl GpuGemma4 {
             m_mv_q4k_dp4a:  ld("matvec_q4_k_dp4a", MATVEC_Q4K_DP4A_SRC)?,
             m_mv_q5k_dp4a:  ld("matvec_q5_k_dp4a", MATVEC_Q5K_DP4A_SRC)?,
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
+            m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
+            m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
+            m_axpy:         ld("axpy", AXPY_SRC)?,
+            moe_logits:  DeviceBuf::new((cfg.expert_count as usize).max(1))?,
+            moe_ids:     DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
+            moe_weights: DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
+            moe_in:      DeviceBuf::new(hidden)?,
+            moe_acc:     DeviceBuf::new(hidden)?,
+            cur_mlp:     DeviceBuf::new(hidden)?,
+            expert_down: DeviceBuf::new(hidden)?,
             xq8,
             stream: Stream::new()?,
             hidden, ffn, vocab, n_heads,
@@ -321,6 +432,9 @@ impl GpuGemma4 {
             sliding_window: cfg.sliding_window as usize,
             rope_dim_swa:  cfg.rope_dim_swa as usize,
             rope_dim_full: cfg.rope_dim_full as usize,
+            n_expert:      cfg.expert_count as usize,
+            n_expert_used: cfg.expert_used_count as usize,
+            expert_ff:     cfg.expert_ff_size as usize,
         })
     }
 
@@ -440,32 +554,42 @@ impl GpuGemma4 {
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
+        self.launch_matvec_raw(w.data.raw_ptr(), w.dtype, w.in_dim, w.out_dim, x, y)
+    }
+
+    /// Matvec from an explicit weight pointer — lets the MoE path point
+    /// at one expert's slice of a 3D expert tensor.
+    fn launch_matvec_raw(&self, w_ptr: *mut c_void, dtype: GgmlType,
+                         in_dim: u32, out_dim: u32, x: *mut c_void, y: *mut c_void)
+        -> Result<(), String>
+    {
         let block: u32 = 64;
 
-        // K-quants: int8 dp4a path — quantize the activation, then
-        // matvec with v_dot4_i32_i8. Same stream, ordering is implicit.
-        // REINSTINCT_GEMMA_NO_DP4A forces the f32 rowblock path (for
-        // numerical A/B checks).
+        // K-quants + Q8_0: int8 dp4a path — quantize the activation,
+        // then matvec with v_dot4_i32_i8. Same stream, ordering implicit.
+        // REINSTINCT_GEMMA_NO_DP4A forces the f32/wave64 path (A/B check).
         let dp4a = std::env::var_os("REINSTINCT_GEMMA_NO_DP4A").is_none()
-            && match w.dtype {
+            && match dtype {
                 GgmlType::Q4_K => std::env::var_os("REINSTINCT_NO_DP4A_Q4").is_none(),
                 GgmlType::Q5_K => std::env::var_os("REINSTINCT_NO_DP4A_Q5").is_none(),
                 GgmlType::Q6_K => std::env::var_os("REINSTINCT_NO_DP4A_Q6").is_none(),
+                GgmlType::Q8_0 => std::env::var_os("REINSTINCT_NO_DP4A_Q8").is_none(),
                 _ => false,
             };
         if dp4a {
-            self.launch_quantize_q8(x, w.in_dim)?;
-            let (module, kname) = match w.dtype {
-                GgmlType::Q4_K => (&self.m_mv_q4k_dp4a, "matvec_q4_k_dp4a_f32"),
-                GgmlType::Q5_K => (&self.m_mv_q5k_dp4a, "matvec_q5_k_dp4a_f32"),
-                _              => (&self.m_mv_q6k_dp4a, "matvec_q6_k_dp4a_f32"),
+            self.launch_quantize_q8(x, in_dim)?;
+            let (module, kname) = match dtype {
+                GgmlType::Q4_K => (&self.m_mv_q4k_dp4a,  "matvec_q4_k_dp4a_f32"),
+                GgmlType::Q5_K => (&self.m_mv_q5k_dp4a,  "matvec_q5_k_dp4a_f32"),
+                GgmlType::Q6_K => (&self.m_mv_q6k_dp4a,  "matvec_q6_k_dp4a_f32"),
+                _              => (&self.m_mv_q8_0_dp4a, "matvec_q8_0_dp4a_f32"),
             };
             let f = module.function(kname)?;
-            let grid = (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
-            let mut wa = w.data.raw_ptr();
+            let grid = (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+            let mut wa = w_ptr;
             let mut xa = self.xq8.raw_ptr();
             let mut ya = y;
-            let mut ia = w.in_dim; let mut oa = w.out_dim;
+            let mut ia = in_dim; let mut oa = out_dim;
             let mut args: [*mut c_void; 5] = [
                 &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
                 &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
@@ -475,27 +599,59 @@ impl GpuGemma4 {
             };
         }
 
-        // Q5_K/Q6_K use the row-blocked kernel (ROWS rows per wavefront);
-        // the rest use the one-row-per-wavefront wave64 kernels.
-        let (module, kname, grid) = match w.dtype {
-            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64",      w.out_dim),
+        // Q4/5/6_K use the row-blocked kernel; the rest the wave64 ones.
+        let (module, kname, grid) = match dtype {
+            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64",      out_dim),
             GgmlType::Q4_K   => (&self.m_mv_q4k,  "matvec_q4_k_rowblock_f32",
-                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+                                 (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
             GgmlType::Q5_K   => (&self.m_mv_q5k,  "matvec_q5_k_rowblock_f32",
-                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+                                 (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
             GgmlType::Q6_K   => (&self.m_mv_q6k,  "matvec_q6_k_rowblock_f32",
-                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
-            GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32", w.out_dim),
-            GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32",  w.out_dim),
+                                 (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+            GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32", out_dim),
+            GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32",  out_dim),
             other => return Err(format!("gemma4 matvec: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
-        let mut wa=w.data.raw_ptr(); let mut xa=x; let mut ya=y;
-        let mut ia=w.in_dim; let mut oa=w.out_dim;
+        let mut wa=w_ptr; let mut xa=x; let mut ya=y;
+        let mut ia=in_dim; let mut oa=out_dim;
         let mut args: [*mut c_void; 5] = [
             &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
             &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Router: softmax + top-k over `n_expert` logits → expert ids and
+    /// renormalised weights (device buffers `moe_ids` / `moe_weights`).
+    fn launch_moe_topk(&self) -> Result<(), String> {
+        let f = self.m_moe_topk.function("moe_topk_f32")?;
+        let mut la = self.moe_logits.raw_ptr();
+        let mut ne = self.n_expert as i32;
+        let mut nu = self.n_expert_used as i32;
+        let mut ida = self.moe_ids.raw_ptr();
+        let mut wa  = self.moe_weights.raw_ptr();
+        let mut args: [*mut c_void; 5] = [
+            &mut la as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void];
+        let block: u32 = 128;
+        let smem = self.n_expert as u32 * 4;
+        unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
+    /// `y += a·x` (or `y = a·x` when `set`). Used to mix expert outputs.
+    fn launch_axpy(&self, y: *mut c_void, x: *mut c_void, a: f32, n: u32, set: bool)
+        -> Result<(), String>
+    {
+        let kname = if set { "scaled_set_f32" } else { "axpy_f32" };
+        let f = self.m_axpy.function(kname)?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut ya=y; let mut xa=x; let mut aa=a; let mut na=n;
+        let mut args: [*mut c_void; 4] = [
+            &mut ya as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -507,6 +663,7 @@ impl GpuGemma4 {
             GgmlType::F32  => (&self.m_embed_f32, "embed_lookup_f32",  256, (hidden + 255)/256),
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_f32", 256, hidden/256),
             GgmlType::Q6_K => (&self.m_embed_q6k, "embed_lookup_q6_k_f32", 256, hidden/256),
+            GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_f32", 256, (hidden + 255)/256),
             other => return Err(format!("gemma4 embed: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
@@ -661,7 +818,36 @@ impl GpuGemma4 {
         self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
         let _ = (q_dim, kv_dim);
 
-        // --- FFN (GeGLU) ---
+        // --- FFN --- (dense GeGLU, or the dual shared-MLP + MoE branch)
+        match &b.moe {
+            None => {
+                self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),
+                                    self.normed.raw_ptr(), h)?;
+                self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
+                self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
+                self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
+                                  self.ffn_a.raw_ptr(), self.ffn as u32)?;
+                self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
+                self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                                    self.normed.raw_ptr(), h)?;
+                self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+            }
+            Some(mw) => self.moe_ffn(b, mw)?,
+        }
+
+        // Per-layer output scale.
+        self.launch_scale(self.hidden_a.raw_ptr(), h, b.layer_output_scale)?;
+        Ok(())
+    }
+
+    /// Dual FFN for a MoE layer: a shared dense MLP plus a 128-expert
+    /// top-8 routed branch, summed, then the shared post-norm + residual.
+    /// `hidden_a` holds attn_out on entry and the post-FFN result on exit.
+    fn moe_ffn(&self, b: &GpuGemma4Block, mw: &MoeBlock) -> Result<(), String> {
+        let h = self.hidden as u32;
+        let ff_exp = self.expert_ff as u32;
+
+        // --- Shared MLP --- → cur_mlp (kept live across the MoE branch).
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
@@ -669,12 +855,58 @@ impl GpuGemma4 {
         self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                           self.ffn_a.raw_ptr(), self.ffn as u32)?;
         self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
-        self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+        self.launch_rmsnorm(self.hidden_b.raw_ptr(), mw.post_ffw_norm_1.raw_ptr(),
+                            self.cur_mlp.raw_ptr(), h)?;
+
+        // --- Router --- on attn_out: plain RMSNorm scaled by gate_inp_s,
+        // then by 1/√hidden, then the F32 projection to expert logits.
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), mw.gate_inp_s.raw_ptr(),
+                            self.normed.raw_ptr(), h)?;
+        self.launch_scale(self.normed.raw_ptr(), h, 1.0 / (self.hidden as f32).sqrt())?;
+        self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(), self.moe_logits.raw_ptr())?;
+        self.launch_moe_topk()?;
+
+        // Read the routing result to host (the only sync per MoE layer).
+        self.stream.synchronize()?;
+        let mut ids = vec![0i32; self.n_expert_used];
+        let mut wts = vec![0.0f32; self.n_expert_used];
+        self.moe_ids.copy_to_host(&mut ids)?;
+        self.moe_weights.copy_to_host(&mut wts)?;
+
+        // --- Routed experts --- input is pre_ffw_norm_2 of attn_out.
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), mw.pre_ffw_norm_2.raw_ptr(),
+                            self.moe_in.raw_ptr(), h)?;
+        for j in 0..self.n_expert_used {
+            let e = ids[j] as usize;
+            // gate_up: [h → 2·ff_exp]; geglu(gate, up) with gate = first
+            // half of ffn_a, up = second half.
+            self.launch_matvec_raw(mw.gate_up_exps.expert_ptr(e), mw.gate_up_exps.dtype,
+                                   h, 2 * ff_exp, self.moe_in.raw_ptr(),
+                                   self.ffn_a.raw_ptr())?;
+            self.launch_geglu(self.ffn_a.raw_ptr(),
+                              off_f32(self.ffn_a.raw_ptr(), self.expert_ff),
+                              self.ffn_b.raw_ptr(), ff_exp)?;
+            // down: [ff_exp → h].
+            self.launch_matvec_raw(mw.down_exps.expert_ptr(e), mw.down_exps.dtype,
+                                   ff_exp, h, self.ffn_b.raw_ptr(),
+                                   self.expert_down.raw_ptr())?;
+            let s = wts[j] * mw.down_exps_s[e];
+            self.launch_axpy(self.moe_acc.raw_ptr(), self.expert_down.raw_ptr(),
+                             s, h, j == 0)?;
+        }
+        // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2)
+        self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
+                            self.normed.raw_ptr(), h)?;
+        // combined = cur_mlp + cur_moe → shared post_ffw_norm → residual.
+        self.launch_add(self.cur_mlp.raw_ptr(), self.normed.raw_ptr(), h)?;
+        self.launch_rmsnorm(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
-
-        // Per-layer output scale.
-        self.launch_scale(self.hidden_a.raw_ptr(), h, b.layer_output_scale)?;
         Ok(())
     }
+}
+
+/// Offset an f32 device pointer by `elems` elements.
+fn off_f32(p: *mut c_void, elems: usize) -> *mut c_void {
+    unsafe { (p as *mut f32).add(elems) as *mut c_void }
 }
