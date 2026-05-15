@@ -164,6 +164,16 @@ fn generate_text(path: &std::path::Path, tokens: Option<Vec<u32>>, steps: usize,
     println!("\ngenerated   = {} tokens in {:.2} s ({:.1} tok/s)",
         new_tokens, elapsed.as_secs_f64(), new_tokens as f64 / elapsed.as_secs_f64());
     println!("output ids  = {all:?}");
+
+    // Decode through the GGUF tokenizer if we can.
+    match reinstinct_engine::tokenizer::Tokenizer::from_gguf(&g) {
+        Ok(tok) => {
+            println!("\n--- prompt ---\n{}", tok.decode(&prompt));
+            println!("\n--- generated ---\n{}", tok.decode(&all[prompt.len()..]));
+            println!("\n--- full output ---\n{}", tok.decode(&all));
+        }
+        Err(e) => println!("\n(tokenizer decode unavailable: {e})"),
+    }
     Ok(())
 }
 
