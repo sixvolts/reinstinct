@@ -23,6 +23,10 @@ const MATVEC_F32_W_SRC:      &str = include_str!("../../kernels/matvec_f32_wave6
 const MATVEC_Q4K_W_SRC:      &str = include_str!("../../kernels/matvec_q4_k_rowblock.cpp");
 const MATVEC_Q5K_W_SRC:      &str = include_str!("../../kernels/matvec_q5_k_rowblock.cpp");
 const MATVEC_Q6K_W_SRC:      &str = include_str!("../../kernels/matvec_q6_k_rowblock.cpp");
+const QUANTIZE_Q8_SRC:       &str = include_str!("../../kernels/quantize_q8.cpp");
+const MATVEC_Q4K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
+const MATVEC_Q5K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
+const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 /// Output rows per wavefront in the row-blocked K-quant matvecs — must
 /// match `ROWS` in matvec_q{4,5,6}_k_rowblock.cpp.
 const Q4K_ROWBLOCK: u32 = 8;
@@ -195,6 +199,12 @@ pub struct GpuGemma4 {
     m_mv_q6k:    Module,
     m_mv_q8_0:   Module,
     m_mv_f16:    Module,
+    m_quantize:  Module,
+    m_mv_q4k_dp4a: Module,
+    m_mv_q5k_dp4a: Module,
+    m_mv_q6k_dp4a: Module,
+    /// Scratch for the int8-quantized activation feeding the dp4a matvec.
+    xq8: DeviceBuf<u8>,
 
     stream: Stream,
 
@@ -258,6 +268,15 @@ impl GpuGemma4 {
 
         let ones = DeviceBuf::from_slice(&vec![1.0f32; hd_max])?;
 
+        // Scratch for the quantized activation: one BlockQ8 (40 bytes)
+        // per 32 input elements, sized to the widest matvec.
+        let max_in_dim = blocks.iter()
+            .flat_map(|b| [b.attn_q.in_dim, b.attn_k.in_dim, b.attn_output.in_dim,
+                           b.ffn_gate.in_dim, b.ffn_up.in_dim, b.ffn_down.in_dim])
+            .chain(std::iter::once(token_embd.in_dim))
+            .max().unwrap_or(0) as usize;
+        let xq8 = DeviceBuf::<u8>::new((max_in_dim / 32) * 40)?;
+
         Ok(Self {
             token_embd, output_norm, blocks,
             rope_cos_swa, rope_sin_swa, rope_cos_full, rope_sin_full,
@@ -290,6 +309,11 @@ impl GpuGemma4 {
             m_mv_q6k:     ld("matvec_q6_k_rowblock", MATVEC_Q6K_W_SRC)?,
             m_mv_q8_0:    ld("matvec_q8_0_wave64", MATVEC_Q8_0_W_SRC)?,
             m_mv_f16:     ld("matvec_f16_wave64", MATVEC_F16_W_SRC)?,
+            m_quantize:     ld("quantize_q8", QUANTIZE_Q8_SRC)?,
+            m_mv_q4k_dp4a:  ld("matvec_q4_k_dp4a", MATVEC_Q4K_DP4A_SRC)?,
+            m_mv_q5k_dp4a:  ld("matvec_q5_k_dp4a", MATVEC_Q5K_DP4A_SRC)?,
+            m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
+            xq8,
             stream: Stream::new()?,
             hidden, ffn, vocab, n_heads,
             rms_eps: cfg.rms_norm_eps,
@@ -400,11 +424,59 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// Quantize an f32 activation of `in_dim` elements into `self.xq8`
+    /// (int8 blocks of 32) for the dp4a matvec.
+    fn launch_quantize_q8(&self, x: *mut c_void, in_dim: u32) -> Result<(), String> {
+        let f = self.m_quantize.function("quantize_q8_f32")?;
+        let mut xa = x;
+        let mut oa = self.xq8.raw_ptr();
+        let mut ia = in_dim;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void];
+        unsafe { f.launch((in_dim / 32, 1, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
-        // Q4_K uses the row-blocked kernel (ROWS rows per wavefront); the
-        // rest use the one-row-per-wavefront wave64 kernels.
+        let block: u32 = 64;
+
+        // K-quants: int8 dp4a path — quantize the activation, then
+        // matvec with v_dot4_i32_i8. Same stream, ordering is implicit.
+        // REINSTINCT_GEMMA_NO_DP4A forces the f32 rowblock path (for
+        // numerical A/B checks).
+        let dp4a = std::env::var_os("REINSTINCT_GEMMA_NO_DP4A").is_none()
+            && match w.dtype {
+                GgmlType::Q4_K => std::env::var_os("REINSTINCT_NO_DP4A_Q4").is_none(),
+                GgmlType::Q5_K => std::env::var_os("REINSTINCT_NO_DP4A_Q5").is_none(),
+                GgmlType::Q6_K => std::env::var_os("REINSTINCT_NO_DP4A_Q6").is_none(),
+                _ => false,
+            };
+        if dp4a {
+            self.launch_quantize_q8(x, w.in_dim)?;
+            let (module, kname) = match w.dtype {
+                GgmlType::Q4_K => (&self.m_mv_q4k_dp4a, "matvec_q4_k_dp4a_f32"),
+                GgmlType::Q5_K => (&self.m_mv_q5k_dp4a, "matvec_q5_k_dp4a_f32"),
+                _              => (&self.m_mv_q6k_dp4a, "matvec_q6_k_dp4a_f32"),
+            };
+            let f = module.function(kname)?;
+            let grid = (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+            let mut wa = w.data.raw_ptr();
+            let mut xa = self.xq8.raw_ptr();
+            let mut ya = y;
+            let mut ia = w.in_dim; let mut oa = w.out_dim;
+            let mut args: [*mut c_void; 5] = [
+                &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+                &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                &mut oa as *mut _ as *mut c_void];
+            return unsafe {
+                f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args)
+            };
+        }
+
+        // Q5_K/Q6_K use the row-blocked kernel (ROWS rows per wavefront);
+        // the rest use the one-row-per-wavefront wave64 kernels.
         let (module, kname, grid) = match w.dtype {
             GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64",      w.out_dim),
             GgmlType::Q4_K   => (&self.m_mv_q4k,  "matvec_q4_k_rowblock_f32",
@@ -418,7 +490,6 @@ impl GpuGemma4 {
             other => return Err(format!("gemma4 matvec: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
-        let block: u32 = 64;
         let mut wa=w.data.raw_ptr(); let mut xa=x; let mut ya=y;
         let mut ia=w.in_dim; let mut oa=w.out_dim;
         let mut args: [*mut c_void; 5] = [

@@ -240,6 +240,8 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
         let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+        // Decode timer — excludes the one-time weight load above.
+        let t_decode = std::time::Instant::now();
         let mut lg = Vec::new();
         for &t in &prompt { lg = gm.forward_token(t, &mut state).map_err(anyhow::Error::msg)?; }
         for _ in 0..steps {
@@ -248,6 +250,10 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             if tok == cfg_eos { break; }
             lg = gm.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
         }
+        let n_fwd = all.len();
+        println!("decode       = {:.1} ms/token ({:.1} tok/s) over {n_fwd} forwards",
+            t_decode.elapsed().as_secs_f64() * 1e3 / n_fwd as f64,
+            n_fwd as f64 / t_decode.elapsed().as_secs_f64());
         // One traced forward for a per-block timing breakdown.
         let probe = *all.last().unwrap();
         let (tlg, e_ms, blk_ms, o_ms) =
