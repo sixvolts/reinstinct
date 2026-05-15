@@ -127,7 +127,7 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     let arch = g.metadata_get("general.architecture")
         .and_then(|v| v.as_str()).unwrap_or("<unknown>");
     if arch == "gemma4" {
-        return generate_text_gemma4(&g, path, tokens, steps, temperature, top_k, seed);
+        return generate_text_gemma4(&g, path, tokens, steps, temperature, top_k, seed, gpu);
     }
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
@@ -210,40 +210,63 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
 /// GPT2-style BPE module doesn't cover yet. Prints token ids + top-K.
 fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
                         tokens: Option<Vec<u32>>, steps: usize,
-                        temperature: f32, top_k: usize, seed: u64) -> anyhow::Result<()> {
+                        temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
     use reinstinct_engine::cpu::gemma4::Gemma4CpuModel;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
 
-    // GgufFile isn't Clone; reopen for the model to own its own mmap.
-    let g_owned = GgufFile::open(path)?;
-    let m = Gemma4CpuModel::load(g_owned).map_err(anyhow::Error::msg)?;
-    let cfg = &m.model.config;
-    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg.eos_token_id]);
+    let cfg_eos = Gemma4Model::load(g).map_err(anyhow::Error::msg)?.config.eos_token_id;
+    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg_eos]);
 
     println!("model       = {} (gemma4)", path.display());
-    println!("backend     = CPU oracle (lazy per-layer dequant)");
+    println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU oracle" });
     println!("prompt      = {prompt:?} ({} tokens)", prompt.len());
     println!("steps       = {steps}");
-    let _ = g;
 
     let mut rng = Rng::new(seed);
-    let mut state = m.new_state();
     let mut all = prompt.clone();
-
     let t0 = std::time::Instant::now();
-    let mut logits = Vec::new();
-    for &t in &prompt {
-        logits = m.forward_token(t, &mut state).map_err(anyhow::Error::msg)?;
+    let logits;
+
+    if gpu {
+        use reinstinct_engine::hip;
+        use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+        if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+        let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let model = Gemma4Model::load(g).map_err(anyhow::Error::msg)?;
+        let max_seq = prompt.len() + steps + 8;
+        let t_load = std::time::Instant::now();
+        let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
+        let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+        let mut lg = Vec::new();
+        for &t in &prompt { lg = gm.forward_token(t, &mut state).map_err(anyhow::Error::msg)?; }
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&lg, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg_eos { break; }
+            lg = gm.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        logits = lg;
+    } else {
+        let g_owned = GgufFile::open(path)?;
+        let m = Gemma4CpuModel::load(g_owned).map_err(anyhow::Error::msg)?;
+        let mut state = m.new_state();
+        let mut lg = Vec::new();
+        for &t in &prompt { lg = m.forward_token(t, &mut state).map_err(anyhow::Error::msg)?; }
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&lg, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg_eos { break; }
+            lg = m.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        logits = lg;
     }
-    for _ in 0..steps {
-        let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
-        all.push(tok);
-        if tok == cfg.eos_token_id { break; }
-        logits = m.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
-    }
+
     let elapsed = t0.elapsed();
     let new_tokens = all.len() - prompt.len();
-    println!("\ngenerated   = {} tokens in {:.1} s ({:.2} s/token)",
+    println!("\ngenerated   = {} tokens in {:.1} s ({:.3} s/token)",
         new_tokens, elapsed.as_secs_f64(),
         elapsed.as_secs_f64() / (prompt.len() + new_tokens).max(1) as f64);
     println!("output ids  = {all:?}");

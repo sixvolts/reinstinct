@@ -11,6 +11,7 @@
 pub mod kernels;
 pub mod prefill;
 pub mod qwen35;
+pub mod gemma4;
 pub mod smoke;
 
 use std::path::{Path, PathBuf};
