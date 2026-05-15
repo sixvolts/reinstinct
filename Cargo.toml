@@ -22,6 +22,9 @@ clap = { version = "4.5", features = ["derive"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Parallelism for the CPU oracle (matvec across output rows)
 rayon = "1.10"
+# Pre-tokenizer regex for the BPE encoder (needs lookahead, which the
+# linear-time `regex` crate doesn't support)
+fancy-regex = "0.14"
 
 [profile.release]
 opt-level = 3

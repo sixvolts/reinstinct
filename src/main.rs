@@ -48,6 +48,10 @@ enum Command {
     /// comma-separated prefill, then `--steps` newly generated tokens.
     GenerateText {
         path: PathBuf,
+        /// Prompt as text — encoded via the GGUF BPE tokenizer.
+        /// Takes precedence over --tokens.
+        #[arg(long)]
+        prompt: Option<String>,
         /// Comma-separated prompt tokens. Defaults to [eos_token_id].
         #[arg(long, value_delimiter = ',')]
         tokens: Option<Vec<u32>>,
@@ -108,19 +112,30 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
-        Command::GenerateText { path, tokens, steps, temperature, top_k, seed, gpu } =>
-            generate_text(&path, tokens, steps, temperature, top_k, seed, gpu),
+        Command::GenerateText { path, prompt, tokens, steps, temperature, top_k, seed, gpu } =>
+            generate_text(&path, prompt, tokens, steps, temperature, top_k, seed, gpu),
     }
 }
 
-fn generate_text(path: &std::path::Path, tokens: Option<Vec<u32>>, steps: usize,
+fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
+                 tokens: Option<Vec<u32>>, steps: usize,
                  temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
+    use reinstinct_engine::tokenizer::Tokenizer;
 
     let g = GgufFile::open(path)?;
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
-    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg.eos_token_id]);
+
+    // Prompt resolution: --prompt text (BPE-encoded) > --tokens > [EOS].
+    let prompt: Vec<u32> = if let Some(text) = &prompt_text {
+        let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+        let ids = tok.encode(text);
+        if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+        ids
+    } else {
+        tokens.unwrap_or_else(|| vec![cfg.eos_token_id])
+    };
 
     println!("model       = {}", path.display());
     println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU" });

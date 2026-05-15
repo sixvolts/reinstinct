@@ -40,11 +40,25 @@ fn bytes_to_unicode() -> [char; 256] {
     out
 }
 
+/// Qwen2-family pre-tokenizer regex. Qwen 2 / 2.5 / 3 (and the "qwen35"
+/// pre type) all use this split pattern; it isolates contractions,
+/// letter runs, number runs, punctuation runs, and whitespace.
+const QWEN_PRETOKENIZER_REGEX: &str =
+    r#"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#;
+
 pub struct Tokenizer {
     /// Vocab table: token_id → vocab string (in GPT2 byte-encoded form).
     tokens: Vec<String>,
     /// Reverse map of `bytes_to_unicode`: codepoint → original byte.
     byte_decoder: HashMap<char, u8>,
+    /// Forward byte→unicode permutation (for encoding).
+    byte_encoder: [char; 256],
+    /// vocab string → token id.
+    vocab_map: HashMap<String, u32>,
+    /// BPE merge ranks: (left, right) → rank (lower = merged first).
+    merge_ranks: HashMap<(String, String), u32>,
+    /// Compiled pre-tokenizer regex.
+    pre_regex: fancy_regex::Regex,
     pub eos_id: u32,
 }
 
@@ -74,13 +88,104 @@ impl Tokenizer {
         // Build the byte decoder: every char that bytes_to_unicode emits
         // maps back to its source byte; chars that aren't in the table
         // are left alone (they're literal UTF-8 from the vocab).
-        let b2u = bytes_to_unicode();
+        let byte_encoder = bytes_to_unicode();
         let mut byte_decoder = HashMap::with_capacity(256);
-        for (b, c) in b2u.iter().enumerate() {
+        for (b, c) in byte_encoder.iter().enumerate() {
             byte_decoder.insert(*c, b as u8);
         }
 
-        Ok(Self { tokens, byte_decoder, eos_id })
+        // Vocab string → id for encode-side lookup.
+        let mut vocab_map = HashMap::with_capacity(tokens.len());
+        for (id, s) in tokens.iter().enumerate() {
+            vocab_map.insert(s.clone(), id as u32);
+        }
+
+        // BPE merge ranks from tokenizer.ggml.merges — each entry is
+        // "<left> <right>"; the array index is the rank.
+        let merge_ranks = match gguf.metadata_get("tokenizer.ggml.merges") {
+            Some(MetaValue::Array { values, .. }) => {
+                let mut m = HashMap::with_capacity(values.len());
+                for (rank, v) in values.iter().enumerate() {
+                    if let MetaValue::String(s) = v {
+                        // Split on the FIRST space — merge halves can't
+                        // themselves contain the byte-encoded space char
+                        // (that's "Ġ", not 0x20).
+                        if let Some(sp) = s.find(' ') {
+                            let l = s[..sp].to_string();
+                            let r = s[sp + 1..].to_string();
+                            m.insert((l, r), rank as u32);
+                        }
+                    }
+                }
+                m
+            }
+            _ => return Err("missing tokenizer.ggml.merges".into()),
+        };
+
+        let pre_regex = fancy_regex::Regex::new(QWEN_PRETOKENIZER_REGEX)
+            .map_err(|e| format!("compile pre-tokenizer regex: {e}"))?;
+
+        Ok(Self { tokens, byte_decoder, byte_encoder, vocab_map, merge_ranks,
+                  pre_regex, eos_id })
+    }
+
+    /// Encode text to token ids. GPT2 byte-level BPE:
+    ///   1. pre-tokenize into chunks via the Qwen regex
+    ///   2. byte-encode each chunk (UTF-8 bytes → byte_encoder chars)
+    ///   3. greedily apply the lowest-rank adjacent merge until none apply
+    ///   4. map each surviving piece to its vocab id
+    ///
+    /// Unknown pieces (shouldn't happen for byte-level BPE — every single
+    /// byte char is in the vocab) are skipped with a logged warning.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        // `find_iter` yields the pre-token chunks in order.
+        let mut search_from = 0usize;
+        while search_from < text.len() {
+            let m = match self.pre_regex.find_from_pos(text, search_from) {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            let chunk = &text[m.start()..m.end()];
+            search_from = m.end().max(search_from + 1);
+            self.encode_chunk(chunk, &mut out);
+        }
+        out
+    }
+
+    /// BPE-encode one pre-token chunk, appending ids to `out`.
+    fn encode_chunk(&self, chunk: &str, out: &mut Vec<u32>) {
+        if chunk.is_empty() { return; }
+
+        // Byte-encode: each UTF-8 byte → one byte_encoder char → a
+        // one-char String. `word` is the working list of pieces.
+        let mut word: Vec<String> = chunk.bytes()
+            .map(|b| self.byte_encoder[b as usize].to_string())
+            .collect();
+        if word.is_empty() { return; }
+
+        // Greedy lowest-rank merge.
+        loop {
+            let mut best_rank = u32::MAX;
+            let mut best_idx = usize::MAX;
+            for i in 0..word.len().saturating_sub(1) {
+                if let Some(&r) = self.merge_ranks.get(&(word[i].clone(), word[i + 1].clone())) {
+                    if r < best_rank { best_rank = r; best_idx = i; }
+                }
+            }
+            if best_idx == usize::MAX { break; }
+            // Merge word[best_idx] + word[best_idx+1].
+            let merged = format!("{}{}", word[best_idx], word[best_idx + 1]);
+            word[best_idx] = merged;
+            word.remove(best_idx + 1);
+        }
+
+        for piece in &word {
+            match self.vocab_map.get(piece) {
+                Some(&id) => out.push(id),
+                None => eprintln!("tokenizer: piece {piece:?} not in vocab — skipped"),
+            }
+        }
     }
 
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
@@ -160,17 +265,41 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_simple_sequence() {
-        // Just verify decoding a known sequence produces non-empty,
-        // non-control-character text. Real BPE round-trips need the
-        // encoder, which we don't have.
+    fn encode_decode_round_trips() {
         let Some(p) = fixture_path() else { eprintln!("skip"); return };
         let g = GgufFile::open(&p).unwrap();
         let tok = Tokenizer::from_gguf(&g).unwrap();
-        // 198=newline, 220=space, 16=number "1", 17=number "2".
-        // Let's just check decoding doesn't panic and produces something.
-        let s = tok.decode(&[198, 220, 16, 17]);
-        eprintln!("decode([198,220,16,17]) = {s:?}");
-        assert!(!s.is_empty());
+        // Byte-level BPE is lossless: decode(encode(x)) == x exactly.
+        let cases = [
+            "Hello, world!",
+            "The quick brown fox jumps over the lazy dog.",
+            "  leading and  multiple   spaces ",
+            "numbers 12345 and symbols @#$%^&*()",
+            "newlines\nand\ttabs",
+            "unicode: café, naïve, 日本語, emoji 🦀",
+            "",
+        ];
+        for case in &cases {
+            let ids = tok.encode(case);
+            let back = tok.decode(&ids);
+            assert_eq!(&back, case,
+                "round-trip failed:\n  in:  {case:?}\n  ids: {ids:?}\n  out: {back:?}");
+        }
+    }
+
+    #[test]
+    fn encode_produces_reasonable_token_counts() {
+        let Some(p) = fixture_path() else { eprintln!("skip"); return };
+        let g = GgufFile::open(&p).unwrap();
+        let tok = Tokenizer::from_gguf(&g).unwrap();
+        // A short English sentence should tokenize to a handful of
+        // tokens — far fewer than its byte length (BPE is doing its job).
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let ids = tok.encode(text);
+        eprintln!("encode({text:?}) = {} tokens: {ids:?}", ids.len());
+        assert!(ids.len() < text.len() / 2,
+            "expected BPE to compress; got {} tokens for {} bytes",
+            ids.len(), text.len());
+        assert!(!ids.is_empty());
     }
 }
