@@ -25,11 +25,12 @@ void gsm_q5k_emb(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
 }
 
 extern "C" __global__
-void embed_lookup_q5_k_f32(const BlockQ5_K* __restrict__ table,
-                           float*           __restrict__ out,
-                           unsigned int row_idx,
+void embed_lookup_q5_k_f32(const BlockQ5_K*    __restrict__ table,
+                           float*              __restrict__ out,
+                           const unsigned int* __restrict__ row_idx_ptr,
                            unsigned int hidden)
 {
+    const unsigned int row_idx = *row_idx_ptr;
     const unsigned int blocks_per_row = hidden >> 8;   // /256
     const unsigned int blk_idx = blockIdx.x;
     if (blk_idx >= blocks_per_row) return;

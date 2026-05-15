@@ -9,7 +9,8 @@
 use std::ffi::c_void;
 
 use crate::gguf::{GgmlType, GgufFile};
-use crate::hip::{DeviceBuf, Event, Module, Stream};
+use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::sys::HipStreamCaptureMode;
 use crate::model::gemma4::{AttnKind, Gemma4Model};
 use crate::runtime::KernelCache;
 use crate::runtime::qwen35::GpuMatvecTensor;
@@ -17,7 +18,7 @@ use crate::runtime::qwen35::GpuMatvecTensor;
 // Reused kernel sources.
 const RMSNORM_SRC:           &str = include_str!("../../kernels/rmsnorm.cpp");
 const RMSNORM_MULTIHEAD_SRC: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
-const ROPE_SRC:              &str = include_str!("../../kernels/rope.cpp");
+const ROPE_SRC:              &str = include_str!("../../kernels/rope_dpos.cpp");
 const ADD_INPLACE_SRC:       &str = include_str!("../../kernels/add_inplace.cpp");
 const MATVEC_F32_W_SRC:      &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
 const MATVEC_Q4K_W_SRC:      &str = include_str!("../../kernels/matvec_q4_k_rowblock.cpp");
@@ -36,7 +37,8 @@ const MATVEC_F16_W_SRC:      &str = include_str!("../../kernels/matvec_f16_wave6
 const GEGLU_SRC:             &str = include_str!("../../kernels/geglu.cpp");
 const LOGIT_SOFTCAP_SRC:     &str = include_str!("../../kernels/logit_softcap.cpp");
 const SCALE_INPLACE_SRC:     &str = include_str!("../../kernels/scale_inplace.cpp");
-const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_window.cpp");
+const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_dpos.cpp");
+const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp");
@@ -297,8 +299,16 @@ pub struct GpuGemma4 {
     m_moe_mv_q8_0: Module,
     m_moe_geglu:   Module,
     m_moe_combine: Module,
+    m_kv_write:    Module,
     /// Scratch for the int8-quantized activation feeding the dp4a matvec.
     xq8: DeviceBuf<u8>,
+
+    /// Decode token + position, device-resident so the embed / rope /
+    /// attention / KV-write kernels read them at execution time — which
+    /// makes the whole forward capturable into one parametric HIP graph.
+    d_token: DeviceBuf<u32>,
+    d_pos:   DeviceBuf<u32>,
+    max_seq: usize,
 
     stream: Stream,
 
@@ -423,6 +433,10 @@ impl GpuGemma4 {
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
+            m_kv_write:     ld("kv_write", KV_WRITE_SRC)?,
+            d_token: DeviceBuf::new(1)?,
+            d_pos:   DeviceBuf::new(1)?,
+            max_seq,
             moe_logits:  DeviceBuf::new((cfg.expert_count as usize).max(1))?,
             moe_ids:     DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
             moe_weights: DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
@@ -478,8 +492,8 @@ impl GpuGemma4 {
         unsafe { f.launch((n_heads,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rope(&self, x: *mut c_void, n_heads: u32, head_dim: u32,
-                   kind: AttnKind, pos: u32) -> Result<(), String>
+    fn launch_rope(&self, x: *mut c_void, n_heads: u32, head_dim: u32, kind: AttnKind)
+        -> Result<(), String>
     {
         let f = self.m_rope.function("rope_apply_f32")?;
         let (cos, sin, rd) = match kind {
@@ -492,13 +506,28 @@ impl GpuGemma4 {
         let block: u32 = 64;
         let grid_x = (half + block - 1) / block;
         let mut xa=x; let mut ca=cos; let mut sa=sin;
-        let mut hd=head_dim; let mut rdv=rd; let mut nh=n_heads; let mut p=pos;
+        let mut hd=head_dim; let mut rdv=rd; let mut nh=n_heads;
+        let mut p=self.d_pos.raw_ptr();
         let mut args: [*mut c_void; 7] = [
             &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
             &mut sa as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
             &mut rdv as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
             &mut p as *mut _ as *mut c_void];
         unsafe { f.launch((grid_x, n_heads, 1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Append the normed K/V vector into the layer's KV cache at `d_pos`.
+    fn launch_kv_write(&self, src: *mut c_void, dst: *mut c_void, kv_dim: u32)
+        -> Result<(), String>
+    {
+        let f = self.m_kv_write.function("kv_write_f32")?;
+        let block: u32 = 256;
+        let grid = (kv_dim + block - 1) / block;
+        let mut sa=src; let mut da=dst; let mut pa=self.d_pos.raw_ptr(); let mut kd=kv_dim;
+        let mut args: [*mut c_void; 4] = [
+            &mut sa as *mut _ as *mut c_void, &mut da as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_add(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
@@ -713,19 +742,18 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void, token: u32)
-        -> Result<(), String>
-    {
+    /// Embedding lookup — the token row is read from `d_token` on device
+    /// (capturable). gemma4's token_embd is Q5_K (31B) or Q8_0 (26B).
+    fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void) -> Result<(), String> {
         let hidden = table.in_dim;   // [hidden, vocab]
         let (module, kname, threads, grid): (&Module, &str, u32, u32) = match table.dtype {
-            GgmlType::F32  => (&self.m_embed_f32, "embed_lookup_f32",  256, (hidden + 255)/256),
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_f32", 256, hidden/256),
-            GgmlType::Q6_K => (&self.m_embed_q6k, "embed_lookup_q6_k_f32", 256, hidden/256),
             GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_f32", 256, (hidden + 255)/256),
             other => return Err(format!("gemma4 embed: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
-        let mut t=table.data.raw_ptr(); let mut o=out; let mut row=token; let mut h=hidden;
+        let mut t=table.data.raw_ptr(); let mut o=out;
+        let mut row=self.d_token.raw_ptr(); let mut h=hidden;
         let mut args: [*mut c_void; 4] = [
             &mut t as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
             &mut row as *mut _ as *mut c_void, &mut h as *mut _ as *mut c_void];
@@ -733,16 +761,18 @@ impl GpuGemma4 {
     }
 
     fn launch_attn(&self, q: *mut c_void, kc: *mut c_void, vc: *mut c_void, out: *mut c_void,
-                   n_kv: u32, head_dim: u32, total_len: u32, window: u32)
+                   n_kv: u32, head_dim: u32, window: u32)
         -> Result<(), String>
     {
         let f = self.m_attn_win.function("attn_step_window_f32")?;
         let block: u32 = 256;
-        let win_len = if window > 0 && total_len > window { window } else { total_len };
-        let smem = ((head_dim + win_len) + block) * 4;
+        // The kernel reads total_len from d_pos; size LDS for the worst
+        // case (the whole decode sequence) so one graph capture serves
+        // every position.
+        let smem = ((head_dim + self.max_seq as u32) + block) * 4;
         let mut qa=q; let mut ka=kc; let mut va=vc; let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut tl=total_len; let mut wn=window; let mut sc=1.0f32;
+        let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
         let mut args: [*mut c_void; 10] = [
             &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
@@ -754,29 +784,74 @@ impl GpuGemma4 {
     }
 
     /// One Gemma 4 decode step → vocab-length soft-capped logits.
-    pub fn forward_token(&self, token: u32, state: &mut Gemma4GpuState)
-        -> Result<Vec<f32>, String>
-    {
+    /// Stage the decode token + position into the device buffers the
+    /// embed / rope / attention / KV-write kernels read.
+    fn set_inputs(&self, token: u32, pos: usize) -> Result<(), String> {
+        self.d_token.copy_from_host(&[token])?;
+        self.d_pos.copy_from_host(&[pos as u32])?;
+        Ok(())
+    }
+
+    /// Enqueue the full forward as a pure async kernel chain on
+    /// `self.stream` — no host sync, no readback. Reads `d_token` /
+    /// `d_pos`, so it is identical for every token/position and can be
+    /// captured once into a HIP graph.
+    fn enqueue_forward(&self, state: &Gemma4GpuState) -> Result<(), String> {
         let h = self.hidden as u32;
-        // Embed → scale by √hidden.
-        self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr())?;
         self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
-
-        let pos = state.pos;
         for (li, block) in self.blocks.iter().enumerate() {
-            let kv = &mut state.caches[li];
-            self.block_forward(block, kv, pos)?;
+            self.block_forward(block, &state.caches[li])?;
         }
-
-        // Final norm + tied projection + soft-cap.
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), h)?;
         self.launch_matvec(&self.token_embd, self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
         if self.softcap > 0.0 {
             self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
         }
+        Ok(())
+    }
+
+    /// One decode step → vocab-length soft-capped logits.
+    pub fn forward_token(&self, token: u32, state: &mut Gemma4GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        self.set_inputs(token, state.pos)?;
+        self.enqueue_forward(state)?;
         self.stream.synchronize()?;
-        state.pos = pos + 1;
+        state.pos += 1;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// Capture the forward as a parametric HIP graph. The graph reads
+    /// `d_token` / `d_pos`, so the single captured executable serves
+    /// every decode step — `forward_via_graph` just stages those two
+    /// device words and replays the graph with one submission, eliding
+    /// the ~1300 individual kernel launches the MI50 is bound by.
+    pub fn capture_forward_graph(&self, state: &Gemma4GpuState)
+        -> Result<GraphExec, String>
+    {
+        Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
+        if let Err(e) = self.enqueue_forward(state) {
+            let _ = Graph::end_capture(&self.stream);
+            return Err(e);
+        }
+        let graph = Graph::end_capture(&self.stream)?;
+        let exec = graph.instantiate()?;
+        drop(graph);
+        Ok(exec)
+    }
+
+    /// Replay a captured forward graph for `token` at `state.pos`.
+    pub fn forward_via_graph(&self, exec: &GraphExec, token: u32, state: &mut Gemma4GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        self.set_inputs(token, state.pos)?;
+        exec.launch(&self.stream)?;
+        self.stream.synchronize()?;
+        state.pos += 1;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
@@ -789,14 +864,14 @@ impl GpuGemma4 {
     {
         let h = self.hidden as u32;
         let n = self.blocks.len();
+        self.set_inputs(token, state.pos)?;
         let ev: Vec<Event> = (0..n + 3).map(|_| Event::new()).collect::<Result<_, _>>()?;
         ev[0].record(&self.stream)?;
-        self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr())?;
         self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
         ev[1].record(&self.stream)?;
-        let pos = state.pos;
         for (li, block) in self.blocks.iter().enumerate() {
-            self.block_forward(block, &mut state.caches[li], pos)?;
+            self.block_forward(block, &state.caches[li])?;
             ev[li + 2].record(&self.stream)?;
         }
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
@@ -807,7 +882,7 @@ impl GpuGemma4 {
         }
         ev[n + 2].record(&self.stream)?;
         ev[n + 2].synchronize()?;
-        state.pos = pos + 1;
+        state.pos += 1;
 
         let embed_ms = Event::elapsed_time(&ev[0], &ev[1])?;
         let mut block_ms = Vec::with_capacity(n);
@@ -818,8 +893,10 @@ impl GpuGemma4 {
         Ok((out, embed_ms, block_ms, output_ms))
     }
 
-    /// One transformer block, in place on `hidden_a`.
-    fn block_forward(&self, b: &GpuGemma4Block, kv: &mut Gemma4KvCache, pos: usize)
+    /// One transformer block, in place on `hidden_a`. All position-
+    /// dependent work (rope, KV write, attention) reads `d_pos`, so the
+    /// chain is identical for every decode step.
+    fn block_forward(&self, b: &GpuGemma4Block, kv: &Gemma4KvCache)
         -> Result<(), String>
     {
         let h = self.hidden as u32;
@@ -836,7 +913,7 @@ impl GpuGemma4 {
         self.launch_rmsnorm_mh(self.q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
                                self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32)?;
         self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32,
-                         b.kind, pos as u32)?;
+                         b.kind)?;
         // K: project. V: project, or reuse the K projection.
         self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
         let v_src = match &b.attn_v {
@@ -850,24 +927,22 @@ impl GpuGemma4 {
         self.launch_rmsnorm_mh(self.k_proj.raw_ptr(), b.attn_k_norm.raw_ptr(),
                                self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32)?;
         self.launch_rope(self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32,
-                         b.kind, pos as u32)?;
+                         b.kind)?;
         // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
         self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
                                n_kv as u32, head_dim as u32)?;
-        // Push (k, v) into the cache — async on the same stream, so
-        // ordering against the preceding norm/rope kernels holds without
-        // a host sync. (The per-block synchronize was the single biggest
-        // serialisation cost — 60 full pipeline drains per token.)
-        kv.k.copy_from_device_at_async(&self.k_norm, pos * kv.kv_dim, &self.stream)?;
-        kv.v.copy_from_device_at_async(&self.v_norm, pos * kv.kv_dim, &self.stream)?;
-        let total_len = (pos + 1) as u32;
+        // Append (k, v) into the cache at d_pos via a kernel — a pos-
+        // offset memcpy node can't be parametrised in a captured graph,
+        // but a kernel reading d_pos can.
+        self.launch_kv_write(self.k_norm.raw_ptr(), kv.k.raw_ptr(), kv.kv_dim as u32)?;
+        self.launch_kv_write(self.v_norm.raw_ptr(), kv.v.raw_ptr(), kv.kv_dim as u32)?;
         let window = match b.kind {
             AttnKind::Sliding => self.sliding_window as u32,
             AttnKind::Full    => 0,
         };
         self.launch_attn(self.q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
                          self.attn_concat.raw_ptr(), n_kv as u32, head_dim as u32,
-                         total_len, window)?;
+                         window)?;
         // Output projection, post-norm, residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
                            self.hidden_b.raw_ptr())?;

@@ -15,11 +15,12 @@ struct __attribute__((packed)) BlockQ8_0 {
 static_assert(sizeof(BlockQ8_0) == 34, "BlockQ8_0 must be 34 bytes");
 
 extern "C" __global__
-void embed_lookup_q8_0_f32(const BlockQ8_0* __restrict__ table,
-                           float*           __restrict__ out,
-                           unsigned int row_idx,
+void embed_lookup_q8_0_f32(const BlockQ8_0*    __restrict__ table,
+                           float*              __restrict__ out,
+                           const unsigned int* __restrict__ row_idx_ptr,
                            unsigned int hidden)
 {
+    const unsigned int row_idx = *row_idx_ptr;
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hidden) return;
 
