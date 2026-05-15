@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 
 use crate::gguf::{GgmlType, GgufFile};
-use crate::hip::{DeviceBuf, Module, Stream};
+use crate::hip::{DeviceBuf, Event, Module, Stream};
 use crate::model::gemma4::{AttnKind, Gemma4Model};
 use crate::runtime::KernelCache;
 use crate::runtime::qwen35::GpuMatvecTensor;
@@ -20,9 +20,12 @@ const RMSNORM_MULTIHEAD_SRC: &str = include_str!("../../kernels/rmsnorm_multihea
 const ROPE_SRC:              &str = include_str!("../../kernels/rope.cpp");
 const ADD_INPLACE_SRC:       &str = include_str!("../../kernels/add_inplace.cpp");
 const MATVEC_F32_W_SRC:      &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
-const MATVEC_Q4K_W_SRC:      &str = include_str!("../../kernels/matvec_q4_k_wave64.cpp");
-const MATVEC_Q5K_W_SRC:      &str = include_str!("../../kernels/matvec_q5_k_wave64.cpp");
-const MATVEC_Q6K_W_SRC:      &str = include_str!("../../kernels/matvec_q6_k_wave64.cpp");
+const MATVEC_Q4K_W_SRC:      &str = include_str!("../../kernels/matvec_q4_k_rowblock.cpp");
+const MATVEC_Q5K_W_SRC:      &str = include_str!("../../kernels/matvec_q5_k_rowblock.cpp");
+const MATVEC_Q6K_W_SRC:      &str = include_str!("../../kernels/matvec_q6_k_rowblock.cpp");
+/// Output rows per wavefront in the row-blocked K-quant matvecs — must
+/// match `ROWS` in matvec_q{4,5,6}_k_rowblock.cpp.
+const Q4K_ROWBLOCK: u32 = 8;
 const MATVEC_Q8_0_W_SRC:     &str = include_str!("../../kernels/matvec_q8_0_wave64.cpp");
 const MATVEC_F16_W_SRC:      &str = include_str!("../../kernels/matvec_f16_wave64.cpp");
 // Gemma-specific kernel sources.
@@ -282,9 +285,9 @@ impl GpuGemma4 {
             m_embed_q6k:  ld("embed_lookup_q6_k", EMBED_Q6K_SRC)?,
             m_embed_f32:  ld("embed_lookup", EMBED_F32_SRC)?,
             m_mv_f32:     ld("matvec_f32_wave64", MATVEC_F32_W_SRC)?,
-            m_mv_q4k:     ld("matvec_q4_k_wave64", MATVEC_Q4K_W_SRC)?,
-            m_mv_q5k:     ld("matvec_q5_k_wave64", MATVEC_Q5K_W_SRC)?,
-            m_mv_q6k:     ld("matvec_q6_k_wave64", MATVEC_Q6K_W_SRC)?,
+            m_mv_q4k:     ld("matvec_q4_k_rowblock", MATVEC_Q4K_W_SRC)?,
+            m_mv_q5k:     ld("matvec_q5_k_rowblock", MATVEC_Q5K_W_SRC)?,
+            m_mv_q6k:     ld("matvec_q6_k_rowblock", MATVEC_Q6K_W_SRC)?,
             m_mv_q8_0:    ld("matvec_q8_0_wave64", MATVEC_Q8_0_W_SRC)?,
             m_mv_f16:     ld("matvec_f16_wave64", MATVEC_F16_W_SRC)?,
             stream: Stream::new()?,
@@ -400,13 +403,18 @@ impl GpuGemma4 {
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
-        let (module, kname) = match w.dtype {
-            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64"),
-            GgmlType::Q4_K   => (&self.m_mv_q4k,  "matvec_q4_k_wave64_f32"),
-            GgmlType::Q5_K   => (&self.m_mv_q5k,  "matvec_q5_k_wave64_f32"),
-            GgmlType::Q6_K   => (&self.m_mv_q6k,  "matvec_q6_k_wave64_f32"),
-            GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32"),
-            GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32"),
+        // Q4_K uses the row-blocked kernel (ROWS rows per wavefront); the
+        // rest use the one-row-per-wavefront wave64 kernels.
+        let (module, kname, grid) = match w.dtype {
+            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64",      w.out_dim),
+            GgmlType::Q4_K   => (&self.m_mv_q4k,  "matvec_q4_k_rowblock_f32",
+                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+            GgmlType::Q5_K   => (&self.m_mv_q5k,  "matvec_q5_k_rowblock_f32",
+                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+            GgmlType::Q6_K   => (&self.m_mv_q6k,  "matvec_q6_k_rowblock_f32",
+                                 (w.out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+            GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32", w.out_dim),
+            GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32",  w.out_dim),
             other => return Err(format!("gemma4 matvec: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
@@ -417,7 +425,7 @@ impl GpuGemma4 {
             &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
             &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void];
-        unsafe { f.launch((w.out_dim,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void, token: u32)
@@ -488,6 +496,42 @@ impl GpuGemma4 {
         Ok(out)
     }
 
+    /// Timed forward: HIP events around embed / each block / output.
+    /// Returns (logits, embed_ms, per_block_ms, output_ms).
+    pub fn forward_token_timed(&self, token: u32, state: &mut Gemma4GpuState)
+        -> Result<(Vec<f32>, f32, Vec<f32>, f32), String>
+    {
+        let h = self.hidden as u32;
+        let n = self.blocks.len();
+        let ev: Vec<Event> = (0..n + 3).map(|_| Event::new()).collect::<Result<_, _>>()?;
+        ev[0].record(&self.stream)?;
+        self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
+        ev[1].record(&self.stream)?;
+        let pos = state.pos;
+        for (li, block) in self.blocks.iter().enumerate() {
+            self.block_forward(block, &mut state.caches[li], pos)?;
+            ev[li + 2].record(&self.stream)?;
+        }
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h)?;
+        self.launch_matvec(&self.token_embd, self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        if self.softcap > 0.0 {
+            self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
+        }
+        ev[n + 2].record(&self.stream)?;
+        ev[n + 2].synchronize()?;
+        state.pos = pos + 1;
+
+        let embed_ms = Event::elapsed_time(&ev[0], &ev[1])?;
+        let mut block_ms = Vec::with_capacity(n);
+        for i in 0..n { block_ms.push(Event::elapsed_time(&ev[i + 1], &ev[i + 2])?); }
+        let output_ms = Event::elapsed_time(&ev[n + 1], &ev[n + 2])?;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok((out, embed_ms, block_ms, output_ms))
+    }
+
     /// One transformer block, in place on `hidden_a`.
     fn block_forward(&self, b: &GpuGemma4Block, kv: &mut Gemma4KvCache, pos: usize)
         -> Result<(), String>
@@ -524,10 +568,12 @@ impl GpuGemma4 {
         // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
         self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
                                n_kv as u32, head_dim as u32)?;
-        // Push (k, v) into the cache.
-        self.stream.synchronize()?;
-        kv.k.copy_from_device_at(&self.k_norm, pos * kv.kv_dim)?;
-        kv.v.copy_from_device_at(&self.v_norm, pos * kv.kv_dim)?;
+        // Push (k, v) into the cache — async on the same stream, so
+        // ordering against the preceding norm/rope kernels holds without
+        // a host sync. (The per-block synchronize was the single biggest
+        // serialisation cost — 60 full pipeline drains per token.)
+        kv.k.copy_from_device_at_async(&self.k_norm, pos * kv.kv_dim, &self.stream)?;
+        kv.v.copy_from_device_at_async(&self.v_norm, pos * kv.kv_dim, &self.stream)?;
         let total_len = (pos + 1) as u32;
         let window = match b.kind {
             AttnKind::Sliding => self.sliding_window as u32,

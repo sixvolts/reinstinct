@@ -248,6 +248,29 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             if tok == cfg_eos { break; }
             lg = gm.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
         }
+        // One traced forward for a per-block timing breakdown.
+        let probe = *all.last().unwrap();
+        let (tlg, e_ms, blk_ms, o_ms) =
+            gm.forward_token_timed(probe, &mut state).map_err(anyhow::Error::msg)?;
+        let total: f32 = e_ms + blk_ms.iter().sum::<f32>() + o_ms;
+        let model = Gemma4Model::load(g).map_err(anyhow::Error::msg)?;
+        use reinstinct_engine::model::gemma4::AttnKind;
+        let (mut sw, mut swn, mut fl, mut fln) = (0.0f32, 0usize, 0.0f32, 0usize);
+        for (i, &t) in blk_ms.iter().enumerate() {
+            match model.config.attn_kinds[i] {
+                AttnKind::Sliding => { sw += t; swn += 1; }
+                AttnKind::Full    => { fl += t; fln += 1; }
+            }
+        }
+        println!("\n--- GPU per-stage breakdown (hipEvent ms) ---");
+        println!("  total           {total:>8.3} ms");
+        println!("  embed           {e_ms:>8.3} ms");
+        println!("  blocks sliding  {sw:>8.3} ms  ({swn} blocks, {:.3} ms each)",
+                 if swn>0 {sw/swn as f32} else {0.0});
+        println!("  blocks full     {fl:>8.3} ms  ({fln} blocks, {:.3} ms each)",
+                 if fln>0 {fl/fln as f32} else {0.0});
+        println!("  output_proj     {o_ms:>8.3} ms");
+        let _ = tlg;
         logits = lg;
     } else {
         let g_owned = GgufFile::open(path)?;
