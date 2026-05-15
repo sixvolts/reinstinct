@@ -44,6 +44,29 @@ enum Command {
         #[arg(long)]
         gpu: bool,
     },
+    /// Sample tokens autoregressively from a prompt — single token or
+    /// comma-separated prefill, then `--steps` newly generated tokens.
+    GenerateText {
+        path: PathBuf,
+        /// Comma-separated prompt tokens. Defaults to [eos_token_id].
+        #[arg(long, value_delimiter = ',')]
+        tokens: Option<Vec<u32>>,
+        /// Number of new tokens to sample after the prompt is consumed.
+        #[arg(short = 'n', long, default_value_t = 32)]
+        steps: usize,
+        /// Sampling temperature (0 = greedy/argmax).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Top-k filter (0 = no filter, full vocab).
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// PRNG seed.
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+        /// Run on GPU.
+        #[arg(long)]
+        gpu: bool,
+    },
     /// Dump diagnostic stats for the embedding row of one or more tokens.
     DebugEmbed {
         path: PathBuf,
@@ -85,7 +108,63 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
+        Command::GenerateText { path, tokens, steps, temperature, top_k, seed, gpu } =>
+            generate_text(&path, tokens, steps, temperature, top_k, seed, gpu),
     }
+}
+
+fn generate_text(path: &std::path::Path, tokens: Option<Vec<u32>>, steps: usize,
+                 temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
+    use reinstinct_engine::sampling::{Rng, sample_temp_topk};
+
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg.eos_token_id]);
+
+    println!("model       = {}", path.display());
+    println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU" });
+    println!("prompt      = {prompt:?} ({} tokens)", prompt.len());
+    println!("steps       = {steps}");
+    println!("sampling    = temp={temperature} top_k={top_k} seed={seed}");
+    let max_seq = prompt.len() + steps + 4;
+    let mut rng = Rng::new(seed);
+    let mut all = prompt.clone();
+
+    let t0 = std::time::Instant::now();
+    if gpu {
+        use reinstinct_engine::hip;
+        use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+        if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+        let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        let mut state = Qwen35GpuState::new(&m, max_seq).map_err(anyhow::Error::msg)?;
+
+        // Prefill: feed every prompt token, keep last logits for first sample.
+        let mut logits = gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg.eos_token_id { break; }
+            logits = gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+    } else {
+        let mut state = m.new_state(max_seq);
+        let mut logits = m.forward_tokens(&prompt, &mut state);
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg.eos_token_id { break; }
+            logits = m.forward_token(tok, &mut state);
+        }
+    }
+    let elapsed = t0.elapsed();
+    let new_tokens = all.len() - prompt.len();
+    println!("\ngenerated   = {} tokens in {:.2} s ({:.1} tok/s)",
+        new_tokens, elapsed.as_secs_f64(), new_tokens as f64 / elapsed.as_secs_f64());
+    println!("output ids  = {all:?}");
+    Ok(())
 }
 
 fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {

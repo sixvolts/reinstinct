@@ -9,3 +9,4 @@ pub mod hip;
 pub mod model;
 pub mod quant;
 pub mod runtime;
+pub mod sampling;
