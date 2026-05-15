@@ -156,8 +156,16 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         let mut state = Qwen35GpuState::new(&m, max_seq).map_err(anyhow::Error::msg)?;
 
-        // Prefill: feed every prompt token, keep last logits for first sample.
-        let mut logits = gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        // Prefill the prompt in one batched pass (rocBLAS GEMM); fall
+        // back to the sequential path for a single-token prompt.
+        let t_pre = std::time::Instant::now();
+        let mut logits = if prompt.len() > 1 {
+            gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
+        } else {
+            gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
+        };
+        println!("prefill       = {:.3} s ({} tokens, batched)",
+            t_pre.elapsed().as_secs_f32(), prompt.len());
         for _ in 0..steps {
             let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
             all.push(tok);

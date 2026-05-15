@@ -24,6 +24,7 @@ use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::gguf::{GgufFile, GgmlType};
 use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
+use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
 /// Per-stage GPU timing breakdown for one `forward_token` call,
 /// measured with HIP events (so each `*_ms` is genuine GPU time
@@ -66,6 +67,15 @@ const MATVEC_Q6_K_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k.cpp")
 const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
+
+const CVT_F32_F16_SOURCE:       &str = include_str!("../../kernels/cvt_f32_f16.cpp");
+const DEQUANT_Q4_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q4_k_f16.cpp");
+const DEQUANT_Q5_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q5_k_f16.cpp");
+const DEQUANT_Q6_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q6_k_f16.cpp");
+const DEQUANT_Q8_0_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q8_0_f16.cpp");
+const DEQUANT_IQ4_XS_F16_SOURCE:&str = include_str!("../../kernels/dequant_iq4_xs_f16.cpp");
+const ROPE_BATCHED_SOURCE:      &str = include_str!("../../kernels/rope_batched.cpp");
+const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
 
 const MATVEC_F32_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
 const MATVEC_Q4_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k_wave64.cpp");
@@ -449,6 +459,17 @@ pub struct GpuQwen35 {
     /// one stream lets us capture the whole forward chain into a HIP graph.
     stream: Stream,
 
+    // --- Batched prefill machinery ---
+    rocblas:           RocblasHandle,
+    cvt_module:        Module,
+    dequant_q4_k_module:   Module,
+    dequant_q5_k_module:   Module,
+    dequant_q6_k_module:   Module,
+    dequant_q8_0_module:   Module,
+    dequant_iq4_xs_module: Module,
+    rope_batched_module:   Module,
+    attn_step_batched_module: Module,
+
     // Dimensions.
     hidden:     usize,
     ffn:        usize,
@@ -576,6 +597,12 @@ impl GpuQwen35 {
             blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind)?);
         }
 
+        // The single stream all launches flow through.
+        let stream = Stream::new()?;
+        // rocBLAS handle for batched-prefill GEMMs, bound to our stream.
+        let rocblas_handle = RocblasHandle::new()?;
+        rocblas_handle.set_stream(&stream)?;
+
         Ok(Self {
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, ffn_a, ffn_b,
@@ -608,6 +635,15 @@ impl GpuQwen35 {
             matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
+            rocblas:                  rocblas_handle,
+            cvt_module:               Module::load(&cache.compile("cvt_f32_f16", CVT_F32_F16_SOURCE)?)?,
+            dequant_q4_k_module:      Module::load(&cache.compile("dequant_q4_k_f16", DEQUANT_Q4_K_F16_SOURCE)?)?,
+            dequant_q5_k_module:      Module::load(&cache.compile("dequant_q5_k_f16", DEQUANT_Q5_K_F16_SOURCE)?)?,
+            dequant_q6_k_module:      Module::load(&cache.compile("dequant_q6_k_f16", DEQUANT_Q6_K_F16_SOURCE)?)?,
+            dequant_q8_0_module:      Module::load(&cache.compile("dequant_q8_0_f16", DEQUANT_Q8_0_F16_SOURCE)?)?,
+            dequant_iq4_xs_module:    Module::load(&cache.compile("dequant_iq4_xs_f16", DEQUANT_IQ4_XS_F16_SOURCE)?)?,
+            rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
+            attn_step_batched_module: Module::load(&cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?)?,
             matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
             matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
@@ -616,7 +652,7 @@ impl GpuQwen35 {
             matvec_iq4_xs_wave64_module: Module::load(&matvec_iq4_xs_wave64_hsaco)?,
             matvec_f16_wave64_module:    Module::load(&matvec_f16_wave64_hsaco)?,
             blocks,
-            stream: Stream::new()?,
+            stream,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
             gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
@@ -1548,6 +1584,365 @@ impl GpuQwen35 {
         Ok(last)
     }
 
+    // ===== Batched prefill =================================================
+
+    fn launch_cvt(&self, kname: &str, src: *mut c_void, dst: *mut c_void, n: u32)
+        -> Result<(), String>
+    {
+        let f = self.cvt_module.function(kname)?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut s = src; let mut d = dst; let mut na = n;
+        let mut args: [*mut c_void; 3] = [
+            &mut s as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Bulk-dequant a quantized weight tensor to a fresh fp16 buffer.
+    fn dequant_weight(&self, w: &GpuMatvecTensor) -> Result<DeviceBuf<u16>, String> {
+        let n = (w.in_dim as usize) * (w.out_dim as usize);
+        let out: DeviceBuf<u16> = DeviceBuf::new(n)?;
+        let (module, kname, wpb, threads): (&Module, &str, usize, u32) = match w.dtype {
+            GgmlType::Q4_K   => (&self.dequant_q4_k_module,   "dequant_q4_k_f16",   256, 256),
+            GgmlType::Q5_K   => (&self.dequant_q5_k_module,   "dequant_q5_k_f16",   256, 256),
+            GgmlType::Q6_K   => (&self.dequant_q6_k_module,   "dequant_q6_k_f16",   256, 256),
+            GgmlType::Q8_0   => (&self.dequant_q8_0_module,   "dequant_q8_0_f16",    32,  32),
+            GgmlType::IQ4_XS => (&self.dequant_iq4_xs_module, "dequant_iq4_xs_f16", 256, 256),
+            other => return Err(format!("dequant_weight: unsupported {other:?}")),
+        };
+        let n_blocks = (n / wpb) as u32;
+        let f = module.function(kname)?;
+        let mut w_ptr = w.data.raw_ptr();
+        let mut o_ptr = out.raw_ptr();
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 3] = [
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut nb    as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((n_blocks, 1, 1), (threads, 1, 1), 0, Some(&self.stream), &mut args)?; }
+        Ok(out)
+    }
+
+    /// Batched matmul: `Y[N, out] = X[N, in] · Wᵀ`. Dequant W→fp16,
+    /// X→fp16, fp32-accumulate GEMM, Y→fp32. All on `self.stream`.
+    fn bmm(&self, w: &GpuMatvecTensor, x_f32: *mut c_void, n_rows: usize,
+           y_f32: *mut c_void) -> Result<(), String>
+    {
+        let in_d = w.in_dim as usize;
+        let out_d = w.out_dim as usize;
+
+        // W → fp16 (F16 weights are already fp16: use raw bytes directly).
+        let dq: Option<DeviceBuf<u16>>;
+        let w_ptr: *mut c_void;
+        if w.dtype == GgmlType::F16 {
+            w_ptr = w.data.raw_ptr();
+            dq = None;
+        } else {
+            let b = self.dequant_weight(w)?;
+            w_ptr = b.raw_ptr();
+            dq = Some(b);
+        }
+        // X → fp16.
+        let x_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * in_d)?;
+        self.launch_cvt("cvt_f32_to_f16", x_f32, x_f16.raw_ptr(), (n_rows * in_d) as u32)?;
+        // GEMM. rocBLAS handle shares self.stream, so it serialises after
+        // the dequant + cvt launches above — no explicit sync needed.
+        let y_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * out_d)?;
+        unsafe {
+            self.rocblas.gemm_f16_f32acc(
+                RocblasOp::Transpose, RocblasOp::None,
+                out_d as i32, n_rows as i32, in_d as i32,
+                1.0,
+                w_ptr as *const c_void, in_d as i32,
+                x_f16.as_ptr() as *const c_void, in_d as i32,
+                0.0,
+                y_f16.as_ptr() as *mut c_void, out_d as i32,
+            )?;
+        }
+        self.launch_cvt("cvt_f16_to_f32", y_f16.raw_ptr(), y_f32, (n_rows * out_d) as u32)?;
+        drop(dq);  // keep the dequant buffer alive across the GEMM
+        Ok(())
+    }
+
+    fn launch_rope_batched(&self, x: *mut c_void, n_heads: u32, n_rows: u32, base_pos: u32)
+        -> Result<(), String>
+    {
+        let f = self.rope_batched_module.function("rope_apply_batched_f32")?;
+        let half = (self.rotary_dim / 2) as u32;
+        let block: u32 = 64;
+        let grid_x = (half + block - 1) / block;
+        let mut xa = x;
+        let mut ca = self.rope_cos.raw_ptr();
+        let mut sa = self.rope_sin.raw_ptr();
+        let mut hd = self.head_dim as u32;
+        let mut rd = self.rotary_dim as u32;
+        let mut nh = n_heads;
+        let mut bp = base_pos;
+        let mut args: [*mut c_void; 7] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid_x, n_heads, n_rows), (block, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    fn launch_attn_step_batched(&self, q: *mut c_void, k_cache: *mut c_void,
+                                v_cache: *mut c_void, out: *mut c_void,
+                                base_pos: u32, n_rows: u32, scaling: f32)
+        -> Result<(), String>
+    {
+        let f = self.attn_step_batched_module.function("attn_step_batched_f32")?;
+        let block: u32 = 256;
+        let head_dim = self.head_dim as u32;
+        let max_total = base_pos + n_rows;
+        let smem = ((head_dim + max_total) + block) * std::mem::size_of::<f32>() as u32;
+        let mut qa = q; let mut ka = k_cache; let mut va = v_cache; let mut oa = out;
+        let mut nh = self.n_heads as u32;
+        let mut nkv = self.n_kv_heads as u32;
+        let mut hd = head_dim;
+        let mut bp = base_pos;
+        let mut nr = n_rows;
+        let mut sc = scaling;
+        let mut args: [*mut c_void; 10] = [
+            &mut qa as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((self.n_heads as u32, n_rows, 1), (block, 1, 1),
+                          smem, Some(&self.stream), &mut args) }
+    }
+
+    /// Batched prefill: process all `tokens` in one pass, advancing each
+    /// block's state, and return the logits at the LAST position.
+    ///
+    /// Mirrors `forward_tokens` but batches every matmul into a single
+    /// rocBLAS GEMM (weight read once, reused across N rows). The GDN
+    /// recurrent + conv steps stay sequential per position — that's an
+    /// inherent data dependency — but their projections are batched.
+    pub fn forward_tokens_batched(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        assert!(!tokens.is_empty(), "forward_tokens_batched needs ≥1 token");
+        let n = tokens.len();
+        let h     = self.hidden;
+        let q_dim = self.q_dim();
+        let kv_dim = self.kv_dim();
+        let vdim  = self.gdn_value_dim;
+        let cdim  = self.gdn_conv_dim;
+        let scaling = (self.head_dim as f32).powf(-0.5);
+
+        // Per-call batched activation buffers.
+        let ba: DeviceBuf<f32> = DeviceBuf::new(n * h)?;        // running hidden
+        let bb: DeviceBuf<f32> = DeviceBuf::new(n * h)?;        // scratch
+        let bnorm: DeviceBuf<f32> = DeviceBuf::new(n * h)?;     // normed scratch
+
+        // 1) Embed all tokens into ba (one row each).
+        for (r, &tok) in tokens.iter().enumerate() {
+            let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
+            self.launch_embed_lookup_dispatch(&self.token_embd, row_ptr, tok)?;
+        }
+
+        // 2) Every block.
+        for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
+            match (block, st) {
+                (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
+                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?;
+                }
+                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
+                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?;
+                }
+                _ => return Err("block kind mismatch".into()),
+            }
+        }
+        let _ = (q_dim, kv_dim, vdim, cdim);
+
+        // 3) Output norm + projection on the LAST row only.
+        let last_in = unsafe { (ba.raw_ptr() as *mut f32).add((n - 1) * h) } as *mut c_void;
+        self.launch_rmsnorm(last_in, self.output_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h as u32, self.rms_eps)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        self.stream.synchronize()?;
+        state.pos += n;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// One full-attention block over a batch of `n` rows. `ba` is the
+    /// running hidden (mutated in place); `bb` / `bnorm` are scratch.
+    fn batched_full_block(&self, ba: &DeviceBuf<f32>, bb: &DeviceBuf<f32>,
+                          bnorm: &DeviceBuf<f32>, w: &GpuFullAttnBlock,
+                          kv: &mut GpuKvCache, n: usize, scaling: f32)
+        -> Result<(), String>
+    {
+        let h = self.hidden;
+        let q_dim = self.q_dim();
+        let kv_dim = self.kv_dim();
+        let base_pos = kv.len;
+        assert!(base_pos + n <= kv.max_seq, "KV cache overflow in batched prefill");
+
+        // pre-norm → bnorm  (n independent rmsnorms via the multihead kernel)
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+
+        // QKV projections, batched.
+        let q_raw: DeviceBuf<f32> = DeviceBuf::new(n * 2 * q_dim)?;
+        let k_raw: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
+        let v_raw: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
+        self.bmm(&w.attn.attn_q, bnorm.raw_ptr(), n, q_raw.raw_ptr())?;
+        self.bmm(&w.attn.attn_k, bnorm.raw_ptr(), n, k_raw.raw_ptr())?;
+        self.bmm(&w.attn.attn_v, bnorm.raw_ptr(), n, v_raw.raw_ptr())?;
+
+        // split q_raw → q, gate. The split kernel walks n_heads*head_dim
+        // elements; passing n*n_heads covers all rows.
+        let q_buf:   DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
+        let gate:    DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
+        self.launch_split_q_gate(q_raw.raw_ptr(), q_buf.raw_ptr(), gate.raw_ptr(),
+                                 (n * self.n_heads) as u32, self.head_dim as u32)?;
+        // per-head Q-norm (n*n_heads independent heads).
+        self.launch_rmsnorm_multihead(q_buf.raw_ptr(), w.attn.attn_q_norm.raw_ptr(),
+                                      q_buf.raw_ptr(),
+                                      (n * self.n_heads) as u32, self.head_dim as u32,
+                                      self.rms_eps)?;
+        self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
+        // per-kv-head K-norm.
+        let k_norm: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
+        self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
+                                      k_norm.raw_ptr(),
+                                      (n * self.n_kv_heads) as u32, self.head_dim as u32,
+                                      self.rms_eps)?;
+        self.launch_rope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, base_pos as u32)?;
+
+        // Push all N (k, v) into the cache at slots [base_pos, base_pos+n).
+        kv.k.copy_from_device_at_async(&k_norm, base_pos * kv_dim, &self.stream)?;
+        kv.v.copy_from_device_at_async(&v_raw,  base_pos * kv_dim, &self.stream)?;
+
+        // Batched causal attention → attn_concat.
+        let attn: DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
+        self.launch_attn_step_batched(q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
+                                      attn.raw_ptr(), base_pos as u32, n as u32, scaling)?;
+        // output gate + projection.
+        self.launch_sigmoid_mul(attn.raw_ptr(), gate.raw_ptr(), (n * q_dim) as u32)?;
+        self.bmm(&w.attn.attn_output, attn.raw_ptr(), n, bb.raw_ptr())?;
+        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+
+        // FFN sub-layer.
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.batched_ffn(bnorm, bb, &w.ffn, n)?;
+        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+
+        kv.len += n;
+        Ok(())
+    }
+
+    /// Batched SwiGLU FFN: `out_bb = down(silu(gate(in)) * up(in))`.
+    fn batched_ffn(&self, input: &DeviceBuf<f32>, out_bb: &DeviceBuf<f32>,
+                   ffn: &GpuFfnWeights, n: usize) -> Result<(), String>
+    {
+        let f = self.ffn;
+        let gate: DeviceBuf<f32> = DeviceBuf::new(n * f)?;
+        let up:   DeviceBuf<f32> = DeviceBuf::new(n * f)?;
+        self.bmm(&ffn.gate, input.raw_ptr(), n, gate.raw_ptr())?;
+        self.bmm(&ffn.up,   input.raw_ptr(), n, up.raw_ptr())?;
+        self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
+        self.bmm(&ffn.down, gate.raw_ptr(), n, out_bb.raw_ptr())?;
+        Ok(())
+    }
+
+    /// One GDN block over a batch of `n` rows: projections batched, the
+    /// conv1d + recurrent state updates looped sequentially per row
+    /// (inherent recurrence — position r depends on r-1).
+    fn batched_linear_block(&self, ba: &DeviceBuf<f32>, bb: &DeviceBuf<f32>,
+                            bnorm: &DeviceBuf<f32>, w: &GpuLinAttnBlock,
+                            st: &mut GpuLinAttnState, n: usize)
+        -> Result<(), String>
+    {
+        let h = self.hidden;
+        let vdim = self.gdn_value_dim;
+        let cdim = self.gdn_conv_dim;
+        let nh   = self.gdn_n_heads as u32;
+        let hd   = self.gdn_head_dim as u32;
+        let q_scale = (self.gdn_head_dim as f32).powf(-0.5);
+
+        // pre-norm.
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+
+        // Four projections, batched.
+        let qkv: DeviceBuf<f32> = DeviceBuf::new(n * cdim)?;
+        let z:   DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
+        let a:   DeviceBuf<f32> = DeviceBuf::new(n * self.gdn_n_heads)?;
+        let b:   DeviceBuf<f32> = DeviceBuf::new(n * self.gdn_n_heads)?;
+        self.bmm(&w.attn.attn_qkv,  bnorm.raw_ptr(), n, qkv.raw_ptr())?;
+        self.bmm(&w.attn.attn_gate, bnorm.raw_ptr(), n, z.raw_ptr())?;
+        self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr())?;
+        self.bmm(&w.attn.ssm_beta,  bnorm.raw_ptr(), n, b.raw_ptr())?;
+
+        // conv1d + SiLU, sequential per row (conv history threads through).
+        let conv_out: DeviceBuf<f32> = DeviceBuf::new(n * cdim)?;
+        for r in 0..n {
+            let in_ptr  = unsafe { (qkv.raw_ptr()      as *mut f32).add(r * cdim) } as *mut c_void;
+            let out_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(r * cdim) } as *mut c_void;
+            self.launch_conv1d_step_silu(in_ptr, w.attn.ssm_conv1d.raw_ptr(),
+                                         st.conv_hist.raw_ptr(), out_ptr,
+                                         cdim as u32, self.gdn_conv_kernel as u32)?;
+        }
+
+        // Per-row: L2-norm Q/K, recurrent step, gated rmsnorm.
+        let core: DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
+        let q_buf: DeviceBuf<f32> = DeviceBuf::new(vdim)?;
+        let k_buf: DeviceBuf<f32> = DeviceBuf::new(vdim)?;
+        for r in 0..n {
+            let conv_ptr = conv_out.raw_ptr() as *mut f32;
+            let q_in = unsafe { conv_ptr.add(r * cdim)            } as *mut c_void;
+            let k_in = unsafe { conv_ptr.add(r * cdim + vdim)     } as *mut c_void;
+            let v_in = unsafe { conv_ptr.add(r * cdim + 2 * vdim) } as *mut c_void;
+            self.launch_l2norm_qk(q_in, q_buf.raw_ptr(), k_in, k_buf.raw_ptr(),
+                                  nh, hd, 1e-6, q_scale)?;
+            let a_row = unsafe { (a.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
+            let b_row = unsafe { (b.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
+            let core_row = unsafe { (core.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
+            self.launch_gdn_recurrent_step_fused(q_buf.raw_ptr(), k_buf.raw_ptr(), v_in,
+                                                 a_row, b_row,
+                                                 w.attn.ssm_a.raw_ptr(),
+                                                 w.attn.ssm_dt_bias.raw_ptr(),
+                                                 st.recurrent.raw_ptr(), core_row,
+                                                 nh, hd)?;
+            let z_row = unsafe { (z.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
+            self.launch_rmsnorm_gated_multihead(core_row, z_row, w.attn.ssm_norm.raw_ptr(),
+                                                core_row, nh, hd, self.rms_eps)?;
+        }
+
+        // ssm_out projection, batched.
+        self.bmm(&w.attn.ssm_out, core.raw_ptr(), n, bb.raw_ptr())?;
+        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+
+        // FFN sub-layer.
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.batched_ffn(bnorm, bb, &w.ffn, n)?;
+        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+        Ok(())
+    }
+
     /// One full transformer block (full-attention variant): pre-norm +
     /// attention + residual + pre-norm + FFN + residual. Mirrors
     /// `cpu::qwen3_5::full_attention_block`.
@@ -1946,6 +2341,52 @@ mod tests {
                 "token {token} idx {worst_at}: gpu={} cpu={} exceeds tol",
                 gpu_logits[worst_at], cpu_logits[worst_at]);
         }
+    }
+
+    #[test]
+    fn forward_tokens_batched_matches_sequential() {
+        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP"); return; }
+        let _dev = hip::Device::set(0).unwrap();
+        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF"); return };
+        let cache = match KernelCache::new() {
+            Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return }
+        };
+        let g = GgufFile::open(&path).unwrap();
+        let m = Qwen35F32Model::load(&g).unwrap();
+        let vocab = m.model.config.vocab_size as usize;
+        let max_seq = 32usize;
+        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("gpu");
+
+        let prompt = [198u32, 100, 248046, 1, 2, 50_000, 7];
+
+        // Sequential fp32 decode path (the reference).
+        let mut s_seq = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let seq = gpu.forward_tokens(&prompt, &mut s_seq).expect("sequential");
+
+        // Batched fp16-GEMM prefill path.
+        let mut s_bat = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let bat = gpu.forward_tokens_batched(&prompt, &mut s_bat).expect("batched");
+
+        assert_eq!(seq.len(), vocab);
+        assert_eq!(bat.len(), vocab);
+
+        let seq_argmax = (0..vocab).max_by(|&a, &b| seq[a].total_cmp(&seq[b])).unwrap();
+        let bat_argmax = (0..vocab).max_by(|&a, &b| bat[a].total_cmp(&bat[b])).unwrap();
+
+        // Top-5 overlap — fp16 prefill drifts from fp32 decode over 24
+        // layers, so we check behavioural agreement, not bit equality.
+        let mut seq_idx: Vec<usize> = (0..vocab).collect();
+        seq_idx.sort_by(|&a, &b| seq[b].total_cmp(&seq[a]));
+        let mut bat_idx: Vec<usize> = (0..vocab).collect();
+        bat_idx.sort_by(|&a, &b| bat[b].total_cmp(&bat[a]));
+        let seq_top5: std::collections::HashSet<usize> = seq_idx[..5].iter().copied().collect();
+        let overlap = bat_idx[..5].iter().filter(|i| seq_top5.contains(i)).count();
+
+        eprintln!("batched prefill: argmax seq={seq_argmax} bat={bat_argmax}, top-5 overlap {overlap}/5");
+        assert_eq!(seq_argmax, bat_argmax,
+            "batched argmax {bat_argmax} != sequential {seq_argmax}");
+        assert!(overlap >= 4, "top-5 overlap {overlap}/5 too low — likely a real bug");
+        assert_eq!(s_bat.pos, prompt.len(), "batched state didn't advance correctly");
     }
 
     #[test]
