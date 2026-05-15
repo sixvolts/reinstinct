@@ -1062,6 +1062,152 @@ mod tests {
         }
     }
 
+    fn check_bulk_dequant(cache: &KernelCache, name: &str, source: &str, kernel: &str,
+                          w_bytes: &[u8], weights_per_block: usize, block_threads: u32,
+                          cpu_f32: &[f32]) {
+        use crate::quant::half::f32_to_f16;
+        let n_blocks = cpu_f32.len() / weights_per_block;
+        let hsaco = cache.compile(name, source).expect("compile");
+        let module = Module::load(&hsaco).expect("load");
+        let f = module.function(kernel).expect("function");
+
+        let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(w_bytes).unwrap();
+        let dout: DeviceBuf<u16> = DeviceBuf::new(cpu_f32.len()).unwrap();
+        let mut w_ptr = dw.raw_ptr();
+        let mut o_ptr = dout.raw_ptr();
+        let mut nb = n_blocks as u32;
+        let mut args: [*mut c_void; 3] = [
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut nb    as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((n_blocks as u32, 1, 1), (block_threads, 1, 1), 0, None, &mut args)
+            .expect("launch"); }
+        hip::Device(0).synchronize().expect("sync");
+
+        let mut got = vec![0u16; cpu_f32.len()];
+        dout.copy_to_host(&mut got).unwrap();
+        // GPU emits fp16; reference is f32→f16 of the CPU dequant.
+        // Compare numerically (decoding both back to f32) rather than by
+        // raw bits — signed zero (±0.0) is numerically equal but differs
+        // in the sign bit, and fp16 rounding can land 1 ulp apart.
+        use crate::quant::half::f16_to_f32;
+        let mut max_abs = 0.0f32;
+        for i in 0..cpu_f32.len() {
+            let want = f16_to_f32(f32_to_f16(cpu_f32[i]));
+            let got_f = f16_to_f32(got[i]);
+            let d = (got_f - want).abs();
+            if d > max_abs { max_abs = d; }
+        }
+        eprintln!("{name}: max abs diff vs f32→f16(cpu) = {max_abs:.3e}");
+        // fp16 has ~3 decimal digits; allow a couple of ulp at the
+        // largest magnitudes seen here (≤ ~40).
+        assert!(max_abs < 5e-2, "{name}: abs diff {max_abs:.3e} too large");
+    }
+
+    #[test]
+    fn bulk_dequant_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        // Synthesise random bytes for each quant type, dequant on CPU to
+        // f32, dequant on GPU to f16, and check the f16 results agree
+        // with f32→f16 of the CPU output.
+        let mut s: u64 = 0xDE2AA47;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+
+        // Q4_K — 256 w / 144 B.
+        {
+            let n_blocks = 64;
+            let mut w = vec![0u8; n_blocks * crate::quant::q4_k::BYTES_PER_BLOCK];
+            for b in w.iter_mut() { *b = rng_u8(); }
+            // Tame the fp16 scales so dequant values stay in fp16 range.
+            for blk in 0..n_blocks {
+                let off = blk * crate::quant::q4_k::BYTES_PER_BLOCK;
+                w[off..off+2].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.01).to_le_bytes());
+                w[off+2..off+4].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.005).to_le_bytes());
+            }
+            let mut cpu = vec![0.0f32; n_blocks * 256];
+            crate::quant::q4_k::dequantize_to_f32(&w, &mut cpu);
+            check_bulk_dequant(&cache, "dequant_q4_k_f16",
+                include_str!("../../kernels/dequant_q4_k_f16.cpp"), "dequant_q4_k_f16",
+                &w, 256, 256, &cpu);
+        }
+        // Q6_K — 256 w / 210 B.
+        {
+            let n_blocks = 64;
+            let bpb = crate::quant::q6_k::BYTES_PER_BLOCK;
+            let mut w = vec![0u8; n_blocks * bpb];
+            for b in w.iter_mut() { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let off = blk * bpb;
+                w[off+208..off+210].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.01).to_le_bytes());
+            }
+            let mut cpu = vec![0.0f32; n_blocks * 256];
+            crate::quant::q6_k::dequantize_to_f32(&w, &mut cpu);
+            check_bulk_dequant(&cache, "dequant_q6_k_f16",
+                include_str!("../../kernels/dequant_q6_k_f16.cpp"), "dequant_q6_k_f16",
+                &w, 256, 256, &cpu);
+        }
+        // Q5_K — 256 w / 176 B.
+        {
+            let n_blocks = 64;
+            let bpb = crate::quant::q5_k::BYTES_PER_BLOCK;
+            let mut w = vec![0u8; n_blocks * bpb];
+            for b in w.iter_mut() { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let off = blk * bpb;
+                w[off..off+2].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.01).to_le_bytes());
+                w[off+2..off+4].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.005).to_le_bytes());
+            }
+            let mut cpu = vec![0.0f32; n_blocks * 256];
+            crate::quant::q5_k::dequantize_to_f32(&w, &mut cpu);
+            check_bulk_dequant(&cache, "dequant_q5_k_f16",
+                include_str!("../../kernels/dequant_q5_k_f16.cpp"), "dequant_q5_k_f16",
+                &w, 256, 256, &cpu);
+        }
+        // Q8_0 — 32 w / 34 B.
+        {
+            let n_blocks = 256;
+            let bpb = crate::quant::q8_0::BYTES_PER_BLOCK;
+            let mut w = vec![0u8; n_blocks * bpb];
+            for b in w.iter_mut() { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let off = blk * bpb;
+                w[off..off+2].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.02).to_le_bytes());
+            }
+            let mut cpu = vec![0.0f32; n_blocks * 32];
+            crate::quant::q8_0::dequantize_to_f32(&w, &mut cpu);
+            check_bulk_dequant(&cache, "dequant_q8_0_f16",
+                include_str!("../../kernels/dequant_q8_0_f16.cpp"), "dequant_q8_0_f16",
+                &w, 32, 32, &cpu);
+        }
+        // IQ4_XS — 256 w / 136 B.
+        {
+            let n_blocks = 64;
+            let bpb = crate::quant::iq4_xs::BYTES_PER_BLOCK;
+            let mut w = vec![0u8; n_blocks * bpb];
+            for b in w.iter_mut() { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let off = blk * bpb;
+                w[off..off+2].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(0.005).to_le_bytes());
+            }
+            let mut cpu = vec![0.0f32; n_blocks * 256];
+            crate::quant::iq4_xs::dequantize_to_f32(&w, &mut cpu);
+            check_bulk_dequant(&cache, "dequant_iq4_xs_f16",
+                include_str!("../../kernels/dequant_iq4_xs_f16.cpp"), "dequant_iq4_xs_f16",
+                &w, 256, 256, &cpu);
+        }
+    }
+
     #[test]
     fn rmsnorm_handles_unit_weight() {
         let Some(cache) = skip_if_no_gpu() else { return };
