@@ -9,6 +9,7 @@
 //! the ~1-2 s `hipcc` invocation.
 
 pub mod kernels;
+pub mod prefill;
 pub mod qwen35;
 pub mod smoke;
 

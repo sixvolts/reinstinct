@@ -37,6 +37,13 @@ pub enum RocblasOp {
     Transpose = 112,
 }
 
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+pub enum RocblasDatatype {
+    F16R = 150,
+    F32R = 151,
+}
+
 pub struct Rocblas {
     _lib: Library,
     pub create_handle:  unsafe extern "C" fn(*mut RocblasHandle) -> RocblasStatus,
@@ -54,6 +61,19 @@ pub struct Rocblas {
         *const u16, i32,                       // B, ldb
         *const u16,                            // beta (fp16 bits)
         *mut u16, i32) -> RocblasStatus,       // C, ldc
+    /// `rocblas_gemm_ex` — typed GEMM. We use it for fp16-storage /
+    /// fp32-compute (HPA): fp16 A/B/C/D, fp32 alpha/beta/accumulate.
+    pub gemm_ex: unsafe extern "C" fn(
+        RocblasHandle, RocblasOp, RocblasOp,
+        i32, i32, i32,                          // m, n, k
+        *const c_void,                          // alpha
+        *const c_void, RocblasDatatype, i32,    // A, a_type, lda
+        *const c_void, RocblasDatatype, i32,    // B, b_type, ldb
+        *const c_void,                          // beta
+        *const c_void, RocblasDatatype, i32,    // C, c_type, ldc
+        *mut c_void,   RocblasDatatype, i32,    // D, d_type, ldd
+        RocblasDatatype,                        // compute_type
+        i32, i32, u32) -> RocblasStatus,        // algo, solution_index, flags
 }
 
 unsafe impl Send for Rocblas {}
@@ -91,6 +111,7 @@ pub fn rocblas() -> Result<&'static Rocblas, &'static str> {
             destroy_handle: sym!(b"rocblas_destroy_handle"),
             set_stream:     sym!(b"rocblas_set_stream"),
             hgemm:          sym!(b"rocblas_hgemm"),
+            gemm_ex:        sym!(b"rocblas_gemm_ex"),
             _lib: lib,
         })
     });
@@ -152,6 +173,48 @@ impl Handle {
             )
         };
         if !s.is_ok() { Err(format!("rocblas_hgemm: status {}", s.0)) } else { Ok(()) }
+    }
+
+    /// fp16-storage / fp32-compute GEMM via `rocblas_gemm_ex`:
+    /// `D ← α · op(A) · op(B) + β · C`, A/B/C/D all fp16, but alpha,
+    /// beta, and the inner accumulation are fp32 — essential for long
+    /// reductions where plain `hgemm`'s fp16 accumulate loses precision.
+    ///
+    /// C and D point at the same buffer here (in-place); β = 0.
+    ///
+    /// # Safety
+    /// Caller sizes the device buffers and keeps them alive across the
+    /// (async) launch.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_f16_f32acc(&self,
+        trans_a: RocblasOp, trans_b: RocblasOp,
+        m: i32, n: i32, k: i32,
+        alpha: f32,
+        a: *const c_void, lda: i32,
+        b: *const c_void, ldb: i32,
+        beta: f32,
+        c: *mut c_void, ldc: i32,
+    ) -> Result<(), String>
+    {
+        let api = rocblas().map_err(|s| s.to_string())?;
+        let alpha = alpha;  // fp32 scalars, passed by pointer
+        let beta  = beta;
+        let s = unsafe {
+            (api.gemm_ex)(
+                self.raw, trans_a, trans_b, m, n, k,
+                &alpha as *const f32 as *const c_void,
+                a, RocblasDatatype::F16R, lda,
+                b, RocblasDatatype::F16R, ldb,
+                &beta as *const f32 as *const c_void,
+                c as *const c_void, RocblasDatatype::F16R, ldc,
+                c, RocblasDatatype::F16R, ldc,
+                RocblasDatatype::F32R,   // fp32 accumulate
+                0,  // rocblas_gemm_algo_standard
+                0,  // solution_index
+                0,  // flags
+            )
+        };
+        if !s.is_ok() { Err(format!("rocblas_gemm_ex: status {}", s.0)) } else { Ok(()) }
     }
 }
 
