@@ -53,6 +53,7 @@ const SILU_INPLACE_SOURCE:          &str = include_str!("../../kernels/silu_inpl
 const L2NORM_MULTIHEAD_SOURCE:      &str = include_str!("../../kernels/l2norm_multihead.cpp");
 const GDN_DECAY_BETA_SOURCE:        &str = include_str!("../../kernels/gdn_decay_beta.cpp");
 const GDN_RECURRENT_STEP_SOURCE:    &str = include_str!("../../kernels/gdn_recurrent_step.cpp");
+const GDN_RECURRENT_STEP_LDS_SOURCE:&str = include_str!("../../kernels/gdn_recurrent_step_lds.cpp");
 const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
 
 const MATVEC_Q8_0_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0.cpp");
@@ -395,6 +396,7 @@ pub struct GpuQwen35 {
     gdn_decay:    DeviceBuf<f32>,  // [n_heads]
     gdn_beta:     DeviceBuf<f32>,  // [n_heads]
     gdn_core_out: DeviceBuf<f32>,  // [value_dim]         core attn out / normed_out
+    gdn_delta:    DeviceBuf<f32>,  // [n_heads, head_dim] cross-thread delta for LDS recurrent kernel
 
     // RoPE tables resident on device.
     rope_cos: DeviceBuf<f32>,      // [max_seq, rotary_dim]
@@ -416,6 +418,7 @@ pub struct GpuQwen35 {
     l2norm_multihead_module:      Module,
     gdn_decay_beta_module:        Module,
     gdn_recurrent_step_module:    Module,
+    gdn_recurrent_step_lds_module: Module,
     rmsnorm_gated_multihead_module: Module,
 
     matvec_q8_0_module:    Module,
@@ -512,6 +515,7 @@ impl GpuQwen35 {
         let gdn_decay    = DeviceBuf::new(gdn_n_heads)?;
         let gdn_beta     = DeviceBuf::new(gdn_n_heads)?;
         let gdn_core_out = DeviceBuf::new(gdn_value_dim)?;
+        let gdn_delta    = DeviceBuf::new(gdn_n_heads * gdn_head_dim)?;
 
         // Build RoPE tables host-side once and upload.
         let rope = crate::cpu::rope::RopeCache::new(rotary_dim, max_seq, cfg.rope_freq_base);
@@ -540,6 +544,7 @@ impl GpuQwen35 {
         let l2norm_multihead_hsaco       = cache.compile("l2norm_multihead",  L2NORM_MULTIHEAD_SOURCE)?;
         let gdn_decay_beta_hsaco         = cache.compile("gdn_decay_beta",    GDN_DECAY_BETA_SOURCE)?;
         let gdn_recurrent_step_hsaco     = cache.compile("gdn_recurrent_step", GDN_RECURRENT_STEP_SOURCE)?;
+        let gdn_recurrent_step_lds_hsaco = cache.compile("gdn_recurrent_step_lds", GDN_RECURRENT_STEP_LDS_SOURCE)?;
         let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
         let matvec_q8_0_hsaco   = cache.compile("matvec_q8_0",   MATVEC_Q8_0_SOURCE)?;
         let matvec_q4_k_hsaco   = cache.compile("matvec_q4_k",   MATVEC_Q4_K_SOURCE)?;
@@ -582,6 +587,7 @@ impl GpuQwen35 {
             l2norm_multihead_module:      Module::load(&l2norm_multihead_hsaco)?,
             gdn_decay_beta_module:        Module::load(&gdn_decay_beta_hsaco)?,
             gdn_recurrent_step_module:    Module::load(&gdn_recurrent_step_hsaco)?,
+            gdn_recurrent_step_lds_module: Module::load(&gdn_recurrent_step_lds_hsaco)?,
             rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
             matvec_q8_0_module:   Module::load(&matvec_q8_0_hsaco)?,
             matvec_q4_k_module:   Module::load(&matvec_q4_k_hsaco)?,
@@ -602,7 +608,7 @@ impl GpuQwen35 {
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
             gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
-            gdn_decay, gdn_beta, gdn_core_out,
+            gdn_decay, gdn_beta, gdn_core_out, gdn_delta,
             rms_eps: cfg.rms_norm_eps,
             max_seq,
         })
@@ -971,6 +977,35 @@ impl GpuQwen35 {
         unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
+    fn launch_gdn_recurrent_step_lds(&self,
+        q: *mut c_void, k: *mut c_void, v: *mut c_void,
+        decay: *mut c_void, beta: *mut c_void,
+        state: *mut c_void, out: *mut c_void, delta_scratch: *mut c_void,
+        n_heads: u32, head_dim: u32) -> Result<(), String>
+    {
+        let f = self.gdn_recurrent_step_lds_module.function("gdn_recurrent_step_lds_f32")?;
+        let block: u32 = head_dim;
+        // Dynamic LDS = state matrix only (head_dim * head_dim floats).
+        let smem = head_dim * head_dim * std::mem::size_of::<f32>() as u32;
+        let mut qa = q; let mut ka = k; let mut va = v;
+        let mut da = decay; let mut ba = beta;
+        let mut sa = state; let mut oa = out; let mut dla = delta_scratch;
+        let mut nh = n_heads; let mut hd = head_dim;
+        let mut args: [*mut c_void; 10] = [
+            &mut qa  as *mut _ as *mut c_void,
+            &mut ka  as *mut _ as *mut c_void,
+            &mut va  as *mut _ as *mut c_void,
+            &mut da  as *mut _ as *mut c_void,
+            &mut ba  as *mut _ as *mut c_void,
+            &mut sa  as *mut _ as *mut c_void,
+            &mut oa  as *mut _ as *mut c_void,
+            &mut dla as *mut _ as *mut c_void,
+            &mut nh  as *mut _ as *mut c_void,
+            &mut hd  as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
+    }
+
     fn launch_rmsnorm_gated_multihead(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
                                       y: *mut c_void, n_heads: u32, head_dim: u32, eps: f32)
         -> Result<(), String>
@@ -1165,6 +1200,122 @@ impl GpuQwen35 {
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
+    }
+
+    /// Diagnostic: run one decode step where every kernel inside one
+    /// chosen linear-attention block is bracketed with HIP events.
+    /// Returns (logits, list of (name, ms) pairs) for the block at
+    /// `traced_block_idx`. Other blocks run normally.
+    pub fn forward_token_traced_gdn(&self, token: u32, state: &mut Qwen35GpuState,
+                                    traced_block_idx: usize)
+        -> Result<(Vec<f32>, Vec<(&'static str, f32)>), String>
+    {
+        assert_eq!(state.block_states.len(), self.blocks.len());
+        let h_dim     = self.hidden        as u32;
+        let value_dim = self.gdn_value_dim as u32;
+        let conv_dim  = self.gdn_conv_dim  as u32;
+        let n_heads   = self.gdn_n_heads   as u32;
+        let head_dim  = self.gdn_head_dim  as u32;
+        let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
+
+        // Embed lookup → hidden_a
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+
+        // Walk blocks, but for `traced_block_idx` (which must be a Linear
+        // block) we expand the chain manually with events between kernels.
+        let mut traced_events: Vec<(&'static str, Event, Event)> = Vec::new();
+        for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
+            if i != traced_block_idx {
+                match (block, st) {
+                    (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
+                        self.step_full_attention_block_dev(
+                            self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, kv)?;
+                    }
+                    (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
+                        self.step_linear_attention_block_dev(
+                            self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, s)?;
+                    }
+                    _ => return Err("block kind mismatch".into()),
+                }
+                continue;
+            }
+
+            // Traced block — must be Linear.
+            let (w, lstate) = match (block, st) {
+                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => (w, s),
+                _ => return Err("traced block must be LinearAttention".into()),
+            };
+
+            // Helper: wrap a closure in HIP events and append to the trace.
+            macro_rules! traced {
+                ($name:expr, $body:expr) => {{
+                    let s = Event::new()?;  s.record(&self.stream)?;
+                    $body?;
+                    let e = Event::new()?;  e.record(&self.stream)?;
+                    traced_events.push(($name, s, e));
+                }};
+            }
+
+            // attn pre-norm (output_ptr = hidden_b serves as scratch)
+            traced!("attn_norm", self.launch_rmsnorm(self.hidden_a.raw_ptr(),
+                w.attn.attn_norm.raw_ptr(), self.hidden_b.raw_ptr(), h_dim, self.rms_eps));
+            traced!("matvec_attn_qkv", self.launch_matvec_dispatch(&w.attn.attn_qkv,
+                self.hidden_b.raw_ptr(), self.gdn_qkv.raw_ptr()));
+            traced!("matvec_attn_gate", self.launch_matvec_dispatch(&w.attn.attn_gate,
+                self.hidden_b.raw_ptr(), self.gdn_z.raw_ptr()));
+            traced!("matvec_ssm_alpha", self.launch_matvec_dispatch(&w.attn.ssm_alpha,
+                self.hidden_b.raw_ptr(), self.gdn_a.raw_ptr()));
+            traced!("matvec_ssm_beta", self.launch_matvec_dispatch(&w.attn.ssm_beta,
+                self.hidden_b.raw_ptr(), self.gdn_b.raw_ptr()));
+            traced!("conv1d_step", self.launch_conv1d_step(self.gdn_qkv.raw_ptr(),
+                w.attn.ssm_conv1d.raw_ptr(), lstate.conv_hist.raw_ptr(),
+                self.gdn_conv_out.raw_ptr(), conv_dim, self.gdn_conv_kernel as u32));
+            traced!("silu", self.launch_silu_inplace(self.gdn_conv_out.raw_ptr(), conv_dim));
+            let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
+            let q_in_ptr = unsafe { conv_out_ptr.add(0)                      } as *mut c_void;
+            let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_value_dim)     } as *mut c_void;
+            let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_value_dim) } as *mut c_void;
+            traced!("l2norm_q", self.launch_l2norm_multihead(q_in_ptr, self.gdn_q.raw_ptr(),
+                n_heads, head_dim, 1e-6, q_scale));
+            traced!("l2norm_k", self.launch_l2norm_multihead(k_in_ptr, self.gdn_k.raw_ptr(),
+                n_heads, head_dim, 1e-6, 1.0));
+            traced!("decay_beta", self.launch_gdn_decay_beta(self.gdn_a.raw_ptr(),
+                self.gdn_b.raw_ptr(), w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
+                self.gdn_decay.raw_ptr(), self.gdn_beta.raw_ptr(), n_heads));
+            traced!("recurrent_step", self.launch_gdn_recurrent_step(
+                self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr,
+                self.gdn_decay.raw_ptr(), self.gdn_beta.raw_ptr(),
+                lstate.recurrent.raw_ptr(), self.gdn_core_out.raw_ptr(),
+                n_heads, head_dim));
+            traced!("rmsnorm_gated", self.launch_rmsnorm_gated_multihead(
+                self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
+                w.attn.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr(),
+                n_heads, head_dim, self.rms_eps));
+            traced!("matvec_ssm_out", self.launch_matvec_dispatch(&w.attn.ssm_out,
+                self.gdn_core_out.raw_ptr(), self.hidden_b.raw_ptr()));
+            // Post-block residual + ffn (untraced)
+            self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
+            self.launch_rmsnorm(self.hidden_a.raw_ptr(), w.post_norm.raw_ptr(),
+                                self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
+            self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &w.ffn)?;
+            self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
+        }
+
+        // Output norm + projection
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        self.stream.synchronize()?;
+        state.pos += 1;
+
+        let mut trace = Vec::with_capacity(traced_events.len());
+        for (name, s, e) in &traced_events {
+            trace.push((*name, Event::elapsed_time(s, e)?));
+        }
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok((out, trace))
     }
 
     /// Like `forward_token` but records per-stage GPU times via HIP
