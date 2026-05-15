@@ -88,6 +88,13 @@ pub struct Gemma4Config {
     pub kv_heads: Vec<u32>,
     /// Attention kind per layer.
     pub attn_kinds: Vec<AttnKind>,
+
+    /// MoE: routed expert count (0 ⇒ dense model, e.g. the 31B).
+    pub expert_count: u32,
+    /// MoE: experts activated per token (top-k of `expert_count`).
+    pub expert_used_count: u32,
+    /// MoE: per-expert FFN intermediate size.
+    pub expert_ff_size: u32,
 }
 
 impl Gemma4Config {
@@ -140,6 +147,11 @@ impl Gemma4Config {
 
         let tied_embeddings = gguf.tensor("output.weight").is_none();
 
+        // MoE metadata — absent on the dense 31B.
+        let expert_count      = optional_u32(gguf, "gemma4.expert_count").unwrap_or(0);
+        let expert_used_count = optional_u32(gguf, "gemma4.expert_used_count").unwrap_or(0);
+        let expert_ff_size    = optional_u32(gguf, "gemma4.expert_feed_forward_length").unwrap_or(0);
+
         Ok(Self {
             block_count, hidden_size, ffn_size, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
@@ -147,7 +159,13 @@ impl Gemma4Config {
             rope_freq_base, rope_freq_base_swa, rope_dim_full, rope_dim_swa,
             final_logit_softcapping, tied_embeddings,
             kv_heads, attn_kinds,
+            expert_count, expert_used_count, expert_ff_size,
         })
+    }
+
+    /// True for MoE models (the 26B-A4B); false for the dense 31B.
+    pub fn is_moe(&self) -> bool {
+        self.expert_count > 0
     }
 
     /// Head dim for the given layer's attention kind.
@@ -187,8 +205,9 @@ impl Gemma4Model {
         if !self.config.tied_embeddings {
             require_tensor(gguf, "output.weight")?;
         }
+        let moe = self.config.is_moe();
         for (layer, &kind) in self.config.attn_kinds.iter().enumerate() {
-            for name in expected_tensors(layer as u32, kind) {
+            for name in expected_tensors(layer as u32, kind, moe) {
                 require_tensor(gguf, &name)?;
             }
         }
@@ -203,7 +222,7 @@ impl Gemma4Model {
 /// layers do **not** — they ship only `attn_k`. (How the V stream is
 /// reconstructed on the full layers is a forward-pass concern resolved
 /// when the Gemma 4 oracle is built.)
-pub fn expected_tensors(layer: u32, kind: AttnKind) -> Vec<String> {
+pub fn expected_tensors(layer: u32, kind: AttnKind, moe: bool) -> Vec<String> {
     let mut names = vec![
         format!("blk.{layer}.attn_norm.weight"),
         format!("blk.{layer}.attn_q.weight"),
@@ -212,6 +231,7 @@ pub fn expected_tensors(layer: u32, kind: AttnKind) -> Vec<String> {
         format!("blk.{layer}.attn_k_norm.weight"),
         format!("blk.{layer}.attn_output.weight"),
         format!("blk.{layer}.post_attention_norm.weight"),
+        // Shared MLP — present on both dense and MoE layers.
         format!("blk.{layer}.ffn_norm.weight"),
         format!("blk.{layer}.ffn_gate.weight"),
         format!("blk.{layer}.ffn_up.weight"),
@@ -221,6 +241,18 @@ pub fn expected_tensors(layer: u32, kind: AttnKind) -> Vec<String> {
     ];
     if kind == AttnKind::Sliding {
         names.push(format!("blk.{layer}.attn_v.weight"));
+    }
+    if moe {
+        // Dual-FFN: the shared MLP gets a post_ffw_norm_1; the routed
+        // expert block adds its own pre/post norm, router, and experts.
+        names.push(format!("blk.{layer}.post_ffw_norm_1.weight"));
+        names.push(format!("blk.{layer}.pre_ffw_norm_2.weight"));
+        names.push(format!("blk.{layer}.post_ffw_norm_2.weight"));
+        names.push(format!("blk.{layer}.ffn_gate_inp.weight"));
+        names.push(format!("blk.{layer}.ffn_gate_inp.scale"));
+        names.push(format!("blk.{layer}.ffn_gate_up_exps.weight"));
+        names.push(format!("blk.{layer}.ffn_down_exps.weight"));
+        names.push(format!("blk.{layer}.ffn_down_exps.scale"));
     }
     names
 }
@@ -235,6 +267,10 @@ fn require_str<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a str> {
     require_metadata(gguf, key)?
         .as_str()
         .ok_or(Gemma4Error::WrongMetadataType { key, expected: "string" })
+}
+
+fn optional_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
+    gguf.metadata_get(key).and_then(|v| v.as_u32())
 }
 
 fn require_u32(gguf: &GgufFile, key: &'static str) -> Result<u32> {
@@ -316,6 +352,26 @@ mod tests {
         }
         assert_eq!(c.final_logit_softcapping, 30.0);
         assert!(c.tied_embeddings);
+    }
+
+    #[test]
+    fn loads_gemma4_26b_moe_config() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let Some(home) = home else { return };
+        let p = home.join("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf");
+        if !p.exists() { eprintln!("skip: no gemma4-26B fixture"); return; }
+        let gguf = GgufFile::open(&p).expect("open gguf");
+        let model = Gemma4Model::load(&gguf).expect("load gemma4 26B");
+        let c = &model.config;
+        assert!(c.is_moe());
+        assert_eq!(c.block_count, 30);
+        assert_eq!(c.hidden_size, 2816);
+        assert_eq!(c.expert_count, 128);
+        assert_eq!(c.expert_used_count, 8);
+        assert_eq!(c.expert_ff_size, 704);
+        assert_eq!(c.ffn_size, 2112);   // shared MLP intermediate
+        eprintln!("gemma4-26B MoE: {} layers, {} experts, {} used, expert_ff {}",
+                  c.block_count, c.expert_count, c.expert_used_count, c.expert_ff_size);
     }
 
     #[test]

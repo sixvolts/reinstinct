@@ -43,7 +43,8 @@ pub struct Gemma4CpuModel {
     output_norm: Vec<f32>,
 }
 
-/// Dequantised weights for one transformer layer.
+/// Dequantised weights for one transformer layer. `ffn_*` is the shared
+/// MLP — present on every layer; `moe` is set only on MoE layers.
 struct LayerWeights {
     attn_norm:    Vec<f32>,
     attn_q:       Vec<f32>,
@@ -60,6 +61,25 @@ struct LayerWeights {
     ffn_down:     Vec<f32>,
     post_ffw_norm: Vec<f32>,
     layer_output_scale: f32,
+    moe:          Option<MoeWeights>,
+}
+
+/// MoE-layer-only weights. The expert matrices themselves are NOT held
+/// here — they are dequantised on demand (only the 8 routed experts per
+/// token), since all 128 at fp32 would be ~3 GB per layer.
+struct MoeWeights {
+    /// Post-norm for the shared MLP branch.
+    post_ffw_norm_1: Vec<f32>,
+    /// Pre-norm for the routed-expert branch.
+    pre_ffw_norm_2:  Vec<f32>,
+    /// Post-norm for the routed-expert branch.
+    post_ffw_norm_2: Vec<f32>,
+    /// Router projection, F32 [hidden, n_expert].
+    gate_inp:    Vec<f32>,
+    /// Router input scale, F32 [hidden].
+    gate_inp_s:  Vec<f32>,
+    /// Per-expert scalar on the down-projection output, F32 [n_expert].
+    down_exps_s: Vec<f32>,
 }
 
 /// Per-layer KV cache. Each `push` appends `kv_heads · head_dim` floats.
@@ -104,6 +124,18 @@ impl Gemma4CpuModel {
             None
         };
         let los = dequant(&self.gguf, &format!("{p}layer_output_scale.weight"))?;
+        let moe = if self.model.config.is_moe() {
+            Some(MoeWeights {
+                post_ffw_norm_1: dequant(&self.gguf, &format!("{p}post_ffw_norm_1.weight"))?,
+                pre_ffw_norm_2:  dequant(&self.gguf, &format!("{p}pre_ffw_norm_2.weight"))?,
+                post_ffw_norm_2: dequant(&self.gguf, &format!("{p}post_ffw_norm_2.weight"))?,
+                gate_inp:    dequant(&self.gguf, &format!("{p}ffn_gate_inp.weight"))?,
+                gate_inp_s:  dequant(&self.gguf, &format!("{p}ffn_gate_inp.scale"))?,
+                down_exps_s: dequant(&self.gguf, &format!("{p}ffn_down_exps.scale"))?,
+            })
+        } else {
+            None
+        };
         Ok(LayerWeights {
             attn_norm:    dequant(&self.gguf, &format!("{p}attn_norm.weight"))?,
             attn_q:       dequant(&self.gguf, &format!("{p}attn_q.weight"))?,
@@ -119,6 +151,7 @@ impl Gemma4CpuModel {
             ffn_down:     dequant(&self.gguf, &format!("{p}ffn_down.weight"))?,
             post_ffw_norm: dequant(&self.gguf, &format!("{p}post_ffw_norm.weight"))?,
             layer_output_scale: los[0],
+            moe,
         })
     }
 
@@ -263,7 +296,9 @@ impl Gemma4CpuModel {
         ops::rmsnorm(&attn_out, &w.post_attention_norm, eps, &mut attn_normed);
         for i in 0..h { x[i] += attn_normed[i]; }
 
-        // --- FFN sub-layer (GeGLU) ---
+        // --- FFN sub-layer ---
+        // Shared MLP (GeGLU) — runs on every layer. `x` still holds
+        // attn_out; we don't mutate it until the final residual add.
         let f = cfg.ffn_size as usize;
         let mut ffn_in = vec![0.0f32; h];
         ops::rmsnorm(x, &w.ffn_norm, eps, &mut ffn_in);
@@ -272,15 +307,89 @@ impl Gemma4CpuModel {
         ops::matvec(&ffn_in, &w.ffn_gate, h, f, &mut gate);
         ops::matvec(&ffn_in, &w.ffn_up,   h, f, &mut up);
         for i in 0..f { gate[i] = ops::gelu(gate[i]) * up[i]; }
-        let mut ffn_out = vec![0.0f32; h];
-        ops::matvec(&gate, &w.ffn_down, f, h, &mut ffn_out);
+        let mut mlp = vec![0.0f32; h];
+        ops::matvec(&gate, &w.ffn_down, f, h, &mut mlp);
+
+        // Combined FFN result (pre the shared post_ffw_norm).
+        let ffn_result = match &w.moe {
+            None => mlp,   // dense layer — the MLP is the whole FFN
+            Some(mw) => {
+                // Shared-MLP branch gets its own post-norm.
+                let mut cur_mlp = vec![0.0f32; h];
+                ops::rmsnorm(&mlp, &mw.post_ffw_norm_1, eps, &mut cur_mlp);
+                // Routed-expert branch.
+                let moe = self.moe_branch(x, layer, mw)?;
+                let mut cur_moe = vec![0.0f32; h];
+                ops::rmsnorm(&moe, &mw.post_ffw_norm_2, eps, &mut cur_moe);
+                for i in 0..h { cur_mlp[i] += cur_moe[i]; }
+                cur_mlp
+            }
+        };
+
         let mut ffn_normed = vec![0.0f32; h];
-        ops::rmsnorm(&ffn_out, &w.post_ffw_norm, eps, &mut ffn_normed);
+        ops::rmsnorm(&ffn_result, &w.post_ffw_norm, eps, &mut ffn_normed);
         for i in 0..h { x[i] += ffn_normed[i]; }
 
         // Per-layer output scale.
         for v in x.iter_mut() { *v *= w.layer_output_scale; }
         Ok(())
+    }
+
+    /// Routed-expert branch of a MoE layer. `attn_out` is the post-
+    /// attention residual stream; returns the expert mixture (h-dim,
+    /// before `post_ffw_norm_2`). Only the 8 routed experts per token
+    /// are dequantised.
+    fn moe_branch(&self, attn_out: &[f32], layer: usize, mw: &MoeWeights)
+        -> Result<Vec<f32>, String>
+    {
+        let cfg = &self.model.config;
+        let h      = cfg.hidden_size as usize;
+        let eps    = cfg.rms_norm_eps;
+        let n_exp  = cfg.expert_count as usize;
+        let n_used = cfg.expert_used_count as usize;
+        let ff_exp = cfg.expert_ff_size as usize;
+
+        // Router: plain RMSNorm of attn_out, scaled by gate_inp_s/√h,
+        // then a small F32 projection to per-expert logits.
+        let inv_sqrt_h = 1.0 / (h as f32).sqrt();
+        let mut router_in = attn_out.to_vec();
+        rmsnorm_plain(&mut router_in, eps);
+        for i in 0..h { router_in[i] *= mw.gate_inp_s[i] * inv_sqrt_h; }
+        let mut logits = vec![0.0f32; n_exp];
+        ops::matvec(&router_in, &mw.gate_inp, h, n_exp, &mut logits);
+
+        // softmax over all experts, then top-k selection.
+        let mut probs = logits;
+        ops::softmax(&mut probs);
+        let mut order: Vec<usize> = (0..n_exp).collect();
+        order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let sel = &order[..n_used];
+        // Renormalise the selected weights to sum to 1 (clamped).
+        let wsum: f32 = sel.iter().map(|&e| probs[e]).sum::<f32>().max(6.103515625e-5);
+
+        // Expert FFN input: pre_ffw_norm_2 of attn_out.
+        let mut moe_in = vec![0.0f32; h];
+        ops::rmsnorm(attn_out, &mw.pre_ffw_norm_2, eps, &mut moe_in);
+
+        let gate_up_name = format!("blk.{layer}.ffn_gate_up_exps.weight");
+        let down_name    = format!("blk.{layer}.ffn_down_exps.weight");
+        let mut moe = vec![0.0f32; h];
+        for &e in sel {
+            let weight = probs[e] / wsum;
+            // gate_up: [h → 2·ff_exp]; gate = first half, up = second.
+            let gate_up_w = dequant_expert(&self.gguf, &gate_up_name, e, h, 2 * ff_exp)?;
+            let mut gu = vec![0.0f32; 2 * ff_exp];
+            ops::matvec(&moe_in, &gate_up_w, h, 2 * ff_exp, &mut gu);
+            let mut act = vec![0.0f32; ff_exp];
+            for i in 0..ff_exp { act[i] = ops::gelu(gu[i]) * gu[ff_exp + i]; }
+            // down: [ff_exp → h], scaled by the per-expert scalar.
+            let down_w = dequant_expert(&self.gguf, &down_name, e, ff_exp, h)?;
+            let mut down = vec![0.0f32; h];
+            ops::matvec(&act, &down_w, ff_exp, h, &mut down);
+            let s = weight * mw.down_exps_s[e];
+            for i in 0..h { moe[i] += s * down[i]; }
+        }
+        Ok(moe)
     }
 }
 
@@ -292,6 +401,41 @@ fn rmsnorm_plain(x: &mut [f32], eps: f32) {
     for &v in x.iter() { ss += v * v; }
     let rrms = (ss / n + eps).sqrt().recip();
     for v in x.iter_mut() { *v *= rrms; }
+}
+
+/// Dequantise one expert's slice of a 3D expert tensor
+/// `[in_dim, out_dim, n_expert]` to fp32 `[in_dim·out_dim]`. Each expert
+/// is a contiguous `[in_dim, out_dim]` quantized matrix.
+fn dequant_expert(gguf: &GgufFile, name: &str, expert: usize,
+                  in_dim: usize, out_dim: usize) -> Result<Vec<f32>, String> {
+    use crate::gguf::GgmlType;
+    let info = gguf.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let bytes = gguf.tensor_data(name)
+        .map_err(|e| format!("read {name}: {e}"))?
+        .ok_or_else(|| format!("no data for {name}"))?;
+    let (bs, bpb) = match info.ggml_type {
+        GgmlType::Q6_K => (quant::q6_k::BLOCK_SIZE, quant::q6_k::BYTES_PER_BLOCK),
+        GgmlType::Q8_0 => (quant::q8_0::BLOCK_SIZE, quant::q8_0::BYTES_PER_BLOCK),
+        GgmlType::Q5_K => (quant::q5_k::BLOCK_SIZE, quant::q5_k::BYTES_PER_BLOCK),
+        GgmlType::Q4_K => (quant::q4_k::BLOCK_SIZE, quant::q4_k::BYTES_PER_BLOCK),
+        other => return Err(format!("dequant_expert {name}: unsupported type {other:?}")),
+    };
+    if in_dim % bs != 0 {
+        return Err(format!("dequant_expert {name}: in_dim {in_dim} not a multiple of {bs}"));
+    }
+    let bytes_per_expert = (in_dim / bs) * bpb * out_dim;
+    let start = expert * bytes_per_expert;
+    let slice = bytes.get(start..start + bytes_per_expert)
+        .ok_or_else(|| format!("dequant_expert {name}: expert {expert} out of range"))?;
+    let mut out = vec![0.0f32; in_dim * out_dim];
+    match info.ggml_type {
+        GgmlType::Q6_K => quant::q6_k::dequantize_to_f32(slice, &mut out),
+        GgmlType::Q8_0 => quant::q8_0::dequantize_to_f32(slice, &mut out),
+        GgmlType::Q5_K => quant::q5_k::dequantize_to_f32(slice, &mut out),
+        GgmlType::Q4_K => quant::q4_k::dequantize_to_f32(slice, &mut out),
+        _ => unreachable!(),
+    }
+    Ok(out)
 }
 
 /// Dequantise a named tensor to fp32.
