@@ -3,7 +3,10 @@
 // of the original values `xsum` (used for the Q4_K/Q5_K dmin term),
 // and 32 signed int8 quants.
 //
-// grid = in_dim / 32; block = 32 (one thread per element).
+// grid = (in_dim/32, n_vec); block = 32 (one thread per element).
+// blockIdx.y selects the vector — a single call quantizes a batch of
+// `n_vec` contiguous `in_dim`-length activations (used for the 8 routed
+// experts' inputs); n_vec=1 grid.y is the ordinary single-vector case.
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -20,6 +23,10 @@ void quantize_q8_f32(const float*  __restrict__ x,
                      BlockQ8*      __restrict__ out,
                      unsigned int  in_dim)
 {
+    const unsigned int vec = blockIdx.y;
+    x   += (size_t)vec * in_dim;
+    out += (size_t)vec * (in_dim >> 5);
+
     const unsigned int blk = blockIdx.x;
     const int l = threadIdx.x;                  // 0..31
     const float v = x[blk * 32 + l];

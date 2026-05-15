@@ -44,7 +44,10 @@ const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_
 // MoE kernel sources.
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MOE_TOPK_SRC:          &str = include_str!("../../kernels/moe_topk.cpp");
-const AXPY_SRC:              &str = include_str!("../../kernels/axpy.cpp");
+const MOE_MATVEC_Q6K_SRC:    &str = include_str!("../../kernels/moe_matvec_q6k_dp4a.cpp");
+const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
+const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
+const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
 
 /// Load an fp32 GGUF tensor straight to device.
 fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
@@ -60,12 +63,14 @@ fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
 
 /// A 3D expert-weight tensor `[in_dim, out_dim, n_expert]` resident on
 /// device in its on-disk quantized form. Each expert is a contiguous
-/// `[in_dim, out_dim]` matrix; `expert_ptr` offsets into the slab.
+/// `[in_dim, out_dim]` matrix `bytes_per_expert` apart; the moe_matvec
+/// kernel offsets into the slab by the device-resident expert id.
 pub struct ExpertTensor {
     data:  DeviceBuf<u8>,
+    /// Quant type — Unsloth's UD recipe varies it per layer (the 26B's
+    /// last-layer gate_up is Q8_0 while the rest are Q6_K), so the
+    /// moe_matvec dispatch must be per-tensor, not hard-coded.
     dtype: GgmlType,
-    in_dim:  u32,
-    out_dim: u32,
     bytes_per_expert: usize,
 }
 
@@ -79,23 +84,14 @@ impl ExpertTensor {
         if shape.len() != 3 {
             return Err(format!("expert tensor {name}: expected 3D, got {shape:?}"));
         }
-        let in_dim   = shape[0] as u32;
-        let out_dim  = shape[1] as u32;
         let n_expert = shape[2] as usize;
         Ok(Self {
             bytes_per_expert: bytes.len() / n_expert,
-            data: DeviceBuf::from_slice(bytes)?,
             dtype: info.ggml_type,
-            in_dim, out_dim,
+            data: DeviceBuf::from_slice(bytes)?,
         })
     }
 
-    /// Device pointer to expert `e`'s `[in_dim, out_dim]` matrix.
-    fn expert_ptr(&self, e: usize) -> *mut c_void {
-        unsafe {
-            (self.data.raw_ptr() as *mut u8).add(e * self.bytes_per_expert) as *mut c_void
-        }
-    }
 }
 
 /// MoE-layer weights: the routed-expert branch that runs alongside the
@@ -112,8 +108,9 @@ pub struct MoeBlock {
     gate_up_exps: ExpertTensor,
     /// Down experts, [expert_ff, hidden, n_expert].
     down_exps:    ExpertTensor,
-    /// Per-expert down-output scalar, host-side [n_expert].
-    down_exps_s:  Vec<f32>,
+    /// Per-expert down-output scalar, F32 [n_expert] — device-resident
+    /// so the combine kernel can index it by the device expert id.
+    down_exps_s:  DeviceBuf<f32>,
 }
 
 /// All weights for one Gemma 4 transformer block on device.
@@ -145,10 +142,6 @@ impl GpuGemma4Block {
                  head_dim: usize, n_kv: usize, moe: bool) -> Result<Self, String> {
         let p = format!("blk.{layer}.");
         let moe_block = if moe {
-            // Per-expert down scalar — read to host.
-            let s_bytes = gguf.tensor_data(&format!("{p}ffn_down_exps.scale"))
-                .map_err(|e| e.to_string())?.ok_or("ffn_down_exps.scale no data")?;
-            let down_exps_s: Vec<f32> = bytemuck::cast_slice::<u8, f32>(s_bytes).to_vec();
             Some(MoeBlock {
                 post_ffw_norm_1: load_fp32(gguf, &format!("{p}post_ffw_norm_1.weight"))?,
                 pre_ffw_norm_2:  load_fp32(gguf, &format!("{p}pre_ffw_norm_2.weight"))?,
@@ -157,7 +150,7 @@ impl GpuGemma4Block {
                 gate_inp_s:  load_fp32(gguf, &format!("{p}ffn_gate_inp.scale"))?,
                 gate_up_exps: ExpertTensor::from_gguf(gguf, &format!("{p}ffn_gate_up_exps.weight"))?,
                 down_exps:    ExpertTensor::from_gguf(gguf, &format!("{p}ffn_down_exps.weight"))?,
-                down_exps_s,
+                down_exps_s:  load_fp32(gguf, &format!("{p}ffn_down_exps.scale"))?,
             })
         } else { None };
         let attn_v = if kind == AttnKind::Sliding {
@@ -270,7 +263,10 @@ pub struct GpuGemma4 {
     moe_in:      DeviceBuf<f32>,   // [hidden] — routed-expert input
     moe_acc:     DeviceBuf<f32>,   // [hidden] — expert mixture accumulator
     cur_mlp:     DeviceBuf<f32>,   // [hidden] — shared-MLP result, kept live
-    expert_down: DeviceBuf<f32>,   // [hidden] — one expert's down output
+    expert_gu:   DeviceBuf<f32>,   // [n_used · 2·expert_ff] — fused gate_up
+    expert_act:  DeviceBuf<f32>,   // [n_used · expert_ff]    — geglu output
+    expert_outs: DeviceBuf<f32>,   // [n_used · hidden]       — per-expert down
+    xq8_experts: DeviceBuf<u8>,    // batched int8 activation for the 8 experts
 
     // Kernel modules.
     m_rmsnorm:   Module,
@@ -297,7 +293,10 @@ pub struct GpuGemma4 {
     m_mv_q6k_dp4a: Module,
     m_mv_q8_0_dp4a: Module,
     m_moe_topk:  Module,
-    m_axpy:      Module,
+    m_moe_mv_q6k:  Module,
+    m_moe_mv_q8_0: Module,
+    m_moe_geglu:   Module,
+    m_moe_combine: Module,
     /// Scratch for the int8-quantized activation feeding the dp4a matvec.
     xq8: DeviceBuf<u8>,
 
@@ -336,6 +335,10 @@ impl GpuGemma4 {
         let output_norm = load_fp32(gguf, "output_norm.weight")?;
 
         let moe = cfg.is_moe();
+        // MoE scratch sizes — .max(1) keeps the buffers non-empty on the
+        // dense 31B (which leaves the expert counts at 0).
+        let n_used_a    = (cfg.expert_used_count as usize).max(1);
+        let expert_ff_a = (cfg.expert_ff_size as usize).max(32);
         let mut blocks = Vec::with_capacity(cfg.block_count as usize);
         for layer in 0..cfg.block_count {
             let kind = cfg.attn_kinds[layer as usize];
@@ -416,14 +419,20 @@ impl GpuGemma4 {
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
             m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
-            m_axpy:         ld("axpy", AXPY_SRC)?,
+            m_moe_mv_q6k:   ld("moe_matvec_q6k_dp4a", MOE_MATVEC_Q6K_SRC)?,
+            m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
+            m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
+            m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
             moe_logits:  DeviceBuf::new((cfg.expert_count as usize).max(1))?,
             moe_ids:     DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
             moe_weights: DeviceBuf::new((cfg.expert_used_count as usize).max(1))?,
             moe_in:      DeviceBuf::new(hidden)?,
             moe_acc:     DeviceBuf::new(hidden)?,
             cur_mlp:     DeviceBuf::new(hidden)?,
-            expert_down: DeviceBuf::new(hidden)?,
+            expert_gu:   DeviceBuf::new(n_used_a * 2 * expert_ff_a)?,
+            expert_act:  DeviceBuf::new(n_used_a * expert_ff_a)?,
+            expert_outs: DeviceBuf::new(n_used_a * hidden)?,
+            xq8_experts: DeviceBuf::<u8>::new(n_used_a * (expert_ff_a / 32).max(1) * 40)?,
             xq8,
             stream: Stream::new()?,
             hidden, ffn, vocab, n_heads,
@@ -538,17 +547,18 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    /// Quantize an f32 activation of `in_dim` elements into `self.xq8`
-    /// (int8 blocks of 32) for the dp4a matvec.
-    fn launch_quantize_q8(&self, x: *mut c_void, in_dim: u32) -> Result<(), String> {
+    /// Quantize `n_vec` contiguous f32 activations of `in_dim` elements
+    /// each into int8 BlockQ8 blocks at `out`, for the dp4a matvec.
+    fn launch_quantize_q8(&self, x: *mut c_void, out: *mut c_void,
+                          in_dim: u32, n_vec: u32) -> Result<(), String> {
         let f = self.m_quantize.function("quantize_q8_f32")?;
         let mut xa = x;
-        let mut oa = self.xq8.raw_ptr();
+        let mut oa = out;
         let mut ia = in_dim;
         let mut args: [*mut c_void; 3] = [
             &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void];
-        unsafe { f.launch((in_dim / 32, 1, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((in_dim / 32, n_vec, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
@@ -577,7 +587,7 @@ impl GpuGemma4 {
                 _ => false,
             };
         if dp4a {
-            self.launch_quantize_q8(x, in_dim)?;
+            self.launch_quantize_q8(x, self.xq8.raw_ptr(), in_dim, 1)?;
             let (module, kname) = match dtype {
                 GgmlType::Q4_K => (&self.m_mv_q4k_dp4a,  "matvec_q4_k_dp4a_f32"),
                 GgmlType::Q5_K => (&self.m_mv_q5k_dp4a,  "matvec_q5_k_dp4a_f32"),
@@ -640,18 +650,66 @@ impl GpuGemma4 {
         unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    /// `y += a·x` (or `y = a·x` when `set`). Used to mix expert outputs.
-    fn launch_axpy(&self, y: *mut c_void, x: *mut c_void, a: f32, n: u32, set: bool)
-        -> Result<(), String>
+    /// One launch covering all `n_expert_used` routed experts: grid.y is
+    /// the expert slot, the expert id is read from `self.moe_ids` on
+    /// device. `xq_stride` is the BlockQ8 count per slot (0 ⇒ all slots
+    /// share one activation, the fused gate_up case).
+    fn launch_moe_matvec(&self, dtype: GgmlType, slab: *mut c_void, xq: *mut c_void,
+                         y: *mut c_void, in_dim: u32, out_dim: u32,
+                         bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
     {
-        let kname = if set { "scaled_set_f32" } else { "axpy_f32" };
-        let f = self.m_axpy.function(kname)?;
+        let (module, kname) = match dtype {
+            GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32"),
+            GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32"),
+            other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+        };
+        let f = module.function(kname)?;
+        let block: u32 = 64;
+        let grid_x = (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+        let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
+        let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert; let mut st=xq_stride;
+        let mut args: [*mut c_void; 8] = [
+            &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
+        unsafe {
+            f.launch((grid_x, self.n_expert_used as u32, 1), (block,1,1), 0,
+                     Some(&self.stream), &mut args)
+        }
+    }
+
+    /// Batched GeGLU over all routed experts: `gu` [n_used, 2·ff_exp] →
+    /// `act` [n_used, ff_exp].
+    fn launch_moe_geglu(&self, gu: *mut c_void, act: *mut c_void) -> Result<(), String> {
+        let f = self.m_moe_geglu.function("moe_geglu_f32")?;
         let block: u32 = 256;
-        let grid = (n + block - 1) / block;
-        let mut ya=y; let mut xa=x; let mut aa=a; let mut na=n;
+        let total = (self.n_expert_used * self.expert_ff) as u32;
+        let grid = (total + block - 1) / block;
+        let mut ga=gu; let mut aa=act;
+        let mut ff=self.expert_ff as u32; let mut ns=self.n_expert_used as u32;
         let mut args: [*mut c_void; 4] = [
-            &mut ya as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
-            &mut aa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
+            &mut ga as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+            &mut ff as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Weighted sum of the per-expert down outputs into `out` [hidden].
+    fn launch_moe_combine(&self, experts: *mut c_void, down_exps_s: *mut c_void,
+                          out: *mut c_void) -> Result<(), String>
+    {
+        let f = self.m_moe_combine.function("moe_combine_f32")?;
+        let block: u32 = 256;
+        let h = self.hidden as u32;
+        let grid = (h + block - 1) / block;
+        let mut ea=experts; let mut ida=self.moe_ids.raw_ptr();
+        let mut wa=self.moe_weights.raw_ptr(); let mut sa=down_exps_s; let mut oa=out;
+        let mut ha=h; let mut nu=self.n_expert_used as u32;
+        let mut args: [*mut c_void; 7] = [
+            &mut ea as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void];
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -866,34 +924,26 @@ impl GpuGemma4 {
         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(), self.moe_logits.raw_ptr())?;
         self.launch_moe_topk()?;
 
-        // Read the routing result to host (the only sync per MoE layer).
-        self.stream.synchronize()?;
-        let mut ids = vec![0i32; self.n_expert_used];
-        let mut wts = vec![0.0f32; self.n_expert_used];
-        self.moe_ids.copy_to_host(&mut ids)?;
-        self.moe_weights.copy_to_host(&mut wts)?;
-
-        // --- Routed experts --- input is pre_ffw_norm_2 of attn_out.
+        // --- Routed experts --- fully device-resident: the expert ids
+        // from moe_topk stay on device, and one launch per stage covers
+        // all n_expert_used experts (grid.y = expert slot). No host
+        // round-trip → the whole forward is a pure kernel chain.
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), mw.pre_ffw_norm_2.raw_ptr(),
                             self.moe_in.raw_ptr(), h)?;
-        for j in 0..self.n_expert_used {
-            let e = ids[j] as usize;
-            // gate_up: [h → 2·ff_exp]; geglu(gate, up) with gate = first
-            // half of ffn_a, up = second half.
-            self.launch_matvec_raw(mw.gate_up_exps.expert_ptr(e), mw.gate_up_exps.dtype,
-                                   h, 2 * ff_exp, self.moe_in.raw_ptr(),
-                                   self.ffn_a.raw_ptr())?;
-            self.launch_geglu(self.ffn_a.raw_ptr(),
-                              off_f32(self.ffn_a.raw_ptr(), self.expert_ff),
-                              self.ffn_b.raw_ptr(), ff_exp)?;
-            // down: [ff_exp → h].
-            self.launch_matvec_raw(mw.down_exps.expert_ptr(e), mw.down_exps.dtype,
-                                   ff_exp, h, self.ffn_b.raw_ptr(),
-                                   self.expert_down.raw_ptr())?;
-            let s = wts[j] * mw.down_exps_s[e];
-            self.launch_axpy(self.moe_acc.raw_ptr(), self.expert_down.raw_ptr(),
-                             s, h, j == 0)?;
-        }
+        // gate_up: one shared activation, quantized once.
+        self.launch_quantize_q8(self.moe_in.raw_ptr(), self.xq8.raw_ptr(), h, 1)?;
+        self.launch_moe_matvec(mw.gate_up_exps.dtype, mw.gate_up_exps.data.raw_ptr(),
+                               self.xq8.raw_ptr(), self.expert_gu.raw_ptr(), h, 2 * ff_exp,
+                               mw.gate_up_exps.bytes_per_expert as u32, 0)?;
+        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
+        // down: each expert has its own activation — quantize the batch.
+        self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
+                                ff_exp, self.n_expert_used as u32)?;
+        self.launch_moe_matvec(mw.down_exps.dtype, mw.down_exps.data.raw_ptr(),
+                               self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
+                               mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
+        self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
+                                self.moe_acc.raw_ptr())?;
         // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2)
         self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
@@ -906,7 +956,3 @@ impl GpuGemma4 {
     }
 }
 
-/// Offset an f32 device pointer by `elems` elements.
-fn off_f32(p: *mut c_void, elems: usize) -> *mut c_void {
-    unsafe { (p as *mut f32).add(elems) as *mut c_void }
-}
