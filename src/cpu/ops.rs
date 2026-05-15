@@ -27,6 +27,14 @@ pub fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
 }
 
+/// GELU, tanh approximation (the variant Gemma's FFN uses):
+///   0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
+#[inline]
+pub fn gelu(x: f32) -> f32 {
+    const K: f32 = 0.797_884_56; // sqrt(2/pi)
+    0.5 * x * (1.0 + (K * (x + 0.044715 * x * x * x)).tanh())
+}
+
 /// In-place RMSNorm:
 ///   out = x * rsqrt(mean(x^2) + eps) * weight
 ///

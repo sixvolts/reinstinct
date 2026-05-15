@@ -71,9 +71,8 @@ pub fn apply_rope(head: &mut [f32], rope_cache: &RopeCache, position: usize) {
     let (cos, sin) = rope_cache.get(position);
 
     // Snapshot the rotated portion first (rotation reads both halves).
-    let mut tmp = [0.0_f32; 256];
-    let buf = &mut tmp[..rd];
-    buf.copy_from_slice(&head[..rd]);
+    // Sized dynamically — Gemma 4 rotates up to 512 dims, Qwen 3.5 only 64.
+    let buf: Vec<f32> = head[..rd].to_vec();
 
     for i in 0..half {
         head[i]        = buf[i]        * cos[i]        - buf[i + half] * sin[i];

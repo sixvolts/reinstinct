@@ -124,6 +124,11 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     use reinstinct_engine::tokenizer::Tokenizer;
 
     let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if arch == "gemma4" {
+        return generate_text_gemma4(&g, path, tokens, steps, temperature, top_k, seed);
+    }
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
 
@@ -197,6 +202,63 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         }
         Err(e) => println!("\n(tokenizer decode unavailable: {e})"),
     }
+    Ok(())
+}
+
+/// Gemma 4 generation via the CPU oracle. Prompt is given as token ids
+/// (`--tokens`) — Gemma uses a SentencePiece tokenizer the engine's
+/// GPT2-style BPE module doesn't cover yet. Prints token ids + top-K.
+fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
+                        tokens: Option<Vec<u32>>, steps: usize,
+                        temperature: f32, top_k: usize, seed: u64) -> anyhow::Result<()> {
+    use reinstinct_engine::sampling::{Rng, sample_temp_topk};
+    use reinstinct_engine::cpu::gemma4::Gemma4CpuModel;
+
+    // GgufFile isn't Clone; reopen for the model to own its own mmap.
+    let g_owned = GgufFile::open(path)?;
+    let m = Gemma4CpuModel::load(g_owned).map_err(anyhow::Error::msg)?;
+    let cfg = &m.model.config;
+    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg.eos_token_id]);
+
+    println!("model       = {} (gemma4)", path.display());
+    println!("backend     = CPU oracle (lazy per-layer dequant)");
+    println!("prompt      = {prompt:?} ({} tokens)", prompt.len());
+    println!("steps       = {steps}");
+    let _ = g;
+
+    let mut rng = Rng::new(seed);
+    let mut state = m.new_state();
+    let mut all = prompt.clone();
+
+    let t0 = std::time::Instant::now();
+    let mut logits = Vec::new();
+    for &t in &prompt {
+        logits = m.forward_token(t, &mut state).map_err(anyhow::Error::msg)?;
+    }
+    for _ in 0..steps {
+        let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+        all.push(tok);
+        if tok == cfg.eos_token_id { break; }
+        logits = m.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+    }
+    let elapsed = t0.elapsed();
+    let new_tokens = all.len() - prompt.len();
+    println!("\ngenerated   = {} tokens in {:.1} s ({:.2} s/token)",
+        new_tokens, elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / (prompt.len() + new_tokens).max(1) as f64);
+    println!("output ids  = {all:?}");
+
+    // Top-K of the final logits for an architecture sanity check.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    println!("\n--- top {} logits (final position) ---", top_k.min(10));
+    for &i in idx.iter().take(top_k.min(10)) {
+        println!("  token {i:>7}  logit {:>9.4}", logits[i]);
+    }
+    let (mn, mx) = logits.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+        |(a, b), &v| (a.min(v), b.max(v)));
+    let nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
+    println!("logit range = [{mn:.3}, {mx:.3}], nonfinite = {nonfinite}");
     Ok(())
 }
 
