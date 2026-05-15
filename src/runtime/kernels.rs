@@ -250,6 +250,89 @@ pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
     Ok(out)
 }
 
+/// `out[i] = gelu(gate[i]) * up[i]` (Gemma 4 FFN gate fusion).
+pub fn geglu_mul_f32(cache: &KernelCache, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
+    assert_eq!(gate.len(), up.len());
+    let n = gate.len();
+    let hsaco = cache.compile("geglu", include_str!("../../kernels/geglu.cpp"))?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("geglu_mul_f32")?;
+    let dg: DeviceBuf<f32> = DeviceBuf::from_slice(gate)?;
+    let du: DeviceBuf<f32> = DeviceBuf::from_slice(up)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(n)?;
+    let block: u32 = 256;
+    let grid: u32 = (n as u32 + block - 1) / block;
+    let mut g = dg.raw_ptr(); let mut u = du.raw_ptr(); let mut y = dy.raw_ptr();
+    let mut na = n as u32;
+    let mut args: [*mut c_void; 4] = [
+        &mut g as *mut _ as *mut c_void, &mut u as *mut _ as *mut c_void,
+        &mut y as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; n];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// In-place final-logit soft-cap: `y[i] = cap·tanh(y[i]/cap)`.
+pub fn logit_softcap_f32(cache: &KernelCache, y: &[f32], cap: f32) -> Result<Vec<f32>, String> {
+    let n = y.len();
+    let hsaco = cache.compile("logit_softcap", include_str!("../../kernels/logit_softcap.cpp"))?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("logit_softcap_f32")?;
+    let dy: DeviceBuf<f32> = DeviceBuf::from_slice(y)?;
+    let block: u32 = 256;
+    let grid: u32 = (n as u32 + block - 1) / block;
+    let mut yp = dy.raw_ptr(); let mut na = n as u32; let mut c = cap;
+    let mut args: [*mut c_void; 3] = [
+        &mut yp as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+        &mut c  as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; n];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Batched causal GQA attention with a sliding window (`window == 0`
+/// means full causal). Same as `attn_step_f32` plus the window bound.
+pub fn attn_step_window_f32(cache: &KernelCache, q: &[f32], k_cache: &[f32], v_cache: &[f32],
+                            n_heads: usize, n_kv_heads: usize, head_dim: usize,
+                            total_len: usize, window: usize, scaling: f32)
+    -> Result<Vec<f32>, String>
+{
+    assert_eq!(q.len(), n_heads * head_dim);
+    let hsaco = cache.compile("attn_step_window",
+                              include_str!("../../kernels/attn_step_window.cpp"))?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("attn_step_window_f32")?;
+    let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
+    let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k_cache)?;
+    let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v_cache)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim)?;
+    let block: u32 = 256;
+    let win_len = if window > 0 && total_len > window { window } else { total_len };
+    let smem = ((head_dim + win_len) as u32 + block) * std::mem::size_of::<f32>() as u32;
+    let mut q_ = dq.raw_ptr(); let mut k_ = dk.raw_ptr(); let mut v_ = dv.raw_ptr();
+    let mut o_ = dy.raw_ptr();
+    let mut nh = n_heads as u32; let mut nkv = n_kv_heads as u32; let mut hd = head_dim as u32;
+    let mut tl = total_len as u32; let mut wn = window as u32; let mut sc = scaling;
+    let mut args: [*mut c_void; 10] = [
+        &mut q_ as *mut _ as *mut c_void, &mut k_ as *mut _ as *mut c_void,
+        &mut v_ as *mut _ as *mut c_void, &mut o_ as *mut _ as *mut c_void,
+        &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+        &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
+        &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((n_heads as u32, 1, 1), (block, 1, 1), smem, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; n_heads * head_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// `out[i] = silu(gate[i]) * up[i]` (Qwen / Llama FFN gate fusion).
 pub fn swiglu_mul_f32(cache: &KernelCache, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
     assert_eq!(gate.len(), up.len());
@@ -899,6 +982,79 @@ mod tests {
             eprintln!("rope pos={pos}: max_abs={max_abs:.3e}");
             assert!(max_abs < 1e-6, "rope pos={pos}: max_abs {max_abs:.3e}");
         }
+    }
+
+    #[test]
+    fn geglu_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let n = 4096;
+        let mut s: u64 = 0x6E61_CAFE;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let gate: Vec<f32> = (0..n).map(|_| rng() * 4.0).collect();
+        let up:   Vec<f32> = (0..n).map(|_| rng() * 4.0).collect();
+        let gpu = geglu_mul_f32(&cache, &gate, &up).expect("gpu geglu");
+        for i in 0..n {
+            let want = crate::cpu::ops::gelu(gate[i]) * up[i];
+            let d = (gpu[i] - want).abs();
+            assert!(d < 1e-4, "geglu[{i}]: gpu {} cpu {} d {d:.3e}", gpu[i], want);
+        }
+    }
+
+    #[test]
+    fn logit_softcap_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let cap = 30.0f32;
+        let y: Vec<f32> = (0..2048).map(|i| (i as f32 - 1024.0) * 0.13).collect();
+        let gpu = logit_softcap_f32(&cache, &y, cap).expect("gpu softcap");
+        for i in 0..y.len() {
+            let want = cap * (y[i] / cap).tanh();
+            let d = (gpu[i] - want).abs();
+            assert!(d < 1e-4, "softcap[{i}]: gpu {} cpu {} d {d:.3e}", gpu[i], want);
+        }
+    }
+
+    #[test]
+    fn attn_step_window_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let n_heads = 8usize; let n_kv = 2usize; let head_dim = 128usize;
+        let groups = n_heads / n_kv;
+        let total_len = 50usize;
+        let window = 16usize;
+        let scaling = 1.0f32;
+        let mut s: u64 = 0x5117_DEAD;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let q: Vec<f32> = (0..n_heads*head_dim).map(|_| rng()).collect();
+        let kc: Vec<f32> = (0..total_len*n_kv*head_dim).map(|_| rng()).collect();
+        let vc: Vec<f32> = (0..total_len*n_kv*head_dim).map(|_| rng()).collect();
+        let gpu = attn_step_window_f32(&cache, &q, &kc, &vc,
+            n_heads, n_kv, head_dim, total_len, window, scaling).expect("gpu");
+        // CPU: each head attends only to [total_len-window, total_len).
+        let lo = total_len - window;
+        let mut cpu = vec![0.0f32; n_heads*head_dim];
+        let mut sc = vec![0.0f32; window];
+        for h in 0..n_heads {
+            let kvh = h / groups;
+            let qh = &q[h*head_dim..(h+1)*head_dim];
+            for s in 0..window {
+                let t = lo + s;
+                let off = (t*n_kv+kvh)*head_dim;
+                let mut a = 0.0f32;
+                for d in 0..head_dim { a += qh[d]*kc[off+d]; }
+                sc[s] = a*scaling;
+            }
+            crate::cpu::ops::softmax(&mut sc);
+            let ho = &mut cpu[h*head_dim..(h+1)*head_dim];
+            for s in 0..window {
+                let off = ((lo+s)*n_kv+kvh)*head_dim;
+                for d in 0..head_dim { ho[d] += sc[s]*vc[off+d]; }
+            }
+        }
+        let mut max_abs = 0.0f32;
+        for i in 0..gpu.len() { max_abs = max_abs.max((gpu[i]-cpu[i]).abs()); }
+        eprintln!("attn_step_window: max_abs={max_abs:.3e}");
+        assert!(max_abs < 5e-5, "attn_step_window max_abs {max_abs:.3e}");
     }
 
     #[test]
