@@ -13,13 +13,20 @@ LIB_DIR="${LIB_DIR:-$LLAMA_CPP_DIR/build/bin}"
 
 cd "$(dirname "$0")"
 
-g++ -std=c++17 -O2 \
-    -I"$LLAMA_CPP_DIR/include" \
-    -I"$LLAMA_CPP_DIR/ggml/include" \
-    -L"$LIB_DIR" \
-    -Wl,-rpath,"$LIB_DIR" \
-    dump_logits.cpp \
-    -lllama -lggml -lggml-base -lggml-cpu \
-    -o dump_logits
+build_one() {
+    g++ -std=c++17 -O2 \
+        -I"$LLAMA_CPP_DIR/include" \
+        -I"$LLAMA_CPP_DIR/ggml/include" \
+        -L"$LIB_DIR" \
+        -Wl,-rpath,"$LIB_DIR" \
+        "$1.cpp" \
+        -lllama -lggml -lggml-base -lggml-cpu \
+        -o "$1"
+    echo "built $(pwd)/$1"
+}
 
-echo "built $(pwd)/dump_logits"
+# dump_logits: golden-logit reference. llama_bench: throughput harness.
+# Both link libllama.so directly — the llama-cli / llama-bench frontends
+# segfault on this build, but the core llama_decode path is sound.
+build_one dump_logits
+build_one llama_bench
