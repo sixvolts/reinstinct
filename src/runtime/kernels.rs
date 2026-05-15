@@ -41,6 +41,106 @@ const ROPE_KERNEL: &str = "rope_apply_f32";
 const ATTN_STEP_SOURCE: &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_STEP_KERNEL: &str = "attn_step_f32";
 
+const ROPE_BATCHED_SOURCE: &str = include_str!("../../kernels/rope_batched.cpp");
+const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
+
+/// Batched partial RoPE: rotate `n_rows` rows, row r at sequence
+/// position `base_pos + r`. Returns the rotated buffer.
+pub fn rope_apply_batched_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
+                              head_dim: usize, rotary_dim: usize, n_heads: usize,
+                              n_rows: usize, base_pos: usize) -> Result<Vec<f32>, String>
+{
+    assert_eq!(x.len(), n_rows * n_heads * head_dim);
+    let hsaco = cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("rope_apply_batched_f32")?;
+
+    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
+    let dc: DeviceBuf<f32> = DeviceBuf::from_slice(cos)?;
+    let ds: DeviceBuf<f32> = DeviceBuf::from_slice(sin)?;
+
+    let half = (rotary_dim / 2) as u32;
+    let block: u32 = 64;
+    let grid_x = (half + block - 1) / block;
+    let mut x_ptr = dx.raw_ptr();
+    let mut c_ptr = dc.raw_ptr();
+    let mut s_ptr = ds.raw_ptr();
+    let mut hd = head_dim as u32;
+    let mut rd = rotary_dim as u32;
+    let mut nh = n_heads as u32;
+    let mut bp = base_pos as u32;
+    let mut args: [*mut c_void; 7] = [
+        &mut x_ptr as *mut _ as *mut c_void,
+        &mut c_ptr as *mut _ as *mut c_void,
+        &mut s_ptr as *mut _ as *mut c_void,
+        &mut hd    as *mut _ as *mut c_void,
+        &mut rd    as *mut _ as *mut c_void,
+        &mut nh    as *mut _ as *mut c_void,
+        &mut bp    as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((grid_x, n_heads as u32, n_rows as u32), (block, 1, 1),
+                      0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; x.len()];
+    dx.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Batched causal GQA attention. `q` is `[n_rows, n_heads, head_dim]`;
+/// `k_cache`/`v_cache` hold `base_pos + n_rows` populated positions.
+/// Query row r attends causally to `[0, base_pos + r]`.
+pub fn attn_step_batched_f32(cache: &KernelCache, q: &[f32], k_cache: &[f32], v_cache: &[f32],
+                             n_heads: usize, n_kv_heads: usize, head_dim: usize,
+                             base_pos: usize, n_rows: usize, scaling: f32)
+    -> Result<Vec<f32>, String>
+{
+    assert_eq!(q.len(), n_rows * n_heads * head_dim);
+    let kv_row = n_kv_heads * head_dim;
+    let max_total = base_pos + n_rows;
+    assert!(k_cache.len() >= max_total * kv_row);
+
+    let hsaco = cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("attn_step_batched_f32")?;
+
+    let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
+    let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k_cache)?;
+    let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v_cache)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(n_rows * n_heads * head_dim)?;
+
+    let block: u32 = 256;
+    // LDS sized for the largest row: q_lds + scores(max_total) + tmp(bs).
+    let smem = ((head_dim + max_total) as u32 + block) * std::mem::size_of::<f32>() as u32;
+    let mut q_ptr = dq.raw_ptr();
+    let mut k_ptr = dk.raw_ptr();
+    let mut v_ptr = dv.raw_ptr();
+    let mut o_ptr = dy.raw_ptr();
+    let mut nh = n_heads as u32;
+    let mut nkv = n_kv_heads as u32;
+    let mut hd = head_dim as u32;
+    let mut bp = base_pos as u32;
+    let mut nr = n_rows as u32;
+    let mut sc = scaling;
+    let mut args: [*mut c_void; 10] = [
+        &mut q_ptr as *mut _ as *mut c_void,
+        &mut k_ptr as *mut _ as *mut c_void,
+        &mut v_ptr as *mut _ as *mut c_void,
+        &mut o_ptr as *mut _ as *mut c_void,
+        &mut nh    as *mut _ as *mut c_void,
+        &mut nkv   as *mut _ as *mut c_void,
+        &mut hd    as *mut _ as *mut c_void,
+        &mut bp    as *mut _ as *mut c_void,
+        &mut nr    as *mut _ as *mut c_void,
+        &mut sc    as *mut _ as *mut c_void,
+    ];
+    unsafe { f.launch((n_heads as u32, n_rows as u32, 1), (block, 1, 1),
+                      smem, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; n_rows * n_heads * head_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// Single-step GQA attention. Computes per-head softmax(Q·Kᵀ/√d) · V.
 ///
 /// `k_cache` and `v_cache` are full pre-allocated caches of shape
@@ -656,6 +756,103 @@ mod tests {
                 "attn total_len={total_len}: idx {worst_at} gpu={} cpu={} exceeds tol",
                 gpu[worst_at], cpu[worst_at]);
         }
+    }
+
+    #[test]
+    fn rope_batched_matches_per_position() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::cpu::rope::{RopeCache, apply_rope};
+        let head_dim = 256usize;
+        let rotary_dim = 64usize;
+        let n_heads = 8usize;
+        let n_rows = 5usize;
+        let base_pos = 3usize;
+        let max_seq = 32usize;
+        let rope = RopeCache::new(rotary_dim, max_seq, 10000.0);
+        let mut cos = vec![0.0f32; max_seq * rotary_dim];
+        let mut sin = vec![0.0f32; max_seq * rotary_dim];
+        for pos in 0..max_seq {
+            let (c, s) = rope.get(pos);
+            cos[pos*rotary_dim..(pos+1)*rotary_dim].copy_from_slice(c);
+            sin[pos*rotary_dim..(pos+1)*rotary_dim].copy_from_slice(s);
+        }
+        let mut s: u64 = 0x5EED_C0DE;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..n_rows*n_heads*head_dim).map(|_| rng()).collect();
+
+        let gpu = rope_apply_batched_f32(&cache, &x, &cos, &sin,
+            head_dim, rotary_dim, n_heads, n_rows, base_pos).expect("gpu");
+
+        let mut cpu = x.clone();
+        for r in 0..n_rows {
+            for h in 0..n_heads {
+                let off = (r*n_heads + h) * head_dim;
+                apply_rope(&mut cpu[off..off+head_dim], &rope, base_pos + r);
+            }
+        }
+        let mut max_abs = 0.0f32;
+        for i in 0..gpu.len() {
+            let d = (gpu[i]-cpu[i]).abs();
+            if d > max_abs { max_abs = d; }
+        }
+        eprintln!("rope_batched: max_abs={max_abs:.3e}");
+        assert!(max_abs < 1e-6);
+    }
+
+    #[test]
+    fn attn_step_batched_matches_per_row() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let n_heads = 8usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 256usize;
+        let groups = n_heads / n_kv_heads;
+        let scaling = (head_dim as f32).powf(-0.5);
+        let base_pos = 2usize;
+        let n_rows = 5usize;
+        let total = base_pos + n_rows;
+
+        let mut s: u64 = 0xA77E_BA7C;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let q: Vec<f32> = (0..n_rows*n_heads*head_dim).map(|_| rng()).collect();
+        let k_cache: Vec<f32> = (0..total*n_kv_heads*head_dim).map(|_| rng()).collect();
+        let v_cache: Vec<f32> = (0..total*n_kv_heads*head_dim).map(|_| rng()).collect();
+
+        let gpu = attn_step_batched_f32(&cache, &q, &k_cache, &v_cache,
+            n_heads, n_kv_heads, head_dim, base_pos, n_rows, scaling).expect("gpu");
+
+        // CPU oracle: per row r, attend over total_len = base_pos + r + 1.
+        let mut cpu = vec![0.0f32; n_rows*n_heads*head_dim];
+        let mut scores = vec![0.0f32; total];
+        for r in 0..n_rows {
+            let tl = base_pos + r + 1;
+            for h in 0..n_heads {
+                let kv_h = h / groups;
+                let q_h = &q[(r*n_heads+h)*head_dim..(r*n_heads+h+1)*head_dim];
+                for t in 0..tl {
+                    let off = (t*n_kv_heads+kv_h)*head_dim;
+                    let mut acc = 0.0f32;
+                    for d in 0..head_dim { acc += q_h[d]*k_cache[off+d]; }
+                    scores[t] = acc*scaling;
+                }
+                crate::cpu::ops::softmax(&mut scores[..tl]);
+                let ho = &mut cpu[(r*n_heads+h)*head_dim..(r*n_heads+h+1)*head_dim];
+                ho.fill(0.0);
+                for t in 0..tl {
+                    let off = (t*n_kv_heads+kv_h)*head_dim;
+                    let sc = scores[t];
+                    for d in 0..head_dim { ho[d] += sc*v_cache[off+d]; }
+                }
+            }
+        }
+        let mut max_abs = 0.0f32;
+        for i in 0..gpu.len() {
+            let d = (gpu[i]-cpu[i]).abs();
+            if d > max_abs { max_abs = d; }
+        }
+        eprintln!("attn_step_batched: max_abs={max_abs:.3e}");
+        assert!(max_abs < 5e-5, "attn_step_batched max_abs {max_abs:.3e}");
     }
 
     #[test]
