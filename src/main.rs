@@ -127,7 +127,8 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     let arch = g.metadata_get("general.architecture")
         .and_then(|v| v.as_str()).unwrap_or("<unknown>");
     if arch == "gemma4" {
-        return generate_text_gemma4(&g, path, tokens, steps, temperature, top_k, seed, gpu);
+        return generate_text_gemma4(&g, path, prompt_text, tokens, steps,
+                                    temperature, top_k, seed, gpu);
     }
     let m = Qwen35F32Model::load(&g)?;
     let cfg = &m.model.config;
@@ -209,14 +210,27 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
 /// (`--tokens`) — Gemma uses a SentencePiece tokenizer the engine's
 /// GPT2-style BPE module doesn't cover yet. Prints token ids + top-K.
 fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
+                        prompt_text: Option<String>,
                         tokens: Option<Vec<u32>>, steps: usize,
                         temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
     use reinstinct_engine::cpu::gemma4::Gemma4CpuModel;
     use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
 
     let cfg_eos = Gemma4Model::load(g).map_err(anyhow::Error::msg)?.config.eos_token_id;
-    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![cfg_eos]);
+    // Gemma 4 SentencePiece tokenizer — encodes --prompt text and
+    // decodes the generated ids back to text.
+    let tok = GemmaTokenizer::from_gguf(g).ok();
+    let prompt: Vec<u32> = if let Some(text) = &prompt_text {
+        let t = tok.as_ref().ok_or_else(||
+            anyhow::anyhow!("--prompt: this GGUF has no usable gemma4 tokenizer"))?;
+        let mut ids = vec![t.bos_id];
+        ids.extend(t.encode(text));
+        ids
+    } else {
+        tokens.unwrap_or_else(|| vec![cfg_eos])
+    };
 
     println!("model       = {} (gemma4)", path.display());
     println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU oracle" });
@@ -340,6 +354,9 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         new_tokens, elapsed.as_secs_f64(),
         elapsed.as_secs_f64() / (prompt.len() + new_tokens).max(1) as f64);
     println!("output ids  = {all:?}");
+    if let Some(t) = &tok {
+        println!("output text = {:?}", t.decode(&all));
+    }
 
     // Top-K of the final logits for an architecture sanity check.
     let mut idx: Vec<usize> = (0..logits.len()).collect();

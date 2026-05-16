@@ -227,6 +227,161 @@ impl Tokenizer {
     }
 }
 
+/// SentencePiece-style BPE tokenizer for Gemma 4 (`tokenizer.ggml.model
+/// == "gemma4"`). Differs from the GPT-2 `Tokenizer`: spaces are the
+/// metaspace char `▁` (U+2581), a dummy `▁` is prepended, and any
+/// character absent from the vocab falls back to `<0xXX>` byte tokens.
+/// Encoding is merge-rank BPE over the metaspace-transformed text.
+pub struct GemmaTokenizer {
+    tokens: Vec<String>,
+    vocab_map: HashMap<String, u32>,
+    merge_ranks: HashMap<(String, String), u32>,
+    /// byte value → `<0xXX>` token id (for byte fallback on encode).
+    byte_to_id: [Option<u32>; 256],
+    /// `<0xXX>` token id → byte value (for decode).
+    id_to_byte: HashMap<u32, u8>,
+    pub bos_id: u32,
+    pub eos_id: u32,
+}
+
+const METASPACE: char = '\u{2581}';
+
+impl GemmaTokenizer {
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, String> {
+        match gguf.metadata_get("tokenizer.ggml.model") {
+            Some(MetaValue::String(s)) if s == "gemma4" => {}
+            other => return Err(format!(
+                "GemmaTokenizer: expected tokenizer.ggml.model \"gemma4\", got {other:?}")),
+        }
+
+        let tokens: Vec<String> = match gguf.metadata_get("tokenizer.ggml.tokens") {
+            Some(MetaValue::Array { values, .. }) => values.iter().map(|v| match v {
+                MetaValue::String(s) => Ok(s.clone()),
+                other => Err(format!("non-string token: {other:?}")),
+            }).collect::<Result<Vec<_>, _>>()?,
+            other => return Err(format!("tokens not an array: {other:?}")),
+        };
+
+        let bos_id = gguf.metadata_get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u32()).ok_or("missing tokenizer.ggml.bos_token_id")?;
+        let eos_id = gguf.metadata_get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32()).ok_or("missing tokenizer.ggml.eos_token_id")?;
+
+        let mut vocab_map = HashMap::with_capacity(tokens.len());
+        for (id, s) in tokens.iter().enumerate() {
+            vocab_map.insert(s.clone(), id as u32);
+        }
+
+        // Merge ranks — "<left> <right>", array index is the rank. The
+        // separator is the only literal space (token strings spell space
+        // as the metaspace char), so split on the first space.
+        let merge_ranks = match gguf.metadata_get("tokenizer.ggml.merges") {
+            Some(MetaValue::Array { values, .. }) => {
+                let mut m = HashMap::with_capacity(values.len());
+                for (rank, v) in values.iter().enumerate() {
+                    if let MetaValue::String(s) = v {
+                        if let Some(sp) = s.find(' ') {
+                            m.insert((s[..sp].to_string(), s[sp + 1..].to_string()),
+                                     rank as u32);
+                        }
+                    }
+                }
+                m
+            }
+            _ => return Err("missing tokenizer.ggml.merges".into()),
+        };
+
+        // Byte-fallback tokens are spelled `<0xXX>` (uppercase hex).
+        let mut byte_to_id = [None; 256];
+        let mut id_to_byte = HashMap::with_capacity(256);
+        for b in 0..256usize {
+            if let Some(&id) = vocab_map.get(&format!("<0x{b:02X}>")) {
+                byte_to_id[b] = Some(id);
+                id_to_byte.insert(id, b as u8);
+            }
+        }
+
+        Ok(Self { tokens, vocab_map, merge_ranks, byte_to_id, id_to_byte, bos_id, eos_id })
+    }
+
+    /// Encode text to token ids (no BOS — the caller prepends `bos_id`).
+    /// SPM metaspace: prepend a dummy space, replace spaces with `▁`,
+    /// split to chars (byte-fallback for non-vocab chars), merge-rank BPE.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let prepared: String = format!(" {text}")
+            .chars().map(|c| if c == ' ' { METASPACE } else { c }).collect();
+
+        let mut word: Vec<String> = Vec::new();
+        for ch in prepared.chars() {
+            let s = ch.to_string();
+            if self.vocab_map.contains_key(&s) {
+                word.push(s);
+            } else {
+                let mut buf = [0u8; 4];
+                for &b in ch.encode_utf8(&mut buf).as_bytes() {
+                    word.push(format!("<0x{b:02X}>"));
+                }
+            }
+        }
+
+        loop {
+            let mut best_rank = u32::MAX;
+            let mut best_idx = usize::MAX;
+            for i in 0..word.len().saturating_sub(1) {
+                if let Some(&r) = self.merge_ranks.get(&(word[i].clone(), word[i + 1].clone())) {
+                    if r < best_rank { best_rank = r; best_idx = i; }
+                }
+            }
+            if best_idx == usize::MAX { break; }
+            let merged = format!("{}{}", word[best_idx], word[best_idx + 1]);
+            word[best_idx] = merged;
+            word.remove(best_idx + 1);
+        }
+
+        let mut out = Vec::with_capacity(word.len());
+        for piece in &word {
+            match self.vocab_map.get(piece) {
+                Some(&id) => out.push(id),
+                None => {
+                    // Should not happen — fall back to raw bytes.
+                    for &b in piece.as_bytes() {
+                        if let Some(id) = self.byte_to_id[b as usize] { out.push(id); }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn vocab_size(&self) -> usize { self.tokens.len() }
+
+    pub fn token_str(&self, id: u32) -> &str {
+        self.tokens.get(id as usize).map(|s| s.as_str()).unwrap_or("<unk>")
+    }
+
+    /// Decode ids to text: byte tokens become raw bytes, the metaspace
+    /// char becomes a space, everything else is literal.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut bytes: Vec<u8> = Vec::new();
+        for &id in ids {
+            if let Some(&b) = self.id_to_byte.get(&id) {
+                bytes.push(b);
+                continue;
+            }
+            let Some(s) = self.tokens.get(id as usize) else { continue };
+            for ch in s.chars() {
+                if ch == METASPACE {
+                    bytes.push(b' ');
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +394,43 @@ mod tests {
         let home = std::env::var_os("HOME")?;
         let p = PathBuf::from(home).join("models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf");
         p.exists().then_some(p)
+    }
+
+    fn gemma_fixture() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("REINSTINCT_GEMMA_FIXTURE") {
+            return Some(PathBuf::from(p));
+        }
+        let home = std::env::var_os("HOME")?;
+        let p = PathBuf::from(home)
+            .join("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf");
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    fn gemma_tokenizer_loads_and_round_trips() {
+        let Some(p) = gemma_fixture() else { eprintln!("skip: no gemma fixture"); return };
+        let g = GgufFile::open(&p).unwrap();
+        let tok = GemmaTokenizer::from_gguf(&g).expect("load gemma tokenizer");
+        eprintln!("gemma vocab = {}, bos = {}, eos = {}",
+                  tok.vocab_size(), tok.bos_id, tok.eos_id);
+        for id in [0u32, 1, 2, 3, 105, 106] {
+            eprintln!("  token {id:>4} = {:?}", tok.token_str(id));
+        }
+        // A few byte-fallback tokens.
+        for b in [0x41u8, 0x0A, 0xFF] {
+            eprintln!("  byte 0x{b:02X} -> id {:?}", tok.byte_to_id[b as usize]);
+        }
+        // Round-trip: SPM is lossless, decode(encode(x)) == " " + x
+        // (the leading space is the dummy metaspace prefix).
+        for case in ["Hello, world!", "The quick brown fox.", "numbers 123 + 456",
+                     "unicode: café 日本語 🦀"] {
+            let ids = tok.encode(case);
+            let back = tok.decode(&ids);
+            eprintln!("encode({case:?}) = {} ids: {ids:?}\n  decode -> {back:?}",
+                      ids.len());
+            assert_eq!(back, format!(" {case}"),
+                       "round-trip failed for {case:?}");
+        }
     }
 
     #[test]
