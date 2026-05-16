@@ -814,12 +814,19 @@ impl GpuGemma4 {
     /// `self.stream` — no host sync, no readback. Reads `d_token` /
     /// `d_pos`, so it is identical for every token/position and can be
     /// captured once into a HIP graph.
-    fn enqueue_forward(&self, state: &Gemma4GpuState) -> Result<(), String> {
+    fn enqueue_forward(&self, state: &Gemma4GpuState, debug: bool) -> Result<(), String> {
         let h = self.hidden as u32;
         self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr())?;
         self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
         for (li, block) in self.blocks.iter().enumerate() {
             self.block_forward(block, &state.caches[li])?;
+            if debug {
+                self.stream.synchronize()?;
+                let mut xh = vec![0.0f32; self.hidden];
+                self.hidden_a.copy_to_host(&mut xh)?;
+                let nrm = xh.iter().map(|v| v*v).sum::<f32>().sqrt();
+                eprintln!("decode layer {li:2} kind={:?}: |x|={nrm:.4}", block.kind);
+            }
         }
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), h)?;
@@ -835,7 +842,7 @@ impl GpuGemma4 {
         -> Result<Vec<f32>, String>
     {
         self.set_inputs(token, state.pos)?;
-        self.enqueue_forward(state)?;
+        self.enqueue_forward(state, std::env::var("REINSTINCT_DECODE_DEBUG").is_ok())?;
         self.stream.synchronize()?;
         state.pos += 1;
         let mut out = vec![0.0f32; self.vocab];
@@ -852,7 +859,7 @@ impl GpuGemma4 {
         -> Result<GraphExec, String>
     {
         Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
-        if let Err(e) = self.enqueue_forward(state) {
+        if let Err(e) = self.enqueue_forward(state, false) {
             let _ = Graph::end_capture(&self.stream);
             return Err(e);
         }
@@ -921,7 +928,7 @@ impl GpuGemma4 {
     pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32])
         -> Result<Vec<f32>, String>
     {
-        use crate::runtime::prefill::batched_matmul_resident;
+        use crate::runtime::prefill::PrefillGemm;
         use crate::hip::rocblas::Handle;
         let p = tokens.len();
         let h = self.hidden;
@@ -964,13 +971,28 @@ impl GpuGemma4 {
 
         let normed = DeviceBuf::<f32>::new(p * h)?;
         let hu = h as u32;
+        // Pooled GEMM context — modules + fp16 scratch loaded once,
+        // pre-sized to the largest weight any block will pass.
+        let (mut max_w, mut max_in, mut max_out) = (0usize, 0usize, 0usize);
+        for b in &self.blocks {
+            let mut ws: Vec<&GpuMatvecTensor> = vec![
+                &b.attn_q, &b.attn_k, &b.attn_output, &b.ffn_gate, &b.ffn_up, &b.ffn_down];
+            if let Some(wv) = &b.attn_v { ws.push(wv); }
+            for w in ws {
+                let (id, od) = (w.in_dim as usize, w.out_dim as usize);
+                max_w = max_w.max(id * od);
+                max_in = max_in.max(id);
+                max_out = max_out.max(od);
+            }
+        }
+        let pg = PrefillGemm::new(cache, max_w, p * max_in, p * max_out)?;
         let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
-            self.stream.synchronize()?;          // input ready before the GEMM's cvt
-            batched_matmul_resident(cache, &handle, &w.data, w.dtype,
-                                    w.in_dim as usize, w.out_dim as usize, xin, p)
+            pg.matmul(&handle, &self.stream, &w.data, w.dtype,
+                      w.in_dim as usize, w.out_dim as usize, xin, p)
         };
 
-        for b in &self.blocks {
+        let dbg = std::env::var("REINSTINCT_PREFILL_DEBUG").is_ok();
+        for (li, b) in self.blocks.iter().enumerate() {
             let hd = b.head_dim;
             let n_kv = b.n_kv;
             let q_dim = self.n_heads * hd;
@@ -1145,6 +1167,16 @@ impl GpuGemma4 {
                         self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
                     }
                 }
+            }
+            if dbg {
+                self.stream.synchronize()?;
+                let mut xh = vec![0.0f32; p * h];
+                x.copy_to_host(&mut xh)?;
+                let nrm = |i: usize| -> f32 {
+                    xh[i*h..(i+1)*h].iter().map(|v| v*v).sum::<f32>().sqrt()
+                };
+                eprintln!("layer {li:2} kind={:?} hd={hd}: |x[0]|={:.4} |x[last]|={:.4}",
+                          b.kind, nrm(0), nrm(p-1));
             }
         }
 

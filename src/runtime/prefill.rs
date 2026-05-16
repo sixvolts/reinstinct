@@ -179,6 +179,139 @@ pub fn batched_matmul_resident(cache: &KernelCache, handle: &Handle,
     Ok(dy_f32)
 }
 
+/// Pooled prefill GEMM context: modules and fp16 scratch buffers loaded
+/// once and reused across every `Y = X · Wᵀ` of a prefill pass.
+///
+/// `batched_matmul_resident` re-loads two modules and `hipMalloc`s a
+/// fresh (up to ~300 MB) fp16 weight buffer on *every* call. Across a
+/// 30-layer prefill that fixed per-weight cost dwarfs the actual GEMM
+/// work — ~2.4 s on the 31B. This context hoists the modules and the
+/// scratch out of the call so the cost is paid once.
+pub struct PrefillGemm {
+    cvt:       Module,
+    deq_q4k:   Module,
+    deq_q5k:   Module,
+    deq_q6k:   Module,
+    deq_q8_0:  Module,
+    deq_iq4xs: Module,
+    w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
+    dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
+    dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
+}
+
+impl PrefillGemm {
+    /// Pre-size the scratch to the largest weight/activation/output the
+    /// caller will pass. Buffers still grow on demand as a safety net.
+    pub fn new(cache: &KernelCache, max_w: usize, max_x: usize, max_y: usize)
+        -> Result<Self, String>
+    {
+        Ok(Self {
+            cvt:       Module::load(&cache.compile("cvt_f32_f16", CVT_SOURCE)?)?,
+            deq_q4k:   Module::load(&cache.compile("dequant_q4_k_f16",
+                           include_str!("../../kernels/dequant_q4_k_f16.cpp"))?)?,
+            deq_q5k:   Module::load(&cache.compile("dequant_q5_k_f16",
+                           include_str!("../../kernels/dequant_q5_k_f16.cpp"))?)?,
+            deq_q6k:   Module::load(&cache.compile("dequant_q6_k_f16",
+                           include_str!("../../kernels/dequant_q6_k_f16.cpp"))?)?,
+            deq_q8_0:  Module::load(&cache.compile("dequant_q8_0_f16",
+                           include_str!("../../kernels/dequant_q8_0_f16.cpp"))?)?,
+            deq_iq4xs: Module::load(&cache.compile("dequant_iq4_xs_f16",
+                           include_str!("../../kernels/dequant_iq4_xs_f16.cpp"))?)?,
+            w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
+            dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
+            dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
+        })
+    }
+
+    fn deq(&self, dt: GgmlType) -> Result<(&Module, &'static str, usize, u32), String> {
+        Ok(match dt {
+            GgmlType::Q4_K   => (&self.deq_q4k,   "dequant_q4_k_f16",   256, 256),
+            GgmlType::Q5_K   => (&self.deq_q5k,   "dequant_q5_k_f16",   256, 256),
+            GgmlType::Q6_K   => (&self.deq_q6k,   "dequant_q6_k_f16",   256, 256),
+            GgmlType::Q8_0   => (&self.deq_q8_0,  "dequant_q8_0_f16",    32,  32),
+            GgmlType::IQ4_XS => (&self.deq_iq4xs, "dequant_iq4_xs_f16", 256, 256),
+            o => return Err(format!("PrefillGemm: unsupported weight dtype {o:?}")),
+        })
+    }
+
+    /// Device-resident `Y = X · Wᵀ`, all kernels ordered on `stream` —
+    /// no internal device syncs, no per-call module loads or weight
+    /// allocations. Only `Y` (`[n_rows, out_dim]` fp32) is freshly
+    /// allocated; the fp16 scratch is pooled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul(&self, handle: &Handle, stream: &hip::Stream,
+                  w_dev: &DeviceBuf<u8>, dtype: GgmlType,
+                  in_dim: usize, out_dim: usize,
+                  x: &DeviceBuf<f32>, n_rows: usize)
+        -> Result<DeviceBuf<f32>, String>
+    {
+        let n_w = out_dim * in_dim;
+        let n_x = n_rows * in_dim;
+        let n_y = n_rows * out_dim;
+        Self::grow(&self.w_f16,  n_w, stream)?;
+        Self::grow(&self.dx_f16, n_x, stream)?;
+        Self::grow(&self.dy_f16, n_y, stream)?;
+        let w_f16  = self.w_f16.borrow();
+        let dx_f16 = self.dx_f16.borrow();
+        let dy_f16 = self.dy_f16.borrow();
+
+        // 1. Dequant W → fp16 scratch (in place reuse).
+        let (module, kname, wpb, bt) = self.deq(dtype)?;
+        assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");
+        let n_blocks = (n_w / wpb) as u32;
+        let f = module.function(kname)?;
+        let mut w_ptr = w_dev.raw_ptr();
+        let mut o_ptr = w_f16.raw_ptr();
+        let mut nb = n_blocks;
+        let mut da: [*mut c_void; 3] = [
+            &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+            &mut nb    as *mut _ as *mut c_void];
+        unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
+
+        // 2. X → fp16 scratch.
+        let to_f16 = self.cvt.function("cvt_f32_to_f16")?;
+        let to_f32 = self.cvt.function("cvt_f16_to_f32")?;
+        let cvt = |f: &crate::hip::Function, src: *mut c_void, dst: *mut c_void, n: u32|
+            -> Result<(), String> {
+            let block: u32 = 256;
+            let mut i=src; let mut o=dst; let mut na=n;
+            let mut args: [*mut c_void; 3] = [
+                &mut i as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
+                &mut na as *mut _ as *mut c_void];
+            unsafe { f.launch(((n+block-1)/block,1,1),(block,1,1),0,Some(stream),&mut args) }
+        };
+        cvt(&to_f16, x.raw_ptr(), dx_f16.raw_ptr(), n_x as u32)?;
+
+        // 3. HGEMM (see batched_matmul_resident for the layout derivation).
+        unsafe {
+            handle.gemm_f16_f32acc(
+                RocblasOp::Transpose, RocblasOp::None,
+                out_dim as i32, n_rows as i32, in_dim as i32,
+                1.0,
+                w_f16.as_ptr() as *const c_void,  in_dim as i32,
+                dx_f16.as_ptr() as *const c_void, in_dim as i32,
+                0.0,
+                dy_f16.as_ptr() as *mut c_void,   out_dim as i32,
+            )?;
+        }
+
+        // 4. Y fp16 → fresh fp32.
+        let dy_f32: DeviceBuf<f32> = DeviceBuf::new(n_y)?;
+        cvt(&to_f32, dy_f16.raw_ptr(), dy_f32.raw_ptr(), n_y as u32)?;
+        Ok(dy_f32)
+    }
+
+    fn grow(buf: &std::cell::RefCell<DeviceBuf<u16>>, n: usize, stream: &hip::Stream)
+        -> Result<(), String>
+    {
+        if buf.borrow().len() < n {
+            stream.synchronize()?;          // old buffer may still be in flight
+            *buf.borrow_mut() = DeviceBuf::new(n)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
