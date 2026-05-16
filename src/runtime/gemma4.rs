@@ -48,6 +48,9 @@ const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
 const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill.cpp");
+const MOE_GROUPED_Q6K_SRC:   &str = include_str!("../../kernels/moe_matvec_grouped_q6k.cpp");
+const MOE_GROUPED_Q8_0_SRC:  &str = include_str!("../../kernels/moe_matvec_grouped_q8_0.cpp");
+const MOE_SCATTER_SRC:       &str = include_str!("../../kernels/moe_scatter_add.cpp");
 const MOE_TOPK_SRC:          &str = include_str!("../../kernels/moe_topk.cpp");
 const MOE_MATVEC_Q6K_SRC:    &str = include_str!("../../kernels/moe_matvec_q6k_dp4a.cpp");
 const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
@@ -927,6 +930,27 @@ impl GpuGemma4 {
         handle.set_stream(&self.stream)?;
         let m_rope = Module::load(&cache.compile("rope_prefill", ROPE_PREFILL_SRC)?)?;
         let m_attn = Module::load(&cache.compile("attn_prefill", ATTN_PREFILL_SRC)?)?;
+        // Grouped-MoE prefill scratch (sized for P; tiny/unused on the
+        // dense 31B). Each expert's weight is processed in one launch over
+        // all its routed tokens — fits in the 4 MB L2, so the weight is
+        // HBM-read once and L2-reused across the tokens.
+        let moe = self.n_expert > 0;
+        let ne_a = self.n_expert.max(1);
+        let ff_a = self.expert_ff.max(32);
+        let m_g6k = Module::load(&cache.compile("moe_matvec_grouped_q6k", MOE_GROUPED_Q6K_SRC)?)?;
+        let m_g8  = Module::load(&cache.compile("moe_matvec_grouped_q8_0", MOE_GROUPED_Q8_0_SRC)?)?;
+        let m_sc  = Module::load(&cache.compile("moe_scatter_add", MOE_SCATTER_SRC)?)?;
+        let moe_in_all  = DeviceBuf::<f32>::new(p * h)?;
+        let cur_mlp     = DeviceBuf::<f32>::new(p * h)?;
+        let cur_moe     = DeviceBuf::<f32>::from_slice(&vec![0.0f32; p * h])?;
+        let xq8_moe     = DeviceBuf::<u8>::new(p * (h / 32) * 40)?;
+        let xq8_e       = DeviceBuf::<u8>::new(p * (ff_a / 32) * 40)?;
+        let expert_gu_p = DeviceBuf::<f32>::new(p * 2 * ff_a)?;
+        let expert_act_p= DeviceBuf::<f32>::new(p * ff_a)?;
+        let expert_dn_p = DeviceBuf::<f32>::new(p * h)?;
+        let all_ids     = DeviceBuf::<i32>::new(p * 8)?;
+        let all_wts     = DeviceBuf::<f32>::new(p * 8)?;
+        let _ = (moe, ne_a);
 
         // --- embed P tokens → x [P, hidden] ---
         let x = DeviceBuf::<f32>::new(p * h)?;
@@ -1020,48 +1044,97 @@ impl GpuGemma4 {
                     }
                 }
                 Some(mw) => {
-                    // Dual FFN. cur_mlp = post_ffw_norm_1(shared MLP).
-                    let cur_mlp = DeviceBuf::<f32>::new(p * h)?;
-                    let cur_moe = DeviceBuf::<f32>::new(p * h)?;
+                    // Dual FFN with a grouped-expert GEMM. cur_mlp =
+                    // post_ffw_norm_1(shared MLP).
+                    let ff_exp = self.expert_ff as u32;
+                    let inv_sqrt_h = 1.0 / (self.hidden as f32).sqrt();
+                    let nu = self.n_expert_used;
                     for i in 0..p {
                         self.launch_rmsnorm(pf_off(mlp.raw_ptr(), i*h),
                                             mw.post_ffw_norm_1.raw_ptr(),
                                             pf_off(cur_mlp.raw_ptr(), i*h), hu)?;
                     }
-                    // Routed experts — per token (v1: weights re-read per
-                    // token; a grouped GEMM would amortise them).
-                    let ff_exp = self.expert_ff as u32;
-                    let inv_sqrt_h = 1.0 / (self.hidden as f32).sqrt();
+                    // expert input for all P, quantized in one batch.
                     for i in 0..p {
-                        // router on x[i]
+                        self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), mw.pre_ffw_norm_2.raw_ptr(),
+                                            pf_off(moe_in_all.raw_ptr(), i*h), hu)?;
+                    }
+                    self.launch_quantize_q8(moe_in_all.raw_ptr(), xq8_moe.raw_ptr(), hu, p as u32)?;
+                    // routing for all P tokens.
+                    for i in 0..p {
                         self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), mw.gate_inp_s.raw_ptr(),
                                             self.normed.raw_ptr(), hu)?;
                         self.launch_scale(self.normed.raw_ptr(), hu, inv_sqrt_h)?;
                         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(),
                                            self.moe_logits.raw_ptr())?;
                         self.launch_moe_topk()?;
-                        // expert input + expert FFN (decode dp4a path)
-                        self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), mw.pre_ffw_norm_2.raw_ptr(),
-                                            self.moe_in.raw_ptr(), hu)?;
-                        self.launch_quantize_q8(self.moe_in.raw_ptr(), self.xq8.raw_ptr(), hu, 1)?;
-                        self.launch_moe_matvec(mw.gate_up_exps.dtype,
-                            mw.gate_up_exps.data.raw_ptr(), self.xq8.raw_ptr(),
-                            self.expert_gu.raw_ptr(), hu, 2*ff_exp,
-                            mw.gate_up_exps.bytes_per_expert as u32, 0)?;
-                        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
-                        self.launch_quantize_q8(self.expert_act.raw_ptr(),
-                            self.xq8_experts.raw_ptr(), ff_exp, self.n_expert_used as u32)?;
-                        self.launch_moe_matvec(mw.down_exps.dtype,
-                            mw.down_exps.data.raw_ptr(), self.xq8_experts.raw_ptr(),
-                            self.expert_outs.raw_ptr(), ff_exp, hu,
-                            mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
-                        self.launch_moe_combine(self.expert_outs.raw_ptr(),
-                            mw.down_exps_s.raw_ptr(), self.moe_acc.raw_ptr())?;
-                        self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
-                                            pf_off(cur_moe.raw_ptr(), i*h), hu)?;
+                        all_ids.copy_from_device_at_async(&self.moe_ids, i*nu, &self.stream)?;
+                        all_wts.copy_from_device_at_async(&self.moe_weights, i*nu, &self.stream)?;
                     }
-                    // cur = cur_mlp + cur_moe → post_ffw_norm → residual.
+                    self.stream.synchronize()?;
+                    let mut ids_h = vec![0i32; p*nu];
+                    let mut wts_h = vec![0.0f32; p*nu];
+                    all_ids.copy_to_host(&mut ids_h)?;
+                    all_wts.copy_to_host(&mut wts_h)?;
+                    // bucket tokens by expert.
+                    let mut buckets: Vec<Vec<(i32, f32)>> = vec![Vec::new(); self.n_expert];
+                    for pi in 0..p {
+                        for j in 0..nu {
+                            let e = ids_h[pi*nu + j];
+                            if e >= 0 && (e as usize) < self.n_expert {
+                                buckets[e as usize].push((pi as i32, wts_h[pi*nu + j]));
+                            }
+                        }
+                    }
+                    self.launch_scale(cur_moe.raw_ptr(), (p*h) as u32, 0.0)?;  // reset accumulator
+                    // Per-tensor kernel dispatch — Unsloth varies the
+                    // expert quant type per layer (26B layer 29 gate_up
+                    // is Q8_0 while the rest are Q6_K).
+                    let pick = |dt: GgmlType| -> Result<(&Module, &str), String> {
+                        match dt {
+                            GgmlType::Q6_K => Ok((&m_g6k, "moe_matvec_grouped_q6k_f32")),
+                            GgmlType::Q8_0 => Ok((&m_g8,  "moe_matvec_grouped_q8_0_f32")),
+                            o => Err(format!("grouped moe: expert dtype {o:?}")),
+                        }
+                    };
+                    let (gu_m, gu_k) = pick(mw.gate_up_exps.dtype)?;
+                    let (dn_m, dn_k) = pick(mw.down_exps.dtype)?;
+                    // one launch per expert over its routed tokens.
+                    let mut keep_i: Vec<DeviceBuf<i32>> = Vec::new();
+                    let mut keep_f: Vec<DeviceBuf<f32>> = Vec::new();
+                    for e in 0..self.n_expert {
+                        let toks = &buckets[e];
+                        if toks.is_empty() { continue; }
+                        let n_e = toks.len();
+                        let idx_h: Vec<i32> = toks.iter().map(|t| t.0).collect();
+                        let wts_h: Vec<f32> = toks.iter().map(|t| t.1).collect();
+                        let ident:  Vec<i32> = (0..n_e as i32).collect();
+                        let idx_e   = DeviceBuf::from_slice(&idx_h)?;
+                        let wts_e   = DeviceBuf::from_slice(&wts_h)?;
+                        let ident_e = DeviceBuf::from_slice(&ident)?;
+                        self.launch_moe_grouped(gu_m, gu_k,
+                            mw.gate_up_exps.data.raw_ptr(), e as u32, idx_e.raw_ptr(),
+                            xq8_moe.raw_ptr(), expert_gu_p.raw_ptr(), hu, 2*ff_exp,
+                            mw.gate_up_exps.bytes_per_expert as u32, hu/32, n_e)?;
+                        self.launch_moe_geglu_n(expert_gu_p.raw_ptr(), expert_act_p.raw_ptr(), n_e)?;
+                        self.launch_quantize_q8(expert_act_p.raw_ptr(), xq8_e.raw_ptr(),
+                                                ff_exp, n_e as u32)?;
+                        self.launch_moe_grouped(dn_m, dn_k,
+                            mw.down_exps.data.raw_ptr(), e as u32, ident_e.raw_ptr(),
+                            xq8_e.raw_ptr(), expert_dn_p.raw_ptr(), ff_exp, hu,
+                            mw.down_exps.bytes_per_expert as u32, ff_exp/32, n_e)?;
+                        self.launch_scatter(&m_sc, expert_dn_p.raw_ptr(), idx_e.raw_ptr(),
+                            wts_e.raw_ptr(), mw.down_exps_s.raw_ptr(), e as u32,
+                            cur_moe.raw_ptr(), hu, n_e)?;
+                        keep_i.push(idx_e); keep_i.push(ident_e); keep_f.push(wts_e);
+                    }
+                    self.stream.synchronize()?;     // before keep_* drop
+                    drop((keep_i, keep_f));
+                    // cur = post_ffw_norm_2(moe) + cur_mlp → post_ffw_norm → residual.
                     for i in 0..p {
+                        self.launch_rmsnorm(pf_off(cur_moe.raw_ptr(), i*h),
+                                            mw.post_ffw_norm_2.raw_ptr(),
+                                            pf_off(cur_moe.raw_ptr(), i*h), hu)?;
                         self.launch_add(pf_off(cur_mlp.raw_ptr(), i*h),
                                         pf_off(cur_moe.raw_ptr(), i*h), hu)?;
                         self.launch_rmsnorm(pf_off(cur_mlp.raw_ptr(), i*h),
@@ -1127,6 +1200,63 @@ impl GpuGemma4 {
             &mut sc as *mut _ as *mut c_void];
         unsafe { f.launch((self.n_heads as u32, p as u32, 1),(block,1,1), smem,
                           Some(&self.stream), &mut args) }
+    }
+
+    /// Grouped expert matvec — expert `expert_id`'s weight against the
+    /// `n_tok` tokens routed to it (`idx` maps slot → input row). Each
+    /// expert's weight fits in L2, so the n_tok slots HBM-read it once.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_grouped(&self, m: &Module, kname: &str, slab: *mut c_void,
+                          expert_id: u32, idx: *mut c_void, xq: *mut c_void, y: *mut c_void,
+                          in_dim: u32, out_dim: u32, bpe: u32, xq_stride: u32, n_tok: usize)
+        -> Result<(), String>
+    {
+        let f = m.function(kname)?;
+        let grid_x = (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+        let mut sa=slab; let mut eid=expert_id; let mut ix=idx; let mut xa=xq; let mut ya=y;
+        let mut ia=in_dim; let mut oa=out_dim; let mut bp=bpe; let mut st=xq_stride;
+        let mut args: [*mut c_void; 9] = [
+            &mut sa as *mut _ as *mut c_void, &mut eid as *mut _ as *mut c_void,
+            &mut ix as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
+            &mut st as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_tok as u32, 1),(64,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Batched GeGLU over `n_slot` vectors (the grouped expert path).
+    fn launch_moe_geglu_n(&self, gu: *mut c_void, act: *mut c_void, n_slot: usize)
+        -> Result<(), String>
+    {
+        let f = self.m_moe_geglu.function("moe_geglu_f32")?;
+        let block: u32 = 256;
+        let total = (n_slot * self.expert_ff) as u32;
+        let grid = (total + block - 1) / block;
+        let mut ga=gu; let mut aa=act;
+        let mut ff=self.expert_ff as u32; let mut ns=n_slot as u32;
+        let mut args: [*mut c_void; 4] = [
+            &mut ga as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+            &mut ff as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Scatter-add expert outputs into the per-token MoE accumulator.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_scatter(&self, m: &Module, src: *mut c_void, idx: *mut c_void,
+                      wts: *mut c_void, down_s: *mut c_void, expert_id: u32,
+                      dst: *mut c_void, hidden: u32, n_tok: usize) -> Result<(), String>
+    {
+        let f = m.function("moe_scatter_add_f32")?;
+        let block: u32 = 256;
+        let grid_x = (hidden + block - 1) / block;
+        let mut sr=src; let mut ix=idx; let mut wt=wts; let mut ds=down_s;
+        let mut eid=expert_id; let mut dt=dst; let mut hd=hidden; let mut nt=n_tok as u32;
+        let mut args: [*mut c_void; 8] = [
+            &mut sr as *mut _ as *mut c_void, &mut ix as *mut _ as *mut c_void,
+            &mut wt as *mut _ as *mut c_void, &mut ds as *mut _ as *mut c_void,
+            &mut eid as *mut _ as *mut c_void, &mut dt as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_tok as u32, 1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     /// One transformer block, in place on `hidden_a`. All position-
