@@ -1,17 +1,17 @@
 // Row-blocked Q6_K matvec for gfx906 — same idea as the Q4_K rowblock.
 //
-// ROWS=8 output rows per wavefront, lane = one 16-weight sub-block.
+// ROWS=2 output rows per wavefront, lane = one 16-weight sub-block.
 // Q6_K blocks are 210 bytes, so the stride is only 2-byte aligned —
 // the ql / qh bytes are read as uint16 (not uint32) to stay aligned
 // while still halving the load-instruction count vs byte-at-a-time.
 //
-// grid = ceil(out_dim / 8); block = 64 (one wavefront).
+// grid = ceil(out_dim / ROWS); block = 64 (one wavefront).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ6_K {
     uint8_t  ql[128];

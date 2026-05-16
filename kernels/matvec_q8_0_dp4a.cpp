@@ -7,15 +7,15 @@
 //   dot = sum_block d_w · d_x · <int8 weights · int8 activation>
 //
 // Q8_0 blocks are 34 bytes, so the int8 payload is only 2-byte aligned —
-// it is read as uint16 pairs and recombined. ROWS=8 rows per wavefront.
+// it is read as uint16 pairs and recombined. ROWS=2 rows per wavefront.
 //
-// grid = ceil(out_dim/8); block = 64.
+// grid = ceil(out_dim/ROWS); block = 64.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ8_0 {
     uint16_t d;

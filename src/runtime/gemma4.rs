@@ -30,7 +30,7 @@ const MATVEC_Q5K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q5_k_dp4a
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 /// Output rows per wavefront in the row-blocked K-quant matvecs — must
 /// match `ROWS` in matvec_q{4,5,6}_k_rowblock.cpp.
-const Q4K_ROWBLOCK: u32 = 8;
+const Q4K_ROWBLOCK: u32 = 2;
 const MATVEC_Q8_0_W_SRC:     &str = include_str!("../../kernels/matvec_q8_0_wave64.cpp");
 const MATVEC_F16_W_SRC:      &str = include_str!("../../kernels/matvec_f16_wave64.cpp");
 // Gemma-specific kernel sources.

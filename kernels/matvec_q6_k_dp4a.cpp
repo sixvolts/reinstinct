@@ -6,15 +6,15 @@
 // sums are dp4a reductions — the second against a vector of ones.
 //
 // Lane = one 16-weight sub-block; the activation is the 32-int8 BlockQ8
-// (one per 32 elements), indexed by half. ROWS=8 rows per wavefront.
+// (one per 32 elements), indexed by half. ROWS=2 rows per wavefront.
 //
-// grid = ceil(out_dim/8); block = 64.
+// grid = ceil(out_dim/ROWS); block = 64.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ6_K {
     uint8_t  ql[128];

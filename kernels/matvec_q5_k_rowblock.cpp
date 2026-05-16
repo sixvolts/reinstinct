@@ -1,17 +1,17 @@
 // Row-blocked Q5_K matvec for gfx906 — same idea as the Q4_K rowblock.
 //
-// ROWS=8 output rows per wavefront; per sub-block each lane touches all
+// ROWS=2 output rows per wavefront; per sub-block each lane touches all
 // 8 rows before consuming a result (8-deep memory pipeline). The 32
 // low-nibble bytes and the 32 high-bit bytes are each read as 8×uint32
 // rather than byte-at-a-time.
 //
-// grid = ceil(out_dim / 8); block = 64 (one wavefront).
+// grid = ceil(out_dim / ROWS); block = 64 (one wavefront).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ5_K {
     uint16_t d;

@@ -9,13 +9,13 @@
 //
 //   dot = sum_sub [ (d_w·sc)·d_x·<nibbles·int8> - (dmin_w·m)·xsum ]
 //
-// ROWS=8 output rows per wavefront; grid = ceil(out_dim/8); block = 64.
+// ROWS=2 output rows per wavefront; grid = ceil(out_dim/ROWS); block = 64.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ4_K {
     uint16_t d;

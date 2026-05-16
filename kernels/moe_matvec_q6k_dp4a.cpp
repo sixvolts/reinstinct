@@ -6,13 +6,13 @@
 // per-slot (xq_stride > 0).
 //
 // Body is matvec_q6_k_dp4a's Q6_K dp4a with an expert-indexing prologue.
-// grid = (ceil(out_dim/8), n_used); block = 64.
+// grid = (ceil(out_dim/ROWS), n_used); block = 64.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ6_K {
     uint8_t  ql[128];

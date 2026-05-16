@@ -4,7 +4,7 @@
 // load, consumes it, issues the next — memory latency barely hidden, so
 // it sustains only ~13% of HBM bandwidth on Gemma's large matmuls.
 //
-// This variant gives each wavefront ROWS=8 output rows. The inner loop
+// This variant gives each wavefront ROWS=2 output rows. The inner loop
 // is over sub-blocks; for each sub-block every lane touches all 8 rows
 // before consuming any result, so 8 independent global loads are in
 // flight at once — an 8-deep memory pipeline per lane. The activation
@@ -14,13 +14,13 @@
 // and the 32 activations as 8×float4 — the byte-at-a-time version was
 // load-issue bound, not bandwidth bound.
 //
-// grid = ceil(out_dim / 8); block = 64 (one wavefront).
+// grid = ceil(out_dim / ROWS); block = 64 (one wavefront).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ4_K {
     uint16_t d;

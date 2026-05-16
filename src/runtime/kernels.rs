@@ -70,7 +70,10 @@ pub fn matvec_kquant_dp4a(cache: &KernelCache, compile_name: &str, mv_src: &str,
         &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
         &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
         &mut oa as *mut _ as *mut c_void];
-    let grid = (out_dim as u32 + 7) / 8;
+    // ROWS output rows per wavefront — must match `#define ROWS` in the
+    // dp4a kernel sources.
+    const ROWS: u32 = 2;
+    let grid = (out_dim as u32 + ROWS - 1) / ROWS;
     unsafe { mvf.launch((grid, 1, 1), (64, 1, 1), 0, None, &mut margs)?; }
     hip::Device(0).synchronize()?;
 

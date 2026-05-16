@@ -2,13 +2,13 @@
 // as moe_matvec_q6k_dp4a; used for the down projection, where each
 // expert slot has its own activation (xq_stride > 0).
 //
-// grid = (ceil(out_dim/8), n_used); block = 64.
+// grid = (ceil(out_dim/ROWS), n_used); block = 64.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS 8
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ8_0 {
     uint16_t d;
