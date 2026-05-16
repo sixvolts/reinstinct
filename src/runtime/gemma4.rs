@@ -45,11 +45,19 @@ const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
 // MoE kernel sources.
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+// Prefill kernel sources.
+const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
+const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill.cpp");
 const MOE_TOPK_SRC:          &str = include_str!("../../kernels/moe_topk.cpp");
 const MOE_MATVEC_Q6K_SRC:    &str = include_str!("../../kernels/moe_matvec_q6k_dp4a.cpp");
 const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
 const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
 const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
+
+/// Offset an f32 device pointer by `elems` elements (prefill row indexing).
+fn pf_off(p: *mut c_void, elems: usize) -> *mut c_void {
+    unsafe { (p as *mut f32).add(elems) as *mut c_void }
+}
 
 /// Load an fp32 GGUF tensor straight to device.
 fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
@@ -898,6 +906,166 @@ impl GpuGemma4 {
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok((out, embed_ms, block_ms, output_ms))
+    }
+
+    /// Batched prefill: process all `tokens` in one pass. Each weight is
+    /// streamed once and reused across all P tokens via rocBLAS HGEMM,
+    /// rather than the decode path's P sequential weight-streaming
+    /// passes. Returns the last token's soft-capped logits.
+    ///
+    /// Dense path only (the 31B); the 26B MoE prefill is layered on top.
+    pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32])
+        -> Result<Vec<f32>, String>
+    {
+        use crate::runtime::prefill::batched_matmul_resident;
+        use crate::hip::rocblas::Handle;
+        let p = tokens.len();
+        let h = self.hidden;
+        assert!(p > 0 && p <= self.max_seq, "prefill: bad token count");
+        let handle = Handle::new()?;
+        handle.set_stream(&self.stream)?;
+        let m_rope = Module::load(&cache.compile("rope_prefill", ROPE_PREFILL_SRC)?)?;
+        let m_attn = Module::load(&cache.compile("attn_prefill", ATTN_PREFILL_SRC)?)?;
+
+        // --- embed P tokens → x [P, hidden] ---
+        let x = DeviceBuf::<f32>::new(p * h)?;
+        let es = (h as f32).sqrt();
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.d_token.copy_from_host(&[tok])?;
+            self.launch_embed(&self.token_embd, pf_off(x.raw_ptr(), i * h))?;
+            self.launch_scale(pf_off(x.raw_ptr(), i * h), h as u32, es)?;
+            self.stream.synchronize()?;          // d_token is reused next iter
+        }
+
+        let normed = DeviceBuf::<f32>::new(p * h)?;
+        let hu = h as u32;
+        let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
+            self.stream.synchronize()?;          // input ready before the GEMM's cvt
+            batched_matmul_resident(cache, &handle, &w.data, w.dtype,
+                                    w.in_dim as usize, w.out_dim as usize, xin, p)
+        };
+
+        for b in &self.blocks {
+            let hd = b.head_dim;
+            let n_kv = b.n_kv;
+            let q_dim = self.n_heads * hd;
+            let kv_dim = n_kv * hd;
+
+            // --- attention ---
+            for i in 0..p {
+                self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), b.attn_norm.raw_ptr(),
+                                    pf_off(normed.raw_ptr(), i*h), hu)?;
+            }
+            let q = gemm(&b.attn_q, &normed)?;
+            let k = gemm(&b.attn_k, &normed)?;
+            let v_gemm;
+            let v_ptr = match &b.attn_v {
+                Some(wv) => { v_gemm = gemm(wv, &normed)?; v_gemm.raw_ptr() }
+                None     => k.raw_ptr(),     // full layers: V is the K projection
+            };
+            // per-head Q/K norm; V plain norm; RoPE (batched over P).
+            for i in 0..p {
+                self.launch_rmsnorm_mh(pf_off(q.raw_ptr(), i*q_dim), b.attn_q_norm.raw_ptr(),
+                                       pf_off(q.raw_ptr(), i*q_dim), self.n_heads as u32, hd as u32)?;
+            }
+            self.launch_rope_prefill(&m_rope, q.raw_ptr(), self.n_heads as u32, hd as u32, b.kind, p)?;
+            let k_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
+            let v_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
+            for i in 0..p {
+                self.launch_rmsnorm_mh(pf_off(k.raw_ptr(), i*kv_dim), b.attn_k_norm.raw_ptr(),
+                                       pf_off(k_norm.raw_ptr(), i*kv_dim), n_kv as u32, hd as u32)?;
+                self.launch_rmsnorm_mh(pf_off(v_ptr, i*kv_dim), self.ones.raw_ptr(),
+                                       pf_off(v_norm.raw_ptr(), i*kv_dim), n_kv as u32, hd as u32)?;
+            }
+            self.launch_rope_prefill(&m_rope, k_norm.raw_ptr(), n_kv as u32, hd as u32, b.kind, p)?;
+            let window = match b.kind {
+                AttnKind::Sliding => self.sliding_window as u32,
+                AttnKind::Full    => 0,
+            };
+            let attn = DeviceBuf::<f32>::new(p * q_dim)?;
+            self.launch_attn_prefill(&m_attn, q.raw_ptr(), k_norm.raw_ptr(), v_norm.raw_ptr(),
+                                     attn.raw_ptr(), n_kv as u32, hd as u32, window, p)?;
+            let attn_out = gemm(&b.attn_output, &attn)?;
+            for i in 0..p {
+                self.launch_rmsnorm(pf_off(attn_out.raw_ptr(), i*h), b.post_attn_norm.raw_ptr(),
+                                    pf_off(normed.raw_ptr(), i*h), hu)?;
+                self.launch_add(pf_off(x.raw_ptr(), i*h), pf_off(normed.raw_ptr(), i*h), hu)?;
+            }
+
+            // --- dense FFN (GeGLU) ---
+            for i in 0..p {
+                self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), b.ffn_norm.raw_ptr(),
+                                    pf_off(normed.raw_ptr(), i*h), hu)?;
+            }
+            let gate = gemm(&b.ffn_gate, &normed)?;
+            let up   = gemm(&b.ffn_up,   &normed)?;
+            let ff = self.ffn as u32;
+            for i in 0..p {
+                self.launch_geglu(pf_off(gate.raw_ptr(), i*self.ffn),
+                                  pf_off(up.raw_ptr(), i*self.ffn),
+                                  pf_off(gate.raw_ptr(), i*self.ffn), ff)?;
+            }
+            let ffn_out = gemm(&b.ffn_down, &gate)?;
+            for i in 0..p {
+                self.launch_rmsnorm(pf_off(ffn_out.raw_ptr(), i*h), b.post_ffw_norm.raw_ptr(),
+                                    pf_off(normed.raw_ptr(), i*h), hu)?;
+                self.launch_add(pf_off(x.raw_ptr(), i*h), pf_off(normed.raw_ptr(), i*h), hu)?;
+                self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
+            }
+        }
+
+        // --- output: last token only ---
+        let last = pf_off(x.raw_ptr(), (p - 1) * h);
+        self.launch_rmsnorm(last, self.output_norm.raw_ptr(), self.hidden_b.raw_ptr(), hu)?;
+        self.launch_matvec(&self.token_embd, self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        if self.softcap > 0.0 {
+            self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
+        }
+        self.stream.synchronize()?;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
+    fn launch_rope_prefill(&self, m: &Module, x: *mut c_void, n_heads: u32, head_dim: u32,
+                           kind: AttnKind, p: usize) -> Result<(), String>
+    {
+        let f = m.function("rope_prefill_f32")?;
+        let (cos, sin, rd) = match kind {
+            AttnKind::Sliding => (self.rope_cos_swa.raw_ptr(), self.rope_sin_swa.raw_ptr(),
+                                  self.rope_dim_swa as u32),
+            AttnKind::Full    => (self.rope_cos_full.raw_ptr(), self.rope_sin_full.raw_ptr(),
+                                  self.rope_dim_full as u32),
+        };
+        let block: u32 = 64;
+        let grid_x = ((rd / 2) + block - 1) / block;
+        let mut xa=x; let mut ca=cos; let mut sa=sin;
+        let mut hd=head_dim; let mut rdv=rd; let mut nh=n_heads;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut rdv as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_heads, p as u32),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_attn_prefill(&self, m: &Module, q: *mut c_void, k: *mut c_void, v: *mut c_void,
+                           out: *mut c_void, n_kv: u32, head_dim: u32, window: u32, p: usize)
+        -> Result<(), String>
+    {
+        let f = m.function("attn_prefill_f32")?;
+        let block: u32 = 256;
+        let smem = (head_dim + p as u32 + block) * 4;
+        let mut qa=q; let mut ka=k; let mut va=v; let mut oa=out;
+        let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
+        let mut wn=window; let mut sc=1.0f32;
+        let mut args: [*mut c_void; 9] = [
+            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void];
+        unsafe { f.launch((self.n_heads as u32, p as u32, 1),(block,1,1), smem,
+                          Some(&self.stream), &mut args) }
     }
 
     /// One transformer block, in place on `hidden_a`. All position-

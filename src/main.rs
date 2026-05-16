@@ -239,6 +239,23 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         let t_load = std::time::Instant::now();
         let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
+
+        // REINSTINCT_PREFILL: run the batched prefill on the prompt, print
+        // timing + top-10, and exit (for A/B vs the decode-style prefill).
+        if std::env::var_os("REINSTINCT_PREFILL").is_some() {
+            let t = std::time::Instant::now();
+            let lg = gm.prefill_forward(&cache, &prompt).map_err(anyhow::Error::msg)?;
+            let el = t.elapsed().as_secs_f64();
+            println!("batched prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                     el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
+            let mut idx: Vec<usize> = (0..lg.len()).collect();
+            idx.sort_unstable_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            for &t in idx.iter().take(10) {
+                println!("  token {t:>8}  logit {:>9.4}", lg[t]);
+            }
+            return Ok(());
+        }
+
         let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
         // Capture the forward once into a parametric HIP graph — decode
         // then replays it with a single submission per token.
