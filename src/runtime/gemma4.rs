@@ -913,7 +913,8 @@ impl GpuGemma4 {
     /// rather than the decode path's P sequential weight-streaming
     /// passes. Returns the last token's soft-capped logits.
     ///
-    /// Dense path only (the 31B); the 26B MoE prefill is layered on top.
+    /// Handles both the dense 31B and the 26B MoE — on MoE layers the
+    /// shared MLP is batched (GEMM) and the routed experts run per token.
     pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32])
         -> Result<Vec<f32>, String>
     {
@@ -992,25 +993,85 @@ impl GpuGemma4 {
                 self.launch_add(pf_off(x.raw_ptr(), i*h), pf_off(normed.raw_ptr(), i*h), hu)?;
             }
 
-            // --- dense FFN (GeGLU) ---
+            // --- FFN: shared MLP (GeGLU), batched ---
+            let ff = self.ffn as u32;
             for i in 0..p {
                 self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), b.ffn_norm.raw_ptr(),
                                     pf_off(normed.raw_ptr(), i*h), hu)?;
             }
             let gate = gemm(&b.ffn_gate, &normed)?;
             let up   = gemm(&b.ffn_up,   &normed)?;
-            let ff = self.ffn as u32;
             for i in 0..p {
                 self.launch_geglu(pf_off(gate.raw_ptr(), i*self.ffn),
                                   pf_off(up.raw_ptr(), i*self.ffn),
                                   pf_off(gate.raw_ptr(), i*self.ffn), ff)?;
             }
-            let ffn_out = gemm(&b.ffn_down, &gate)?;
-            for i in 0..p {
-                self.launch_rmsnorm(pf_off(ffn_out.raw_ptr(), i*h), b.post_ffw_norm.raw_ptr(),
-                                    pf_off(normed.raw_ptr(), i*h), hu)?;
-                self.launch_add(pf_off(x.raw_ptr(), i*h), pf_off(normed.raw_ptr(), i*h), hu)?;
-                self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
+            let mlp = gemm(&b.ffn_down, &gate)?;
+
+            match &b.moe {
+                None => {
+                    // dense layer — the shared MLP is the whole FFN.
+                    for i in 0..p {
+                        self.launch_rmsnorm(pf_off(mlp.raw_ptr(), i*h), b.post_ffw_norm.raw_ptr(),
+                                            pf_off(normed.raw_ptr(), i*h), hu)?;
+                        self.launch_add(pf_off(x.raw_ptr(), i*h),
+                                        pf_off(normed.raw_ptr(), i*h), hu)?;
+                        self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
+                    }
+                }
+                Some(mw) => {
+                    // Dual FFN. cur_mlp = post_ffw_norm_1(shared MLP).
+                    let cur_mlp = DeviceBuf::<f32>::new(p * h)?;
+                    let cur_moe = DeviceBuf::<f32>::new(p * h)?;
+                    for i in 0..p {
+                        self.launch_rmsnorm(pf_off(mlp.raw_ptr(), i*h),
+                                            mw.post_ffw_norm_1.raw_ptr(),
+                                            pf_off(cur_mlp.raw_ptr(), i*h), hu)?;
+                    }
+                    // Routed experts — per token (v1: weights re-read per
+                    // token; a grouped GEMM would amortise them).
+                    let ff_exp = self.expert_ff as u32;
+                    let inv_sqrt_h = 1.0 / (self.hidden as f32).sqrt();
+                    for i in 0..p {
+                        // router on x[i]
+                        self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), mw.gate_inp_s.raw_ptr(),
+                                            self.normed.raw_ptr(), hu)?;
+                        self.launch_scale(self.normed.raw_ptr(), hu, inv_sqrt_h)?;
+                        self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(),
+                                           self.moe_logits.raw_ptr())?;
+                        self.launch_moe_topk()?;
+                        // expert input + expert FFN (decode dp4a path)
+                        self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), mw.pre_ffw_norm_2.raw_ptr(),
+                                            self.moe_in.raw_ptr(), hu)?;
+                        self.launch_quantize_q8(self.moe_in.raw_ptr(), self.xq8.raw_ptr(), hu, 1)?;
+                        self.launch_moe_matvec(mw.gate_up_exps.dtype,
+                            mw.gate_up_exps.data.raw_ptr(), self.xq8.raw_ptr(),
+                            self.expert_gu.raw_ptr(), hu, 2*ff_exp,
+                            mw.gate_up_exps.bytes_per_expert as u32, 0)?;
+                        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
+                        self.launch_quantize_q8(self.expert_act.raw_ptr(),
+                            self.xq8_experts.raw_ptr(), ff_exp, self.n_expert_used as u32)?;
+                        self.launch_moe_matvec(mw.down_exps.dtype,
+                            mw.down_exps.data.raw_ptr(), self.xq8_experts.raw_ptr(),
+                            self.expert_outs.raw_ptr(), ff_exp, hu,
+                            mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
+                        self.launch_moe_combine(self.expert_outs.raw_ptr(),
+                            mw.down_exps_s.raw_ptr(), self.moe_acc.raw_ptr())?;
+                        self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
+                                            pf_off(cur_moe.raw_ptr(), i*h), hu)?;
+                    }
+                    // cur = cur_mlp + cur_moe → post_ffw_norm → residual.
+                    for i in 0..p {
+                        self.launch_add(pf_off(cur_mlp.raw_ptr(), i*h),
+                                        pf_off(cur_moe.raw_ptr(), i*h), hu)?;
+                        self.launch_rmsnorm(pf_off(cur_mlp.raw_ptr(), i*h),
+                                            b.post_ffw_norm.raw_ptr(),
+                                            pf_off(normed.raw_ptr(), i*h), hu)?;
+                        self.launch_add(pf_off(x.raw_ptr(), i*h),
+                                        pf_off(normed.raw_ptr(), i*h), hu)?;
+                        self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
+                    }
+                }
             }
         }
 
