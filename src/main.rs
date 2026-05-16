@@ -240,11 +240,14 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
 
-        // REINSTINCT_PREFILL: run the batched prefill on the prompt, print
-        // timing + top-10, and exit (for A/B vs the decode-style prefill).
+        let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+
+        // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
+        // print timing + top-10, and exit (skips generation).
         if std::env::var_os("REINSTINCT_PREFILL").is_some() {
             let t = std::time::Instant::now();
-            let lg = gm.prefill_forward(&cache, &prompt).map_err(anyhow::Error::msg)?;
+            let lg = gm.prefill_forward(&cache, &prompt, &mut state)
+                .map_err(anyhow::Error::msg)?;
             let el = t.elapsed().as_secs_f64();
             println!("batched prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
                      el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
@@ -256,9 +259,8 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             return Ok(());
         }
 
-        let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
-        // Capture the forward once into a parametric HIP graph — decode
-        // then replays it with a single submission per token.
+        // Capture the decode forward once into a parametric HIP graph —
+        // decode then replays it with a single submission per token.
         let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none();
         let t_cap = std::time::Instant::now();
         let graph = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
@@ -271,20 +273,28 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             if use_graph { gm.forward_via_graph(&graph, t, st) }
             else { gm.forward_token(t, st) }
         };
-        // Decode timer — excludes the one-time weight load + capture.
+        // Prefill the prompt in one batched pass — this populates every
+        // layer's KV cache, so decode continues straight from position P.
+        let t_prefill = std::time::Instant::now();
+        let mut lg = gm.prefill_forward(&cache, &prompt, &mut state)
+            .map_err(anyhow::Error::msg)?;
+        let pf = t_prefill.elapsed().as_secs_f64();
+        println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token)",
+                 pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64);
+        // Decode timer — generated tokens only.
         let t_decode = std::time::Instant::now();
-        let mut lg = Vec::new();
-        for &t in &prompt { lg = fwd(&gm, t, &mut state).map_err(anyhow::Error::msg)?; }
         for _ in 0..steps {
             let tok = sample_temp_topk(&lg, temperature, top_k, &mut rng);
             all.push(tok);
             if tok == cfg_eos { break; }
             lg = fwd(&gm, tok, &mut state).map_err(anyhow::Error::msg)?;
         }
-        let n_fwd = all.len();
-        println!("decode       = {:.1} ms/token ({:.1} tok/s) over {n_fwd} forwards",
-            t_decode.elapsed().as_secs_f64() * 1e3 / n_fwd as f64,
-            n_fwd as f64 / t_decode.elapsed().as_secs_f64());
+        let n_gen = all.len() - prompt.len();
+        if n_gen > 0 {
+            println!("decode       = {:.1} ms/token ({:.1} tok/s) over {n_gen} forwards",
+                t_decode.elapsed().as_secs_f64() * 1e3 / n_gen as f64,
+                n_gen as f64 / t_decode.elapsed().as_secs_f64());
+        }
         // One traced forward for a per-block timing breakdown.
         let probe = *all.last().unwrap();
         let (tlg, e_ms, blk_ms, o_ms) =

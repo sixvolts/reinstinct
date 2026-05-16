@@ -48,6 +48,7 @@ const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
 const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill.cpp");
+const KV_QUANT_PREFILL_SRC:  &str = include_str!("../../kernels/kv_quant_prefill.cpp");
 const MOE_GROUPED_Q6K_SRC:   &str = include_str!("../../kernels/moe_matvec_grouped_q6k.cpp");
 const MOE_GROUPED_Q8_0_SRC:  &str = include_str!("../../kernels/moe_matvec_grouped_q8_0.cpp");
 const MOE_SCATTER_SRC:       &str = include_str!("../../kernels/moe_scatter_add.cpp");
@@ -925,7 +926,8 @@ impl GpuGemma4 {
     ///
     /// Handles both the dense 31B and the 26B MoE — on MoE layers the
     /// shared MLP is batched (GEMM) and the routed experts run per token.
-    pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32])
+    pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32],
+                           state: &mut Gemma4GpuState)
         -> Result<Vec<f32>, String>
     {
         use crate::runtime::prefill::PrefillGemm;
@@ -933,10 +935,12 @@ impl GpuGemma4 {
         let p = tokens.len();
         let h = self.hidden;
         assert!(p > 0 && p <= self.max_seq, "prefill: bad token count");
+        assert_eq!(state.caches.len(), self.blocks.len(), "prefill: state/model mismatch");
         let handle = Handle::new()?;
         handle.set_stream(&self.stream)?;
         let m_rope = Module::load(&cache.compile("rope_prefill", ROPE_PREFILL_SRC)?)?;
         let m_attn = Module::load(&cache.compile("attn_prefill", ATTN_PREFILL_SRC)?)?;
+        let m_kvq  = Module::load(&cache.compile("kv_quant_prefill", KV_QUANT_PREFILL_SRC)?)?;
         // Grouped-MoE prefill scratch (sized for P; tiny/unused on the
         // dense 31B). Each expert's weight is processed in one launch over
         // all its routed tokens — fits in the 4 MB L2, so the weight is
@@ -1025,6 +1029,14 @@ impl GpuGemma4 {
                                        pf_off(v_norm.raw_ptr(), i*kv_dim), n_kv as u32, hd as u32)?;
             }
             self.launch_rope_prefill(&m_rope, k_norm.raw_ptr(), n_kv as u32, hd as u32, b.kind, p)?;
+            // Populate this layer's decode KV cache: quantize the P
+            // prompt tokens' K/V (post-rope K, plain-norm V) to int8 at
+            // positions 0..P-1, so decode can continue from position P.
+            let kvc = &state.caches[li];
+            self.launch_kv_quant_prefill(&m_kvq, k_norm.raw_ptr(), kvc.k.raw_ptr(),
+                                         kvc.ks.raw_ptr(), n_kv as u32, hd as u32, p)?;
+            self.launch_kv_quant_prefill(&m_kvq, v_norm.raw_ptr(), kvc.v.raw_ptr(),
+                                         kvc.vs.raw_ptr(), n_kv as u32, hd as u32, p)?;
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
@@ -1190,7 +1202,27 @@ impl GpuGemma4 {
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
+        // The KV cache now holds the P prompt tokens — decode continues
+        // from position P.
+        for c in &mut state.caches { c.len = p; }
+        state.pos = p;
         Ok(out)
+    }
+
+    /// Batched per-(token,head) int8 quantization of a prefill K or V
+    /// tensor straight into the decode KV cache — grid (n_kv, P).
+    fn launch_kv_quant_prefill(&self, m: &Module, src: *mut c_void, dst_q: *mut c_void,
+                               dst_s: *mut c_void, n_kv: u32, head_dim: u32, p: usize)
+        -> Result<(), String>
+    {
+        let f = m.function("kv_quant_prefill_f32")?;
+        let mut sa=src; let mut dq=dst_q; let mut ds=dst_s;
+        let mut nk=n_kv; let mut hd=head_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut sa as *mut _ as *mut c_void, &mut dq as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void];
+        unsafe { f.launch((n_kv, p as u32, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_rope_prefill(&self, m: &Module, x: *mut c_void, n_heads: u32, head_dim: u32,
