@@ -37,8 +37,8 @@ const MATVEC_F16_W_SRC:      &str = include_str!("../../kernels/matvec_f16_wave6
 const GEGLU_SRC:             &str = include_str!("../../kernels/geglu.cpp");
 const LOGIT_SOFTCAP_SRC:     &str = include_str!("../../kernels/logit_softcap.cpp");
 const SCALE_INPLACE_SRC:     &str = include_str!("../../kernels/scale_inplace.cpp");
-const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_dpos.cpp");
-const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write.cpp");
+const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_q8.cpp");
+const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp");
@@ -187,12 +187,15 @@ impl GpuGemma4Block {
     }
 }
 
-/// Per-layer KV cache. Sliding and full layers have different
-/// (n_kv, head_dim), so each layer sizes its own.
+/// Per-layer int8 KV cache. K and V are stored as symmetric int8 with
+/// one f32 scale per (token, head) — 4× smaller than f32, and the
+/// attention kernel dots K against a quantized Q via dp4a. Sliding and
+/// full layers have different (n_kv, head_dim), so each sizes its own.
 pub struct Gemma4KvCache {
-    k: DeviceBuf<f32>,
-    v: DeviceBuf<f32>,
-    kv_dim: usize,
+    k:  DeviceBuf<i8>,    // [max_seq, n_kv, head_dim]
+    v:  DeviceBuf<i8>,
+    ks: DeviceBuf<f32>,   // [max_seq, n_kv]
+    vs: DeviceBuf<f32>,
     max_seq: usize,
     len: usize,
 }
@@ -201,9 +204,11 @@ impl Gemma4KvCache {
     fn new(n_kv: usize, head_dim: usize, max_seq: usize) -> Result<Self, String> {
         let kv_dim = n_kv * head_dim;
         Ok(Self {
-            k: DeviceBuf::new(max_seq * kv_dim)?,
-            v: DeviceBuf::new(max_seq * kv_dim)?,
-            kv_dim, max_seq, len: 0,
+            k:  DeviceBuf::new(max_seq * kv_dim)?,
+            v:  DeviceBuf::new(max_seq * kv_dim)?,
+            ks: DeviceBuf::new(max_seq * n_kv)?,
+            vs: DeviceBuf::new(max_seq * n_kv)?,
+            max_seq, len: 0,
         })
     }
 }
@@ -516,18 +521,19 @@ impl GpuGemma4 {
         unsafe { f.launch((grid_x, n_heads, 1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    /// Append the normed K/V vector into the layer's KV cache at `d_pos`.
-    fn launch_kv_write(&self, src: *mut c_void, dst: *mut c_void, kv_dim: u32)
-        -> Result<(), String>
+    /// Quantize a normed K/V vector to int8 and append it to the cache
+    /// at `d_pos` — one f32 scale per head. grid = n_kv heads.
+    fn launch_kv_write_q8(&self, src: *mut c_void, dst_q: *mut c_void, dst_s: *mut c_void,
+                          n_kv: u32, head_dim: u32) -> Result<(), String>
     {
-        let f = self.m_kv_write.function("kv_write_f32")?;
-        let block: u32 = 256;
-        let grid = (kv_dim + block - 1) / block;
-        let mut sa=src; let mut da=dst; let mut pa=self.d_pos.raw_ptr(); let mut kd=kv_dim;
-        let mut args: [*mut c_void; 4] = [
-            &mut sa as *mut _ as *mut c_void, &mut da as *mut _ as *mut c_void,
-            &mut pa as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
-        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+        let f = self.m_kv_write.function("kv_write_q8_f32")?;
+        let mut sa=src; let mut dq=dst_q; let mut ds=dst_s;
+        let mut pa=self.d_pos.raw_ptr(); let mut nk=n_kv; let mut hd=head_dim;
+        let mut args: [*mut c_void; 6] = [
+            &mut sa as *mut _ as *mut c_void, &mut dq as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void];
+        unsafe { f.launch((n_kv,1,1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_add(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
@@ -760,22 +766,23 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(threads,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_attn(&self, q: *mut c_void, kc: *mut c_void, vc: *mut c_void, out: *mut c_void,
-                   n_kv: u32, head_dim: u32, window: u32)
-        -> Result<(), String>
+    /// int8-KV decode attention: dp4a Q·Kᵀ, f32-accumulate P·V.
+    fn launch_attn_q8(&self, q: *mut c_void, kq: *mut c_void, ks: *mut c_void,
+                      vq: *mut c_void, vs: *mut c_void, out: *mut c_void,
+                      n_kv: u32, head_dim: u32, window: u32) -> Result<(), String>
     {
-        let f = self.m_attn_win.function("attn_step_window_f32")?;
+        let f = self.m_attn_win.function("attn_step_q8_f32")?;
         let block: u32 = 256;
-        // The kernel reads total_len from d_pos; size LDS for the worst
-        // case (the whole decode sequence) so one graph capture serves
-        // every position.
-        let smem = ((head_dim + self.max_seq as u32) + block) * 4;
-        let mut qa=q; let mut ka=kc; let mut va=vc; let mut oa=out;
+        // LDS: qi (head_dim int8) | scores (max_seq f32) | tmp (block f32).
+        let smem = head_dim + (self.max_seq as u32 + block) * 4;
+        let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
+        let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
         let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
-        let mut args: [*mut c_void; 10] = [
-            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
-            &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+        let mut args: [*mut c_void; 12] = [
+            &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
+            &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
+            &mut vsa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
             &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
@@ -931,18 +938,19 @@ impl GpuGemma4 {
         // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
         self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
                                n_kv as u32, head_dim as u32)?;
-        // Append (k, v) into the cache at d_pos via a kernel — a pos-
-        // offset memcpy node can't be parametrised in a captured graph,
-        // but a kernel reading d_pos can.
-        self.launch_kv_write(self.k_norm.raw_ptr(), kv.k.raw_ptr(), kv.kv_dim as u32)?;
-        self.launch_kv_write(self.v_norm.raw_ptr(), kv.v.raw_ptr(), kv.kv_dim as u32)?;
+        // Quantize (k, v) and append into the int8 cache at d_pos — a
+        // kernel reading d_pos (a pos-offset memcpy can't be captured).
+        self.launch_kv_write_q8(self.k_norm.raw_ptr(), kv.k.raw_ptr(), kv.ks.raw_ptr(),
+                                n_kv as u32, head_dim as u32)?;
+        self.launch_kv_write_q8(self.v_norm.raw_ptr(), kv.v.raw_ptr(), kv.vs.raw_ptr(),
+                                n_kv as u32, head_dim as u32)?;
         let window = match b.kind {
             AttnKind::Sliding => self.sliding_window as u32,
             AttnKind::Full    => 0,
         };
-        self.launch_attn(self.q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
-                         self.attn_concat.raw_ptr(), n_kv as u32, head_dim as u32,
-                         window)?;
+        self.launch_attn_q8(self.q_buf.raw_ptr(), kv.k.raw_ptr(), kv.ks.raw_ptr(),
+                            kv.v.raw_ptr(), kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
+                            n_kv as u32, head_dim as u32, window)?;
         // Output projection, post-norm, residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
                            self.hidden_b.raw_ptr())?;
