@@ -37,6 +37,39 @@ const MATVEC_Q4_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_k_dp4a.
 const MATVEC_Q5_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
+
+/// Batched causal attention over `p` query tokens. Q/K/V are row-major
+/// `[p, n_heads|n_kv, head_dim]`; returns `out [p, n_heads, head_dim]`.
+pub fn attn_prefill_f32(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f32],
+                        p: usize, n_heads: usize, n_kv: usize, head_dim: usize,
+                        window: u32) -> Result<Vec<f32>, String>
+{
+    let hsaco = cache.compile("attn_prefill", ATTN_PREFILL_SRC)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("attn_prefill_f32")?;
+    let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
+    let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k)?;
+    let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v)?;
+    let dout: DeviceBuf<f32> = DeviceBuf::new(p * n_heads * head_dim)?;
+    let block: u32 = 256;
+    let smem = (head_dim as u32 + p as u32 + block) * 4;
+    let mut qa=dq.raw_ptr(); let mut ka=dk.raw_ptr(); let mut va=dv.raw_ptr();
+    let mut oa=dout.raw_ptr();
+    let mut nh=n_heads as u32; let mut nkv=n_kv as u32; let mut hd=head_dim as u32;
+    let mut wn=window; let mut sc=1.0f32;
+    let mut args: [*mut c_void; 9] = [
+        &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+        &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+        &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+        &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+        &mut sc as *mut _ as *mut c_void];
+    unsafe { f.launch((n_heads as u32, p as u32, 1), (block,1,1), smem, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; p * n_heads * head_dim];
+    dout.copy_to_host(&mut out)?;
+    Ok(out)
+}
 
 /// Quantize an f32 activation to int8 q8 blocks on the GPU, then run a
 /// K-quant dp4a matvec. Used by the dp4a correctness tests. The q8
@@ -1440,6 +1473,49 @@ mod tests {
         let e = rel_l2(&gpu, &cpu);
         eprintln!("matvec_q6_k_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
         assert!(e < DP4A_REL_L2_MAX, "q6_k dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
+    #[test]
+    fn attn_prefill_matches_reference() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (p, n_heads, n_kv, hd) = (12usize, 4usize, 2usize, 64usize);
+        let window = 0u32;          // full causal
+        let mut s: u64 = 0x5EED_A77;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 40) as u32 as f32 / (1u32<<24) as f32) - 0.5 };
+        let q: Vec<f32> = (0..p*n_heads*hd).map(|_| rng()).collect();
+        let k: Vec<f32> = (0..p*n_kv*hd).map(|_| rng()).collect();
+        let v: Vec<f32> = (0..p*n_kv*hd).map(|_| rng()).collect();
+
+        let gpu = attn_prefill_f32(&cache, &q, &k, &v, p, n_heads, n_kv, hd, window)
+            .expect("attn_prefill");
+
+        // CPU reference: per (query, head) causal attention.
+        let groups = n_heads / n_kv;
+        let mut cpu = vec![0.0f32; p * n_heads * hd];
+        for qp in 0..p {
+            for h in 0..n_heads {
+                let kv_h = h / groups;
+                let qh = &q[(qp*n_heads + h)*hd..][..hd];
+                let mut sc = vec![0.0f32; qp + 1];
+                for t in 0..=qp {
+                    let kt = &k[(t*n_kv + kv_h)*hd..][..hd];
+                    sc[t] = (0..hd).map(|d| qh[d]*kt[d]).sum();
+                }
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let exp: Vec<f32> = sc.iter().map(|&x| (x-m).exp()).collect();
+                let sum: f32 = exp.iter().sum();
+                let o = &mut cpu[(qp*n_heads + h)*hd..][..hd];
+                for t in 0..=qp {
+                    let vt = &v[(t*n_kv + kv_h)*hd..][..hd];
+                    let w = exp[t] / sum;
+                    for d in 0..hd { o[d] += w * vt[d]; }
+                }
+            }
+        }
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("attn_prefill {p}q {n_heads}h: rel_l2={e:.3e}");
+        assert!(e < 1e-4, "attn_prefill rel_l2 {e:.3e}");
     }
 
     #[test]
