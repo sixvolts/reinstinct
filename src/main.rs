@@ -130,8 +130,12 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         return generate_text_gemma4(&g, path, prompt_text, tokens, steps,
                                     temperature, top_k, seed, gpu);
     }
-    let m = Qwen35F32Model::load(&g)?;
-    let cfg = &m.model.config;
+    // Typed model — config + quantized tensor refs only. The f32
+    // CPU oracle (Qwen35F32Model) is loaded lazily in the CPU branch;
+    // building it for --gpu would needlessly materialise the whole
+    // model in host RAM (87 GB+ on a 27B model — OOM).
+    let model = Qwen35Model::load(&g)?;
+    let cfg = &model.config;
 
     // Prompt resolution: --prompt text (BPE-encoded) > --tokens > [EOS].
     let prompt: Vec<u32> = if let Some(text) = &prompt_text {
@@ -159,8 +163,8 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
         let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
         let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
-        let mut state = Qwen35GpuState::new(&m, max_seq).map_err(anyhow::Error::msg)?;
+        let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
 
         // Prefill the prompt in one batched pass (rocBLAS GEMM); fall
         // back to the sequential path for a single-token prompt.
@@ -179,6 +183,8 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             logits = gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
         }
     } else {
+        // CPU oracle — needs the f32-dequantized weights.
+        let m = Qwen35F32Model::load(&g)?;
         let mut state = m.new_state(max_seq);
         let mut logits = m.forward_tokens(&prompt, &mut state);
         for _ in 0..steps {
@@ -391,10 +397,10 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     println!("token = {token}, iterations = {iters}");
     println!("loading weights to device...");
     let t0 = std::time::Instant::now();
-    let gpu = GpuQwen35::new(&m, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
+    let gpu = GpuQwen35::new(&m.model, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
     println!("  load took {:.2} s", t0.elapsed().as_secs_f64());
 
-    let mut state = Qwen35GpuState::new(&m, iters + 4).map_err(anyhow::Error::msg)?;
+    let mut state = Qwen35GpuState::new(&m.model,iters + 4).map_err(anyhow::Error::msg)?;
 
     // Warm up once (compiles + caches paged-in, etc.)
     let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
@@ -707,9 +713,9 @@ fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>
         let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
         let max_seq = prompt.len() + 8;
         let t_load = std::time::Instant::now();
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         println!("weights load  = {:.2} s", t_load.elapsed().as_secs_f32());
-        let mut state = Qwen35GpuState::new(&m, max_seq).map_err(anyhow::Error::msg)?;
+        let mut state = Qwen35GpuState::new(&m.model,max_seq).map_err(anyhow::Error::msg)?;
         let t0 = std::time::Instant::now();
         let l = gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?;
         println!("forward took  = {:.3} s ({} tokens, {:.1} ms/token)",

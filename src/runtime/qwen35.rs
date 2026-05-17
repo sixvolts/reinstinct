@@ -20,7 +20,9 @@
 
 use std::ffi::c_void;
 
+#[cfg(test)]
 use crate::cpu::qwen3_5::Qwen35F32Model;
+use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
 use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
@@ -67,6 +69,7 @@ const MATVEC_Q6_K_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k.cpp")
 const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
+const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
 
 const CVT_F32_F16_SOURCE:       &str = include_str!("../../kernels/cvt_f32_f16.cpp");
 const DEQUANT_Q4_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q4_k_f16.cpp");
@@ -326,12 +329,12 @@ pub struct Qwen35GpuState {
 }
 
 impl Qwen35GpuState {
-    pub fn new(model: &Qwen35F32Model, max_seq: usize) -> Result<Self, String> {
+    pub fn new(model: &Qwen35Model, max_seq: usize) -> Result<Self, String> {
         use crate::model::qwen3_5::BlockKind;
-        let cfg = &model.model.config;
+        let cfg = &model.config;
         let conv_dim = 3 * cfg.gdn_value_dim as usize;
-        let mut block_states = Vec::with_capacity(model.model.block_kinds.len());
-        for &kind in &model.model.block_kinds {
+        let mut block_states = Vec::with_capacity(model.block_kinds.len());
+        for &kind in &model.block_kinds {
             block_states.push(match kind {
                 BlockKind::FullAttention => GpuBlockState::Full(GpuKvCache::new(
                     max_seq,
@@ -444,6 +447,7 @@ pub struct GpuQwen35 {
     matvec_iq4_xs_module:  Module,
     matvec_f16_module:     Module,
     embed_lookup_q6_k_module: Module,
+    embed_lookup_q4_k_module: Module,
     matvec_f32_wave64_module:    Module,
     matvec_q4_k_wave64_module:   Module,
     matvec_q5_k_wave64_module:   Module,
@@ -490,10 +494,10 @@ pub struct GpuQwen35 {
 }
 
 impl GpuQwen35 {
-    pub fn new(model: &Qwen35F32Model, gguf: &GgufFile, cache: &KernelCache, max_seq: usize)
+    pub fn new(model: &Qwen35Model, gguf: &GgufFile, cache: &KernelCache, max_seq: usize)
         -> Result<Self, String>
     {
-        let cfg = &model.model.config;
+        let cfg = &model.config;
         let hidden     = cfg.hidden_size      as usize;
         let ffn        = cfg.ffn_size         as usize;
         let vocab      = cfg.vocab_size       as usize;
@@ -583,6 +587,7 @@ impl GpuQwen35 {
         let matvec_iq4_xs_hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
+        let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
         let matvec_f32_wave64_hsaco    = cache.compile("matvec_f32_wave64",    MATVEC_F32_WAVE64_SOURCE)?;
         let matvec_q4_k_wave64_hsaco   = cache.compile("matvec_q4_k_wave64",   MATVEC_Q4_K_WAVE64_SOURCE)?;
         let matvec_q5_k_wave64_hsaco   = cache.compile("matvec_q5_k_wave64",   MATVEC_Q5_K_WAVE64_SOURCE)?;
@@ -592,8 +597,8 @@ impl GpuQwen35 {
         let matvec_f16_wave64_hsaco    = cache.compile("matvec_f16_wave64",    MATVEC_F16_WAVE64_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
-        let mut blocks = Vec::with_capacity(model.model.block_kinds.len());
-        for (i, &kind) in model.model.block_kinds.iter().enumerate() {
+        let mut blocks = Vec::with_capacity(model.block_kinds.len());
+        for (i, &kind) in model.block_kinds.iter().enumerate() {
             blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind)?);
         }
 
@@ -635,6 +640,7 @@ impl GpuQwen35 {
             matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
+            embed_lookup_q4_k_module: Module::load(&embed_lookup_q4_k_hsaco)?,
             rocblas:                  rocblas_handle,
             cvt_module:               Module::load(&cache.compile("cvt_f32_f16", CVT_F32_F16_SOURCE)?)?,
             dequant_q4_k_module:      Module::load(&cache.compile("dequant_q4_k_f16", DEQUANT_Q4_K_F16_SOURCE)?)?,
@@ -712,6 +718,23 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    fn launch_embed_lookup_q4_k(&self, table: *mut c_void, out: *mut c_void,
+                                token: u32, hidden: u32) -> Result<(), String>
+    {
+        let f = self.embed_lookup_q4_k_module.function("embed_lookup_q4_k_f32")?;
+        // One HIP block per Q4_K super-block (256 weights), 256 threads each.
+        let block: u32 = 256;
+        let grid = hidden / 256;
+        let mut t = table; let mut o = out; let mut row = token; let mut h = hidden;
+        let mut args: [*mut c_void; 4] = [
+            &mut t   as *mut _ as *mut c_void,
+            &mut o   as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void,
+            &mut h   as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     /// Gather one row from `table` (shape `[hidden, vocab]` in GGUF order)
     /// and write the dequantised fp32 row into `out`. Dispatches by the
     /// table's on-disk dtype.
@@ -722,6 +745,7 @@ impl GpuQwen35 {
         match table.dtype {
             GgmlType::F32  => self.launch_embed_lookup(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q6_K => self.launch_embed_lookup_q6_k(table.data.raw_ptr(), out, token, hidden),
+            GgmlType::Q4_K => self.launch_embed_lookup_q4_k(table.data.raw_ptr(), out, token, hidden),
             other => Err(format!("embed_lookup: no kernel for {:?}", other)),
         }
     }
@@ -2175,7 +2199,7 @@ mod tests {
         let hidden = cfg.hidden_size as usize;
         let vocab  = cfg.vocab_size as usize;
 
-        let gpu = GpuQwen35::new(&m, &g, &cache, 32).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, 32).expect("new GpuQwen35");
 
         // Test on a couple of tokens including EOS and a mid-vocab.
         for &token in &[cfg.eos_token_id, 100u32, 50_000u32] {
@@ -2260,7 +2284,7 @@ mod tests {
 
             // GPU.
             let weights = GpuFfnWeights::from_gguf(&g, block_idx as u32).expect("alloc ffn weights");
-            let gpu = GpuQwen35::new(&m, &g, &cache, 32).expect("new GpuQwen35");
+            let gpu = GpuQwen35::new(&m.model, &g, &cache, 32).expect("new GpuQwen35");
             let gpu_out = gpu.apply_swiglu_ffn(&input, &weights).expect("gpu ffn");
 
             // Compare with combined abs+rel tolerance.
@@ -2300,7 +2324,7 @@ mod tests {
         let vocab = cfg.vocab_size as usize;
 
         let max_seq = 16usize;
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("new GpuQwen35");
 
         // Validate against the CPU oracle on a handful of single tokens
         // we already have golden coverage for.
@@ -2308,7 +2332,7 @@ mod tests {
             let mut cpu_state = m.new_state(max_seq);
             let cpu_logits = m.forward_token(token, &mut cpu_state);
 
-            let mut gpu_state = Qwen35GpuState::new(&m, max_seq).expect("new gpu state");
+            let mut gpu_state = Qwen35GpuState::new(&m.model,max_seq).expect("new gpu state");
             let gpu_logits = gpu.forward_token(token, &mut gpu_state).expect("gpu forward");
 
             assert_eq!(gpu_logits.len(), vocab);
@@ -2355,16 +2379,16 @@ mod tests {
         let m = Qwen35F32Model::load(&g).unwrap();
         let vocab = m.model.config.vocab_size as usize;
         let max_seq = 32usize;
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("gpu");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("gpu");
 
         let prompt = [198u32, 100, 248046, 1, 2, 50_000, 7];
 
         // Sequential fp32 decode path (the reference).
-        let mut s_seq = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let mut s_seq = Qwen35GpuState::new(&m.model,max_seq).unwrap();
         let seq = gpu.forward_tokens(&prompt, &mut s_seq).expect("sequential");
 
         // Batched fp16-GEMM prefill path.
-        let mut s_bat = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let mut s_bat = Qwen35GpuState::new(&m.model,max_seq).unwrap();
         let bat = gpu.forward_tokens_batched(&prompt, &mut s_bat).expect("batched");
 
         assert_eq!(seq.len(), vocab);
@@ -2402,13 +2426,13 @@ mod tests {
         let g = GgufFile::open(&path).unwrap();
         let m = Qwen35F32Model::load(&g).unwrap();
         let max_seq = 16usize;
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("gpu");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("gpu");
 
         let prompt = [198u32, 100, 248046, 1, 2];
-        let mut s_one = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let mut s_one = Qwen35GpuState::new(&m.model,max_seq).unwrap();
         let logits_batch = gpu.forward_tokens(&prompt, &mut s_one).unwrap();
 
-        let mut s_step = Qwen35GpuState::new(&m, max_seq).unwrap();
+        let mut s_step = Qwen35GpuState::new(&m.model,max_seq).unwrap();
         let mut logits_step = Vec::new();
         for &t in &prompt {
             logits_step = gpu.forward_token(t, &mut s_step).unwrap();
@@ -2456,7 +2480,7 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&m, &g, &cache, 16).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, 16).expect("new GpuQwen35");
         let gpu_w = GpuLinAttnWeights::from_gguf(&g, block_idx as u32).expect("upload GDN weights");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2533,7 +2557,7 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&m, &g, &cache, 16).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, 16).expect("new GpuQwen35");
         let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32).expect("upload GDN block");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2610,7 +2634,7 @@ mod tests {
         );
         let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
 
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("new GpuQwen35");
         let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32).expect("upload block");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
@@ -2692,7 +2716,7 @@ mod tests {
         let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
 
         // GPU side.
-        let gpu = GpuQwen35::new(&m, &g, &cache, max_seq).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("new GpuQwen35");
         let gpu_w = GpuFullAttnWeights::from_gguf(&g, block_idx as u32).expect("upload attn weights");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
@@ -2754,7 +2778,7 @@ mod tests {
 
         let g = GgufFile::open(&path).unwrap();
         let m = Qwen35F32Model::load(&g).unwrap();
-        let gpu = GpuQwen35::new(&m, &g, &cache, 32).unwrap();
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, 32).unwrap();
         let token = m.model.config.eos_token_id;
 
         let a = gpu.embed_norm_proj(token).unwrap();
