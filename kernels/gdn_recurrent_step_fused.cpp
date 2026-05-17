@@ -1,27 +1,33 @@
-// GDN recurrent update with decay/beta computation fused in.
-//
-// Identical to gdn_recurrent_step.cpp except it takes the raw
-// projection outputs (a, b) plus the per-head parameters (ssm_a,
-// dt_bias) and computes decay/beta inline instead of receiving them
-// from a separate gdn_decay_beta kernel:
+// GDN recurrent (gated delta-rule) update with decay/beta fused in.
 //
 //   beta  = sigmoid(b[h])
 //   decay = exp(ssm_a[h] * softplus(a[h] + dt_bias[h]))
+//   state *= decay
+//   delta  = (v - stateᵀ·k) * beta
+//   state += k ⊗ delta
+//   out    = stateᵀ·q
 //
-// Every thread recomputes the two per-head scalars — that's a handful
-// of flops, far cheaper than a separate kernel launch.
+// The recurrence is independent per value-dim column vv: every column's
+// state slice s[:,vv] is decayed, used, updated and read back using only
+// that column plus the shared k/q vectors. So one thread owns one column
+// and runs the whole recurrence for it — no inter-phase __syncthreads
+// (the old kernel had four), and consecutive threads touch consecutive
+// vv, so the strided state accesses coalesce.
+//
+// grid = (n_heads, head_dim / COLS); block = COLS.
+//
+// GQA: `n_heads` value heads, `n_k_heads` key/query heads; value head h
+// pairs with key head h % n_k_heads (Qwen3.5 tiles them).
 
 #include <hip/hip_runtime.h>
+
+#define COLS 64
 
 __device__ __forceinline__ float softplus_stable_r(float x) {
     return (x > 0.0f) ? x + __logf(1.0f + __expf(-x))
                       :     __logf(1.0f + __expf(x));
 }
 
-// GQA: `n_heads` value heads, `n_k_heads` key/query heads. Qwen3.5 GDN
-// tiles the value heads over key heads, so value head h reads its q/k
-// from key head `h % n_k_heads` (not a blocked `h / group`). With
-// n_k_heads == n_heads this reduces to the uniform-head case.
 extern "C" __global__
 void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_heads, head_dim]
                                   const float* __restrict__ k_in,    // [n_k_heads, head_dim]
@@ -36,66 +42,43 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_hea
                                   unsigned int head_dim,
                                   unsigned int n_k_heads)
 {
-    extern __shared__ float lds[];
-    const int h = blockIdx.x;                              // value head
+    extern __shared__ float lds[];                  // q_lds | k_lds, head_dim each
+    const int h  = blockIdx.x;                      // value head
     if (h >= (int)n_heads) return;
-    const int kh = h % (int)n_k_heads;                     // key/query head
-    const int tid = threadIdx.x;
-    const int bs  = blockDim.x;
+    const int kh = h % (int)n_k_heads;              // key/query head
+    const unsigned int vv = blockIdx.y * COLS + threadIdx.x;   // this thread's column
 
     float* q_lds = lds;
-    float* k_lds = lds +     head_dim;
-    float* v_lds = lds + 2 * head_dim;
-    float* delta = lds + 3 * head_dim;
-
-    for (int i = tid; i < (int)head_dim; i += bs) {
+    float* k_lds = lds + head_dim;
+    for (int i = threadIdx.x; i < (int)head_dim; i += COLS) {
         q_lds[i] = q_in[(size_t)kh * head_dim + i];
         k_lds[i] = k_in[(size_t)kh * head_dim + i];
-        v_lds[i] = v_in[(size_t)h  * head_dim + i];
     }
     __syncthreads();
+    if (vv >= head_dim) return;
 
-    // Fused decay/beta — every thread computes the same two scalars.
-    const float ax  = a_in[h] + dt_bias[h];
-    const float dec = __expf(ssm_a[h] * softplus_stable_r(ax));
+    const float dec = __expf(ssm_a[h] * softplus_stable_r(a_in[h] + dt_bias[h]));
     const float bet = 1.0f / (1.0f + __expf(-b_in[h]));
+    const float vval = v_in[(size_t)h * head_dim + vv];
 
-    float* s = state + (size_t)h * head_dim * head_dim;
+    float* col = state + (size_t)h * head_dim * head_dim + vv;   // s[kk] at col[kk*head_dim]
     const size_t hd = head_dim;
 
-    // 1. state *= decay
-    const int n_state = (int)hd * (int)hd;
-    for (int i = tid; i < n_state; i += bs) {
-        s[i] *= dec;
+    // decay the column, accumulate kv_mem = stateᵀ·k
+    float kv = 0.0f;
+    for (int kk = 0; kk < (int)head_dim; kk++) {
+        float s = col[(size_t)kk * hd] * dec;
+        col[(size_t)kk * hd] = s;
+        kv += s * k_lds[kk];
     }
-    __syncthreads();
+    const float delta = (vval - kv) * bet;
 
-    // 2 & 3. delta = (v - state^T·k) * beta
-    for (int vv = tid; vv < (int)head_dim; vv += bs) {
-        float kv_mem = 0.0f;
-        for (int kk = 0; kk < (int)head_dim; kk++) {
-            kv_mem += s[(size_t)kk * hd + vv] * k_lds[kk];
-        }
-        delta[vv] = (v_lds[vv] - kv_mem) * bet;
+    // rank-1 update, then out = stateᵀ·q
+    float acc = 0.0f;
+    for (int kk = 0; kk < (int)head_dim; kk++) {
+        float s = col[(size_t)kk * hd] + k_lds[kk] * delta;
+        col[(size_t)kk * hd] = s;
+        acc += s * q_lds[kk];
     }
-    __syncthreads();
-
-    // 4. state += k ⊗ delta
-    for (int kk = tid; kk < (int)head_dim; kk += bs) {
-        const float kk_v = k_lds[kk];
-        float* row = s + (size_t)kk * hd;
-        for (int vv = 0; vv < (int)head_dim; vv++) {
-            row[vv] += kk_v * delta[vv];
-        }
-    }
-    __syncthreads();
-
-    // 5. out = state^T · q
-    for (int vv = tid; vv < (int)head_dim; vv += bs) {
-        float acc = 0.0f;
-        for (int kk = 0; kk < (int)head_dim; kk++) {
-            acc += s[(size_t)kk * hd + vv] * q_lds[kk];
-        }
-        out[(size_t)h * head_dim + vv] = acc;
-    }
+    out[(size_t)h * head_dim + vv] = acc;
 }

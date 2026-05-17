@@ -1211,8 +1211,12 @@ impl GpuQwen35 {
         n_heads: u32, head_dim: u32, n_k_heads: u32) -> Result<(), String>
     {
         let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_fused_f32")?;
-        let block: u32 = head_dim;
-        let smem = 4 * head_dim * std::mem::size_of::<f32>() as u32;
+        // One thread per value-dim column; grid.y splits head_dim into
+        // COLS-wide chunks (COLS = 64, the kernel's #define). LDS = q | k.
+        const COLS: u32 = 64;
+        let block: u32 = COLS;
+        let grid_y = (head_dim + COLS - 1) / COLS;
+        let smem = 2 * head_dim * std::mem::size_of::<f32>() as u32;
         let mut qa = q; let mut ka = k; let mut va = v;
         let mut aa = a; let mut ba = b; let mut sma = ssm_a; let mut dta = dt_bias;
         let mut sa = state; let mut oa = out;
@@ -1231,7 +1235,7 @@ impl GpuQwen35 {
             &mut hd  as *mut _ as *mut c_void,
             &mut nkh as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
+        unsafe { f.launch((n_heads, grid_y, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_rmsnorm_gated_multihead(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
