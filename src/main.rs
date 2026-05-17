@@ -176,11 +176,20 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         };
         println!("prefill       = {:.3} s ({} tokens, batched)",
             t_pre.elapsed().as_secs_f32(), prompt.len());
+        // Decode timer — steady-state per-token cost, excluding the
+        // one-time weight load and the prompt prefill.
+        let t_dec = std::time::Instant::now();
         for _ in 0..steps {
             let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
             all.push(tok);
             if tok == cfg.eos_token_id { break; }
             logits = gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let n_dec = all.len() - prompt.len();
+        if n_dec > 0 {
+            let d = t_dec.elapsed().as_secs_f64();
+            println!("decode        = {:.1} ms/token ({:.1} tok/s) over {n_dec} forwards",
+                d * 1e3 / n_dec as f64, n_dec as f64 / d);
         }
     } else {
         // CPU oracle — needs the f32-dequantized weights.
