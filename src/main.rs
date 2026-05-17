@@ -680,6 +680,58 @@ void stream_read(const float4* __restrict__ in, float* __restrict__ out,
     let read = bytes / (ms / 1000.0 / iters as f64) / 1e9;
     println!("  kernel-read  {read:>6.2} GB/s   ({:.3} ms / pass, compute-kernel ceiling)",
         ms / iters as f64);
+
+    // Per-kernel dispatch cost — the fixed overhead of a kernel that does
+    // ~no work, measured both as a HIP-graph replay (the path decode
+    // uses: CPU dispatch amortised, leaves GPU-side per-dispatch cost)
+    // and as direct launches (adds CPU dispatch). Multiply by the kernel
+    // count to size what kernel fusion can recover.
+    const NOOP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void noop_kernel(int* p) {
+    if (threadIdx.x == 0) p[0] += 1;
+}
+"#;
+    let nmod = hip::Module::load(&cache.compile("noop_kernel", NOOP_SRC).map_err(anyhow::Error::msg)?)
+        .map_err(anyhow::Error::msg)?;
+    let nf = nmod.function("noop_kernel").map_err(anyhow::Error::msg)?;
+    let nbuf: hip::DeviceBuf<i32> = hip::DeviceBuf::new(1).map_err(anyhow::Error::msg)?;
+    let n_kern = 1024usize;
+    let noop = |st: &hip::Stream| -> Result<(), String> {
+        let mut p = nbuf.raw_ptr();
+        let mut a: [*mut std::ffi::c_void; 1] = [&mut p as *mut _ as *mut std::ffi::c_void];
+        unsafe { nf.launch((1, 1, 1), (64, 1, 1), 0, Some(st), &mut a) }
+    };
+
+    // Graph replay: capture n_kern noop launches, replay `iters` times.
+    use reinstinct_engine::hip::sys::HipStreamCaptureMode;
+    hip::Graph::begin_capture(&stream, HipStreamCaptureMode::Global).map_err(anyhow::Error::msg)?;
+    for _ in 0..n_kern { noop(&stream).map_err(anyhow::Error::msg)?; }
+    let g = hip::Graph::end_capture(&stream).map_err(anyhow::Error::msg)?;
+    let gexec = g.instantiate().map_err(anyhow::Error::msg)?;
+    gexec.launch(&stream).map_err(anyhow::Error::msg)?;        // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let gs = hip::Event::new().map_err(anyhow::Error::msg)?;
+    let ge = hip::Event::new().map_err(anyhow::Error::msg)?;
+    gs.record(&stream).map_err(anyhow::Error::msg)?;
+    for _ in 0..iters { gexec.launch(&stream).map_err(anyhow::Error::msg)?; }
+    ge.record(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let g_ms = hip::Event::elapsed_time(&gs, &ge).map_err(anyhow::Error::msg)? as f64;
+    let g_per = g_ms * 1000.0 / (iters as f64 * n_kern as f64);   // µs / kernel
+
+    // Direct launches: n_kern * iters, wall-clock timed.
+    noop(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let t = std::time::Instant::now();
+    for _ in 0..iters { for _ in 0..n_kern { noop(&stream).map_err(anyhow::Error::msg)?; } }
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let d_per = t.elapsed().as_secs_f64() * 1e6 / (iters as f64 * n_kern as f64);
+
+    println!("\nper-kernel dispatch cost ({} kernels, {} iters):", n_kern, iters);
+    println!("  graph replay  {g_per:.3} µs / kernel   (GPU-side dispatch)");
+    println!("  direct launch {d_per:.3} µs / kernel   (+ CPU dispatch)");
+    println!("  → 1260 kernels/token ≈ {:.2} ms graph-side", g_per * 1260.0 / 1000.0);
     Ok(())
 }
 
