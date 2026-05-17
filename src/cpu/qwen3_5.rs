@@ -378,7 +378,6 @@ pub fn linear_attention_step(
     let value_dim = config.gdn_value_dim as usize;   // n_heads * head_dim
     let key_dim = config.gdn_key_dim() as usize;     // n_k_heads * head_dim
     let conv_dim = 2 * key_dim + value_dim;
-    let kv_group = n_heads / n_k_heads;              // value heads per key head
     let scale = (head_dim as f32).powf(-0.5);
 
     assert_eq!(hidden.len(), h_dim);
@@ -449,8 +448,9 @@ pub fn linear_attention_step(
             .zip(core_attn_out.par_chunks_exact_mut(head_dim))
             .enumerate()
             .for_each(|(h, (s, head_out))| {
-                // GQA: value head h takes its q/k from key head h/kv_group.
-                let kh = h / kv_group;
+                // GQA: the value heads are tiled over key heads — value
+                // head h pairs with key head h % n_k_heads (not blocked).
+                let kh = h % n_k_heads;
                 let q_h = &q[kh * head_dim..(kh + 1) * head_dim];
                 let k_h = &k[kh * head_dim..(kh + 1) * head_dim];
                 let v_h = &v[h * head_dim..(h + 1) * head_dim];

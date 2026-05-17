@@ -18,8 +18,9 @@ __device__ __forceinline__ float softplus_stable_r(float x) {
                       :     __logf(1.0f + __expf(x));
 }
 
-// GQA: `n_heads` value heads, `n_k_heads` key/query heads. Value head h
-// reads its q/k from key head `h / (n_heads / n_k_heads)`. With
+// GQA: `n_heads` value heads, `n_k_heads` key/query heads. Qwen3.5 GDN
+// tiles the value heads over key heads, so value head h reads its q/k
+// from key head `h % n_k_heads` (not a blocked `h / group`). With
 // n_k_heads == n_heads this reduces to the uniform-head case.
 extern "C" __global__
 void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_heads, head_dim]
@@ -38,7 +39,7 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_hea
     extern __shared__ float lds[];
     const int h = blockIdx.x;                              // value head
     if (h >= (int)n_heads) return;
-    const int kh = h / ((int)n_heads / (int)n_k_heads);    // key/query head
+    const int kh = h % (int)n_k_heads;                     // key/query head
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
 
