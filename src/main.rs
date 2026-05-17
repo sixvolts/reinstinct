@@ -614,6 +614,72 @@ fn hip_info(mb: usize, iters: usize) -> anyhow::Result<()> {
     let d2h = bytes / (d2h_total / iters as f64) / 1e9;
     println!("  H2D  {h2d:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * h2d_total / iters as f64);
     println!("  D2H  {d2h:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * d2h_total / iters as f64);
+
+    // D2D streaming bandwidth: an in-VRAM copy moves `bytes` read + `bytes`
+    // written, so effective HBM traffic per copy is 2*bytes. This is the
+    // achievable streaming-bandwidth ceiling to compare matvec GB/s against.
+    let dst: hip::DeviceBuf<f32> = hip::DeviceBuf::new(n_elems).map_err(anyhow::Error::msg)?;
+    dst.copy_from_device_at(&buf, 0).map_err(anyhow::Error::msg)?; // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let mut d2d_total = 0.0_f64;
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        dst.copy_from_device_at(&buf, 0).map_err(anyhow::Error::msg)?;
+        _dev.synchronize().map_err(anyhow::Error::msg)?;
+        d2d_total += t.elapsed().as_secs_f64();
+    }
+    let d2d = 2.0 * bytes / (d2d_total / iters as f64) / 1e9;
+    println!("  D2D  {d2d:>6.2} GB/s   ({:.3} ms / copy, read+write traffic)",
+        1000.0 * d2d_total / iters as f64);
+
+    // Compute-kernel streaming read: the bandwidth a *compute kernel* (not
+    // the DMA copy engine) sustains on a perfectly-coalesced contiguous
+    // float4 read. This is the honest ceiling a matvec kernel can target.
+    const STREAM_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__
+void stream_read(const float4* __restrict__ in, float* __restrict__ out,
+                 unsigned int n4) {
+    unsigned int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+    float sx = 0.f, sy = 0.f, sz = 0.f, sw = 0.f;
+    for (unsigned int i = tid; i < n4; i += stride) {
+        float4 v = in[i];
+        sx += v.x; sy += v.y; sz += v.z; sw += v.w;
+    }
+    out[tid] = sx + sy + sz + sw;
+}
+"#;
+    let cache = reinstinct_engine::runtime::KernelCache::new().map_err(anyhow::Error::msg)?;
+    let hsaco = cache.compile("stream_read", STREAM_SRC).map_err(anyhow::Error::msg)?;
+    let module = hip::Module::load(&hsaco).map_err(anyhow::Error::msg)?;
+    let f = module.function("stream_read").map_err(anyhow::Error::msg)?;
+    let stream = hip::Stream::new().map_err(anyhow::Error::msg)?;
+    let (grid, block) = (480u32, 256u32);
+    let sink: hip::DeviceBuf<f32> = hip::DeviceBuf::new((grid * block) as usize)
+        .map_err(anyhow::Error::msg)?;
+    let n4 = (n_elems / 4) as u32;
+    let launch = |st: &hip::Stream| -> Result<(), String> {
+        let mut ia = buf.raw_ptr();
+        let mut oa = sink.raw_ptr();
+        let mut na = n4;
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &mut ia as *mut _ as *mut std::ffi::c_void, &mut oa as *mut _ as *mut std::ffi::c_void,
+            &mut na as *mut _ as *mut std::ffi::c_void];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(st), &mut args) }
+    };
+    launch(&stream).map_err(anyhow::Error::msg)?; // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let start = hip::Event::new().map_err(anyhow::Error::msg)?;
+    let stop  = hip::Event::new().map_err(anyhow::Error::msg)?;
+    start.record(&stream).map_err(anyhow::Error::msg)?;
+    for _ in 0..iters { launch(&stream).map_err(anyhow::Error::msg)?; }
+    stop.record(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let ms = hip::Event::elapsed_time(&start, &stop).map_err(anyhow::Error::msg)? as f64;
+    let read = bytes / (ms / 1000.0 / iters as f64) / 1e9;
+    println!("  kernel-read  {read:>6.2} GB/s   ({:.3} ms / pass, compute-kernel ceiling)",
+        ms / iters as f64);
     Ok(())
 }
 
