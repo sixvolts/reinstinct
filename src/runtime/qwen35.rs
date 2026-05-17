@@ -792,7 +792,9 @@ impl GpuQwen35 {
                       n: u32, eps: f32) -> Result<(), String>
     {
         let f = self.rmsnorm_module.function("rmsnorm_f32")?;
-        let block: u32 = 256;
+        // One block per vector — use the full 1024 (16 wavefronts) so the
+        // single occupied CU has enough wavefronts to hide memory latency.
+        let block: u32 = 1024;
         let mut xa = x; let mut wa = w; let mut ya = y;
         let mut na = n; let mut ea = eps;
         let mut args: [*mut c_void; 5] = [
