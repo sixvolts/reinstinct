@@ -605,7 +605,8 @@ impl GpuGemma4 {
         let mut args: [*mut c_void; 3] = [
             &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void];
-        unsafe { f.launch((in_dim / 32, n_vec, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch(((in_dim + 255) / 256, n_vec, 1), (256, 1, 1),
+                          0, Some(&self.stream), &mut args) }
     }
 
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)

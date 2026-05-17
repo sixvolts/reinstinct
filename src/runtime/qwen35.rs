@@ -880,7 +880,8 @@ impl GpuQwen35 {
         let mut args: [*mut c_void; 3] = [
             &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void];
-        unsafe { f.launch((in_dim / 32, 1, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch(((in_dim + 255) / 256, 1, 1), (256, 1, 1),
+                          0, Some(&self.stream), &mut args) }
     }
 
     /// Dispatch a matvec to the right kernel based on the weight's on-disk

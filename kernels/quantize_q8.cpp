@@ -3,10 +3,11 @@
 // of the original values `xsum` (used for the Q4_K/Q5_K dmin term),
 // and 32 signed int8 quants.
 //
-// grid = (in_dim/32, n_vec); block = 32 (one thread per element).
-// blockIdx.y selects the vector — a single call quantizes a batch of
-// `n_vec` contiguous `in_dim`-length activations (used for the 8 routed
-// experts' inputs); n_vec=1 grid.y is the ordinary single-vector case.
+// grid = (ceil(in_dim/256), n_vec); block = 256 — a full wavefront ×4,
+// each block doing 8 sub-blocks of 32. The earlier block=32 launch was
+// a half-wavefront on gfx906 (Wave64) and spawned in_dim/32 tiny
+// blocks; this amortizes the dispatch over 8× the work per block.
+// blockIdx.y selects the vector for the batched (n_vec > 1) case.
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -27,12 +28,15 @@ void quantize_q8_f32(const float*  __restrict__ x,
     x   += (size_t)vec * in_dim;
     out += (size_t)vec * (in_dim >> 5);
 
-    const unsigned int blk = blockIdx.x;
-    const int l = threadIdx.x;                  // 0..31
-    const float v = x[blk * 32 + l];
+    const unsigned int n_sub = in_dim >> 5;                        // total sub-blocks
+    const unsigned int blk = blockIdx.x * 8 + (threadIdx.x >> 5);  // this thread's sub-block
+    const int l = threadIdx.x & 31;                                // 0..31 within it
+    if (blk >= n_sub) return;
 
+    const float v = x[blk * 32 + l];
     float amax = fabsf(v);
     float sum  = v;
+    // Reduction stays within the 32-aligned lane group.
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         amax = fmaxf(amax, __shfl_xor(amax, o));
