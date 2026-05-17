@@ -29,6 +29,8 @@ const MATVEC_Q4K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q4_k_dp4a
 const MATVEC_Q5K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
+const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 /// Output rows per wavefront in the row-blocked K-quant matvecs — must
 /// match `ROWS` in matvec_q{4,5,6}_k_rowblock.cpp.
 const Q4K_ROWBLOCK: u32 = 2;
@@ -313,6 +315,8 @@ pub struct GpuGemma4 {
     m_mv_q6k_dp4a: Module,
     m_mv_q8_0_dp4a: Module,
     m_mv_q4k_repacked: Module,
+    m_mv_q5k_repacked: Module,
+    m_mv_q6k_repacked: Module,
     m_moe_topk:  Module,
     m_moe_mv_q6k:  Module,
     m_moe_mv_q8_0: Module,
@@ -448,6 +452,8 @@ impl GpuGemma4 {
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
             m_mv_q4k_repacked: ld("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?,
+            m_mv_q5k_repacked: ld("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC)?,
+            m_mv_q6k_repacked: ld("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC)?,
             m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
             m_moe_mv_q6k:   ld("moe_matvec_q6k_dp4a", MOE_MATVEC_Q6K_SRC)?,
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
@@ -619,7 +625,12 @@ impl GpuGemma4 {
         // (4 wavefronts × 2 rows = 8 rows).
         if w.repacked {
             self.launch_quantize_q8(x, self.xq8.raw_ptr(), w.in_dim, 1)?;
-            let f = self.m_mv_q4k_repacked.function("matvec_q4k_repacked_f32")?;
+            let (module, kname) = match w.dtype {
+                GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32"),
+                GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32"),
+                _              => (&self.m_mv_q4k_repacked, "matvec_q4k_repacked_f32"),
+            };
+            let f = module.function(kname)?;
             let grid = (w.out_dim + 7) / 8;
             let mut wa = w.data.raw_ptr();
             let mut xa = self.xq8.raw_ptr();

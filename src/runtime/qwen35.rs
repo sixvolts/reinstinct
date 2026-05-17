@@ -79,6 +79,10 @@ const DEQUANT_Q8_0_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q8_0_
 const DEQUANT_IQ4_XS_F16_SOURCE:&str = include_str!("../../kernels/dequant_iq4_xs_f16.cpp");
 const DEQUANT_Q4K_REPACKED_F16_SOURCE: &str =
     include_str!("../../kernels/dequant_q4k_repacked_f16.cpp");
+const DEQUANT_Q5K_REPACKED_F16_SOURCE: &str =
+    include_str!("../../kernels/dequant_q5k_repacked_f16.cpp");
+const DEQUANT_Q6K_REPACKED_F16_SOURCE: &str =
+    include_str!("../../kernels/dequant_q6k_repacked_f16.cpp");
 const ROPE_BATCHED_SOURCE:      &str = include_str!("../../kernels/rope_batched.cpp");
 const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
 
@@ -88,6 +92,8 @@ const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
+const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 /// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
 const DP4A_ROWBLOCK: u32 = 2;
 
@@ -154,22 +160,28 @@ impl GpuMatvecTensor {
         }
         let in_dim  = shape[0] as u32;
         let out_dim = shape[1] as u32;
-        if info.ggml_type == GgmlType::Q4_K {
-            let packed = crate::quant::q4_k::repack_for_matvec(
-                bytes, in_dim as usize, out_dim as usize);
-            Ok(Self {
-                data: DeviceBuf::from_slice(&packed)?,
+        let packed = match info.ggml_type {
+            GgmlType::Q4_K => Some(crate::quant::q4_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize)),
+            GgmlType::Q5_K => Some(crate::quant::q5_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize)),
+            GgmlType::Q6_K => Some(crate::quant::q6_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize)),
+            _ => None,
+        };
+        match packed {
+            Some(p) => Ok(Self {
+                data: DeviceBuf::from_slice(&p)?,
                 dtype: info.ggml_type,
                 in_dim, out_dim,
                 repacked: true,
-            })
-        } else {
-            Ok(Self {
+            }),
+            None => Ok(Self {
                 data: DeviceBuf::from_slice(bytes)?,
                 dtype: info.ggml_type,
                 in_dim, out_dim,
                 repacked: false,
-            })
+            }),
         }
     }
 }
@@ -523,6 +535,8 @@ pub struct GpuQwen35 {
     matvec_q6_k_dp4a_module: Module,
     matvec_q8_0_dp4a_module: Module,
     matvec_q4k_repacked_module: Module,
+    matvec_q5k_repacked_module: Module,
+    matvec_q6k_repacked_module: Module,
     /// Scratch for the quantized activation (BlockQ8, 40 bytes per 32).
     xq8: DeviceBuf<u8>,
     /// Use the int8 dp4a matvec (vs the fp32 wave64 path). Env-set once;
@@ -545,6 +559,8 @@ pub struct GpuQwen35 {
     dequant_q8_0_module:   Module,
     dequant_iq4_xs_module: Module,
     dequant_q4k_repacked_module: Module,
+    dequant_q5k_repacked_module: Module,
+    dequant_q6k_repacked_module: Module,
     rope_batched_module:   Module,
     attn_step_batched_module: Module,
 
@@ -681,6 +697,10 @@ impl GpuQwen35 {
         let matvec_q8_0_dp4a_hsaco = cache.compile("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SOURCE)?;
         let matvec_q4k_repacked_hsaco =
             cache.compile("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SOURCE)?;
+        let matvec_q5k_repacked_hsaco =
+            cache.compile("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SOURCE)?;
+        let matvec_q6k_repacked_hsaco =
+            cache.compile("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.block_kinds.len());
@@ -736,6 +756,10 @@ impl GpuQwen35 {
             dequant_iq4_xs_module:    Module::load(&cache.compile("dequant_iq4_xs_f16", DEQUANT_IQ4_XS_F16_SOURCE)?)?,
             dequant_q4k_repacked_module: Module::load(&cache.compile(
                 "dequant_q4k_repacked_f16", DEQUANT_Q4K_REPACKED_F16_SOURCE)?)?,
+            dequant_q5k_repacked_module: Module::load(&cache.compile(
+                "dequant_q5k_repacked_f16", DEQUANT_Q5K_REPACKED_F16_SOURCE)?)?,
+            dequant_q6k_repacked_module: Module::load(&cache.compile(
+                "dequant_q6k_repacked_f16", DEQUANT_Q6K_REPACKED_F16_SOURCE)?)?,
             rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
             attn_step_batched_module: Module::load(&cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?)?,
             matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
@@ -751,6 +775,8 @@ impl GpuQwen35 {
             matvec_q6_k_dp4a_module: Module::load(&matvec_q6_k_dp4a_hsaco)?,
             matvec_q8_0_dp4a_module: Module::load(&matvec_q8_0_dp4a_hsaco)?,
             matvec_q4k_repacked_module: Module::load(&matvec_q4k_repacked_hsaco)?,
+            matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
+            matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
             xq8: DeviceBuf::new(((ffn.max(hidden) + 31) / 32) * 40)?,
             dp4a_enabled: std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none(),
             blocks,
@@ -959,7 +985,12 @@ impl GpuQwen35 {
         // 256-thread workgroup (4 wavefronts × 2 rows = 8 rows).
         if w.repacked {
             self.launch_quantize_q8(x, in_d)?;
-            let f = self.matvec_q4k_repacked_module.function("matvec_q4k_repacked_f32")?;
+            let (module, kname) = match w.dtype {
+                GgmlType::Q5_K => (&self.matvec_q5k_repacked_module, "matvec_q5k_repacked_f32"),
+                GgmlType::Q6_K => (&self.matvec_q6k_repacked_module, "matvec_q6k_repacked_f32"),
+                _              => (&self.matvec_q4k_repacked_module, "matvec_q4k_repacked_f32"),
+            };
+            let f = module.function(kname)?;
             let grid = (out_d + 7) / 8;
             let mut wa = wp; let mut xa = self.xq8.raw_ptr(); let mut ya = y;
             let mut ia = in_d; let mut oa = out_d;
@@ -1810,7 +1841,12 @@ impl GpuQwen35 {
         // Repacked Q4_K: the two-plane layout dequantizes a sub-block at a
         // time straight into [out_dim, in_dim] fp16 order.
         if w.repacked {
-            let f = self.dequant_q4k_repacked_module.function("dequant_q4k_repacked_f16")?;
+            let (module, kname) = match w.dtype {
+                GgmlType::Q5_K => (&self.dequant_q5k_repacked_module, "dequant_q5k_repacked_f16"),
+                GgmlType::Q6_K => (&self.dequant_q6k_repacked_module, "dequant_q6k_repacked_f16"),
+                _              => (&self.dequant_q4k_repacked_module, "dequant_q4k_repacked_f16"),
+            };
+            let f = module.function(kname)?;
             let n_sub_total = (n / 32) as u32;   // out_dim * (in_dim/32)
             let mut w_ptr = w.data.raw_ptr();
             let mut o_ptr = out.raw_ptr();

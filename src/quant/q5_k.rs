@@ -16,7 +16,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::quant::half::f16_to_f32;
+use crate::quant::half::{f16_to_f32, f32_to_f16};
 
 pub const BLOCK_SIZE: usize = 256;
 pub const BYTES_PER_BLOCK: usize = 176;
@@ -83,6 +83,67 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
             u2 <<= 2;
         }
     }
+}
+
+/// Repack a Q5_K matvec weight `[out_dim, in_dim]` into three contiguous
+/// planes (row stride `nsp = q4_k::repacked_n_sub_padded(in_dim)`):
+///   * nibble plane — `nsp*16` B/row, low 4 bits per weight, permuted as
+///     in `q4_k::repack_for_matvec`.
+///   * qh plane — `nsp*4` B/row. Per sub-block one u32: bit `4g+b` is the
+///     5th bit of the `b`-th weight of dp4a group `g`.
+///   * scale plane — `nsp*4` B/row: `fp16(d·sc)`, `fp16(dmin·m)`.
+pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8> {
+    assert_eq!(in_dim % BLOCK_SIZE, 0, "Q5_K in_dim must be a multiple of 256");
+    let n_blocks = in_dim / BLOCK_SIZE;
+    let nsp      = crate::quant::q4_k::repacked_n_sub_padded(in_dim);
+    let nib_len  = out_dim * nsp * 16;
+    let qh_len   = out_dim * nsp * 4;
+    let mut out  = vec![0u8; nib_len + qh_len + out_dim * nsp * 4];
+
+    let blocks: &[BlockQ5_K] =
+        bytemuck::cast_slice(&bytes[..out_dim * n_blocks * BYTES_PER_BLOCK]);
+
+    for row in 0..out_dim {
+        for blk in 0..n_blocks {
+            let b    = &blocks[row * n_blocks + blk];
+            let d    = f16_to_f32(b.d);
+            let dmin = f16_to_f32(b.dmin);
+
+            for s in 0..8usize {
+                let gsb = blk * 8 + s;
+                let qs  = &b.qs[(s >> 1) * 32..(s >> 1) * 32 + 32];
+
+                let mut w = [0u8; 32];
+                let mut hb = [0u8; 32];
+                for l in 0..32 {
+                    w[l]  = if s & 1 == 0 { qs[l] & 0x0F } else { qs[l] >> 4 };
+                    hb[l] = (b.qh[l] >> s) & 1;
+                }
+
+                let nib_off = (row * nsp + gsb) * 16;
+                let mut qh_packed: u32 = 0;
+                for j in 0..4 {
+                    for bb in 0..4 {
+                        out[nib_off + j * 4 + bb] =
+                            w[4 * j + bb] | (w[16 + 4 * j + bb] << 4);
+                        // dp4a group 2j → weights 4j+bb, group 2j+1 → 16+4j+bb.
+                        qh_packed |= (hb[4 * j + bb] as u32)      << (4 * (2 * j)     + bb);
+                        qh_packed |= (hb[16 + 4 * j + bb] as u32) << (4 * (2 * j + 1) + bb);
+                    }
+                }
+                let qh_off = nib_len + (row * nsp + gsb) * 4;
+                out[qh_off..qh_off + 4].copy_from_slice(&qh_packed.to_le_bytes());
+
+                let (sc, m) = get_scale_min_k4(s, &b.scales);
+                let dsc  = f32_to_f16(d * sc as f32);
+                let deff = f32_to_f16(dmin * m as f32);
+                let so = nib_len + qh_len + (row * nsp + gsb) * 4;
+                out[so..so + 2].copy_from_slice(&dsc.to_le_bytes());
+                out[so + 2..so + 4].copy_from_slice(&deff.to_le_bytes());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

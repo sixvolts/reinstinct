@@ -38,6 +38,8 @@ const MATVEC_Q5_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q5_k_dp4a.
 const MATVEC_Q6_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
+const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 
 /// Batched causal attention over `p` query tokens. Q/K/V are row-major
@@ -122,21 +124,21 @@ pub fn matvec_kquant_dp4a(cache: &KernelCache, compile_name: &str, mv_src: &str,
     Ok(out)
 }
 
-/// Test-only: repack a Q4_K weight into the two-plane layout and run the
-/// `matvec_q4k_repacked` kernel against a quantized activation.
-pub fn matvec_q4k_repacked(cache: &KernelCache, w_bytes: &[u8], x: &[f32],
+/// Test-only: run a repacked K-quant matvec kernel against a quantized
+/// activation. `packed` is the repacked weight (the caller picks the
+/// per-dtype `repack_for_matvec`).
+pub fn run_repacked_matvec(cache: &KernelCache, compile_name: &str, mv_src: &str,
+                           mv_kernel: &str, packed: &[u8], x: &[f32],
                            in_dim: usize, out_dim: usize) -> Result<Vec<f32>, String>
 {
     let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?;
     let qf = qmod.function("quantize_q8_f32")?;
-    let mvmod = Module::load(&cache.compile("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?)?;
-    let mvf = mvmod.function("matvec_q4k_repacked_f32")?;
-
-    let packed = crate::quant::q4_k::repack_for_matvec(w_bytes, in_dim, out_dim);
+    let mvmod = Module::load(&cache.compile(compile_name, mv_src)?)?;
+    let mvf = mvmod.function(mv_kernel)?;
 
     let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
     let dxq: DeviceBuf<u8> = DeviceBuf::new((in_dim / 32) * 40)?;
-    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(&packed)?;
+    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(packed)?;
     let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim)?;
 
     let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr();
@@ -1470,12 +1472,69 @@ mod tests {
         let mut cpu = vec![0.0f32; out_dim];
         crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
 
-        let gpu = matvec_q4k_repacked(&cache, &w_bytes, &x, in_dim, out_dim)
-            .expect("q4k repacked");
+        let packed = crate::quant::q4_k::repack_for_matvec(&w_bytes, in_dim, out_dim);
+        let gpu = run_repacked_matvec(&cache, "matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC,
+            "matvec_q4k_repacked_f32", &packed, &x, in_dim, out_dim).expect("q4k repacked");
         let e = rel_l2(&gpu, &cpu);
         eprintln!("matvec_q4k_repacked {out_dim}x{in_dim}: rel_l2={e:.3e}");
         assert!(e < DP4A_REL_L2_MAX,
             "q4k repacked rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+
+        // --- Q5_K repacked, same harness ---
+        {
+            use crate::quant::q5_k::{BLOCK_SIZE as Q5_BS, BYTES_PER_BLOCK as Q5_BPB};
+            let tb = out_dim * (in_dim / Q5_BS);
+            let mut wb = vec![0u8; tb * Q5_BPB];
+            let mut s: u64 = 0xD5A5_1234;
+            let mut r = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                             (s >> 56) as u8 };
+            for blk in 0..tb {
+                let o = blk * Q5_BPB;
+                let d    = ((blk % 29) as f32 - 14.0) * 0.003;
+                let dmin = ((blk % 17) as f32 -  8.0) * 0.0015;
+                wb[o..o+2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                wb[o+2..o+4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+                for i in 0..172 { wb[o+4+i] = r(); }
+            }
+            let mut wf = vec![0.0f32; out_dim * in_dim];
+            crate::quant::q5_k::dequantize_to_f32(&wb, &mut wf);
+            let mut cpu5 = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&x, &wf, in_dim, out_dim, &mut cpu5);
+            let p5 = crate::quant::q5_k::repack_for_matvec(&wb, in_dim, out_dim);
+            let g5 = run_repacked_matvec(&cache, "matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC,
+                "matvec_q5k_repacked_f32", &p5, &x, in_dim, out_dim).expect("q5k repacked");
+            let e5 = rel_l2(&g5, &cpu5);
+            eprintln!("matvec_q5k_repacked {out_dim}x{in_dim}: rel_l2={e5:.3e}");
+            assert!(e5 < DP4A_REL_L2_MAX,
+                "q5k repacked rel_l2 {e5:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+        }
+
+        // --- Q6_K repacked, same harness ---
+        {
+            use crate::quant::q6_k::{BLOCK_SIZE as Q6_BS, BYTES_PER_BLOCK as Q6_BPB};
+            let tb = out_dim * (in_dim / Q6_BS);
+            let mut wb = vec![0u8; tb * Q6_BPB];
+            let mut s: u64 = 0xD6A6_5678;
+            let mut r = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                             (s >> 56) as u8 };
+            for blk in 0..tb {
+                let o = blk * Q6_BPB;
+                for i in 0..208 { wb[o + i] = r(); }      // ql + qh + scales
+                let d = ((blk % 23) as f32 - 11.0) * 0.004;
+                wb[o+208..o+210].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            }
+            let mut wf = vec![0.0f32; out_dim * in_dim];
+            crate::quant::q6_k::dequantize_to_f32(&wb, &mut wf);
+            let mut cpu6 = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&x, &wf, in_dim, out_dim, &mut cpu6);
+            let p6 = crate::quant::q6_k::repack_for_matvec(&wb, in_dim, out_dim);
+            let g6 = run_repacked_matvec(&cache, "matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC,
+                "matvec_q6k_repacked_f32", &p6, &x, in_dim, out_dim).expect("q6k repacked");
+            let e6 = rel_l2(&g6, &cpu6);
+            eprintln!("matvec_q6k_repacked {out_dim}x{in_dim}: rel_l2={e6:.3e}");
+            assert!(e6 < DP4A_REL_L2_MAX,
+                "q6k repacked rel_l2 {e6:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+        }
     }
 
     #[test]

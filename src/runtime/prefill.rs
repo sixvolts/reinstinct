@@ -195,6 +195,8 @@ pub struct PrefillGemm {
     deq_q8_0:  Module,
     deq_iq4xs: Module,
     deq_q4k_repacked: Module,
+    deq_q5k_repacked: Module,
+    deq_q6k_repacked: Module,
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
     dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
@@ -220,6 +222,10 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_iq4_xs_f16.cpp"))?)?,
             deq_q4k_repacked: Module::load(&cache.compile("dequant_q4k_repacked_f16",
                            include_str!("../../kernels/dequant_q4k_repacked_f16.cpp"))?)?,
+            deq_q5k_repacked: Module::load(&cache.compile("dequant_q5k_repacked_f16",
+                           include_str!("../../kernels/dequant_q5k_repacked_f16.cpp"))?)?,
+            deq_q6k_repacked: Module::load(&cache.compile("dequant_q6k_repacked_f16",
+                           include_str!("../../kernels/dequant_q6k_repacked_f16.cpp"))?)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
             dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
@@ -263,8 +269,13 @@ impl PrefillGemm {
         let mut w_ptr = w_dev.raw_ptr();
         let mut o_ptr = w_f16.raw_ptr();
         if repacked {
-            // Repacked Q4_K: one HIP block per 32-weight sub-block.
-            let f = self.deq_q4k_repacked.function("dequant_q4k_repacked_f16")?;
+            // Repacked K-quant: one HIP block per 32-weight sub-block.
+            let (module, kname) = match dtype {
+                GgmlType::Q5_K => (&self.deq_q5k_repacked, "dequant_q5k_repacked_f16"),
+                GgmlType::Q6_K => (&self.deq_q6k_repacked, "dequant_q6k_repacked_f16"),
+                _              => (&self.deq_q4k_repacked, "dequant_q4k_repacked_f16"),
+            };
+            let f = module.function(kname)?;
             let mut ia = in_dim as u32;
             let mut oa = out_dim as u32;
             let mut da: [*mut c_void; 4] = [
