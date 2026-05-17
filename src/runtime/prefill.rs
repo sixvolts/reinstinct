@@ -194,6 +194,7 @@ pub struct PrefillGemm {
     deq_q6k:   Module,
     deq_q8_0:  Module,
     deq_iq4xs: Module,
+    deq_q4k_repacked: Module,
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
     dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
@@ -217,6 +218,8 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_q8_0_f16.cpp"))?)?,
             deq_iq4xs: Module::load(&cache.compile("dequant_iq4_xs_f16",
                            include_str!("../../kernels/dequant_iq4_xs_f16.cpp"))?)?,
+            deq_q4k_repacked: Module::load(&cache.compile("dequant_q4k_repacked_f16",
+                           include_str!("../../kernels/dequant_q4k_repacked_f16.cpp"))?)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
             dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
@@ -239,8 +242,9 @@ impl PrefillGemm {
     /// allocations. Only `Y` (`[n_rows, out_dim]` fp32) is freshly
     /// allocated; the fp16 scratch is pooled.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn matmul(&self, handle: &Handle, stream: &hip::Stream,
-                  w_dev: &DeviceBuf<u8>, dtype: GgmlType,
+                  w_dev: &DeviceBuf<u8>, dtype: GgmlType, repacked: bool,
                   in_dim: usize, out_dim: usize,
                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<DeviceBuf<f32>, String>
@@ -256,17 +260,29 @@ impl PrefillGemm {
         let dy_f16 = self.dy_f16.borrow();
 
         // 1. Dequant W → fp16 scratch (in place reuse).
-        let (module, kname, wpb, bt) = self.deq(dtype)?;
-        assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");
-        let n_blocks = (n_w / wpb) as u32;
-        let f = module.function(kname)?;
         let mut w_ptr = w_dev.raw_ptr();
         let mut o_ptr = w_f16.raw_ptr();
-        let mut nb = n_blocks;
-        let mut da: [*mut c_void; 3] = [
-            &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
-            &mut nb    as *mut _ as *mut c_void];
-        unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
+        if repacked {
+            // Repacked Q4_K: one HIP block per 32-weight sub-block.
+            let f = self.deq_q4k_repacked.function("dequant_q4k_repacked_f16")?;
+            let mut ia = in_dim as u32;
+            let mut oa = out_dim as u32;
+            let mut da: [*mut c_void; 4] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut ia    as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_w / 32) as u32, 1, 1), (32, 1, 1),
+                              0, Some(stream), &mut da)?; }
+        } else {
+            let (module, kname, wpb, bt) = self.deq(dtype)?;
+            assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");
+            let n_blocks = (n_w / wpb) as u32;
+            let f = module.function(kname)?;
+            let mut nb = n_blocks;
+            let mut da: [*mut c_void; 3] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut nb    as *mut _ as *mut c_void];
+            unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
+        }
 
         // 2. X → fp16 scratch.
         let to_f16 = self.cvt.function("cvt_f32_to_f16")?;

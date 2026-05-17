@@ -37,6 +37,7 @@ const MATVEC_Q4_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_k_dp4a.
 const MATVEC_Q5_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 
 /// Batched causal attention over `p` query tokens. Q/K/V are row-major
@@ -95,7 +96,8 @@ pub fn matvec_kquant_dp4a(cache: &KernelCache, compile_name: &str, mv_src: &str,
     let mut qargs: [*mut c_void; 3] = [
         &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
         &mut ind as *mut _ as *mut c_void];
-    unsafe { qf.launch(((in_dim / 32) as u32, 1, 1), (32, 1, 1), 0, None, &mut qargs)?; }
+    unsafe { qf.launch((((in_dim as u32) + 255) / 256, 1, 1), (256, 1, 1),
+                       0, None, &mut qargs)?; }
 
     let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
     let mut ia = in_dim as u32; let mut oa = out_dim as u32;
@@ -103,11 +105,56 @@ pub fn matvec_kquant_dp4a(cache: &KernelCache, compile_name: &str, mv_src: &str,
         &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
         &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
         &mut oa as *mut _ as *mut c_void];
-    // ROWS output rows per wavefront — must match `#define ROWS` in the
-    // dp4a kernel sources.
-    const ROWS: u32 = 2;
-    let grid = (out_dim as u32 + ROWS - 1) / ROWS;
-    unsafe { mvf.launch((grid, 1, 1), (64, 1, 1), 0, None, &mut margs)?; }
+    // Rows per workgroup / workgroup size — must match the kernel's
+    // launch contract. The Q4_K kernel uses 256-thread workgroups (4
+    // wavefronts, 2 rows each = 8 rows); the others 64-thread, 2 rows.
+    let (block, rows): (u32, u32) = if mv_kernel == "matvec_q4_k_dp4a_f32" {
+        (256, 8)
+    } else {
+        (64, 2)
+    };
+    let grid = (out_dim as u32 + rows - 1) / rows;
+    unsafe { mvf.launch((grid, 1, 1), (block, 1, 1), 0, None, &mut margs)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; out_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Test-only: repack a Q4_K weight into the two-plane layout and run the
+/// `matvec_q4k_repacked` kernel against a quantized activation.
+pub fn matvec_q4k_repacked(cache: &KernelCache, w_bytes: &[u8], x: &[f32],
+                           in_dim: usize, out_dim: usize) -> Result<Vec<f32>, String>
+{
+    let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?;
+    let qf = qmod.function("quantize_q8_f32")?;
+    let mvmod = Module::load(&cache.compile("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?)?;
+    let mvf = mvmod.function("matvec_q4k_repacked_f32")?;
+
+    let packed = crate::quant::q4_k::repack_for_matvec(w_bytes, in_dim, out_dim);
+
+    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
+    let dxq: DeviceBuf<u8> = DeviceBuf::new((in_dim / 32) * 40)?;
+    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(&packed)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim)?;
+
+    let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr();
+    let mut ind = in_dim as u32;
+    let mut qargs: [*mut c_void; 3] = [
+        &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+        &mut ind as *mut _ as *mut c_void];
+    unsafe { qf.launch((((in_dim as u32) + 255) / 256, 1, 1), (256, 1, 1),
+                       0, None, &mut qargs)?; }
+
+    let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
+    let mut ia = in_dim as u32; let mut oa = out_dim as u32;
+    let mut margs: [*mut c_void; 5] = [
+        &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
+        &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+        &mut oa as *mut _ as *mut c_void];
+    unsafe { mvf.launch(((out_dim as u32 + 7) / 8, 1, 1), (256, 1, 1),
+                        0, None, &mut margs)?; }
     hip::Device(0).synchronize()?;
 
     let mut out = vec![0.0f32; out_dim];
@@ -1386,6 +1433,123 @@ mod tests {
         let e = rel_l2(&gpu, &cpu);
         eprintln!("matvec_q4_k_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
         assert!(e < DP4A_REL_L2_MAX, "q4_k dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
+    #[test]
+    fn matvec_q4k_repacked_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0xD4A4_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let d    = ((blk % 29) as f32 - 14.0) * 0.003;
+            let dmin = ((blk % 17) as f32 -  8.0) * 0.0015;
+            w_bytes[off..off+2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            w_bytes[off+2..off+4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+            for i in 0..12  { w_bytes[off + 4  + i] = rng_u8(); }
+            for i in 0..128 { w_bytes[off + 16 + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x1357_9BDF;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::q4_k::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        let gpu = matvec_q4k_repacked(&cache, &w_bytes, &x, in_dim, out_dim)
+            .expect("q4k repacked");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_q4k_repacked {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "q4k repacked rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_q4k_repacked_vs_dp4a() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+      for &(in_dim, out_dim) in &[(5376usize, 21504usize), (5376, 8192),
+                                  (5376, 4096), (8192, 5376), (4096, 5376)] {
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0xBEEF_0001;
+        let mut r = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 56) as u8 };
+        for blk in 0..total_blocks {
+            let o = blk * BYTES_PER_BLOCK;
+            w[o..o+2].copy_from_slice(&f32_to_f16(0.01).to_le_bytes());
+            w[o+2..o+4].copy_from_slice(&f32_to_f16(0.005).to_le_bytes());
+            for i in 0..140 { w[o+4+i] = r(); }
+        }
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let packed = crate::quant::q4_k::repack_for_matvec(&w, in_dim, out_dim);
+
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let dp4a = Module::load(&cache.compile("matvec_q4_k_dp4a", MATVEC_Q4_K_DP4A_SRC).unwrap()).unwrap();
+        let repk = Module::load(&cache.compile("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC).unwrap()).unwrap();
+
+        let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
+        let dxq: DeviceBuf<u8> = DeviceBuf::new((in_dim / 32) * 40).unwrap();
+        let dw_q: DeviceBuf<u8> = DeviceBuf::from_slice(&w).unwrap();
+        let dw_r: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
+        let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim).unwrap();
+        let stream = hip::Stream::new().unwrap();
+
+        // quantize the activation once
+        {
+            let qf = qmod.function("quantize_q8_f32").unwrap();
+            let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut id = in_dim as u32;
+            let mut a: [*mut c_void; 3] = [&mut xp as *mut _ as *mut c_void,
+                &mut qp as *mut _ as *mut c_void, &mut id as *mut _ as *mut c_void];
+            unsafe { qf.launch(((in_dim as u32 + 255)/256,1,1),(256,1,1),0,Some(&stream),&mut a).unwrap(); }
+        }
+
+        let bench = |module: &Module, kname: &str, wptr: *mut c_void, bytes: f64| -> (f64, f64) {
+            let f = module.function(kname).unwrap();
+            let grid = (out_dim as u32 + 7) / 8;
+            let launch = || {
+                let mut wp = wptr; let mut qp = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
+                let mut id = in_dim as u32; let mut od = out_dim as u32;
+                let mut a: [*mut c_void; 5] = [&mut wp as *mut _ as *mut c_void,
+                    &mut qp as *mut _ as *mut c_void, &mut yp as *mut _ as *mut c_void,
+                    &mut id as *mut _ as *mut c_void, &mut od as *mut _ as *mut c_void];
+                unsafe { f.launch((grid,1,1),(256,1,1),0,Some(&stream),&mut a).unwrap(); }
+            };
+            for _ in 0..20 { launch(); }
+            stream.synchronize().unwrap();
+            let (a, b) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+            a.record(&stream).unwrap();
+            const N: usize = 300;
+            for _ in 0..N { launch(); }
+            b.record(&stream).unwrap();
+            stream.synchronize().unwrap();
+            let ms = hip::Event::elapsed_time(&a, &b).unwrap() as f64 / N as f64;
+            (ms, bytes / (ms / 1000.0) / 1e9)
+        };
+
+        let q_bytes = (out_dim * (in_dim / BLOCK_SIZE) * BYTES_PER_BLOCK) as f64;
+        let r_bytes = (out_dim * (in_dim / 32) * 20) as f64;
+        let (dm, dgb) = bench(&dp4a, "matvec_q4_k_dp4a_f32", dw_q.raw_ptr(), q_bytes);
+        let (rm, rgb) = bench(&repk, "matvec_q4k_repacked_f32", dw_r.raw_ptr(), r_bytes);
+        eprintln!("q4_k matvec {out_dim}x{in_dim}:  dp4a {dm:.4}ms {dgb:.0}GB/s  \
+                   repacked {rm:.4}ms {rgb:.0}GB/s  ({:.2}x)", dm / rm);
+      }
     }
 
     #[test]

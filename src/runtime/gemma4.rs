@@ -28,6 +28,7 @@ const QUANTIZE_Q8_SRC:       &str = include_str!("../../kernels/quantize_q8.cpp"
 const MATVEC_Q4K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
+const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 /// Output rows per wavefront in the row-blocked K-quant matvecs — must
 /// match `ROWS` in matvec_q{4,5,6}_k_rowblock.cpp.
 const Q4K_ROWBLOCK: u32 = 2;
@@ -160,7 +161,7 @@ impl GpuGemma4Block {
                 post_ffw_norm_1: load_fp32(gguf, &format!("{p}post_ffw_norm_1.weight"))?,
                 pre_ffw_norm_2:  load_fp32(gguf, &format!("{p}pre_ffw_norm_2.weight"))?,
                 post_ffw_norm_2: load_fp32(gguf, &format!("{p}post_ffw_norm_2.weight"))?,
-                gate_inp:    GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_gate_inp.weight"))?,
+                gate_inp:    GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}ffn_gate_inp.weight"))?,
                 gate_inp_s:  load_fp32(gguf, &format!("{p}ffn_gate_inp.scale"))?,
                 gate_up_exps: ExpertTensor::from_gguf(gguf, &format!("{p}ffn_gate_up_exps.weight"))?,
                 down_exps:    ExpertTensor::from_gguf(gguf, &format!("{p}ffn_down_exps.weight"))?,
@@ -168,7 +169,7 @@ impl GpuGemma4Block {
             })
         } else { None };
         let attn_v = if kind == AttnKind::Sliding {
-            Some(GpuMatvecTensor::from_gguf(gguf, &format!("{p}attn_v.weight"))?)
+            Some(GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}attn_v.weight"))?)
         } else { None };
         // layer_output_scale is a [1] f32 — read it to host.
         let los_info = gguf.tensor(&format!("{p}layer_output_scale.weight"))
@@ -181,17 +182,17 @@ impl GpuGemma4Block {
 
         Ok(Self {
             attn_norm:      load_fp32(gguf, &format!("{p}attn_norm.weight"))?,
-            attn_q:         GpuMatvecTensor::from_gguf(gguf, &format!("{p}attn_q.weight"))?,
-            attn_k:         GpuMatvecTensor::from_gguf(gguf, &format!("{p}attn_k.weight"))?,
+            attn_q:         GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}attn_q.weight"))?,
+            attn_k:         GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}attn_k.weight"))?,
             attn_v,
             attn_q_norm:    load_fp32(gguf, &format!("{p}attn_q_norm.weight"))?,
             attn_k_norm:    load_fp32(gguf, &format!("{p}attn_k_norm.weight"))?,
-            attn_output:    GpuMatvecTensor::from_gguf(gguf, &format!("{p}attn_output.weight"))?,
+            attn_output:    GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}attn_output.weight"))?,
             post_attn_norm: load_fp32(gguf, &format!("{p}post_attention_norm.weight"))?,
             ffn_norm:       load_fp32(gguf, &format!("{p}ffn_norm.weight"))?,
-            ffn_gate:       GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_gate.weight"))?,
-            ffn_up:         GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_up.weight"))?,
-            ffn_down:       GpuMatvecTensor::from_gguf(gguf, &format!("{p}ffn_down.weight"))?,
+            ffn_gate:       GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}ffn_gate.weight"))?,
+            ffn_up:         GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}ffn_up.weight"))?,
+            ffn_down:       GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}ffn_down.weight"))?,
             post_ffw_norm:  load_fp32(gguf, &format!("{p}post_ffw_norm.weight"))?,
             layer_output_scale, kind, head_dim, n_kv,
             moe: moe_block,
@@ -311,6 +312,7 @@ pub struct GpuGemma4 {
     m_mv_q5k_dp4a: Module,
     m_mv_q6k_dp4a: Module,
     m_mv_q8_0_dp4a: Module,
+    m_mv_q4k_repacked: Module,
     m_moe_topk:  Module,
     m_moe_mv_q6k:  Module,
     m_moe_mv_q8_0: Module,
@@ -445,6 +447,7 @@ impl GpuGemma4 {
             m_mv_q5k_dp4a:  ld("matvec_q5_k_dp4a", MATVEC_Q5K_DP4A_SRC)?,
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
+            m_mv_q4k_repacked: ld("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?,
             m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
             m_moe_mv_q6k:   ld("moe_matvec_q6k_dp4a", MOE_MATVEC_Q6K_SRC)?,
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
@@ -612,6 +615,24 @@ impl GpuGemma4 {
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
+        // Repacked Q4_K: contiguous two-plane layout, 256-thread workgroup
+        // (4 wavefronts × 2 rows = 8 rows).
+        if w.repacked {
+            self.launch_quantize_q8(x, self.xq8.raw_ptr(), w.in_dim, 1)?;
+            let f = self.m_mv_q4k_repacked.function("matvec_q4k_repacked_f32")?;
+            let grid = (w.out_dim + 7) / 8;
+            let mut wa = w.data.raw_ptr();
+            let mut xa = self.xq8.raw_ptr();
+            let mut ya = y;
+            let mut ia = w.in_dim; let mut oa = w.out_dim;
+            let mut args: [*mut c_void; 5] = [
+                &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+                &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                &mut oa as *mut _ as *mut c_void];
+            return unsafe {
+                f.launch((grid, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut args)
+            };
+        }
         self.launch_matvec_raw(w.data.raw_ptr(), w.dtype, w.in_dim, w.out_dim, x, y)
     }
 
@@ -994,7 +1015,7 @@ impl GpuGemma4 {
         }
         let pg = PrefillGemm::new(cache, max_w, p * max_in, p * max_out)?;
         let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
-            pg.matmul(&handle, &self.stream, &w.data, w.dtype,
+            pg.matmul(&handle, &self.stream, &w.data, w.dtype, w.repacked,
                       w.in_dim as usize, w.out_dim as usize, xin, p)
         };
 
