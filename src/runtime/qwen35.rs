@@ -80,6 +80,14 @@ const DEQUANT_IQ4_XS_F16_SOURCE:&str = include_str!("../../kernels/dequant_iq4_x
 const ROPE_BATCHED_SOURCE:      &str = include_str!("../../kernels/rope_batched.cpp");
 const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
 
+const QUANTIZE_Q8_SOURCE:      &str = include_str!("../../kernels/quantize_q8.cpp");
+const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
+const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
+const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
+const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+/// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
+const DP4A_ROWBLOCK: u32 = 2;
+
 const MATVEC_F32_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
 const MATVEC_Q4_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k_wave64.cpp");
 const MATVEC_Q5_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k_wave64.cpp");
@@ -456,6 +464,15 @@ pub struct GpuQwen35 {
     matvec_iq4_xs_wave64_module: Module,
     matvec_f16_wave64_module:    Module,
 
+    // int8 dp4a matvec: quantize the activation once, then v_dot4_i32_i8.
+    quantize_q8_module:      Module,
+    matvec_q4_k_dp4a_module: Module,
+    matvec_q5_k_dp4a_module: Module,
+    matvec_q6_k_dp4a_module: Module,
+    matvec_q8_0_dp4a_module: Module,
+    /// Scratch for the quantized activation (BlockQ8, 40 bytes per 32).
+    xq8: DeviceBuf<u8>,
+
     /// Per-layer transformer block weights, in schedule order.
     blocks: Vec<GpuBlock>,
 
@@ -600,6 +617,11 @@ impl GpuQwen35 {
         let matvec_q8_0_wave64_hsaco   = cache.compile("matvec_q8_0_wave64",   MATVEC_Q8_0_WAVE64_SOURCE)?;
         let matvec_iq4_xs_wave64_hsaco = cache.compile("matvec_iq4_xs_wave64", MATVEC_IQ4_XS_WAVE64_SOURCE)?;
         let matvec_f16_wave64_hsaco    = cache.compile("matvec_f16_wave64",    MATVEC_F16_WAVE64_SOURCE)?;
+        let quantize_q8_hsaco      = cache.compile("quantize_q8",      QUANTIZE_Q8_SOURCE)?;
+        let matvec_q4_k_dp4a_hsaco = cache.compile("matvec_q4_k_dp4a", MATVEC_Q4_K_DP4A_SOURCE)?;
+        let matvec_q5_k_dp4a_hsaco = cache.compile("matvec_q5_k_dp4a", MATVEC_Q5_K_DP4A_SOURCE)?;
+        let matvec_q6_k_dp4a_hsaco = cache.compile("matvec_q6_k_dp4a", MATVEC_Q6_K_DP4A_SOURCE)?;
+        let matvec_q8_0_dp4a_hsaco = cache.compile("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.block_kinds.len());
@@ -662,6 +684,12 @@ impl GpuQwen35 {
             matvec_q8_0_wave64_module:   Module::load(&matvec_q8_0_wave64_hsaco)?,
             matvec_iq4_xs_wave64_module: Module::load(&matvec_iq4_xs_wave64_hsaco)?,
             matvec_f16_wave64_module:    Module::load(&matvec_f16_wave64_hsaco)?,
+            quantize_q8_module:      Module::load(&quantize_q8_hsaco)?,
+            matvec_q4_k_dp4a_module: Module::load(&matvec_q4_k_dp4a_hsaco)?,
+            matvec_q5_k_dp4a_module: Module::load(&matvec_q5_k_dp4a_hsaco)?,
+            matvec_q6_k_dp4a_module: Module::load(&matvec_q6_k_dp4a_hsaco)?,
+            matvec_q8_0_dp4a_module: Module::load(&matvec_q8_0_dp4a_hsaco)?,
+            xq8: DeviceBuf::new(((ffn.max(hidden) + 31) / 32) * 40)?,
             blocks,
             stream,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
@@ -834,14 +862,53 @@ impl GpuQwen35 {
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// Quantize an fp32 activation row to int8 `BlockQ8` (40 B / 32 vals)
+    /// into the shared `xq8` scratch — the dp4a matvec's left input.
+    fn launch_quantize_q8(&self, x: *mut c_void, in_dim: u32) -> Result<(), String> {
+        let f = self.quantize_q8_module.function("quantize_q8_f32")?;
+        let mut xa = x; let mut oa = self.xq8.raw_ptr(); let mut ia = in_dim;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void];
+        unsafe { f.launch((in_dim / 32, 1, 1), (32, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     /// Dispatch a matvec to the right kernel based on the weight's on-disk
-    /// dtype. Output `y` always lands as fp32.
+    /// dtype. Output `y` always lands as fp32. K-quants and Q8_0 take the
+    /// int8 dp4a path (quantize the activation, then v_dot4_i32_i8 — far
+    /// fewer instructions than the fp32-dequant wave64 matvec, so the
+    /// kernel is bandwidth-bound instead of issue-bound).
     fn launch_matvec_dispatch(&self, w: &GpuMatvecTensor,
                               x: *mut c_void, y: *mut c_void) -> Result<(), String>
     {
         let in_d  = w.in_dim;
         let out_d = w.out_dim;
         let wp    = w.data.raw_ptr();
+
+        let dp4a = std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none()
+            && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
+                               | GgmlType::Q6_K | GgmlType::Q8_0);
+        if dp4a {
+            self.launch_quantize_q8(x, in_d)?;
+            let (module, kname) = match w.dtype {
+                GgmlType::Q4_K => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32"),
+                GgmlType::Q5_K => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32"),
+                GgmlType::Q6_K => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32"),
+                _              => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32"),
+            };
+            let f = module.function(kname)?;
+            let grid = (out_d + DP4A_ROWBLOCK - 1) / DP4A_ROWBLOCK;
+            let mut wa = wp; let mut xa = self.xq8.raw_ptr(); let mut ya = y;
+            let mut ia = in_d; let mut oa = out_d;
+            let mut args: [*mut c_void; 5] = [
+                &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+                &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                &mut oa as *mut _ as *mut c_void];
+            return unsafe {
+                f.launch((grid, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args)
+            };
+        }
+
         match w.dtype {
             GgmlType::F32    => self.launch_matvec_wave64(&self.matvec_f32_wave64_module,
                                     "matvec_f32_wave64", wp, x, y, in_d, out_d),
