@@ -472,6 +472,9 @@ pub struct GpuQwen35 {
     matvec_q8_0_dp4a_module: Module,
     /// Scratch for the quantized activation (BlockQ8, 40 bytes per 32).
     xq8: DeviceBuf<u8>,
+    /// Use the int8 dp4a matvec (vs the fp32 wave64 path). Env-set once;
+    /// `set_dp4a` lets the GPU-vs-CPU consistency tests force fp32.
+    dp4a_enabled: bool,
 
     /// Per-layer transformer block weights, in schedule order.
     blocks: Vec<GpuBlock>,
@@ -690,6 +693,7 @@ impl GpuQwen35 {
             matvec_q6_k_dp4a_module: Module::load(&matvec_q6_k_dp4a_hsaco)?,
             matvec_q8_0_dp4a_module: Module::load(&matvec_q8_0_dp4a_hsaco)?,
             xq8: DeviceBuf::new(((ffn.max(hidden) + 31) / 32) * 40)?,
+            dp4a_enabled: std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none(),
             blocks,
             stream,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
@@ -862,6 +866,10 @@ impl GpuQwen35 {
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// Force the fp32 or int8-dp4a matvec path. Used by the GPU-vs-CPU
+    /// consistency tests to compare against the fp32 CPU oracle.
+    pub fn set_dp4a(&mut self, on: bool) { self.dp4a_enabled = on; }
+
     /// Quantize an fp32 activation row to int8 `BlockQ8` (40 B / 32 vals)
     /// into the shared `xq8` scratch — the dp4a matvec's left input.
     fn launch_quantize_q8(&self, x: *mut c_void, in_dim: u32) -> Result<(), String> {
@@ -885,7 +893,7 @@ impl GpuQwen35 {
         let out_d = w.out_dim;
         let wp    = w.data.raw_ptr();
 
-        let dp4a = std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none()
+        let dp4a = self.dp4a_enabled
             && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
                                | GgmlType::Q6_K | GgmlType::Q8_0);
         if dp4a {
@@ -2291,7 +2299,8 @@ mod tests {
         let output = if cfg.tied_embeddings { None }
                      else { Some(dequant_named(&g, "output.weight").expect("output")) };
 
-        let gpu = GpuQwen35::new(&model, &g, &cache, 32).expect("new GpuQwen35");
+        let mut gpu = GpuQwen35::new(&model, &g, &cache, 32).expect("new GpuQwen35");
+        gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
 
         // Test on a couple of tokens including EOS and a mid-vocab.
         for &token in &[cfg.eos_token_id, 100u32, 50_000u32] {
@@ -2568,7 +2577,8 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
+        let mut gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
+        gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
         let gpu_w = GpuLinAttnWeights::from_gguf(&g, block_idx as u32).expect("upload GDN weights");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2643,7 +2653,8 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
+        let mut gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
+        gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
         let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32).expect("upload GDN block");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2718,7 +2729,8 @@ mod tests {
         );
         let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
 
-        let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).expect("new GpuQwen35");
+        let mut gpu = GpuQwen35::new(&model, &g, &cache, max_seq).expect("new GpuQwen35");
+        gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
         let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32).expect("upload block");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
