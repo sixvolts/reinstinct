@@ -120,8 +120,10 @@ impl Gemma4Config {
         let final_logit_softcapping = require_f32(gguf, "gemma4.final_logit_softcapping")?;
         let eos_token_id   = require_u32(gguf, "tokenizer.ggml.eos_token_id")?;
 
-        // Per-layer KV head counts.
-        let kv_heads = read_u32_vec(gguf, "gemma4.attention.head_count_kv")?;
+        // Per-layer KV head counts. Larger Gemma 4 models store this as
+        // a per-layer array; E4B stores a single scalar — broadcast it.
+        let kv_heads = read_u32_vec_or_broadcast(
+            gguf, "gemma4.attention.head_count_kv", block_count as usize)?;
         if kv_heads.len() != block_count as usize {
             return Err(Gemma4Error::WrongArrayLength {
                 key: "gemma4.attention.head_count_kv",
@@ -285,14 +287,23 @@ fn require_f32(gguf: &GgufFile, key: &'static str) -> Result<f32> {
         .ok_or(Gemma4Error::WrongMetadataType { key, expected: "f32-compatible float" })
 }
 
-fn read_u32_vec(gguf: &GgufFile, key: &'static str) -> Result<Vec<u32>> {
-    let (_, arr) = require_metadata(gguf, key)?
-        .as_array()
-        .ok_or(Gemma4Error::WrongMetadataType { key, expected: "array" })?;
-    arr.iter()
-        .map(|e| e.as_u32().ok_or(Gemma4Error::WrongMetadataType {
-            key, expected: "array of integers" }))
-        .collect()
+/// Read a per-layer u32 array, or a single scalar broadcast to `count`
+/// entries. Gemma 4 31B/26B store `head_count_kv` as an array; E4B
+/// stores one scalar.
+fn read_u32_vec_or_broadcast(gguf: &GgufFile, key: &'static str, count: usize)
+    -> Result<Vec<u32>>
+{
+    let mv = require_metadata(gguf, key)?;
+    if let Some((_, arr)) = mv.as_array() {
+        arr.iter()
+            .map(|e| e.as_u32().ok_or(Gemma4Error::WrongMetadataType {
+                key, expected: "array of integers" }))
+            .collect()
+    } else if let Some(s) = mv.as_u32() {
+        Ok(vec![s; count])
+    } else {
+        Err(Gemma4Error::WrongMetadataType { key, expected: "integer or array of integers" })
+    }
 }
 
 fn read_bool_vec(gguf: &GgufFile, key: &'static str) -> Result<Vec<bool>> {
