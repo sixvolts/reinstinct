@@ -964,7 +964,7 @@ fn model(path: &std::path::Path) -> anyhow::Result<()> {
     println!("arch = {arch}");
 
     match arch {
-        "qwen35" => {
+        "qwen35" | "qwen35moe" => {
             let m = Qwen35Model::load(&g)?;
             print_qwen35(&m);
         }
@@ -999,6 +999,12 @@ fn print_qwen35(m: &Qwen35Model) {
     println!("    rotated dims    = {} of {}", c.rope_dim_count, c.attn_head_dim);
     println!("    mrope sections  = {:?}", c.rope_dim_sections);
     println!("  layer schedule    = full attention every {} blocks", c.full_attention_interval);
+    if let Some(moe) = &c.moe {
+        println!("  MoE FFN:");
+        println!("    experts         = {} ({} used/token)", moe.n_expert, moe.n_expert_used);
+        println!("    expert_ff       = {}", moe.expert_ff);
+        println!("    shared_expert_ff= {}", moe.shared_expert_ff);
+    }
 
     println!("\n--- block schedule ---");
     for (i, &k) in m.block_kinds.iter().enumerate() {

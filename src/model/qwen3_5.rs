@@ -1,31 +1,30 @@
-//! Qwen 3.5: typed config + tensor binding for the hybrid Gated-DeltaNet
-//! / GQA-attention architecture.
+//! Qwen 3.5 / 3.6: typed config + tensor binding for the hybrid
+//! Gated-DeltaNet / GQA-attention architecture.
+//!
+//! Handles two GGUF architectures that share the GDN + full-attention
+//! layer stack and differ only in the FFN:
+//!   * `qwen35`    — dense SwiGLU FFN (`ffn_gate/up/down`).
+//!   * `qwen35moe` — MoE FFN: 256 routed experts + a gated shared expert.
 //!
 //! Layer schedule alternates `linear_attention` and `full_attention` per
-//! `qwen35.full_attention_interval` (4 in the reference 0.8B model — pattern
-//! `[L,L,L,F]×6`). The two block types load distinct tensor sets; the
-//! validator below enforces full presence at load time.
+//! `<arch>.full_attention_interval` (pattern `[L,L,L,F]…`).
 //!
-//! See `gfx906-inference-engine-design.md` for the broader engine plan and
-//! the project memory `project_qwen35_tensor_map.md` for the GGUF→PyTorch
-//! parameter mapping this module implements.
+//! See `project_qwen35_tensor_map.md` for the GGUF→PyTorch mapping.
 
 use thiserror::Error;
 
 use crate::gguf::{GgmlType, GgufFile, MetaValue};
 
-const ARCH: &str = "qwen35";
-
 #[derive(Debug, Error)]
 pub enum Qwen35Error {
-    #[error("not a Qwen 3.5 file: general.architecture = {got:?}, expected {expected:?}")]
-    WrongArchitecture { got: String, expected: &'static str },
+    #[error("unsupported architecture {got:?} (expected qwen35 or qwen35moe)")]
+    WrongArchitecture { got: String },
 
     #[error("missing required GGUF metadata key: {0}")]
-    MissingMetadata(&'static str),
+    MissingMetadata(String),
 
     #[error("metadata key {key} has wrong type (expected {expected})")]
-    WrongMetadataType { key: &'static str, expected: &'static str },
+    WrongMetadataType { key: String, expected: &'static str },
 
     #[error("missing required tensor: {0}")]
     MissingTensor(String),
@@ -39,45 +38,52 @@ pub enum Qwen35Error {
 
 type Result<T> = std::result::Result<T, Qwen35Error>;
 
-/// Hyperparameters loaded from `qwen35.*` GGUF metadata plus a few inferred
-/// values (vocab size from `token_embd` shape, tied embeddings from absence
-/// of `output.weight`).
+/// MoE FFN hyperparameters — present only for the `qwen35moe` arch.
+#[derive(Debug, Clone)]
+pub struct MoeConfig {
+    /// Total routed experts (`expert_count`).
+    pub n_expert: u32,
+    /// Experts selected per token (`expert_used_count`).
+    pub n_expert_used: u32,
+    /// Routed-expert intermediate width (`expert_feed_forward_length`).
+    pub expert_ff: u32,
+    /// Shared-expert intermediate width (`expert_shared_feed_forward_length`).
+    pub shared_expert_ff: u32,
+}
+
+/// Hyperparameters loaded from `<arch>.*` GGUF metadata plus a few
+/// inferred values (vocab from `token_embd`, tied embeddings from the
+/// absence of `output.weight`).
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
+    /// `"qwen35"` or `"qwen35moe"`.
+    pub arch: String,
+
     // Topology
     pub block_count: u32,
     pub hidden_size: u32,
+    /// Dense FFN intermediate width — 0 on the MoE arch (no dense FFN).
     pub ffn_size: u32,
     pub vocab_size: u32,
     pub context_length: u32,
     pub rms_norm_eps: f32,
     pub eos_token_id: u32,
 
-    // Full-attention block (every Nth block per full_attention_interval)
+    // Full-attention block
     pub attn_n_heads: u32,
     pub attn_n_kv_heads: u32,
     pub attn_head_dim: u32,
 
-    // Linear-attention (Gated DeltaNet) block. Qwen 3.5 GDN is GQA:
-    // `gdn_n_heads` value heads, `gdn_n_k_heads` key/query heads
-    // (gdn_n_heads is a multiple of it). The 0.8B has the two equal.
-    /// value_dim = gdn_n_heads × gdn_head_dim. From `qwen35.ssm.inner_size`.
+    // Linear-attention (Gated DeltaNet), GQA.
     pub gdn_value_dim: u32,
-    /// Number of value heads (= recurrent states). From `qwen35.ssm.time_step_rank`.
     pub gdn_n_heads: u32,
-    /// Number of key/query heads. From `qwen35.ssm.group_count`.
     pub gdn_n_k_heads: u32,
-    /// Per-head dim, shared by K/Q and V. From `qwen35.ssm.state_size`.
     pub gdn_head_dim: u32,
     pub gdn_conv_kernel: u32,
 
     // RoPE
     pub rope_freq_base: f32,
-    /// Number of head-dim values that get rotated (partial RoPE). For Qwen 3.5
-    /// 0.8B this is 64 of 256 → partial_rotary_factor = 0.25.
     pub rope_dim_count: u32,
-    /// M-RoPE per-axis section sizes. Stored as a fixed array padded with 0.
-    /// Used for vision tokens; pure-text inference treats all as one axis.
     pub rope_dim_sections: [u32; 4],
 
     // Layer schedule
@@ -85,76 +91,80 @@ pub struct Qwen35Config {
 
     // Embedding
     pub tied_embeddings: bool,
+
+    /// `Some` on `qwen35moe`.
+    pub moe: Option<MoeConfig>,
 }
 
 impl Qwen35Config {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
-        let arch = require_str(gguf, "general.architecture")?;
-        if arch != ARCH {
-            return Err(Qwen35Error::WrongArchitecture {
-                got: arch.to_owned(),
-                expected: ARCH,
-            });
-        }
+        let arch = require_str(gguf, "general.architecture")?.to_owned();
+        let is_moe = match arch.as_str() {
+            "qwen35"    => false,
+            "qwen35moe" => true,
+            _ => return Err(Qwen35Error::WrongArchitecture { got: arch }),
+        };
+        let p = arch.as_str();   // metadata key prefix
 
-        let block_count             = require_u32(gguf, "qwen35.block_count")?;
-        let hidden_size             = require_u32(gguf, "qwen35.embedding_length")?;
-        let ffn_size                = require_u32(gguf, "qwen35.feed_forward_length")?;
-        let context_length          = require_u32(gguf, "qwen35.context_length")?;
-        let rms_norm_eps            = require_f32(gguf, "qwen35.attention.layer_norm_rms_epsilon")?;
-        let attn_n_heads            = require_u32(gguf, "qwen35.attention.head_count")?;
-        let attn_n_kv_heads         = require_u32(gguf, "qwen35.attention.head_count_kv")?;
-        let attn_head_dim           = require_u32(gguf, "qwen35.attention.key_length")?;
-        let gdn_value_dim           = require_u32(gguf, "qwen35.ssm.inner_size")?;
-        let gdn_n_heads             = require_u32(gguf, "qwen35.ssm.time_step_rank")?;
-        let gdn_n_k_heads           = require_u32(gguf, "qwen35.ssm.group_count")?;
-        let gdn_head_dim            = require_u32(gguf, "qwen35.ssm.state_size")?;
-        let gdn_conv_kernel         = require_u32(gguf, "qwen35.ssm.conv_kernel")?;
-        let rope_freq_base          = require_f32(gguf, "qwen35.rope.freq_base")?;
-        let rope_dim_count          = require_u32(gguf, "qwen35.rope.dimension_count")?;
-        let full_attention_interval = require_u32(gguf, "qwen35.full_attention_interval")?;
+        let block_count             = require_u32(gguf, &k(p, "block_count"))?;
+        let hidden_size             = require_u32(gguf, &k(p, "embedding_length"))?;
+        let context_length          = require_u32(gguf, &k(p, "context_length"))?;
+        let rms_norm_eps            = require_f32(gguf, &k(p, "attention.layer_norm_rms_epsilon"))?;
+        let attn_n_heads            = require_u32(gguf, &k(p, "attention.head_count"))?;
+        let attn_n_kv_heads         = require_u32(gguf, &k(p, "attention.head_count_kv"))?;
+        let attn_head_dim           = require_u32(gguf, &k(p, "attention.key_length"))?;
+        let gdn_value_dim           = require_u32(gguf, &k(p, "ssm.inner_size"))?;
+        let gdn_n_heads             = require_u32(gguf, &k(p, "ssm.time_step_rank"))?;
+        let gdn_n_k_heads           = require_u32(gguf, &k(p, "ssm.group_count"))?;
+        let gdn_head_dim            = require_u32(gguf, &k(p, "ssm.state_size"))?;
+        let gdn_conv_kernel         = require_u32(gguf, &k(p, "ssm.conv_kernel"))?;
+        let rope_freq_base          = require_f32(gguf, &k(p, "rope.freq_base"))?;
+        let rope_dim_count          = require_u32(gguf, &k(p, "rope.dimension_count"))?;
+        let full_attention_interval = require_u32(gguf, &k(p, "full_attention_interval"))?;
         let eos_token_id            = require_u32(gguf, "tokenizer.ggml.eos_token_id")?;
+        let rope_dim_sections       = read_u32_array(gguf, &k(p, "rope.dimension_sections"))?;
 
-        let rope_dim_sections = read_u32_array(gguf, "qwen35.rope.dimension_sections")?;
+        // Dense FFN width — absent on the MoE arch.
+        let ffn_size = gguf.metadata_get(&k(p, "feed_forward_length"))
+            .and_then(|v| v.as_u32()).unwrap_or(0);
 
-        // Vocab size: read from the token embedding tensor's shape rather
-        // than trusting metadata, since they should agree but the tensor
-        // is the authoritative source for what the model actually projects to.
+        let moe = if is_moe {
+            Some(MoeConfig {
+                n_expert:         require_u32(gguf, &k(p, "expert_count"))?,
+                n_expert_used:    require_u32(gguf, &k(p, "expert_used_count"))?,
+                expert_ff:        require_u32(gguf, &k(p, "expert_feed_forward_length"))?,
+                shared_expert_ff: require_u32(gguf, &k(p, "expert_shared_feed_forward_length"))?,
+            })
+        } else {
+            None
+        };
+
+        // Vocab size from the token embedding tensor (authoritative).
         let token_embd = gguf.tensor("token_embd.weight")
             .ok_or_else(|| Qwen35Error::MissingTensor("token_embd.weight".into()))?;
-        if token_embd.shape().len() != 2 {
+        if token_embd.shape().len() != 2 || token_embd.shape()[0] != hidden_size as u64 {
             return Err(Qwen35Error::WrongTensorShape {
                 name: "token_embd.weight".into(),
                 got: token_embd.shape().to_vec(),
                 expected: vec![hidden_size as u64, 0],
             });
         }
-        if token_embd.shape()[0] != hidden_size as u64 {
-            return Err(Qwen35Error::WrongTensorShape {
-                name: "token_embd.weight".into(),
-                got: token_embd.shape().to_vec(),
-                expected: vec![hidden_size as u64, token_embd.shape()[1]],
-            });
-        }
         let vocab_size = token_embd.shape()[1] as u32;
-
-        // Tied embeddings if there's no separate output projection.
         let tied_embeddings = gguf.tensor("output.weight").is_none();
 
         Ok(Self {
+            arch,
             block_count, hidden_size, ffn_size, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
             attn_n_heads, attn_n_kv_heads, attn_head_dim,
             gdn_value_dim, gdn_n_heads, gdn_n_k_heads, gdn_head_dim, gdn_conv_kernel,
             rope_freq_base, rope_dim_count, rope_dim_sections,
-            full_attention_interval,
-            tied_embeddings,
+            full_attention_interval, tied_embeddings, moe,
         })
     }
 
-    /// Per-layer block type. Pattern is `[L]×(N-1) [F]` repeated
-    /// `block_count / full_attention_interval` times — i.e. blocks where
-    /// `(idx + 1) % full_attention_interval == 0` are full attention.
+    /// Per-layer block type. Blocks where `(idx+1) % interval == 0` are
+    /// full attention, the rest linear (GDN).
     pub fn block_kind(&self, layer_idx: u32) -> BlockKind {
         if (layer_idx + 1) % self.full_attention_interval == 0 {
             BlockKind::FullAttention
@@ -163,19 +173,15 @@ impl Qwen35Config {
         }
     }
 
+    pub fn is_moe(&self) -> bool { self.moe.is_some() }
+
     /// Linear-attention key/value head dim (K/Q and V share it).
-    pub fn gdn_value_head_dim(&self) -> u32 {
-        self.gdn_head_dim
-    }
+    pub fn gdn_value_head_dim(&self) -> u32 { self.gdn_head_dim }
 
     /// Linear-attention key/query projection width = n_k_heads × head_dim.
-    pub fn gdn_key_dim(&self) -> u32 {
-        self.gdn_n_k_heads * self.gdn_head_dim
-    }
+    pub fn gdn_key_dim(&self) -> u32 { self.gdn_n_k_heads * self.gdn_head_dim }
 
-    /// Linear-attention input-projection output dim = q ‖ k ‖ v widths,
-    /// i.e. 2 × key_dim + value_dim. With GQA key_dim ≠ value_dim; the
-    /// 0.8B has them equal so this is 3 × value_dim there.
+    /// Linear-attention input-projection output dim = q ‖ k ‖ v widths.
     pub fn gdn_qkv_concat_dim(&self) -> u32 {
         2 * self.gdn_key_dim() + self.gdn_value_dim
     }
@@ -187,9 +193,8 @@ pub enum BlockKind {
     FullAttention,
 }
 
-/// Loaded Qwen 3.5 model: config + per-layer block schedule. Tensor data
-/// stays in the underlying `GgufFile` mmap; this struct only holds the
-/// parsed metadata and validates that every expected weight is present.
+/// Loaded model: config + per-layer block schedule. Tensor data stays in
+/// the underlying `GgufFile` mmap.
 #[derive(Debug, Clone)]
 pub struct Qwen35Model {
     pub config: Qwen35Config,
@@ -214,7 +219,7 @@ impl Qwen35Model {
             require_tensor(gguf, "output.weight")?;
         }
         for (i, &kind) in self.block_kinds.iter().enumerate() {
-            for name in expected_tensors(i as u32, kind) {
+            for name in expected_tensors(i as u32, kind, self.config.is_moe()) {
                 require_tensor(gguf, &name)?;
             }
         }
@@ -222,15 +227,32 @@ impl Qwen35Model {
     }
 }
 
-/// Iterate the GGUF tensor names a block of the given kind requires.
-pub fn expected_tensors(layer: u32, kind: BlockKind) -> Vec<String> {
+/// GGUF tensor names a block of the given kind requires. `moe` selects
+/// the MoE FFN tensor set (routed experts + shared expert) over the
+/// dense `ffn_gate/up/down`.
+pub fn expected_tensors(layer: u32, kind: BlockKind, moe: bool) -> Vec<String> {
     let mut names = vec![
         format!("blk.{layer}.attn_norm.weight"),
         format!("blk.{layer}.post_attention_norm.weight"),
-        format!("blk.{layer}.ffn_gate.weight"),
-        format!("blk.{layer}.ffn_up.weight"),
-        format!("blk.{layer}.ffn_down.weight"),
     ];
+    if moe {
+        names.extend([
+            format!("blk.{layer}.ffn_gate_inp.weight"),
+            format!("blk.{layer}.ffn_gate_exps.weight"),
+            format!("blk.{layer}.ffn_up_exps.weight"),
+            format!("blk.{layer}.ffn_down_exps.weight"),
+            format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+            format!("blk.{layer}.ffn_gate_shexp.weight"),
+            format!("blk.{layer}.ffn_up_shexp.weight"),
+            format!("blk.{layer}.ffn_down_shexp.weight"),
+        ]);
+    } else {
+        names.extend([
+            format!("blk.{layer}.ffn_gate.weight"),
+            format!("blk.{layer}.ffn_up.weight"),
+            format!("blk.{layer}.ffn_down.weight"),
+        ]);
+    }
     match kind {
         BlockKind::LinearAttention => {
             names.extend([
@@ -261,38 +283,44 @@ pub fn expected_tensors(layer: u32, kind: BlockKind) -> Vec<String> {
 
 // ---- helpers -----------------------------------------------------------------
 
-fn require_metadata<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a MetaValue> {
-    gguf.metadata_get(key).ok_or(Qwen35Error::MissingMetadata(key))
+/// Build a `<prefix>.<suffix>` metadata key.
+fn k(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}.{suffix}")
 }
 
-fn require_str<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a str> {
+fn require_metadata<'a>(gguf: &'a GgufFile, key: &str) -> Result<&'a MetaValue> {
+    gguf.metadata_get(key).ok_or_else(|| Qwen35Error::MissingMetadata(key.to_owned()))
+}
+
+fn require_str<'a>(gguf: &'a GgufFile, key: &str) -> Result<&'a str> {
     require_metadata(gguf, key)?
         .as_str()
-        .ok_or(Qwen35Error::WrongMetadataType { key, expected: "string" })
+        .ok_or_else(|| Qwen35Error::WrongMetadataType { key: key.to_owned(), expected: "string" })
 }
 
-fn require_u32(gguf: &GgufFile, key: &'static str) -> Result<u32> {
+fn require_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
     require_metadata(gguf, key)?
         .as_u32()
-        .ok_or(Qwen35Error::WrongMetadataType { key, expected: "u32-compatible integer" })
+        .ok_or_else(|| Qwen35Error::WrongMetadataType {
+            key: key.to_owned(), expected: "u32-compatible integer" })
 }
 
-fn require_f32(gguf: &GgufFile, key: &'static str) -> Result<f32> {
+fn require_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
     require_metadata(gguf, key)?
         .as_f32()
-        .ok_or(Qwen35Error::WrongMetadataType { key, expected: "f32-compatible float" })
+        .ok_or_else(|| Qwen35Error::WrongMetadataType {
+            key: key.to_owned(), expected: "f32-compatible float" })
 }
 
-fn read_u32_array(gguf: &GgufFile, key: &'static str) -> Result<[u32; 4]> {
+fn read_u32_array(gguf: &GgufFile, key: &str) -> Result<[u32; 4]> {
     let v = require_metadata(gguf, key)?;
     let (_, arr) = v.as_array()
-        .ok_or(Qwen35Error::WrongMetadataType { key, expected: "array" })?;
+        .ok_or_else(|| Qwen35Error::WrongMetadataType { key: key.to_owned(), expected: "array" })?;
     let mut out = [0u32; 4];
     for (i, slot) in out.iter_mut().enumerate() {
         if let Some(elem) = arr.get(i) {
-            *slot = elem.as_u32().ok_or(Qwen35Error::WrongMetadataType {
-                key, expected: "array of u32-compatible integers",
-            })?;
+            *slot = elem.as_u32().ok_or_else(|| Qwen35Error::WrongMetadataType {
+                key: key.to_owned(), expected: "array of u32-compatible integers" })?;
         }
     }
     Ok(out)
@@ -309,20 +337,23 @@ fn require_tensor(gguf: &GgufFile, name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn block_schedule_matches_full_attention_interval() {
-        // Synthetic config matching the 0.8B layout.
-        let cfg = Qwen35Config {
+    fn synth_config() -> Qwen35Config {
+        Qwen35Config {
+            arch: "qwen35".into(),
             block_count: 24, hidden_size: 1024, ffn_size: 3584, vocab_size: 248320,
             context_length: 262144, rms_norm_eps: 1e-6, eos_token_id: 248046,
             attn_n_heads: 8, attn_n_kv_heads: 2, attn_head_dim: 256,
             gdn_value_dim: 2048, gdn_n_heads: 16, gdn_n_k_heads: 16,
             gdn_head_dim: 128, gdn_conv_kernel: 4,
             rope_freq_base: 1e7, rope_dim_count: 64, rope_dim_sections: [11, 11, 10, 0],
-            full_attention_interval: 4, tied_embeddings: true,
-        };
+            full_attention_interval: 4, tied_embeddings: true, moe: None,
+        }
+    }
+
+    #[test]
+    fn block_schedule_matches_full_attention_interval() {
+        let cfg = synth_config();
         let kinds: Vec<BlockKind> = (0..cfg.block_count).map(|i| cfg.block_kind(i)).collect();
-        // L,L,L,F repeated 6 times → 24 total
         assert_eq!(kinds.len(), 24);
         for i in 0..24 {
             let expected = if (i + 1) % 4 == 0 {
@@ -332,29 +363,34 @@ mod tests {
             };
             assert_eq!(kinds[i as usize], expected, "block {i}");
         }
-        let n_full = kinds.iter().filter(|k| **k == BlockKind::FullAttention).count();
-        assert_eq!(n_full, 6);
+        assert_eq!(kinds.iter().filter(|k| **k == BlockKind::FullAttention).count(), 6);
     }
 
     #[test]
     fn linear_attention_block_has_ssm_tensors() {
-        let names = expected_tensors(0, BlockKind::LinearAttention);
+        let names = expected_tensors(0, BlockKind::LinearAttention, false);
         assert!(names.iter().any(|n| n == "blk.0.attn_qkv.weight"));
-        assert!(names.iter().any(|n| n == "blk.0.attn_gate.weight"));
         assert!(names.iter().any(|n| n == "blk.0.ssm_conv1d.weight"));
-        assert!(names.iter().any(|n| n == "blk.0.ssm_out.weight"));
+        assert!(names.iter().any(|n| n == "blk.0.ffn_gate.weight"));
         assert!(!names.iter().any(|n| n == "blk.0.attn_q.weight"));
     }
 
     #[test]
     fn full_attention_block_has_qkv_split_and_qk_norm() {
-        let names = expected_tensors(3, BlockKind::FullAttention);
+        let names = expected_tensors(3, BlockKind::FullAttention, false);
         assert!(names.iter().any(|n| n == "blk.3.attn_q.weight"));
-        assert!(names.iter().any(|n| n == "blk.3.attn_k.weight"));
-        assert!(names.iter().any(|n| n == "blk.3.attn_v.weight"));
         assert!(names.iter().any(|n| n == "blk.3.attn_q_norm.weight"));
-        assert!(names.iter().any(|n| n == "blk.3.attn_k_norm.weight"));
-        assert!(names.iter().any(|n| n == "blk.3.attn_output.weight"));
         assert!(!names.iter().any(|n| n.contains("ssm_")));
+    }
+
+    #[test]
+    fn moe_block_has_expert_tensors() {
+        let names = expected_tensors(0, BlockKind::LinearAttention, true);
+        assert!(names.iter().any(|n| n == "blk.0.ffn_gate_exps.weight"));
+        assert!(names.iter().any(|n| n == "blk.0.ffn_down_exps.weight"));
+        assert!(names.iter().any(|n| n == "blk.0.ffn_gate_inp.weight"));
+        assert!(names.iter().any(|n| n == "blk.0.ffn_gate_shexp.weight"));
+        assert!(names.iter().any(|n| n == "blk.0.ffn_gate_inp_shexp.weight"));
+        assert!(!names.iter().any(|n| n == "blk.0.ffn_gate.weight"));
     }
 }
