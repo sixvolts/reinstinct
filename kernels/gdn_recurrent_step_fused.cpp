@@ -7,21 +7,22 @@
 //   state += k ⊗ delta
 //   out    = stateᵀ·q
 //
-// The recurrence is independent per value-dim column vv: every column's
-// state slice s[:,vv] is decayed, used, updated and read back using only
-// that column plus the shared k/q vectors. So one thread owns one column
-// and runs the whole recurrence for it — no inter-phase __syncthreads
-// (the old kernel had four), and consecutive threads touch consecutive
-// vv, so the strided state accesses coalesce.
+// The recurrence is independent per value-dim column vv. Two threads
+// cooperate on one column, each owning half the kk range: each does the
+// decay + rank-1 update for its half and a partial kv_mem / output dot,
+// combined with one __shfl_xor. Splitting kk doubles the wavefront
+// count vs one-thread-per-column — this kernel is occupancy-bound on
+// the state traffic, not compute-bound.
 //
-// grid = (n_heads, head_dim / COLS); block = COLS.
+// block = 64 (one wavefront): COLS=32 columns × 2 kk-halves. Consecutive
+// lanes map to consecutive vv, so the strided state accesses coalesce.
+// grid = (n_heads, head_dim / COLS).
 //
-// GQA: `n_heads` value heads, `n_k_heads` key/query heads; value head h
-// pairs with key head h % n_k_heads (Qwen3.5 tiles them).
+// GQA: value head h pairs with key head h % n_k_heads (Qwen3.5 tiling).
 
 #include <hip/hip_runtime.h>
 
-#define COLS 64
+#define COLS 32
 
 __device__ __forceinline__ float softplus_stable_r(float x) {
     return (x > 0.0f) ? x + __logf(1.0f + __expf(-x))
@@ -43,14 +44,16 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_hea
                                   unsigned int n_k_heads)
 {
     extern __shared__ float lds[];                  // q_lds | k_lds, head_dim each
-    const int h  = blockIdx.x;                      // value head
+    const int h = blockIdx.x;                       // value head
     if (h >= (int)n_heads) return;
-    const int kh = h % (int)n_k_heads;              // key/query head
-    const unsigned int vv = blockIdx.y * COLS + threadIdx.x;   // this thread's column
+    const int kh  = h % (int)n_k_heads;             // key/query head
+    const int tid = threadIdx.x;                    // 0..63
+    const int grp = tid >> 5;                       // kk half (0 or 1)
+    const unsigned int vv = blockIdx.y * COLS + (tid & 31);   // this column
 
     float* q_lds = lds;
     float* k_lds = lds + head_dim;
-    for (int i = threadIdx.x; i < (int)head_dim; i += COLS) {
+    for (int i = tid; i < (int)head_dim; i += 64) {
         q_lds[i] = q_in[(size_t)kh * head_dim + i];
         k_lds[i] = k_in[(size_t)kh * head_dim + i];
     }
@@ -61,24 +64,29 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_hea
     const float bet = 1.0f / (1.0f + __expf(-b_in[h]));
     const float vval = v_in[(size_t)h * head_dim + vv];
 
+    const int half = (int)head_dim >> 1;
+    const int kk0  = grp * half;
+    const int kk1  = kk0 + half;
     float* col = state + (size_t)h * head_dim * head_dim + vv;   // s[kk] at col[kk*head_dim]
     const size_t hd = head_dim;
 
-    // decay the column, accumulate kv_mem = stateᵀ·k
-    float kv = 0.0f;
-    for (int kk = 0; kk < (int)head_dim; kk++) {
+    // decay this half of the column, accumulate partial stateᵀ·k
+    float pkv = 0.0f;
+    for (int kk = kk0; kk < kk1; kk++) {
         float s = col[(size_t)kk * hd] * dec;
         col[(size_t)kk * hd] = s;
-        kv += s * k_lds[kk];
+        pkv += s * k_lds[kk];
     }
+    const float kv = pkv + __shfl_xor(pkv, 32);
     const float delta = (vval - kv) * bet;
 
-    // rank-1 update, then out = stateᵀ·q
-    float acc = 0.0f;
-    for (int kk = 0; kk < (int)head_dim; kk++) {
+    // rank-1 update of this half, accumulate partial stateᵀ·q
+    float pout = 0.0f;
+    for (int kk = kk0; kk < kk1; kk++) {
         float s = col[(size_t)kk * hd] + k_lds[kk] * delta;
         col[(size_t)kk * hd] = s;
-        acc += s * q_lds[kk];
+        pout += s * q_lds[kk];
     }
-    out[(size_t)h * head_dim + vv] = acc;
+    const float acc = pout + __shfl_xor(pout, 32);
+    if (grp == 0) out[(size_t)h * head_dim + vv] = acc;
 }

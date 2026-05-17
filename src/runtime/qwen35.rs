@@ -1219,10 +1219,11 @@ impl GpuQwen35 {
         n_heads: u32, head_dim: u32, n_k_heads: u32) -> Result<(), String>
     {
         let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_fused_f32")?;
-        // One thread per value-dim column; grid.y splits head_dim into
-        // COLS-wide chunks (COLS = 64, the kernel's #define). LDS = q | k.
-        const COLS: u32 = 64;
-        let block: u32 = COLS;
+        // Two threads per value-dim column (split kk); grid.y splits
+        // head_dim into COLS-wide chunks (COLS = 32, the kernel #define).
+        // block = 2*COLS = 64 (one wavefront). LDS = q | k.
+        const COLS: u32 = 32;
+        let block: u32 = 2 * COLS;
         let grid_y = (head_dim + COLS - 1) / COLS;
         let smem = 2 * head_dim * std::mem::size_of::<f32>() as u32;
         let mut qa = q; let mut ka = k; let mut va = v;
