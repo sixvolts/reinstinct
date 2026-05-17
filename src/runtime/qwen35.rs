@@ -1688,7 +1688,13 @@ impl GpuQwen35 {
             )?;
         }
         self.launch_cvt("cvt_f16_to_f32", y_f16.raw_ptr(), y_f32, (n_rows * out_d) as u32)?;
-        drop(dq);  // keep the dequant buffer alive across the GEMM
+        // dq / x_f16 / y_f16 are local — freed when this fn returns. The
+        // dequant / cvt / rocBLAS kernels above run async on the stream,
+        // so sync before the buffers drop: otherwise the freed memory is
+        // reused under the still-running kernels, a GPU memory fault
+        // (hit on the 27B; the 0.8B raced through by luck).
+        self.stream.synchronize()?;
+        let _ = dq;
         Ok(())
     }
 
