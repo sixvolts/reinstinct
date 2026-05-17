@@ -70,6 +70,7 @@ const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
+const EMBED_LOOKUP_Q8_0_SOURCE: &str = include_str!("../../kernels/embed_lookup_q8_0_v.cpp");
 
 const CVT_F32_F16_SOURCE:       &str = include_str!("../../kernels/cvt_f32_f16.cpp");
 const DEQUANT_Q4_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q4_k_f16.cpp");
@@ -87,6 +88,12 @@ const ROPE_BATCHED_SOURCE:      &str = include_str!("../../kernels/rope_batched.
 const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
 
 const QUANTIZE_Q8_SOURCE:      &str = include_str!("../../kernels/quantize_q8.cpp");
+const MOE_TOPK_SOURCE:        &str = include_str!("../../kernels/moe_topk.cpp");
+const MOE_COMBINE_SOURCE:     &str = include_str!("../../kernels/moe_combine.cpp");
+const MOE_MV_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q4k_repacked.cpp");
+const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_repacked.cpp");
+const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
+const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.cpp");
 const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
@@ -223,21 +230,194 @@ impl GpuFfnWeights {
     }
 }
 
+/// A 3D expert-weight tensor `[in_dim, out_dim, n_expert]` on device.
+/// K-quant slices are repacked per expert into the contiguous matvec
+/// layout (`quant::q*_k::repack_for_matvec`).
+pub struct GpuExpertTensor {
+    pub data:    DeviceBuf<u8>,
+    pub dtype:   GgmlType,
+    pub in_dim:  u32,
+    pub out_dim: u32,
+    pub bytes_per_expert: usize,
+    pub repacked: bool,
+}
+
+impl GpuExpertTensor {
+    pub fn from_gguf(gguf: &GgufFile, name: &str) -> Result<Self, String> {
+        let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+        let bytes = gguf.tensor_data(name)
+            .map_err(|e| format!("read {name}: {e}"))?
+            .ok_or_else(|| format!("tensor {name} has no data"))?;
+        let shape = info.shape();
+        if shape.len() != 3 {
+            return Err(format!("expert tensor {name}: expected 3D, got {shape:?}"));
+        }
+        let in_dim   = shape[0] as usize;
+        let out_dim  = shape[1] as usize;
+        let n_expert = shape[2] as usize;
+        let bpe = bytes.len() / n_expert;
+        // K-quant experts repack per slice; other dtypes load on-disk.
+        let repack_one = |slice: &[u8]| -> Option<Vec<u8>> {
+            match info.ggml_type {
+                GgmlType::Q4_K => Some(crate::quant::q4_k::repack_for_matvec(slice, in_dim, out_dim)),
+                GgmlType::Q5_K => Some(crate::quant::q5_k::repack_for_matvec(slice, in_dim, out_dim)),
+                GgmlType::Q6_K => Some(crate::quant::q6_k::repack_for_matvec(slice, in_dim, out_dim)),
+                _ => None,
+            }
+        };
+        if repack_one(&bytes[..bpe]).is_some() {
+            let mut packed = Vec::new();
+            for e in 0..n_expert {
+                packed.extend_from_slice(&repack_one(&bytes[e * bpe..(e + 1) * bpe]).unwrap());
+            }
+            Ok(Self {
+                bytes_per_expert: packed.len() / n_expert,
+                dtype: info.ggml_type,
+                in_dim: in_dim as u32, out_dim: out_dim as u32,
+                data: DeviceBuf::from_slice(&packed)?,
+                repacked: true,
+            })
+        } else {
+            Ok(Self {
+                bytes_per_expert: bpe,
+                dtype: info.ggml_type,
+                in_dim: in_dim as u32, out_dim: out_dim as u32,
+                data: DeviceBuf::from_slice(bytes)?,
+                repacked: false,
+            })
+        }
+    }
+}
+
+/// MoE FFN weights for one `qwen35moe` block: a 256-expert routed branch
+/// plus a sigmoid-gated shared expert.
+pub struct GpuMoeFfn {
+    /// Router projection, F32 `[hidden, n_expert]`.
+    pub gate_inp:   GpuMatvecTensor,
+    pub gate_exps:  GpuExpertTensor,   // Q4_K [hidden, expert_ff, n_expert]
+    pub up_exps:    GpuExpertTensor,   // Q4_K
+    pub down_exps:  GpuExpertTensor,   // Q5_K [expert_ff, hidden, n_expert]
+    /// Shared-expert scalar gate, F32 `[hidden]`.
+    pub gate_inp_shexp: DeviceBuf<f32>,
+    pub gate_shexp: GpuMatvecTensor,   // [hidden, shared_expert_ff]
+    pub up_shexp:   GpuMatvecTensor,
+    pub down_shexp: GpuMatvecTensor,   // [shared_expert_ff, hidden]
+}
+
+impl GpuMoeFfn {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool) -> Result<Self, String> {
+        let pre = format!("blk.{layer}.");
+        let mv = |n: &str| if repack { GpuMatvecTensor::from_gguf_matvec(gguf, n) }
+                           else      { GpuMatvecTensor::from_gguf(gguf, n) };
+        Ok(Self {
+            gate_inp:   GpuMatvecTensor::from_gguf(gguf, &format!("{pre}ffn_gate_inp.weight"))?,
+            gate_exps:  GpuExpertTensor::from_gguf(gguf, &format!("{pre}ffn_gate_exps.weight"))?,
+            up_exps:    GpuExpertTensor::from_gguf(gguf, &format!("{pre}ffn_up_exps.weight"))?,
+            down_exps:  GpuExpertTensor::from_gguf(gguf, &format!("{pre}ffn_down_exps.weight"))?,
+            gate_inp_shexp: load_fp32_tensor(gguf, &format!("{pre}ffn_gate_inp_shexp.weight"))?,
+            gate_shexp: mv(&format!("{pre}ffn_gate_shexp.weight"))?,
+            up_shexp:   mv(&format!("{pre}ffn_up_shexp.weight"))?,
+            down_shexp: mv(&format!("{pre}ffn_down_shexp.weight"))?,
+        })
+    }
+}
+
+/// A block's FFN — dense SwiGLU (`qwen35`) or MoE (`qwen35moe`).
+pub enum BlockFfn {
+    Dense(GpuFfnWeights),
+    Moe(GpuMoeFfn),
+}
+
+impl BlockFfn {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool, moe: bool)
+        -> Result<Self, String>
+    {
+        if moe {
+            Ok(BlockFfn::Moe(GpuMoeFfn::from_gguf(gguf, layer, repack)?))
+        } else {
+            Ok(BlockFfn::Dense(GpuFfnWeights::from_gguf(gguf, layer, repack)?))
+        }
+    }
+}
+
+/// Model-wide MoE runtime — kernel modules + scratch buffers, built once
+/// for a `qwen35moe` model and shared across all blocks.
+struct MoeRuntime {
+    n_expert: usize,
+    n_used:   usize,
+    expert_ff: usize,
+    shexp_ff:  usize,
+    m_topk:       Module,
+    m_mv_q4k:     Module,
+    m_mv_q5k:     Module,
+    m_mv_q6k:     Module,
+    m_combine:    Module,
+    m_shexp_gate: Module,
+    logits:  DeviceBuf<f32>,   // [n_expert] router logits
+    ids:     DeviceBuf<i32>,   // [n_used] selected expert ids
+    weights: DeviceBuf<f32>,   // [n_used] renormalised routing weights
+    ones:    DeviceBuf<f32>,   // [n_expert] = 1.0 (combine has no per-expert scale)
+    xq8_exp: DeviceBuf<u8>,    // [n_used] quantised down-expert activations
+    e_gate:  DeviceBuf<f32>,   // [n_used, expert_ff]
+    e_up:    DeviceBuf<f32>,   // [n_used, expert_ff]
+    e_out:   DeviceBuf<f32>,   // [n_used, hidden]
+    sh_gate: DeviceBuf<f32>,   // [shexp_ff]
+    sh_up:   DeviceBuf<f32>,   // [shexp_ff]
+    sh_out:  DeviceBuf<f32>,   // [hidden]
+}
+
+impl MoeRuntime {
+    fn new(moe: &crate::model::qwen3_5::MoeConfig, hidden: usize, cache: &KernelCache)
+        -> Result<Self, String>
+    {
+        let n_expert  = moe.n_expert as usize;
+        let n_used    = moe.n_expert_used as usize;
+        let expert_ff = moe.expert_ff as usize;
+        let shexp_ff  = moe.shared_expert_ff as usize;
+        let ones = DeviceBuf::from_slice(&vec![1.0f32; n_expert])?;
+        Ok(Self {
+            n_expert, n_used, expert_ff, shexp_ff,
+            m_topk:       Module::load(&cache.compile("moe_topk", MOE_TOPK_SOURCE)?)?,
+            m_mv_q4k:     Module::load(&cache.compile(
+                              "moe_matvec_q4k_repacked", MOE_MV_Q4K_REPACKED_SOURCE)?)?,
+            m_mv_q5k:     Module::load(&cache.compile(
+                              "moe_matvec_q5k_repacked", MOE_MV_Q5K_REPACKED_SOURCE)?)?,
+            m_mv_q6k:     Module::load(&cache.compile(
+                              "moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SOURCE)?)?,
+            m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
+            m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
+            logits:  DeviceBuf::new(n_expert)?,
+            ids:     DeviceBuf::new(n_used)?,
+            weights: DeviceBuf::new(n_used)?,
+            ones,
+            xq8_exp: DeviceBuf::new(n_used * (expert_ff / 32).max(1) * 40)?,
+            e_gate:  DeviceBuf::new(n_used * expert_ff)?,
+            e_up:    DeviceBuf::new(n_used * expert_ff)?,
+            e_out:   DeviceBuf::new(n_used * hidden)?,
+            sh_gate: DeviceBuf::new(shexp_ff)?,
+            sh_up:   DeviceBuf::new(shexp_ff)?,
+            sh_out:  DeviceBuf::new(hidden)?,
+        })
+    }
+}
+
 /// All weights for one full-attention transformer block on the GPU.
 /// Bundles the attention sub-layer, the post-attention norm, and the
 /// FFN sub-layer in the same lifetime.
 pub struct GpuFullAttnBlock {
     pub attn:       GpuFullAttnWeights,
     pub post_norm:  DeviceBuf<f32>,    // [hidden] — pre-FFN RMSNorm weight
-    pub ffn:        GpuFfnWeights,
+    pub ffn:        BlockFfn,
 }
 
 impl GpuFullAttnBlock {
-    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool, moe: bool)
+        -> Result<Self, String>
+    {
         Ok(Self {
             attn:      GpuFullAttnWeights::from_gguf(gguf, layer, repack)?,
             post_norm: load_fp32_tensor(gguf, &format!("blk.{layer}.post_attention_norm.weight"))?,
-            ffn:       GpuFfnWeights::from_gguf(gguf, layer, repack)?,
+            ffn:       BlockFfn::from_gguf(gguf, layer, repack, moe)?,
         })
     }
 }
@@ -309,15 +489,17 @@ impl GpuLinAttnWeights {
 pub struct GpuLinAttnBlock {
     pub attn:      GpuLinAttnWeights,
     pub post_norm: DeviceBuf<f32>,
-    pub ffn:       GpuFfnWeights,
+    pub ffn:       BlockFfn,
 }
 
 impl GpuLinAttnBlock {
-    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool) -> Result<Self, String> {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool, moe: bool)
+        -> Result<Self, String>
+    {
         Ok(Self {
             attn:      GpuLinAttnWeights::from_gguf(gguf, layer, repack)?,
             post_norm: load_fp32_tensor(gguf, &format!("blk.{layer}.post_attention_norm.weight"))?,
-            ffn:       GpuFfnWeights::from_gguf(gguf, layer, repack)?,
+            ffn:       BlockFfn::from_gguf(gguf, layer, repack, moe)?,
         })
     }
 }
@@ -366,12 +548,14 @@ pub enum GpuBlock {
 
 impl GpuBlock {
     pub fn from_gguf(gguf: &GgufFile, layer: u32, kind: crate::model::qwen3_5::BlockKind,
-                     repack: bool) -> Result<Self, String>
+                     repack: bool, moe: bool) -> Result<Self, String>
     {
         use crate::model::qwen3_5::BlockKind;
         Ok(match kind {
-            BlockKind::FullAttention   => GpuBlock::Full(GpuFullAttnBlock::from_gguf(gguf, layer, repack)?),
-            BlockKind::LinearAttention => GpuBlock::Linear(GpuLinAttnBlock::from_gguf(gguf, layer, repack)?),
+            BlockKind::FullAttention =>
+                GpuBlock::Full(GpuFullAttnBlock::from_gguf(gguf, layer, repack, moe)?),
+            BlockKind::LinearAttention =>
+                GpuBlock::Linear(GpuLinAttnBlock::from_gguf(gguf, layer, repack, moe)?),
         })
     }
 }
@@ -520,6 +704,7 @@ pub struct GpuQwen35 {
     matvec_f16_module:     Module,
     embed_lookup_q6_k_module: Module,
     embed_lookup_q4_k_module: Module,
+    embed_lookup_q8_0_module: Module,
     matvec_f32_wave64_module:    Module,
     matvec_q4_k_wave64_module:   Module,
     matvec_q5_k_wave64_module:   Module,
@@ -583,6 +768,9 @@ pub struct GpuQwen35 {
     rms_eps:    f32,
     #[allow(dead_code)]
     max_seq:    usize,
+
+    /// `Some` for a `qwen35moe` model — MoE FFN kernels + scratch.
+    moe: Option<MoeRuntime>,
 }
 
 impl GpuQwen35 {
@@ -683,6 +871,7 @@ impl GpuQwen35 {
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
         let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
+        let embed_lookup_q8_0_hsaco = cache.compile("embed_lookup_q8_0_v", EMBED_LOOKUP_Q8_0_SOURCE)?;
         let matvec_f32_wave64_hsaco    = cache.compile("matvec_f32_wave64",    MATVEC_F32_WAVE64_SOURCE)?;
         let matvec_q4_k_wave64_hsaco   = cache.compile("matvec_q4_k_wave64",   MATVEC_Q4_K_WAVE64_SOURCE)?;
         let matvec_q5_k_wave64_hsaco   = cache.compile("matvec_q5_k_wave64",   MATVEC_Q5_K_WAVE64_SOURCE)?;
@@ -705,8 +894,12 @@ impl GpuQwen35 {
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.block_kinds.len());
         for (i, &kind) in model.block_kinds.iter().enumerate() {
-            blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind, true)?);
+            blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind, true, model.config.is_moe())?);
         }
+        let moe_runtime = match &cfg.moe {
+            Some(mc) => Some(MoeRuntime::new(mc, hidden, cache)?),
+            None => None,
+        };
 
         // The single stream all launches flow through.
         let stream = Stream::new()?;
@@ -747,6 +940,7 @@ impl GpuQwen35 {
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
             embed_lookup_q4_k_module: Module::load(&embed_lookup_q4_k_hsaco)?,
+            embed_lookup_q8_0_module: Module::load(&embed_lookup_q8_0_hsaco)?,
             rocblas:                  rocblas_handle,
             cvt_module:               Module::load(&cache.compile("cvt_f32_f16", CVT_F32_F16_SOURCE)?)?,
             dequant_q4_k_module:      Module::load(&cache.compile("dequant_q4_k_f16", DEQUANT_Q4_K_F16_SOURCE)?)?,
@@ -788,6 +982,7 @@ impl GpuQwen35 {
             gdn_decay, gdn_beta, gdn_core_out, gdn_delta,
             rms_eps: cfg.rms_norm_eps,
             max_seq,
+            moe: moe_runtime,
         })
     }
 
@@ -858,6 +1053,22 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    fn launch_embed_lookup_q8_0(&self, table: *mut c_void, out: *mut c_void,
+                                token: u32, hidden: u32) -> Result<(), String>
+    {
+        let f = self.embed_lookup_q8_0_module.function("embed_lookup_q8_0_v_f32")?;
+        let block: u32 = 256;
+        let grid = (hidden + block - 1) / block;
+        let mut t = table; let mut o = out; let mut row = token; let mut h = hidden;
+        let mut args: [*mut c_void; 4] = [
+            &mut t   as *mut _ as *mut c_void,
+            &mut o   as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void,
+            &mut h   as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     /// Gather one row from `table` (shape `[hidden, vocab]` in GGUF order)
     /// and write the dequantised fp32 row into `out`. Dispatches by the
     /// table's on-disk dtype.
@@ -869,6 +1080,7 @@ impl GpuQwen35 {
             GgmlType::F32  => self.launch_embed_lookup(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q6_K => self.launch_embed_lookup_q6_k(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q4_K => self.launch_embed_lookup_q4_k(table.data.raw_ptr(), out, token, hidden),
+            GgmlType::Q8_0 => self.launch_embed_lookup_q8_0(table.data.raw_ptr(), out, token, hidden),
             other => Err(format!("embed_lookup: no kernel for {:?}", other)),
         }
     }
@@ -1500,6 +1712,146 @@ impl GpuQwen35 {
         Ok(())
     }
 
+    /// Single-token FFN — dense SwiGLU or MoE, dispatched on the block's
+    /// FFN kind.
+    fn step_ffn(&self, input_ptr: *mut c_void, output_ptr: *mut c_void, ffn: &BlockFfn)
+        -> Result<(), String>
+    {
+        match ffn {
+            BlockFfn::Dense(d) => self.step_swiglu_ffn(input_ptr, output_ptr, d),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(input_ptr, output_ptr, m),
+        }
+    }
+
+    /// Qwen MoE FFN for one token: router → top-k routed experts (SwiGLU)
+    /// → sigmoid-gated shared expert. Writes `output_ptr` [hidden].
+    fn step_moe_ffn(&self, input_ptr: *mut c_void, output_ptr: *mut c_void, w: &GpuMoeFfn)
+        -> Result<(), String>
+    {
+        let moe = self.moe.as_ref().expect("step_moe_ffn on a non-MoE model");
+        let h  = self.hidden as u32;
+        let ff = moe.expert_ff as u32;
+        let shff = moe.shexp_ff as u32;
+        let n_used = moe.n_used as u32;
+
+        // --- Router: logits → top-k expert ids + renormalised weights ---
+        self.launch_matvec_dispatch(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
+        self.launch_moe_topk(moe)?;
+
+        // --- Routed experts --- shared int8 activation, quantised once.
+        self.launch_quantize_q8(input_ptr, h)?;
+        self.launch_moe_expert_matvec(moe, &w.gate_exps, self.xq8.raw_ptr(),
+                                      moe.e_gate.raw_ptr(), h, ff, 0)?;
+        self.launch_moe_expert_matvec(moe, &w.up_exps, self.xq8.raw_ptr(),
+                                      moe.e_up.raw_ptr(), h, ff, 0)?;
+        self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                           moe.e_gate.raw_ptr(), n_used * ff)?;
+        // down: each expert has its own activation — quantise the batch.
+        self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
+                                     ff, n_used)?;
+        self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                                      moe.e_out.raw_ptr(), ff, h, ff / 32)?;
+        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr)?;
+
+        // --- Shared expert --- runs every token, scaled by a sigmoid gate.
+        self.launch_matvec_dispatch(&w.gate_shexp, input_ptr, moe.sh_gate.raw_ptr())?;
+        self.launch_matvec_dispatch(&w.up_shexp,   input_ptr, moe.sh_up.raw_ptr())?;
+        self.launch_swiglu(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
+                           moe.sh_gate.raw_ptr(), shff)?;
+        self.launch_matvec_dispatch(&w.down_shexp, moe.sh_gate.raw_ptr(),
+                                    moe.sh_out.raw_ptr())?;
+        self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
+                                   w.gate_inp_shexp.raw_ptr())?;
+        self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), h)?;
+        Ok(())
+    }
+
+    fn launch_moe_topk(&self, moe: &MoeRuntime) -> Result<(), String> {
+        let f = moe.m_topk.function("moe_topk_f32")?;
+        let mut la = moe.logits.raw_ptr();
+        let mut ne = moe.n_expert as i32;
+        let mut nu = moe.n_used as i32;
+        let mut ida = moe.ids.raw_ptr();
+        let mut wa  = moe.weights.raw_ptr();
+        let mut args: [*mut c_void; 5] = [
+            &mut la as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void];
+        let smem = moe.n_expert as u32 * 4;
+        unsafe { f.launch((1,1,1),(128,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
+    /// One launch over all `n_used` routed experts (grid.y = expert slot).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_expert_matvec(&self, moe: &MoeRuntime, et: &GpuExpertTensor,
+                                xq8: *mut c_void, y: *mut c_void,
+                                in_dim: u32, out_dim: u32, xq_stride: u32)
+        -> Result<(), String>
+    {
+        let (module, kname) = match et.dtype {
+            GgmlType::Q4_K => (&moe.m_mv_q4k, "moe_matvec_q4k_repacked_f32"),
+            GgmlType::Q5_K => (&moe.m_mv_q5k, "moe_matvec_q5k_repacked_f32"),
+            GgmlType::Q6_K => (&moe.m_mv_q6k, "moe_matvec_q6k_repacked_f32"),
+            other => return Err(format!("moe expert matvec: dtype {other:?}")),
+        };
+        let f = module.function(kname)?;
+        let grid_x = (out_dim + 7) / 8;
+        let mut sa = et.data.raw_ptr(); let mut ida = moe.ids.raw_ptr();
+        let mut xa = xq8; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut bpe = et.bytes_per_expert as u32; let mut st = xq_stride;
+        let mut args: [*mut c_void; 8] = [
+            &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, moe.n_used as u32, 1), (256,1,1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    fn launch_moe_combine(&self, moe: &MoeRuntime, experts: *mut c_void, out: *mut c_void)
+        -> Result<(), String>
+    {
+        let f = moe.m_combine.function("moe_combine_f32")?;
+        let block: u32 = 256;
+        let h = self.hidden as u32;
+        let grid = (h + block - 1) / block;
+        let mut ea = experts; let mut ida = moe.ids.raw_ptr();
+        let mut wa = moe.weights.raw_ptr(); let mut sa = moe.ones.raw_ptr();
+        let mut oa = out; let mut ha = h; let mut nu = moe.n_used as u32;
+        let mut args: [*mut c_void; 7] = [
+            &mut ea as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_moe_shexp_gate(&self, moe: &MoeRuntime, sh_out: *mut c_void,
+                             hidden: *mut c_void, gate_w: *mut c_void) -> Result<(), String>
+    {
+        let f = moe.m_shexp_gate.function("moe_shexp_gate_f32")?;
+        let block: u32 = 256;
+        let mut sa = sh_out; let mut ha = hidden; let mut ga = gate_w;
+        let mut na = self.hidden as u32;
+        let mut args: [*mut c_void; 4] = [
+            &mut sa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
+            &mut ga as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
+        unsafe { f.launch((1,1,1),(block,1,1), block * 4, Some(&self.stream), &mut args) }
+    }
+
+    /// Quantize `n_vec` activation vectors of `in_dim` into `out` (BlockQ8).
+    fn launch_quantize_q8_into(&self, x: *mut c_void, out: *mut c_void,
+                               in_dim: u32, n_vec: u32) -> Result<(), String> {
+        let f = self.quantize_q8_module.function("quantize_q8_f32")?;
+        let mut xa = x; let mut oa = out; let mut ia = in_dim;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void];
+        unsafe { f.launch(((in_dim + 255) / 256, n_vec, 1), (256,1,1),
+                          0, Some(&self.stream), &mut args) }
+    }
+
     /// On-device "full transformer block" composer: takes a hidden_io
     /// buffer (mutated in place by both residual sums) and a scratch
     /// buffer (overwritten three times — first as attn_out, then as
@@ -1513,7 +1865,7 @@ impl GpuQwen35 {
         self.step_full_attention(hidden_io, scratch, &weights.attn, kv_cache)?;
         self.launch_add_inplace(hidden_io, scratch, h)?;
         self.launch_rmsnorm(hidden_io, weights.post_norm.raw_ptr(), scratch, h, self.rms_eps)?;
-        self.step_swiglu_ffn(scratch, scratch, &weights.ffn)?;
+        self.step_ffn(scratch, scratch, &weights.ffn)?;
         self.launch_add_inplace(hidden_io, scratch, h)?;
         Ok(())
     }
@@ -1528,7 +1880,7 @@ impl GpuQwen35 {
         self.step_linear_attention(hidden_io, scratch, &weights.attn, state)?;
         self.launch_add_inplace(hidden_io, scratch, h)?;
         self.launch_rmsnorm(hidden_io, weights.post_norm.raw_ptr(), scratch, h, self.rms_eps)?;
-        self.step_swiglu_ffn(scratch, scratch, &weights.ffn)?;
+        self.step_ffn(scratch, scratch, &weights.ffn)?;
         self.launch_add_inplace(hidden_io, scratch, h)?;
         Ok(())
     }
@@ -1645,7 +1997,7 @@ impl GpuQwen35 {
             self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
             self.launch_rmsnorm(self.hidden_a.raw_ptr(), w.post_norm.raw_ptr(),
                                 self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
-            self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &w.ffn)?;
+            self.step_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &w.ffn)?;
             self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
         }
 
@@ -1860,6 +2212,13 @@ impl GpuQwen35 {
             ];
             unsafe { f.launch((n_sub_total, 1, 1), (32, 1, 1), 0,
                               Some(&self.stream), &mut args)?; }
+            return Ok(out);
+        }
+
+        // F32 weights (qwen35moe's ssm_alpha/beta) need no dequant — just
+        // narrow to fp16 for the HGEMM.
+        if w.dtype == GgmlType::F32 {
+            self.launch_cvt("cvt_f32_to_f16", w.data.raw_ptr(), out.raw_ptr(), n as u32)?;
             return Ok(out);
         }
 
@@ -2119,15 +2478,29 @@ impl GpuQwen35 {
 
     /// Batched SwiGLU FFN: `out_bb = down(silu(gate(in)) * up(in))`.
     fn batched_ffn(&self, input: &DeviceBuf<f32>, out_bb: &DeviceBuf<f32>,
-                   ffn: &GpuFfnWeights, n: usize) -> Result<(), String>
+                   ffn: &BlockFfn, n: usize) -> Result<(), String>
     {
-        let f = self.ffn;
-        let gate: DeviceBuf<f32> = DeviceBuf::new(n * f)?;
-        let up:   DeviceBuf<f32> = DeviceBuf::new(n * f)?;
-        self.bmm(&ffn.gate, input.raw_ptr(), n, gate.raw_ptr())?;
-        self.bmm(&ffn.up,   input.raw_ptr(), n, up.raw_ptr())?;
-        self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
-        self.bmm(&ffn.down, gate.raw_ptr(), n, out_bb.raw_ptr())?;
+        match ffn {
+            BlockFfn::Dense(d) => {
+                let f = self.ffn;
+                let gate: DeviceBuf<f32> = DeviceBuf::new(n * f)?;
+                let up:   DeviceBuf<f32> = DeviceBuf::new(n * f)?;
+                self.bmm(&d.gate, input.raw_ptr(), n, gate.raw_ptr())?;
+                self.bmm(&d.up,   input.raw_ptr(), n, up.raw_ptr())?;
+                self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
+                self.bmm(&d.down, gate.raw_ptr(), n, out_bb.raw_ptr())?;
+            }
+            BlockFfn::Moe(m) => {
+                // Prefill MoE: each token through the single-token MoE FFN
+                // (routed experts need per-token routing — no batched form).
+                let h = self.hidden;
+                for t in 0..n {
+                    let inp  = unsafe { (input.raw_ptr()  as *mut f32).add(t * h) as *mut c_void };
+                    let outp = unsafe { (out_bb.raw_ptr() as *mut f32).add(t * h) as *mut c_void };
+                    self.step_moe_ffn(inp, outp, m)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2239,7 +2612,7 @@ impl GpuQwen35 {
                             self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
         // FFN reads hidden_b, writes hidden_b (alias OK — gate/up read
         // happens before down writes within the stream).
-        self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(),
+        self.step_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(),
                              &weights.ffn)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
 
@@ -2349,7 +2722,7 @@ impl GpuQwen35 {
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), weights.post_norm.raw_ptr(),
                             self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
-        self.step_swiglu_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &weights.ffn)?;
+        self.step_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &weights.ffn)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
@@ -2806,7 +3179,7 @@ mod tests {
 
         let mut gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
         gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
-        let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32, false).expect("upload GDN block");
+        let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32, false, false).expect("upload GDN block");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
             cfg.gdn_head_dim    as usize,
@@ -2882,7 +3255,7 @@ mod tests {
 
         let mut gpu = GpuQwen35::new(&model, &g, &cache, max_seq).expect("new GpuQwen35");
         gpu.set_dp4a(false);  // consistency check vs the fp32 CPU oracle
-        let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32, false).expect("upload block");
+        let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32, false, false).expect("upload block");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
             cfg.attn_n_kv_heads as usize,
