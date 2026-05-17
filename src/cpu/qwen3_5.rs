@@ -103,7 +103,7 @@ impl Qwen35F32Weights {
     }
 }
 
-fn load_linear_attention(gguf: &GgufFile, layer: u32) -> Result<LinAttnWeights, LoadError> {
+pub fn load_linear_attention(gguf: &GgufFile, layer: u32) -> Result<LinAttnWeights, LoadError> {
     Ok(LinAttnWeights {
         attn_norm:           dequant_named(gguf, &format!("blk.{layer}.attn_norm.weight"))?,
         attn_qkv:            dequant_named(gguf, &format!("blk.{layer}.attn_qkv.weight"))?,
@@ -122,7 +122,7 @@ fn load_linear_attention(gguf: &GgufFile, layer: u32) -> Result<LinAttnWeights, 
     })
 }
 
-fn load_full_attention(gguf: &GgufFile, layer: u32) -> Result<FullAttnWeights, LoadError> {
+pub fn load_full_attention(gguf: &GgufFile, layer: u32) -> Result<FullAttnWeights, LoadError> {
     Ok(FullAttnWeights {
         attn_norm:           dequant_named(gguf, &format!("blk.{layer}.attn_norm.weight"))?,
         attn_q:              dequant_named(gguf, &format!("blk.{layer}.attn_q.weight"))?,
@@ -138,7 +138,7 @@ fn load_full_attention(gguf: &GgufFile, layer: u32) -> Result<FullAttnWeights, L
     })
 }
 
-fn dequant_named(gguf: &GgufFile, name: &str) -> Result<Vec<f32>, LoadError> {
+pub fn dequant_named(gguf: &GgufFile, name: &str) -> Result<Vec<f32>, LoadError> {
     let info: &TensorInfo = gguf.tensor(name).ok_or_else(|| {
         // Should never trigger after Qwen35Model::load — kept for defense in depth.
         LoadError::Gguf(GgufError::Io(std::io::Error::other(
@@ -372,10 +372,13 @@ pub fn linear_attention_step(
     out: &mut [f32],
 ) {
     let h_dim = config.hidden_size as usize;
-    let n_heads = config.gdn_n_heads as usize;
-    let head_dim = config.gdn_head_dim as usize;     // 128 (k = v in Qwen 3.5)
-    let value_dim = config.gdn_value_dim as usize;   // 2048 = n_heads * head_dim
-    let conv_dim = 2 * value_dim + value_dim;        // 6144 = 2*key_dim + value_dim, key=value here
+    let n_heads = config.gdn_n_heads as usize;       // value heads
+    let n_k_heads = config.gdn_n_k_heads as usize;   // key/query heads (GQA)
+    let head_dim = config.gdn_head_dim as usize;     // shared by K/Q and V
+    let value_dim = config.gdn_value_dim as usize;   // n_heads * head_dim
+    let key_dim = config.gdn_key_dim() as usize;     // n_k_heads * head_dim
+    let conv_dim = 2 * key_dim + value_dim;
+    let kv_group = n_heads / n_k_heads;              // value heads per key head
     let scale = (head_dim as f32).powf(-0.5);
 
     assert_eq!(hidden.len(), h_dim);
@@ -402,21 +405,22 @@ pub fn linear_attention_step(
     state.conv.step(&mixed_qkv, &weights.ssm_conv1d, &mut conv_out);
     for v in conv_out.iter_mut() { *v = ops::silu(*v); }
 
-    // Split into Q | K | V — each [n_heads * head_dim] = [2048].
-    let q_slice = &conv_out[0..value_dim];
-    let k_slice = &conv_out[value_dim..2 * value_dim];
-    let v_slice = &conv_out[2 * value_dim..3 * value_dim];
+    // Split into Q | K | V. Q/K are key_dim wide (n_k_heads heads),
+    // V is value_dim wide (n_heads heads).
+    let q_slice = &conv_out[0..key_dim];
+    let k_slice = &conv_out[key_dim..2 * key_dim];
+    let v_slice = &conv_out[2 * key_dim..2 * key_dim + value_dim];
 
-    // Per-head L2-norm of Q and K, then Q-side scale.
-    let mut q = vec![0.0_f32; value_dim];
-    let mut k = vec![0.0_f32; value_dim];
+    // Per-head L2-norm of Q and K (n_k_heads heads), then Q-side scale.
+    let mut q = vec![0.0_f32; key_dim];
+    let mut k = vec![0.0_f32; key_dim];
     let v: &[f32] = v_slice;
-    for h in 0..n_heads {
+    for h in 0..n_k_heads {
         let off = h * head_dim;
         ops::l2norm(&q_slice[off..off + head_dim], 1e-6, &mut q[off..off + head_dim]);
         ops::l2norm(&k_slice[off..off + head_dim], 1e-6, &mut k[off..off + head_dim]);
     }
-    for v in q.iter_mut() { *v *= scale; }
+    for x in q.iter_mut() { *x *= scale; }
 
     // Per-head decay and beta. Note that `convert_hf_to_gguf.py` stores
     // `ssm_a` as `-exp(A_log)` already (Qwen3NextModel.modify_tensors does
@@ -445,8 +449,10 @@ pub fn linear_attention_step(
             .zip(core_attn_out.par_chunks_exact_mut(head_dim))
             .enumerate()
             .for_each(|(h, (s, head_out))| {
-                let q_h = &q[h * head_dim..(h + 1) * head_dim];
-                let k_h = &k[h * head_dim..(h + 1) * head_dim];
+                // GQA: value head h takes its q/k from key head h/kv_group.
+                let kh = h / kv_group;
+                let q_h = &q[kh * head_dim..(kh + 1) * head_dim];
+                let k_h = &k[kh * head_dim..(kh + 1) * head_dim];
                 let v_h = &v[h * head_dim..(h + 1) * head_dim];
                 let decay_h = decay[h];
                 let beta_h = beta[h];
@@ -527,7 +533,7 @@ pub struct Qwen35F32State {
 
 impl Qwen35F32State {
     pub fn new(config: &Qwen35Config, block_kinds: &[BlockKind], max_seq: usize) -> Self {
-        let conv_dim = 3 * config.gdn_value_dim as usize;
+        let conv_dim = config.gdn_qkv_concat_dim() as usize;
         let mut kv_caches = Vec::with_capacity(block_kinds.len());
         let mut gdn_states = Vec::with_capacity(block_kinds.len());
         for &kind in block_kinds {

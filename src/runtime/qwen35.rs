@@ -2211,25 +2211,29 @@ mod tests {
         };
 
         let g = GgufFile::open(&path).expect("open gguf");
-        let m = Qwen35F32Model::load(&g).expect("load model");
-        let cfg = &m.model.config;
+        let model = Qwen35Model::load(&g).expect("load model");
+        let cfg = &model.config;
         let hidden = cfg.hidden_size as usize;
         let vocab  = cfg.vocab_size as usize;
 
-        let gpu = GpuQwen35::new(&m.model, &g, &cache, 32).expect("new GpuQwen35");
+        // Load only the embedding table + output norm/proj — not the
+        // whole f32 model (≈100 GB of block weights on the 27B).
+        use crate::cpu::qwen3_5::dequant_named;
+        let token_embd  = dequant_named(&g, "token_embd.weight").expect("token_embd");
+        let output_norm = dequant_named(&g, "output_norm.weight").expect("output_norm");
+        let output = if cfg.tied_embeddings { None }
+                     else { Some(dequant_named(&g, "output.weight").expect("output")) };
+
+        let gpu = GpuQwen35::new(&model, &g, &cache, 32).expect("new GpuQwen35");
 
         // Test on a couple of tokens including EOS and a mid-vocab.
         for &token in &[cfg.eos_token_id, 100u32, 50_000u32] {
             // CPU oracle: embed → output_norm → output_proj.
             let off = token as usize * hidden;
-            let embed = &m.weights.token_embd[off..off + hidden];
+            let embed = &token_embd[off..off + hidden];
             let mut normed = vec![0.0f32; hidden];
-            crate::cpu::ops::rmsnorm(embed, &m.weights.output_norm, cfg.rms_norm_eps, &mut normed);
-            let proj_w = if cfg.tied_embeddings {
-                m.weights.token_embd.as_slice()
-            } else {
-                m.weights.output.as_ref().unwrap().as_slice()
-            };
+            crate::cpu::ops::rmsnorm(embed, &output_norm, cfg.rms_norm_eps, &mut normed);
+            let proj_w = output.as_deref().unwrap_or(token_embd.as_slice());
             let mut cpu_logits = vec![0.0f32; vocab];
             crate::cpu::ops::matvec(&normed, proj_w, hidden, vocab, &mut cpu_logits);
 
@@ -2470,22 +2474,22 @@ mod tests {
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
         };
 
-        use crate::cpu::qwen3_5::{BlockWeights, LinAttnState as CpuLinAttnState,
-                                  linear_attention_step};
+        use crate::cpu::qwen3_5::{LinAttnState as CpuLinAttnState,
+                                  linear_attention_step, load_linear_attention};
 
         let g = GgufFile::open(&path).unwrap();
-        let m = Qwen35F32Model::load(&g).unwrap();
-        let cfg = &m.model.config;
+        // Load only the config + one GDN block, not the whole f32 model —
+        // Qwen35F32Model::load would materialise the entire model (≈100 GB
+        // for the 27B) in host RAM.
+        let model = Qwen35Model::load(&g).unwrap();
+        let cfg = &model.config;
         let h = cfg.hidden_size as usize;
 
-        // Block 0 is LinearAttention in Qwen 3.5.
-        let block_idx = m.model.block_kinds.iter()
+        let block_idx = model.block_kinds.iter()
             .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::LinearAttention))
             .expect("model has at least one LinearAttention block");
-        let weights = match &m.weights.blocks[block_idx] {
-            BlockWeights::LinearAttention(w) => w,
-            _ => unreachable!(),
-        };
+        let weights = &load_linear_attention(&g, block_idx as u32)
+            .expect("load CPU GDN block");
         eprintln!("validating GDN step on block {block_idx}");
 
         let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
@@ -2497,7 +2501,7 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&m.model, &g, &cache, 16).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
         let gpu_w = GpuLinAttnWeights::from_gguf(&g, block_idx as u32).expect("upload GDN weights");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2549,21 +2553,19 @@ mod tests {
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
         };
 
-        use crate::cpu::qwen3_5::{BlockWeights, LinAttnState as CpuLinAttnState,
-                                  linear_attention_block};
+        use crate::cpu::qwen3_5::{LinAttnState as CpuLinAttnState,
+                                  linear_attention_block, load_linear_attention};
 
         let g = GgufFile::open(&path).unwrap();
-        let m = Qwen35F32Model::load(&g).unwrap();
-        let cfg = &m.model.config;
+        let model = Qwen35Model::load(&g).unwrap();
+        let cfg = &model.config;
         let h = cfg.hidden_size as usize;
 
-        let block_idx = m.model.block_kinds.iter()
+        let block_idx = model.block_kinds.iter()
             .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::LinearAttention))
             .expect("model has at least one LinearAttention block");
-        let weights = match &m.weights.blocks[block_idx] {
-            BlockWeights::LinearAttention(w) => w,
-            _ => unreachable!(),
-        };
+        let weights = &load_linear_attention(&g, block_idx as u32)
+            .expect("load CPU GDN block");
 
         let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
         let mut cpu_state = CpuLinAttnState::new(
@@ -2574,7 +2576,7 @@ mod tests {
             cfg.gdn_conv_kernel as usize,
         );
 
-        let gpu = GpuQwen35::new(&m.model, &g, &cache, 16).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&model, &g, &cache, 16).expect("new GpuQwen35");
         let gpu_block = GpuLinAttnBlock::from_gguf(&g, block_idx as u32).expect("upload GDN block");
         let mut gpu_state = GpuLinAttnState::new(
             cfg.gdn_n_heads     as usize,
@@ -2626,21 +2628,19 @@ mod tests {
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
         };
 
-        use crate::cpu::qwen3_5::{BlockWeights, LayerKvCache, full_attention_block};
+        use crate::cpu::qwen3_5::{LayerKvCache, full_attention_block, load_full_attention};
         use crate::cpu::rope::RopeCache;
 
         let g = GgufFile::open(&path).unwrap();
-        let m = Qwen35F32Model::load(&g).unwrap();
-        let cfg = &m.model.config;
+        let model = Qwen35Model::load(&g).unwrap();
+        let cfg = &model.config;
         let h = cfg.hidden_size as usize;
 
-        let block_idx = m.model.block_kinds.iter()
+        let block_idx = model.block_kinds.iter()
             .position(|k| matches!(k, crate::model::qwen3_5::BlockKind::FullAttention))
             .expect("model has at least one FullAttention block");
-        let weights = match &m.weights.blocks[block_idx] {
-            BlockWeights::FullAttention(w) => w,
-            _ => unreachable!(),
-        };
+        let weights = &load_full_attention(&g, block_idx as u32)
+            .expect("load CPU full-attn block");
         eprintln!("validating full block {block_idx} (FullAttention + FFN)");
 
         let max_seq = 16usize;
@@ -2651,7 +2651,7 @@ mod tests {
         );
         let rope = RopeCache::new(cfg.rope_dim_count as usize, max_seq, cfg.rope_freq_base);
 
-        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).expect("new GpuQwen35");
+        let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).expect("new GpuQwen35");
         let gpu_block = GpuFullAttnBlock::from_gguf(&g, block_idx as u32).expect("upload block");
         let mut gpu_kv = GpuKvCache::new(
             max_seq,
