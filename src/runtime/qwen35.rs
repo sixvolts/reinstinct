@@ -1739,6 +1739,9 @@ impl GpuQwen35 {
         self.launch_moe_topk(moe)?;
 
         // --- Routed experts --- shared int8 activation, quantised once.
+        // (Routed result lands in e_out; the combine into `output` is
+        //  deferred until the shared expert has read `input` — callers
+        //  pass input == output, so the combine would clobber it.)
         self.launch_quantize_q8(input_ptr, h)?;
         self.launch_moe_expert_matvec(moe, &w.gate_exps, self.xq8.raw_ptr(),
                                       moe.e_gate.raw_ptr(), h, ff, 0)?;
@@ -1751,9 +1754,9 @@ impl GpuQwen35 {
                                      ff, n_used)?;
         self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
                                       moe.e_out.raw_ptr(), ff, h, ff / 32)?;
-        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr)?;
 
         // --- Shared expert --- runs every token, scaled by a sigmoid gate.
+        // Reads `input` — must finish before the combine writes `output`.
         self.launch_matvec_dispatch(&w.gate_shexp, input_ptr, moe.sh_gate.raw_ptr())?;
         self.launch_matvec_dispatch(&w.up_shexp,   input_ptr, moe.sh_up.raw_ptr())?;
         self.launch_swiglu(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
@@ -1762,6 +1765,9 @@ impl GpuQwen35 {
                                     moe.sh_out.raw_ptr())?;
         self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
                                    w.gate_inp_shexp.raw_ptr())?;
+
+        // `input` fully consumed — combine routed experts, add the shared.
+        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr)?;
         self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), h)?;
         Ok(())
     }
