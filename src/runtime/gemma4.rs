@@ -57,6 +57,9 @@ const MOE_GROUPED_Q8_0_SRC:  &str = include_str!("../../kernels/moe_matvec_group
 const MOE_SCATTER_SRC:       &str = include_str!("../../kernels/moe_scatter_add.cpp");
 const MOE_TOPK_SRC:          &str = include_str!("../../kernels/moe_topk.cpp");
 const MOE_MATVEC_Q6K_SRC:    &str = include_str!("../../kernels/moe_matvec_q6k_dp4a.cpp");
+const MOE_MV_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
+const MOE_GROUPED_Q6K_REPACKED_SRC: &str =
+    include_str!("../../kernels/moe_matvec_grouped_q6k_repacked.cpp");
 const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
 const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
 const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
@@ -89,6 +92,9 @@ pub struct ExpertTensor {
     /// moe_matvec dispatch must be per-tensor, not hard-coded.
     dtype: GgmlType,
     bytes_per_expert: usize,
+    /// True when each expert slice was repacked into the contiguous
+    /// `quant::q6_k::repack_for_matvec` layout (Q6_K experts only).
+    repacked: bool,
 }
 
 impl ExpertTensor {
@@ -101,11 +107,31 @@ impl ExpertTensor {
         if shape.len() != 3 {
             return Err(format!("expert tensor {name}: expected 3D, got {shape:?}"));
         }
+        let in_dim   = shape[0] as usize;
+        let out_dim  = shape[1] as usize;
         let n_expert = shape[2] as usize;
+        // Q6_K experts: repack each expert slice into the contiguous
+        // matvec layout (same win as the dense Q6_K repack). Q8_0 experts
+        // are left on-disk — that layout is already contiguous-friendly.
+        if info.ggml_type == GgmlType::Q6_K {
+            let bpe = bytes.len() / n_expert;
+            let mut packed = Vec::new();
+            for e in 0..n_expert {
+                packed.extend_from_slice(&crate::quant::q6_k::repack_for_matvec(
+                    &bytes[e * bpe..(e + 1) * bpe], in_dim, out_dim));
+            }
+            return Ok(Self {
+                bytes_per_expert: packed.len() / n_expert,
+                dtype: info.ggml_type,
+                data: DeviceBuf::from_slice(&packed)?,
+                repacked: true,
+            });
+        }
         Ok(Self {
             bytes_per_expert: bytes.len() / n_expert,
             dtype: info.ggml_type,
             data: DeviceBuf::from_slice(bytes)?,
+            repacked: false,
         })
     }
 
@@ -319,6 +345,7 @@ pub struct GpuGemma4 {
     m_mv_q6k_repacked: Module,
     m_moe_topk:  Module,
     m_moe_mv_q6k:  Module,
+    m_moe_mv_q6k_repacked: Module,
     m_moe_mv_q8_0: Module,
     m_moe_geglu:   Module,
     m_moe_combine: Module,
@@ -456,6 +483,7 @@ impl GpuGemma4 {
             m_mv_q6k_repacked: ld("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC)?,
             m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
             m_moe_mv_q6k:   ld("moe_matvec_q6k_dp4a", MOE_MATVEC_Q6K_SRC)?,
+            m_moe_mv_q6k_repacked: ld("moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SRC)?,
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
@@ -736,18 +764,24 @@ impl GpuGemma4 {
     /// the expert slot, the expert id is read from `self.moe_ids` on
     /// device. `xq_stride` is the BlockQ8 count per slot (0 ⇒ all slots
     /// share one activation, the fused gate_up case).
-    fn launch_moe_matvec(&self, dtype: GgmlType, slab: *mut c_void, xq: *mut c_void,
+    fn launch_moe_matvec(&self, dtype: GgmlType, repacked: bool,
+                         slab: *mut c_void, xq: *mut c_void,
                          y: *mut c_void, in_dim: u32, out_dim: u32,
                          bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
     {
-        let (module, kname) = match dtype {
-            GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32"),
-            GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32"),
-            other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+        // Repacked Q6_K experts use the contiguous kernel (256-thread, 8
+        // rows/workgroup); others the on-disk dp4a kernels (64-thread, 2).
+        let (module, kname, block, rows): (&Module, &str, u32, u32) = if repacked {
+            (&self.m_moe_mv_q6k_repacked, "moe_matvec_q6k_repacked_f32", 256, 8)
+        } else {
+            match dtype {
+                GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
+                GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
+                other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+            }
         };
         let f = module.function(kname)?;
-        let block: u32 = 64;
-        let grid_x = (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+        let grid_x = (out_dim + rows - 1) / rows;
         let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
         let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert; let mut st=xq_stride;
         let mut args: [*mut c_void; 8] = [
@@ -984,6 +1018,8 @@ impl GpuGemma4 {
         let ne_a = self.n_expert.max(1);
         let ff_a = self.expert_ff.max(32);
         let m_g6k = Module::load(&cache.compile("moe_matvec_grouped_q6k", MOE_GROUPED_Q6K_SRC)?)?;
+        let m_g6k_rp = Module::load(&cache.compile("moe_matvec_grouped_q6k_repacked",
+                                    MOE_GROUPED_Q6K_REPACKED_SRC)?)?;
         let m_g8  = Module::load(&cache.compile("moe_matvec_grouped_q8_0", MOE_GROUPED_Q8_0_SRC)?)?;
         let m_sc  = Module::load(&cache.compile("moe_scatter_add", MOE_SCATTER_SRC)?)?;
         let moe_in_all  = DeviceBuf::<f32>::new(p * h)?;
@@ -1159,15 +1195,18 @@ impl GpuGemma4 {
                     // Per-tensor kernel dispatch — Unsloth varies the
                     // expert quant type per layer (26B layer 29 gate_up
                     // is Q8_0 while the rest are Q6_K).
-                    let pick = |dt: GgmlType| -> Result<(&Module, &str), String> {
+                    let pick = |dt: GgmlType, rep: bool| -> Result<(&Module, &str), String> {
+                        if rep {
+                            return Ok((&m_g6k_rp, "moe_matvec_grouped_q6k_repacked_f32"));
+                        }
                         match dt {
                             GgmlType::Q6_K => Ok((&m_g6k, "moe_matvec_grouped_q6k_f32")),
                             GgmlType::Q8_0 => Ok((&m_g8,  "moe_matvec_grouped_q8_0_f32")),
                             o => Err(format!("grouped moe: expert dtype {o:?}")),
                         }
                     };
-                    let (gu_m, gu_k) = pick(mw.gate_up_exps.dtype)?;
-                    let (dn_m, dn_k) = pick(mw.down_exps.dtype)?;
+                    let (gu_m, gu_k) = pick(mw.gate_up_exps.dtype, mw.gate_up_exps.repacked)?;
+                    let (dn_m, dn_k) = pick(mw.down_exps.dtype, mw.down_exps.repacked)?;
                     // one launch per expert over its routed tokens.
                     let mut keep_i: Vec<DeviceBuf<i32>> = Vec::new();
                     let mut keep_f: Vec<DeviceBuf<f32>> = Vec::new();
@@ -1181,14 +1220,14 @@ impl GpuGemma4 {
                         let idx_e   = DeviceBuf::from_slice(&idx_h)?;
                         let wts_e   = DeviceBuf::from_slice(&wts_h)?;
                         let ident_e = DeviceBuf::from_slice(&ident)?;
-                        self.launch_moe_grouped(gu_m, gu_k,
+                        self.launch_moe_grouped(gu_m, gu_k, mw.gate_up_exps.repacked,
                             mw.gate_up_exps.data.raw_ptr(), e as u32, idx_e.raw_ptr(),
                             xq8_moe.raw_ptr(), expert_gu_p.raw_ptr(), hu, 2*ff_exp,
                             mw.gate_up_exps.bytes_per_expert as u32, hu/32, n_e)?;
                         self.launch_moe_geglu_n(expert_gu_p.raw_ptr(), expert_act_p.raw_ptr(), n_e)?;
                         self.launch_quantize_q8(expert_act_p.raw_ptr(), xq8_e.raw_ptr(),
                                                 ff_exp, n_e as u32)?;
-                        self.launch_moe_grouped(dn_m, dn_k,
+                        self.launch_moe_grouped(dn_m, dn_k, mw.down_exps.repacked,
                             mw.down_exps.data.raw_ptr(), e as u32, ident_e.raw_ptr(),
                             xq8_e.raw_ptr(), expert_dn_p.raw_ptr(), ff_exp, hu,
                             mw.down_exps.bytes_per_expert as u32, ff_exp/32, n_e)?;
@@ -1305,13 +1344,16 @@ impl GpuGemma4 {
     /// `n_tok` tokens routed to it (`idx` maps slot → input row). Each
     /// expert's weight fits in L2, so the n_tok slots HBM-read it once.
     #[allow(clippy::too_many_arguments)]
-    fn launch_moe_grouped(&self, m: &Module, kname: &str, slab: *mut c_void,
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_grouped(&self, m: &Module, kname: &str, repacked: bool, slab: *mut c_void,
                           expert_id: u32, idx: *mut c_void, xq: *mut c_void, y: *mut c_void,
                           in_dim: u32, out_dim: u32, bpe: u32, xq_stride: u32, n_tok: usize)
         -> Result<(), String>
     {
         let f = m.function(kname)?;
-        let grid_x = (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK;
+        // Repacked grouped kernel: 256-thread, 8 rows/workgroup.
+        let (block, rows): (u32, u32) = if repacked { (256, 8) } else { (64, Q4K_ROWBLOCK) };
+        let grid_x = (out_dim + rows - 1) / rows;
         let mut sa=slab; let mut eid=expert_id; let mut ix=idx; let mut xa=xq; let mut ya=y;
         let mut ia=in_dim; let mut oa=out_dim; let mut bp=bpe; let mut st=xq_stride;
         let mut args: [*mut c_void; 9] = [
@@ -1320,7 +1362,7 @@ impl GpuGemma4 {
             &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
             &mut st as *mut _ as *mut c_void];
-        unsafe { f.launch((grid_x, n_tok as u32, 1),(64,1,1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid_x, n_tok as u32, 1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     /// Batched GeGLU over `n_slot` vectors (the grouped expert path).
@@ -1473,14 +1515,16 @@ impl GpuGemma4 {
                             self.moe_in.raw_ptr(), h)?;
         // gate_up: one shared activation, quantized once.
         self.launch_quantize_q8(self.moe_in.raw_ptr(), self.xq8.raw_ptr(), h, 1)?;
-        self.launch_moe_matvec(mw.gate_up_exps.dtype, mw.gate_up_exps.data.raw_ptr(),
+        self.launch_moe_matvec(mw.gate_up_exps.dtype, mw.gate_up_exps.repacked,
+                               mw.gate_up_exps.data.raw_ptr(),
                                self.xq8.raw_ptr(), self.expert_gu.raw_ptr(), h, 2 * ff_exp,
                                mw.gate_up_exps.bytes_per_expert as u32, 0)?;
         self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
         // down: each expert has its own activation — quantize the batch.
         self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
                                 ff_exp, self.n_expert_used as u32)?;
-        self.launch_moe_matvec(mw.down_exps.dtype, mw.down_exps.data.raw_ptr(),
+        self.launch_moe_matvec(mw.down_exps.dtype, mw.down_exps.repacked,
+                               mw.down_exps.data.raw_ptr(),
                                self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
                                mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
         self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
