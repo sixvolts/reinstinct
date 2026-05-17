@@ -18,10 +18,13 @@ __device__ __forceinline__ float softplus_stable_r(float x) {
                       :     __logf(1.0f + __expf(x));
 }
 
+// GQA: `n_heads` value heads, `n_k_heads` key/query heads. Value head h
+// reads its q/k from key head `h / (n_heads / n_k_heads)`. With
+// n_k_heads == n_heads this reduces to the uniform-head case.
 extern "C" __global__
-void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_heads, head_dim]
-                                  const float* __restrict__ k_in,
-                                  const float* __restrict__ v_in,
+void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_k_heads, head_dim]
+                                  const float* __restrict__ k_in,    // [n_k_heads, head_dim]
+                                  const float* __restrict__ v_in,    // [n_heads,   head_dim]
                                   const float* __restrict__ a_in,    // [n_heads] ssm_alpha proj
                                   const float* __restrict__ b_in,    // [n_heads] ssm_beta proj
                                   const float* __restrict__ ssm_a,   // [n_heads] -exp(A_log)
@@ -29,11 +32,13 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_heads
                                   float*       __restrict__ state,   // [n_heads, head_dim, head_dim]
                                   float*       __restrict__ out,     // [n_heads, head_dim]
                                   unsigned int n_heads,
-                                  unsigned int head_dim)
+                                  unsigned int head_dim,
+                                  unsigned int n_k_heads)
 {
     extern __shared__ float lds[];
-    const int h = blockIdx.x;
+    const int h = blockIdx.x;                              // value head
     if (h >= (int)n_heads) return;
+    const int kh = h / ((int)n_heads / (int)n_k_heads);    // key/query head
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
 
@@ -43,9 +48,9 @@ void gdn_recurrent_step_fused_f32(const float* __restrict__ q_in,    // [n_heads
     float* delta = lds + 3 * head_dim;
 
     for (int i = tid; i < (int)head_dim; i += bs) {
-        q_lds[i] = q_in[(size_t)h * head_dim + i];
-        k_lds[i] = k_in[(size_t)h * head_dim + i];
-        v_lds[i] = v_in[(size_t)h * head_dim + i];
+        q_lds[i] = q_in[(size_t)kh * head_dim + i];
+        k_lds[i] = k_in[(size_t)kh * head_dim + i];
+        v_lds[i] = v_in[(size_t)h  * head_dim + i];
     }
     __syncthreads();
 

@@ -332,7 +332,7 @@ impl Qwen35GpuState {
     pub fn new(model: &Qwen35Model, max_seq: usize) -> Result<Self, String> {
         use crate::model::qwen3_5::BlockKind;
         let cfg = &model.config;
-        let conv_dim = 3 * cfg.gdn_value_dim as usize;
+        let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
         let mut block_states = Vec::with_capacity(model.block_kinds.len());
         for &kind in &model.block_kinds {
             block_states.push(match kind {
@@ -484,8 +484,10 @@ pub struct GpuQwen35 {
     rotary_dim: usize,
     // GDN dims.
     gdn_value_dim:   usize,
+    gdn_key_dim:     usize,
     gdn_conv_dim:    usize,
-    gdn_n_heads:     usize,
+    gdn_n_heads:     usize,   // value heads (= recurrent states)
+    gdn_n_k_heads:   usize,   // key/query heads
     gdn_head_dim:    usize,
     gdn_conv_kernel: usize,
     rms_eps:    f32,
@@ -507,13 +509,16 @@ impl GpuQwen35 {
         let rotary_dim = cfg.rope_dim_count   as usize;
         let q_dim  = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
-        // GDN dims.
+        // GDN dims. Qwen 3.5 GDN is GQA: gdn_n_heads value heads,
+        // gdn_n_k_heads key/query heads. The 0.8B has them equal.
         let gdn_value_dim   = cfg.gdn_value_dim   as usize;
         let gdn_n_heads     = cfg.gdn_n_heads     as usize;
+        let gdn_n_k_heads   = cfg.gdn_n_k_heads   as usize;
         let gdn_head_dim    = cfg.gdn_head_dim    as usize;
         let gdn_conv_kernel = cfg.gdn_conv_kernel as usize;
-        // conv_dim = 2 * key_dim + value_dim; in Qwen 3.5 0.8B key=value, so 3*value_dim.
-        let gdn_conv_dim    = 3 * gdn_value_dim;
+        let gdn_key_dim     = cfg.gdn_key_dim()   as usize;
+        // conv operates on q ‖ k ‖ v = 2 × key_dim + value_dim.
+        let gdn_conv_dim    = cfg.gdn_qkv_concat_dim() as usize;
 
         let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
         let output_norm = load_fp32_tensor(gguf, "output_norm.weight")?;
@@ -541,8 +546,8 @@ impl GpuQwen35 {
         let gdn_z        = DeviceBuf::new(gdn_value_dim)?;
         let gdn_a        = DeviceBuf::new(gdn_n_heads)?;
         let gdn_b        = DeviceBuf::new(gdn_n_heads)?;
-        let gdn_q        = DeviceBuf::new(gdn_value_dim)?;
-        let gdn_k        = DeviceBuf::new(gdn_value_dim)?;
+        let gdn_q        = DeviceBuf::new(gdn_key_dim)?;
+        let gdn_k        = DeviceBuf::new(gdn_key_dim)?;
         let gdn_decay    = DeviceBuf::new(gdn_n_heads)?;
         let gdn_beta     = DeviceBuf::new(gdn_n_heads)?;
         let gdn_core_out = DeviceBuf::new(gdn_value_dim)?;
@@ -660,7 +665,8 @@ impl GpuQwen35 {
             blocks,
             stream,
             hidden, ffn, vocab, n_heads, n_kv_heads, head_dim, rotary_dim,
-            gdn_value_dim, gdn_conv_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
+            gdn_value_dim, gdn_key_dim, gdn_conv_dim, gdn_n_heads, gdn_n_k_heads,
+            gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
             gdn_decay, gdn_beta, gdn_core_out, gdn_delta,
             rms_eps: cfg.rms_norm_eps,
@@ -1122,11 +1128,12 @@ impl GpuQwen35 {
         unsafe { f.launch((n_heads, 2, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_gdn_recurrent_step_fused(&self,
         q: *mut c_void, k: *mut c_void, v: *mut c_void,
         a: *mut c_void, b: *mut c_void, ssm_a: *mut c_void, dt_bias: *mut c_void,
         state: *mut c_void, out: *mut c_void,
-        n_heads: u32, head_dim: u32) -> Result<(), String>
+        n_heads: u32, head_dim: u32, n_k_heads: u32) -> Result<(), String>
     {
         let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_fused_f32")?;
         let block: u32 = head_dim;
@@ -1134,8 +1141,8 @@ impl GpuQwen35 {
         let mut qa = q; let mut ka = k; let mut va = v;
         let mut aa = a; let mut ba = b; let mut sma = ssm_a; let mut dta = dt_bias;
         let mut sa = state; let mut oa = out;
-        let mut nh = n_heads; let mut hd = head_dim;
-        let mut args: [*mut c_void; 11] = [
+        let mut nh = n_heads; let mut hd = head_dim; let mut nkh = n_k_heads;
+        let mut args: [*mut c_void; 12] = [
             &mut qa  as *mut _ as *mut c_void,
             &mut ka  as *mut _ as *mut c_void,
             &mut va  as *mut _ as *mut c_void,
@@ -1147,6 +1154,7 @@ impl GpuQwen35 {
             &mut oa  as *mut _ as *mut c_void,
             &mut nh  as *mut _ as *mut c_void,
             &mut hd  as *mut _ as *mut c_void,
+            &mut nkh as *mut _ as *mut c_void,
         ];
         unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
@@ -1357,9 +1365,9 @@ impl GpuQwen35 {
     {
         assert_eq!(state.block_states.len(), self.blocks.len());
         let h_dim     = self.hidden        as u32;
-        let value_dim = self.gdn_value_dim as u32;
         let conv_dim  = self.gdn_conv_dim  as u32;
         let n_heads   = self.gdn_n_heads   as u32;
+        let n_k_heads = self.gdn_n_k_heads as u32;
         let head_dim  = self.gdn_head_dim  as u32;
         let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
 
@@ -1416,17 +1424,17 @@ impl GpuQwen35 {
                 w.attn.ssm_conv1d.raw_ptr(), lstate.conv_hist.raw_ptr(),
                 self.gdn_conv_out.raw_ptr(), conv_dim, self.gdn_conv_kernel as u32));
             let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
-            let q_in_ptr = unsafe { conv_out_ptr.add(0)                      } as *mut c_void;
-            let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_value_dim)     } as *mut c_void;
-            let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_value_dim) } as *mut c_void;
+            let q_in_ptr = unsafe { conv_out_ptr.add(0)                    } as *mut c_void;
+            let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_key_dim)     } as *mut c_void;
+            let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_key_dim) } as *mut c_void;
             traced!("l2norm_qk", self.launch_l2norm_qk(q_in_ptr, self.gdn_q.raw_ptr(),
-                k_in_ptr, self.gdn_k.raw_ptr(), n_heads, head_dim, 1e-6, q_scale));
+                k_in_ptr, self.gdn_k.raw_ptr(), n_k_heads, head_dim, 1e-6, q_scale));
             traced!("recurrent_step_fused", self.launch_gdn_recurrent_step_fused(
                 self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr,
                 self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr(),
                 w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
                 lstate.recurrent.raw_ptr(), self.gdn_core_out.raw_ptr(),
-                n_heads, head_dim));
+                n_heads, head_dim, n_k_heads));
             traced!("rmsnorm_gated", self.launch_rmsnorm_gated_multihead(
                 self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
                 w.attn.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr(),
@@ -1907,8 +1915,10 @@ impl GpuQwen35 {
     {
         let h = self.hidden;
         let vdim = self.gdn_value_dim;
+        let kdim = self.gdn_key_dim;
         let cdim = self.gdn_conv_dim;
-        let nh   = self.gdn_n_heads as u32;
+        let nh   = self.gdn_n_heads as u32;        // value heads
+        let nkh  = self.gdn_n_k_heads as u32;      // key/query heads
         let hd   = self.gdn_head_dim as u32;
         let q_scale = (self.gdn_head_dim as f32).powf(-0.5);
 
@@ -1938,15 +1948,15 @@ impl GpuQwen35 {
 
         // Per-row: L2-norm Q/K, recurrent step, gated rmsnorm.
         let core: DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
-        let q_buf: DeviceBuf<f32> = DeviceBuf::new(vdim)?;
-        let k_buf: DeviceBuf<f32> = DeviceBuf::new(vdim)?;
+        let q_buf: DeviceBuf<f32> = DeviceBuf::new(kdim)?;
+        let k_buf: DeviceBuf<f32> = DeviceBuf::new(kdim)?;
         for r in 0..n {
             let conv_ptr = conv_out.raw_ptr() as *mut f32;
-            let q_in = unsafe { conv_ptr.add(r * cdim)            } as *mut c_void;
-            let k_in = unsafe { conv_ptr.add(r * cdim + vdim)     } as *mut c_void;
-            let v_in = unsafe { conv_ptr.add(r * cdim + 2 * vdim) } as *mut c_void;
+            let q_in = unsafe { conv_ptr.add(r * cdim)                } as *mut c_void;
+            let k_in = unsafe { conv_ptr.add(r * cdim + kdim)         } as *mut c_void;
+            let v_in = unsafe { conv_ptr.add(r * cdim + 2 * kdim)     } as *mut c_void;
             self.launch_l2norm_qk(q_in, q_buf.raw_ptr(), k_in, k_buf.raw_ptr(),
-                                  nh, hd, 1e-6, q_scale)?;
+                                  nkh, hd, 1e-6, q_scale)?;
             let a_row = unsafe { (a.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
             let b_row = unsafe { (b.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
             let core_row = unsafe { (core.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
@@ -1955,7 +1965,7 @@ impl GpuQwen35 {
                                                  w.attn.ssm_a.raw_ptr(),
                                                  w.attn.ssm_dt_bias.raw_ptr(),
                                                  st.recurrent.raw_ptr(), core_row,
-                                                 nh, hd)?;
+                                                 nh, hd, nkh)?;
             let z_row = unsafe { (z.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
             self.launch_rmsnorm_gated_multihead(core_row, z_row, w.attn.ssm_norm.raw_ptr(),
                                                 core_row, nh, hd, self.rms_eps)?;
@@ -2024,7 +2034,8 @@ impl GpuQwen35 {
     {
         let h_dim     = self.hidden        as u32;
         let conv_dim  = self.gdn_conv_dim  as u32;
-        let n_heads   = self.gdn_n_heads   as u32;
+        let n_heads   = self.gdn_n_heads   as u32;     // value heads
+        let n_k_heads = self.gdn_n_k_heads as u32;     // key/query heads
         let head_dim  = self.gdn_head_dim  as u32;
         let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
 
@@ -2043,18 +2054,18 @@ impl GpuQwen35 {
                                      state.conv_hist.raw_ptr(), self.gdn_conv_out.raw_ptr(),
                                      conv_dim, self.gdn_conv_kernel as u32)?;
 
-        // 4) conv_out is laid out [Q | K | V], each [n_heads * head_dim] = value_dim.
-        //    Slice by pointer arithmetic — the data is contiguous.
+        // 4) conv_out is laid out [Q | K | V]: Q/K are key_dim wide
+        //    (n_k_heads heads), V is value_dim wide (n_heads heads).
         let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
-        let q_in_ptr = unsafe { conv_out_ptr.add(0)                      } as *mut c_void;
-        let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_value_dim)     } as *mut c_void;
-        let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_value_dim) } as *mut c_void;
+        let q_in_ptr = unsafe { conv_out_ptr.add(0)                    } as *mut c_void;
+        let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_key_dim)     } as *mut c_void;
+        let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_key_dim) } as *mut c_void;
 
-        // 5) Per-head L2-norm of Q (scale 1/√head_dim) and K (scale 1),
-        //    fused into one 2D-grid launch.
+        // 5) Per-head L2-norm of Q (scale 1/√head_dim) and K (scale 1) —
+        //    n_k_heads heads each.
         self.launch_l2norm_qk(q_in_ptr, self.gdn_q.raw_ptr(),
                               k_in_ptr, self.gdn_k.raw_ptr(),
-                              n_heads, head_dim, 1e-6, q_scale)?;
+                              n_k_heads, head_dim, 1e-6, q_scale)?;
 
         // 6+7) Recurrent gated delta-rule update — decay/beta computed
         //      inside the kernel from a/b/ssm_a/dt_bias.
@@ -2063,7 +2074,7 @@ impl GpuQwen35 {
                                              weights.ssm_a.raw_ptr(), weights.ssm_dt_bias.raw_ptr(),
                                              state.recurrent.raw_ptr(),
                                              self.gdn_core_out.raw_ptr(),
-                                             n_heads, head_dim)?;
+                                             n_heads, head_dim, n_k_heads)?;
 
         // 8) Per-head gated RMSNorm: core_out *= w * silu(z), in place.
         self.launch_rmsnorm_gated_multihead(self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
@@ -2477,7 +2488,7 @@ mod tests {
         };
         eprintln!("validating GDN step on block {block_idx}");
 
-        let conv_dim = 3 * cfg.gdn_value_dim as usize;
+        let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
         let mut cpu_state = CpuLinAttnState::new(
             cfg.gdn_n_heads as usize,
             cfg.gdn_head_dim as usize,
@@ -2554,7 +2565,7 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let conv_dim = 3 * cfg.gdn_value_dim as usize;
+        let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
         let mut cpu_state = CpuLinAttnState::new(
             cfg.gdn_n_heads as usize,
             cfg.gdn_head_dim as usize,

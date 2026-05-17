@@ -58,12 +58,16 @@ pub struct Qwen35Config {
     pub attn_n_kv_heads: u32,
     pub attn_head_dim: u32,
 
-    // Linear-attention (Gated DeltaNet) block
-    /// value_dim = num_v_heads × value_head_dim. From `qwen35.ssm.inner_size`.
+    // Linear-attention (Gated DeltaNet) block. Qwen 3.5 GDN is GQA:
+    // `gdn_n_heads` value heads, `gdn_n_k_heads` key/query heads
+    // (gdn_n_heads is a multiple of it). The 0.8B has the two equal.
+    /// value_dim = gdn_n_heads × gdn_head_dim. From `qwen35.ssm.inner_size`.
     pub gdn_value_dim: u32,
-    /// = num_v_heads. From `qwen35.ssm.group_count`.
+    /// Number of value heads (= recurrent states). From `qwen35.ssm.time_step_rank`.
     pub gdn_n_heads: u32,
-    /// Per-head dim. Both K and V share this in Qwen 3.5. From `qwen35.ssm.state_size`.
+    /// Number of key/query heads. From `qwen35.ssm.group_count`.
+    pub gdn_n_k_heads: u32,
+    /// Per-head dim, shared by K/Q and V. From `qwen35.ssm.state_size`.
     pub gdn_head_dim: u32,
     pub gdn_conv_kernel: u32,
 
@@ -102,7 +106,8 @@ impl Qwen35Config {
         let attn_n_kv_heads         = require_u32(gguf, "qwen35.attention.head_count_kv")?;
         let attn_head_dim           = require_u32(gguf, "qwen35.attention.key_length")?;
         let gdn_value_dim           = require_u32(gguf, "qwen35.ssm.inner_size")?;
-        let gdn_n_heads             = require_u32(gguf, "qwen35.ssm.group_count")?;
+        let gdn_n_heads             = require_u32(gguf, "qwen35.ssm.time_step_rank")?;
+        let gdn_n_k_heads           = require_u32(gguf, "qwen35.ssm.group_count")?;
         let gdn_head_dim            = require_u32(gguf, "qwen35.ssm.state_size")?;
         let gdn_conv_kernel         = require_u32(gguf, "qwen35.ssm.conv_kernel")?;
         let rope_freq_base          = require_f32(gguf, "qwen35.rope.freq_base")?;
@@ -140,7 +145,7 @@ impl Qwen35Config {
             block_count, hidden_size, ffn_size, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
             attn_n_heads, attn_n_kv_heads, attn_head_dim,
-            gdn_value_dim, gdn_n_heads, gdn_head_dim, gdn_conv_kernel,
+            gdn_value_dim, gdn_n_heads, gdn_n_k_heads, gdn_head_dim, gdn_conv_kernel,
             rope_freq_base, rope_dim_count, rope_dim_sections,
             full_attention_interval,
             tied_embeddings,
@@ -158,15 +163,21 @@ impl Qwen35Config {
         }
     }
 
-    /// Linear-attention key/value head dim (both equal in Qwen 3.5).
+    /// Linear-attention key/value head dim (K/Q and V share it).
     pub fn gdn_value_head_dim(&self) -> u32 {
-        self.gdn_value_dim / self.gdn_n_heads
+        self.gdn_head_dim
     }
 
-    /// Linear-attention input projection output dim:
-    ///   2 × key_dim + value_dim = 3 × value_dim   (since num_k_heads = num_v_heads, head_dim equal)
+    /// Linear-attention key/query projection width = n_k_heads × head_dim.
+    pub fn gdn_key_dim(&self) -> u32 {
+        self.gdn_n_k_heads * self.gdn_head_dim
+    }
+
+    /// Linear-attention input-projection output dim = q ‖ k ‖ v widths,
+    /// i.e. 2 × key_dim + value_dim. With GQA key_dim ≠ value_dim; the
+    /// 0.8B has them equal so this is 3 × value_dim there.
     pub fn gdn_qkv_concat_dim(&self) -> u32 {
-        2 * self.gdn_value_dim + self.gdn_value_dim
+        2 * self.gdn_key_dim() + self.gdn_value_dim
     }
 }
 
@@ -305,7 +316,8 @@ mod tests {
             block_count: 24, hidden_size: 1024, ffn_size: 3584, vocab_size: 248320,
             context_length: 262144, rms_norm_eps: 1e-6, eos_token_id: 248046,
             attn_n_heads: 8, attn_n_kv_heads: 2, attn_head_dim: 256,
-            gdn_value_dim: 2048, gdn_n_heads: 16, gdn_head_dim: 128, gdn_conv_kernel: 4,
+            gdn_value_dim: 2048, gdn_n_heads: 16, gdn_n_k_heads: 16,
+            gdn_head_dim: 128, gdn_conv_kernel: 4,
             rope_freq_base: 1e7, rope_dim_count: 64, rope_dim_sections: [11, 11, 10, 0],
             full_attention_interval: 4, tied_embeddings: true,
         };
