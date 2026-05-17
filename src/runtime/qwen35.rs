@@ -930,6 +930,14 @@ impl GpuQwen35 {
                                     "matvec_q6_k_wave64_f32", wp, x, y, in_d, out_d),
             GgmlType::IQ4_XS => self.launch_matvec_wave64(&self.matvec_iq4_xs_wave64_module,
                                     "matvec_iq4_xs_wave64_f32", wp, x, y, in_d, out_d),
+            // F16 weights are the tiny GDN projections (ssm_alpha/beta,
+            // out_dim = n_v_heads). wave64's one-wavefront-per-row leaves
+            // the GPU starved at that size; the block-256 kernel gives 4×
+            // the wavefronts. Large F16 matvecs (none in Qwen 3.5) would
+            // still prefer wave64.
+            GgmlType::F16 if out_d <= 512
+                             => self.launch_matvec_q_kernel(&self.matvec_f16_module,
+                                    "matvec_f16_f32", wp, x, y, in_d, out_d),
             GgmlType::F16    => self.launch_matvec_wave64(&self.matvec_f16_wave64_module,
                                     "matvec_f16_wave64_f32", wp, x, y, in_d, out_d),
             other => Err(format!("matvec dispatch: no kernel for {:?}", other)),
