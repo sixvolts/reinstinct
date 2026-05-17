@@ -901,14 +901,16 @@ impl GpuQwen35 {
                                | GgmlType::Q6_K | GgmlType::Q8_0);
         if dp4a {
             self.launch_quantize_q8(x, in_d)?;
-            let (module, kname) = match w.dtype {
-                GgmlType::Q4_K => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32"),
-                GgmlType::Q5_K => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32"),
-                GgmlType::Q6_K => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32"),
-                _              => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32"),
+            // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
+            // others: 64-thread, 2 rows per wavefront.
+            let (module, kname, rows, block) = match w.dtype {
+                GgmlType::Q4_K => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
+                GgmlType::Q5_K => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                GgmlType::Q6_K => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                _              => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
             };
             let f = module.function(kname)?;
-            let grid = (out_d + DP4A_ROWBLOCK - 1) / DP4A_ROWBLOCK;
+            let grid = (out_d + rows - 1) / rows;
             let mut wa = wp; let mut xa = self.xq8.raw_ptr(); let mut ya = y;
             let mut ia = in_d; let mut oa = out_d;
             let mut args: [*mut c_void; 5] = [
@@ -916,7 +918,7 @@ impl GpuQwen35 {
                 &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
                 &mut oa as *mut _ as *mut c_void];
             return unsafe {
-                f.launch((grid, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args)
+                f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args)
             };
         }
 

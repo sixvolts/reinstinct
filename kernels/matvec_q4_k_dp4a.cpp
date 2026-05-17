@@ -9,7 +9,10 @@
 //
 //   dot = sum_sub [ (d_w·sc)·d_x·<nibbles·int8> - (dmin_w·m)·xsum ]
 //
-// ROWS=2 output rows per wavefront; grid = ceil(out_dim/ROWS); block = 64.
+// ROWS=2 output rows per wavefront; 4 wavefronts (256 threads) per
+// workgroup, each independent — block=64 is capped at 16 workgroups/CU
+// (= 16 wavefronts) on gfx906, too few to hide HBM latency; 256 threads
+// lifts that to the VGPR-bound occupancy.  grid = ceil(out_dim / 8).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -48,8 +51,9 @@ void matvec_q4_k_dp4a_f32(const BlockQ4_K* __restrict__ w_blocks,
                           unsigned int in_dim,
                           unsigned int out_dim)
 {
-    const int row0 = blockIdx.x * ROWS;
-    const int lane = threadIdx.x;
+    const int wave = threadIdx.x >> 6;          // 0..3
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
     const unsigned int n_blocks    = in_dim >> 8;
     const unsigned int n_subblocks = in_dim >> 5;
 
