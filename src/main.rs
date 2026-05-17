@@ -389,18 +389,21 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
 
     let g = GgufFile::open(path)?;
-    let m = Qwen35F32Model::load(&g)?;
-    let cfg = &m.model.config;
+    // Profiling only needs the config + GPU-resident weights — load the
+    // lightweight typed model, not the f32 oracle (which would OOM the
+    // host on the 27B).
+    let m = Qwen35Model::load(&g)?;
+    let cfg = &m.config;
     let token = token.unwrap_or(cfg.eos_token_id);
 
     println!("model = {}", path.display());
     println!("token = {token}, iterations = {iters}");
     println!("loading weights to device...");
     let t0 = std::time::Instant::now();
-    let gpu = GpuQwen35::new(&m.model, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
+    let gpu = GpuQwen35::new(&m, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
     println!("  load took {:.2} s", t0.elapsed().as_secs_f64());
 
-    let mut state = Qwen35GpuState::new(&m.model,iters + 4).map_err(anyhow::Error::msg)?;
+    let mut state = Qwen35GpuState::new(&m, iters + 4).map_err(anyhow::Error::msg)?;
 
     // Warm up once (compiles + caches paged-in, etc.)
     let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
@@ -432,7 +435,7 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     let mut sum_embed = 0.0_f32;
     let mut sum_norm  = 0.0_f32;
     let mut sum_proj  = 0.0_f32;
-    let mut sum_block = vec![0.0_f32; m.model.block_kinds.len()];
+    let mut sum_block = vec![0.0_f32; m.block_kinds.len()];
     let mut sum_total = 0.0_f32;
     for _ in 0..trace_iters {
         let (_logits, t) = gpu.forward_token_traced(token, &mut state).map_err(anyhow::Error::msg)?;
@@ -450,7 +453,7 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     let proj  = sum_proj / n;
     let mut sum_lin  = 0.0_f32; let mut count_lin  = 0usize;
     let mut sum_full = 0.0_f32; let mut count_full = 0usize;
-    for (acc, &kind) in sum_block.iter().zip(m.model.block_kinds.iter()) {
+    for (acc, &kind) in sum_block.iter().zip(m.block_kinds.iter()) {
         let avg = acc / n;
         match kind {
             BlockKind::LinearAttention => { sum_lin += avg; count_lin += 1; }
@@ -469,7 +472,7 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     println!("  output_proj     {proj:>8.3} ms ({:>4.1}%)", pct(proj));
 
     // Per-kernel breakdown for one GDN block (block 0). Pick an L block.
-    let lin_idx = m.model.block_kinds.iter()
+    let lin_idx = m.block_kinds.iter()
         .position(|k| matches!(k, BlockKind::LinearAttention))
         .ok_or_else(|| anyhow::anyhow!("no L block"))?;
     state.reset().map_err(anyhow::Error::msg)?;
@@ -527,24 +530,32 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     let label = if graph_speedup >= 1.0 { "speedup over direct" } else { "slowdown vs direct" };
     println!("  graph: {graph_speedup:.2}× {label}");
 
-    // CPU baseline for direct comparison.
-    println!("\n--- CPU forward_token, {iters} iterations ---");
-    let mut cpu_state = m.new_state(iters + 4);
-    let _ = m.forward_token(token, &mut cpu_state);  // warmup
-    cpu_state.reset();
-    let mut cpu_times_us = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let t = std::time::Instant::now();
-        let _ = m.forward_token(token, &mut cpu_state);
-        cpu_times_us.push(t.elapsed().as_micros() as u64);
+    // CPU baseline — only when the f32 oracle fits in host RAM. The
+    // f32 model is ≈7× the GGUF file; skip it for large models so the
+    // GPU profile still runs (the 27B f32 oracle would be ~115 GB).
+    let gguf_bytes = std::fs::metadata(path).map(|md| md.len()).unwrap_or(0);
+    if gguf_bytes < 4 * 1024 * 1024 * 1024 {
+        println!("\n--- CPU forward_token, {iters} iterations ---");
+        let cpu_m = Qwen35F32Model::load(&g)?;
+        let mut cpu_state = cpu_m.new_state(iters + 4);
+        let _ = cpu_m.forward_token(token, &mut cpu_state);  // warmup
         cpu_state.reset();
+        let mut cpu_times_us = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            let _ = cpu_m.forward_token(token, &mut cpu_state);
+            cpu_times_us.push(t.elapsed().as_micros() as u64);
+            cpu_state.reset();
+        }
+        cpu_times_us.sort_unstable();
+        let cpu_median = cpu_times_us[cpu_times_us.len() / 2] as f64 / 1000.0;
+        println!("  median  {cpu_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / cpu_median);
+        let speedup = cpu_median / median;
+        let label = if speedup >= 1.0 { "speedup" } else { "slowdown" };
+        println!("\nGPU vs CPU: {speedup:.2}× {label} (median)");
+    } else {
+        println!("\n(CPU baseline skipped — f32 oracle too large for host RAM)");
     }
-    cpu_times_us.sort_unstable();
-    let cpu_median = cpu_times_us[cpu_times_us.len() / 2] as f64 / 1000.0;
-    println!("  median  {cpu_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / cpu_median);
-    let speedup = cpu_median / median;
-    let label = if speedup >= 1.0 { "speedup" } else { "slowdown" };
-    println!("\nGPU vs CPU: {speedup:.2}× {label} (median)");
     Ok(())
 }
 
