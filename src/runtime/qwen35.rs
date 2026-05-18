@@ -100,6 +100,8 @@ const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp
 const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const MMQ_GEMM_Q4K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
+const MMQ_GEMM_Q5K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
+const MMQ_GEMM_Q6K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 /// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
@@ -759,8 +761,11 @@ pub struct GpuQwen35 {
     dequant_q6k_repacked_module: Module,
     rope_batched_module:   Module,
     attn_step_batched_module: Module,
-    /// 2D-tiled int8 MMQ GEMM — replaces dequant+HGEMM for repacked Q4_K.
+    /// 2D-tiled int8 MMQ GEMM — replaces dequant+HGEMM for repacked
+    /// K-quants in the dense prefill.
     mmq_q4k_module:        Module,
+    mmq_q5k_module:        Module,
+    mmq_q6k_module:        Module,
 
     // Dimensions.
     hidden:     usize,
@@ -970,6 +975,8 @@ impl GpuQwen35 {
             rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
             attn_step_batched_module: Module::load(&cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?)?,
             mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
+            mmq_q5k_module:           Module::load(&cache.compile("mmq_gemm_q5k_repacked", MMQ_GEMM_Q5K_SOURCE)?)?,
+            mmq_q6k_module:           Module::load(&cache.compile("mmq_gemm_q6k_repacked", MMQ_GEMM_Q6K_SOURCE)?)?,
             matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
             matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
@@ -2332,10 +2339,11 @@ impl GpuQwen35 {
         let in_d = w.in_dim as usize;
         let out_d = w.out_dim as usize;
 
-        // Repacked Q4_K: the 2D-tiled int8 MMQ GEMM consumes the
+        // Repacked K-quants: the 2D-tiled int8 MMQ GEMM consumes the
         // quantised weight directly — no dequant to fp16, no HGEMM.
-        if w.repacked && w.dtype == GgmlType::Q4_K {
-            return self.bmm_mmq_q4k(w, x_f32, n_rows, y_f32);
+        if w.repacked && matches!(w.dtype,
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            return self.bmm_mmq(w, x_f32, n_rows, y_f32);
         }
 
         // W → fp16 (F16 weights are already fp16: use raw bytes directly).
@@ -2377,20 +2385,25 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    /// Repacked-Q4_K `Y = X · Wᵀ` via the 2D-tiled int8 MMQ GEMM:
+    /// Repacked-K-quant `Y = X · Wᵀ` via the 2D-tiled int8 MMQ GEMM:
     /// quantise X → BlockQ8, then one dp4a GEMM straight off the
     /// quantised weight.
-    fn bmm_mmq_q4k(&self, w: &GpuMatvecTensor, x_f32: *mut c_void, n_rows: usize,
-                   y_f32: *mut c_void) -> Result<(), String>
+    fn bmm_mmq(&self, w: &GpuMatvecTensor, x_f32: *mut c_void, n_rows: usize,
+               y_f32: *mut c_void) -> Result<(), String>
     {
         let in_d = w.in_dim as usize;
         let out_d = w.out_dim as usize;
+        let (module, kname) = match w.dtype {
+            GgmlType::Q5_K => (&self.mmq_q5k_module, "mmq_gemm_q5k_repacked_f32"),
+            GgmlType::Q6_K => (&self.mmq_q6k_module, "mmq_gemm_q6k_repacked_f32"),
+            _              => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
+        };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
         let xq8: DeviceBuf<u8> = DeviceBuf::new(n_rows * (in_d / 32) * 40)?;
         self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
 
         // MMQ GEMM — BM=64 output rows × BN=64 tokens per workgroup.
-        let f = self.mmq_q4k_module.function("mmq_gemm_q4k_repacked_f32")?;
+        let f = module.function(kname)?;
         let mut wp = w.data.raw_ptr(); let mut xp = xq8.raw_ptr(); let mut yp = y_f32;
         let mut ia = in_d as u32; let mut oa = out_d as u32; let mut pa = n_rows as u32;
         let mut args: [*mut c_void; 6] = [
