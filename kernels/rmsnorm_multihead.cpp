@@ -22,8 +22,10 @@ void rmsnorm_multihead_f32(const float* __restrict__ x,        // [n_heads, head
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
 
-    const float* x_h = x + (size_t)h * head_dim;
-    float*       y_h = y + (size_t)h * head_dim;
+    // Batched over tokens: blockIdx.y selects the token row.
+    const size_t vrow = (size_t)blockIdx.y * n_heads * head_dim;
+    const float* x_h = x + vrow + (size_t)h * head_dim;
+    float*       y_h = y + vrow + (size_t)h * head_dim;
 
     float sum = 0.0f;
     for (int i = tid; i < (int)head_dim; i += bs) {

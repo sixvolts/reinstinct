@@ -10,5 +10,6 @@ void scale_inplace_f32(float* __restrict__ x, unsigned int n, float s)
 {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    x[i] *= s;
+    // Batched over vectors: blockIdx.y selects the row.
+    x[(size_t)blockIdx.y * n + i] *= s;
 }

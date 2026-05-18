@@ -12,5 +12,7 @@ void add_inplace_f32(float*       __restrict__ x,    // [n] in/out
 {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    x[i] += y[i];
+    // Batched over vectors: blockIdx.y selects the row.
+    const size_t off = (size_t)blockIdx.y * n;
+    x[off + i] += y[off + i];
 }

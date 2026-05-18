@@ -620,6 +620,77 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
+    // --- Batched (grid.y = p) variants for the prefill path: one launch
+    // over all P token rows instead of P single-vector launches. The
+    // kernels offset by blockIdx.y · n; the per-token launch fns above
+    // are the grid.y = 1 case.
+
+    fn launch_rmsnorm_batched(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
+                              n: u32, p: u32) -> Result<(), String>
+    {
+        let f = self.m_rmsnorm.function("rmsnorm_f32")?;
+        let block: u32 = 256;
+        let mut xa=x; let mut wa=w; let mut ya=y; let mut na=n; let mut ea=self.rms_eps;
+        let mut args: [*mut c_void; 5] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void];
+        unsafe { f.launch((1,p,1),(block,1,1), block*4, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_rmsnorm_mh_batched(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
+                                 n_heads: u32, head_dim: u32, p: u32) -> Result<(), String>
+    {
+        let f = self.m_rmsnorm_mh.function("rmsnorm_multihead_f32")?;
+        let block: u32 = 256;
+        let mut xa=x; let mut wa=w; let mut ya=y;
+        let mut nh=n_heads; let mut hd=head_dim; let mut ea=self.rms_eps;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ea as *mut _ as *mut c_void];
+        unsafe { f.launch((n_heads,p,1),(block,1,1), block*4, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_add_batched(&self, x: *mut c_void, y: *mut c_void, n: u32, p: u32)
+        -> Result<(), String>
+    {
+        let f = self.m_add.function("add_inplace_f32")?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut xa=x; let mut ya=y; let mut na=n;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,p,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_scale_batched(&self, x: *mut c_void, n: u32, s: f32, p: u32)
+        -> Result<(), String>
+    {
+        let f = self.m_scale.function("scale_inplace_f32")?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut xa=x; let mut na=n; let mut sa=s;
+        let mut args: [*mut c_void; 3] = [
+            &mut xa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,p,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_geglu_batched(&self, gate: *mut c_void, up: *mut c_void, out: *mut c_void,
+                            n: u32, p: u32) -> Result<(), String>
+    {
+        let f = self.m_geglu.function("geglu_mul_f32")?;
+        let block: u32 = 256;
+        let grid = (n + block - 1) / block;
+        let mut g=gate; let mut u=up; let mut o=out; let mut na=n;
+        let mut args: [*mut c_void; 4] = [
+            &mut g as *mut _ as *mut c_void, &mut u as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,p,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
     fn launch_softcap(&self, y: *mut c_void, n: u32) -> Result<(), String> {
         let f = self.m_softcap.function("logit_softcap_f32")?;
         let block: u32 = 256;
@@ -1084,6 +1155,23 @@ impl GpuGemma4 {
         };
 
         let dbg = std::env::var("REINSTINCT_PREFILL_DEBUG").is_ok();
+        // Per-category prefill timing (REINSTINCT_PREFILL_DEBUG). `lap`
+        // syncs the stream and charges the elapsed time since the last
+        // lap to a bucket — so the breakdown is serial-attributed.
+        let t_gemm = std::cell::Cell::new(0.0f64);
+        let t_attn = std::cell::Cell::new(0.0f64);
+        let t_norm = std::cell::Cell::new(0.0f64);
+        let mark = std::cell::Cell::new(std::time::Instant::now());
+        let lap = |acc: &std::cell::Cell<f64>| -> Result<(), String> {
+            if dbg {
+                self.stream.synchronize()?;
+                let now = std::time::Instant::now();
+                acc.set(acc.get() + now.duration_since(mark.get()).as_secs_f64());
+                mark.set(now);
+            }
+            Ok(())
+        };
+        if dbg { self.stream.synchronize()?; mark.set(std::time::Instant::now()); }
         for (li, b) in self.blocks.iter().enumerate() {
             let hd = b.head_dim;
             let n_kv = b.n_kv;
@@ -1091,10 +1179,9 @@ impl GpuGemma4 {
             let kv_dim = n_kv * hd;
 
             // --- attention ---
-            for i in 0..p {
-                self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), b.attn_norm.raw_ptr(),
-                                    pf_off(normed.raw_ptr(), i*h), hu)?;
-            }
+            self.launch_rmsnorm_batched(x.raw_ptr(), b.attn_norm.raw_ptr(),
+                                        normed.raw_ptr(), hu, p as u32)?;
+            lap(&t_norm)?;
             let q = gemm(&b.attn_q, &normed)?;
             let k = gemm(&b.attn_k, &normed)?;
             let v_gemm;
@@ -1102,20 +1189,18 @@ impl GpuGemma4 {
                 Some(wv) => { v_gemm = gemm(wv, &normed)?; v_gemm.raw_ptr() }
                 None     => k.raw_ptr(),     // full layers: V is the K projection
             };
+            lap(&t_gemm)?;
             // per-head Q/K norm; V plain norm; RoPE (batched over P).
-            for i in 0..p {
-                self.launch_rmsnorm_mh(pf_off(q.raw_ptr(), i*q_dim), b.attn_q_norm.raw_ptr(),
-                                       pf_off(q.raw_ptr(), i*q_dim), self.n_heads as u32, hd as u32)?;
-            }
+            let _ = q_dim;
+            self.launch_rmsnorm_mh_batched(q.raw_ptr(), b.attn_q_norm.raw_ptr(),
+                q.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
             self.launch_rope_prefill(&m_rope, q.raw_ptr(), self.n_heads as u32, hd as u32, b.kind, p)?;
             let k_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
             let v_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
-            for i in 0..p {
-                self.launch_rmsnorm_mh(pf_off(k.raw_ptr(), i*kv_dim), b.attn_k_norm.raw_ptr(),
-                                       pf_off(k_norm.raw_ptr(), i*kv_dim), n_kv as u32, hd as u32)?;
-                self.launch_rmsnorm_mh(pf_off(v_ptr, i*kv_dim), self.ones.raw_ptr(),
-                                       pf_off(v_norm.raw_ptr(), i*kv_dim), n_kv as u32, hd as u32)?;
-            }
+            self.launch_rmsnorm_mh_batched(k.raw_ptr(), b.attn_k_norm.raw_ptr(),
+                k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
+            self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
+                v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
             self.launch_rope_prefill(&m_rope, k_norm.raw_ptr(), n_kv as u32, hd as u32, b.kind, p)?;
             // Populate this layer's decode KV cache: quantize the P
             // prompt tokens' K/V (post-rope K, plain-norm V) to int8 at
@@ -1129,41 +1214,39 @@ impl GpuGemma4 {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
             };
+            lap(&t_norm)?;
             let attn = DeviceBuf::<f32>::new(p * q_dim)?;
             self.launch_attn_prefill(&m_attn, q.raw_ptr(), k_norm.raw_ptr(), v_norm.raw_ptr(),
                                      attn.raw_ptr(), n_kv as u32, hd as u32, window, p)?;
+            lap(&t_attn)?;
             let attn_out = gemm(&b.attn_output, &attn)?;
-            for i in 0..p {
-                self.launch_rmsnorm(pf_off(attn_out.raw_ptr(), i*h), b.post_attn_norm.raw_ptr(),
-                                    pf_off(normed.raw_ptr(), i*h), hu)?;
-                self.launch_add(pf_off(x.raw_ptr(), i*h), pf_off(normed.raw_ptr(), i*h), hu)?;
-            }
+            lap(&t_gemm)?;
+            self.launch_rmsnorm_batched(attn_out.raw_ptr(), b.post_attn_norm.raw_ptr(),
+                normed.raw_ptr(), hu, p as u32)?;
+            self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
 
             // --- FFN: shared MLP (GeGLU), batched ---
             let ff = self.ffn as u32;
-            for i in 0..p {
-                self.launch_rmsnorm(pf_off(x.raw_ptr(), i*h), b.ffn_norm.raw_ptr(),
-                                    pf_off(normed.raw_ptr(), i*h), hu)?;
-            }
+            self.launch_rmsnorm_batched(x.raw_ptr(), b.ffn_norm.raw_ptr(),
+                normed.raw_ptr(), hu, p as u32)?;
+            lap(&t_norm)?;
             let gate = gemm(&b.ffn_gate, &normed)?;
             let up   = gemm(&b.ffn_up,   &normed)?;
-            for i in 0..p {
-                self.launch_geglu(pf_off(gate.raw_ptr(), i*self.ffn),
-                                  pf_off(up.raw_ptr(), i*self.ffn),
-                                  pf_off(gate.raw_ptr(), i*self.ffn), ff)?;
-            }
+            lap(&t_gemm)?;
+            self.launch_geglu_batched(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(),
+                                      ff, p as u32)?;
+            lap(&t_norm)?;
             let mlp = gemm(&b.ffn_down, &gate)?;
+            lap(&t_gemm)?;
 
             match &b.moe {
                 None => {
                     // dense layer — the shared MLP is the whole FFN.
-                    for i in 0..p {
-                        self.launch_rmsnorm(pf_off(mlp.raw_ptr(), i*h), b.post_ffw_norm.raw_ptr(),
-                                            pf_off(normed.raw_ptr(), i*h), hu)?;
-                        self.launch_add(pf_off(x.raw_ptr(), i*h),
-                                        pf_off(normed.raw_ptr(), i*h), hu)?;
-                        self.launch_scale(pf_off(x.raw_ptr(), i*h), hu, b.layer_output_scale)?;
-                    }
+                    self.launch_rmsnorm_batched(mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                        normed.raw_ptr(), hu, p as u32)?;
+                    self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
+                    self.launch_scale_batched(x.raw_ptr(), hu, b.layer_output_scale, p as u32)?;
+                    lap(&t_norm)?;
                 }
                 Some(mw) => {
                     // Dual FFN with a grouped-expert GEMM. cur_mlp =
@@ -1281,12 +1364,22 @@ impl GpuGemma4 {
                 eprintln!("layer {li:2} kind={:?} hd={hd}: |x[0]|={:.4} |x[last]|={:.4}",
                           b.kind, nrm(0), nrm(p-1));
             }
+            // Don't charge the diagnostic block above to the next layer.
+            if dbg { mark.set(std::time::Instant::now()); }
         }
 
         // --- output: last token only ---
         let last = pf_off(x.raw_ptr(), (p - 1) * h);
         self.launch_rmsnorm(last, self.output_norm.raw_ptr(), self.hidden_b.raw_ptr(), hu)?;
         self.launch_matvec(&self.token_embd, self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        lap(&t_gemm)?;
+        if dbg {
+            let (g, a, n) = (t_gemm.get(), t_attn.get(), t_norm.get());
+            let tot = g + a + n;
+            eprintln!("prefill breakdown ({p} tok): gemm {:.0} ms ({:.0}%), \
+                attn {:.0} ms ({:.0}%), norm/rope/kv {:.0} ms ({:.0}%)",
+                g*1e3, g/tot*100.0, a*1e3, a/tot*100.0, n*1e3, n/tot*100.0);
+        }
         if self.softcap > 0.0 {
             self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
         }

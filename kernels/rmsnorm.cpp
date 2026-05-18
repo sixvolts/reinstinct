@@ -22,6 +22,11 @@ void rmsnorm_f32(const float* __restrict__ x,
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
 
+    // Batched over vectors: blockIdx.y selects the row (grid.y = 1 for
+    // the single-vector decode callers — offset 0, a no-op).
+    x += (size_t)blockIdx.y * n;
+    y += (size_t)blockIdx.y * n;
+
     // Per-thread partial sum of squares.
     float sum = 0.0f;
     for (int i = tid; i < (int)n; i += bs) {

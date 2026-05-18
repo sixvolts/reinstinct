@@ -14,6 +14,9 @@ void geglu_mul_f32(const float* __restrict__ gate,
 {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // Batched over vectors: blockIdx.y selects the row.
+    const size_t off = (size_t)blockIdx.y * n;
+    gate += off; up += off; out += off;
     const float x = gate[i];
     const float k = 0.7978845608f;   // sqrt(2/pi)
     const float inner = k * (x + 0.044715f * x * x * x);
