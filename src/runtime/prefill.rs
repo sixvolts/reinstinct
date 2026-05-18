@@ -266,13 +266,9 @@ impl PrefillGemm {
                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<DeviceBuf<f32>, String>
     {
-        // Repacked Q4_K: the int8 MMQ GEMM consumes the quantised weight
-        // directly — no dequant to fp16, no HGEMM. The current MMQ kernel
-        // amortises the weight read across the token tile but re-reads the
-        // activation per row-block; it beats the dequant+HGEMM path only
-        // up to P≈256. Above that the HGEMM's 2D tiling wins, so gate on
-        // P. (A 2D-tiled LDS MMQ would lift this gate — see task 120.)
-        if repacked && dtype == GgmlType::Q4_K && n_rows <= 256 {
+        // Repacked Q4_K: the 2D-tiled int8 MMQ GEMM consumes the
+        // quantised weight directly — no dequant to fp16, no HGEMM.
+        if repacked && dtype == GgmlType::Q4_K {
             return self.matmul_mmq_q4k(stream, w_dev, in_dim, out_dim, x, n_rows);
         }
 
@@ -394,7 +390,8 @@ impl PrefillGemm {
             &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
         // grid: 8 output rows × TN=32 tokens per workgroup.
-        unsafe { gf.launch(((out_dim as u32 + 7) / 8, (n_rows as u32 + 31) / 32, 1),
+        // grid: BM=64 output rows × BN=64 tokens per workgroup.
+        unsafe { gf.launch(((out_dim as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
                            (256, 1, 1), 0, Some(stream), &mut ga)?; }
         Ok(dy)
     }

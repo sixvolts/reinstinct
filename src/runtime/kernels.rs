@@ -198,8 +198,8 @@ pub fn run_mmq_gemm_q4k_repacked(cache: &KernelCache, packed: &[u8], x: &[f32],
         &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
         &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
         &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
-    // grid: 8 output rows × TN=32 tokens per workgroup.
-    unsafe { gf.launch(((out_dim as u32 + 7) / 8, (p_rows as u32 + 31) / 32, 1),
+    // grid: BM=64 output rows × BN=64 tokens per workgroup.
+    unsafe { gf.launch(((out_dim as u32 + 63) / 64, (p_rows as u32 + 63) / 64, 1),
                        (256, 1, 1), 0, None, &mut gargs)?; }
     hip::Device(0).synchronize()?;
 
