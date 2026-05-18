@@ -85,7 +85,7 @@ const DEQUANT_Q5K_REPACKED_F16_SOURCE: &str =
 const DEQUANT_Q6K_REPACKED_F16_SOURCE: &str =
     include_str!("../../kernels/dequant_q6k_repacked_f16.cpp");
 const ROPE_BATCHED_SOURCE:      &str = include_str!("../../kernels/rope_batched.cpp");
-const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_step_batched.cpp");
+const ATTN_STEP_BATCHED_SOURCE: &str = include_str!("../../kernels/attn_prefill_flash.cpp");
 
 const QUANTIZE_Q8_SOURCE:      &str = include_str!("../../kernels/quantize_q8.cpp");
 const MOE_TOPK_SOURCE:        &str = include_str!("../../kernels/moe_topk.cpp");
@@ -973,7 +973,7 @@ impl GpuQwen35 {
             dequant_q6k_repacked_module: Module::load(&cache.compile(
                 "dequant_q6k_repacked_f16", DEQUANT_Q6K_REPACKED_F16_SOURCE)?)?,
             rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
-            attn_step_batched_module: Module::load(&cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?)?,
+            attn_step_batched_module: Module::load(&cache.compile("attn_prefill_flash", ATTN_STEP_BATCHED_SOURCE)?)?,
             mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
             mmq_q5k_module:           Module::load(&cache.compile("mmq_gemm_q5k_repacked", MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k_module:           Module::load(&cache.compile("mmq_gemm_q6k_repacked", MMQ_GEMM_Q6K_SOURCE)?)?,
@@ -2460,24 +2460,29 @@ impl GpuQwen35 {
                           Some(&self.stream), &mut args) }
     }
 
+    /// Batched causal attention for the qwen full-attention prefill —
+    /// the flash-attention kernel (full causal, window 0). BQ=8 queries
+    /// per workgroup, BK=8-key LDS tiles; must match the kernel #defines.
     fn launch_attn_step_batched(&self, q: *mut c_void, k_cache: *mut c_void,
                                 v_cache: *mut c_void, out: *mut c_void,
                                 base_pos: u32, n_rows: u32, scaling: f32)
         -> Result<(), String>
     {
-        let f = self.attn_step_batched_module.function("attn_step_batched_f32")?;
-        let block: u32 = 256;
+        const BQ: u32 = 8;
+        const BK: u32 = 8;
+        let f = self.attn_step_batched_module.function("attn_prefill_flash_f32")?;
+        let block: u32 = 64 * BQ;
         let head_dim = self.head_dim as u32;
-        let max_total = base_pos + n_rows;
-        let smem = ((head_dim + max_total) + block) * std::mem::size_of::<f32>() as u32;
+        let smem = 2 * BK * head_dim * 4;
         let mut qa = q; let mut ka = k_cache; let mut va = v_cache; let mut oa = out;
         let mut nh = self.n_heads as u32;
         let mut nkv = self.n_kv_heads as u32;
         let mut hd = head_dim;
-        let mut bp = base_pos;
-        let mut nr = n_rows;
+        let mut wn = 0u32;          // qwen full-attention layers: full causal
         let mut sc = scaling;
-        let mut args: [*mut c_void; 10] = [
+        let mut nr = n_rows;
+        let mut bp = base_pos;
+        let mut args: [*mut c_void; 11] = [
             &mut qa as *mut _ as *mut c_void,
             &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void,
@@ -2485,12 +2490,13 @@ impl GpuQwen35 {
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((self.n_heads as u32, n_rows, 1), (block, 1, 1),
-                          smem, Some(&self.stream), &mut args) }
+        unsafe { f.launch((self.n_heads as u32, (n_rows + BQ - 1) / BQ, 1),
+                          (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     /// Batched prefill: process all `tokens` in one pass, advancing each

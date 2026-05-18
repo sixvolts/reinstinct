@@ -1,19 +1,22 @@
 // Flash-attention-style batched causal attention for prefill.
 //
-// The plain attn_prefill kernel uses one workgroup per (head, query) and
-// reads each query's K/V rows straight from global — so K/V global
-// traffic is O(P²). This kernel processes a tile of BQ queries per
-// workgroup (one wavefront each) and streams the keys in BK-key tiles,
-// each tile staged once into LDS and reused by all BQ queries — K/V
-// traffic drops to O(P²/BQ). Softmax is the online (flash) form, so the
-// full [BQ, P] score matrix is never materialised.
+// The plain attn_prefill / attn_step_batched kernels use one workgroup
+// per (head, query) and read each query's K/V rows straight from global
+// — so K/V global traffic is O(P²). This kernel processes a tile of BQ
+// queries per workgroup (one wavefront each) and streams the keys in
+// BK-key tiles, each tile staged once into LDS and reused by all BQ
+// queries — K/V traffic drops to O(P²/BQ). Softmax is the online
+// (flash) form, so the [BQ, P] score matrix is never materialised.
 //
-//   Q : [P, n_heads,    head_dim]   K/V : [P, n_kv_heads, head_dim]
-//   out: [P, n_heads,   head_dim]
+//   Q  : [n_rows, n_heads,    head_dim]
+//   K/V: [base_pos+n_rows, n_kv_heads, head_dim]   (cache, abs position)
+//   out: [n_rows, n_heads,    head_dim]
 //
-// A wavefront owns one query; lane l holds query elements l, l+64, …
-// (head_dim must be a multiple of 64 — 256 / 512 here). grid =
-// (n_heads, ceil(P/BQ)); block = 64·BQ. Dynamic LDS = 2·BK·head_dim f32.
+// Query row r is the token at absolute position base_pos+r and attends
+// to cache positions [lo, base_pos+r] (lo from the sliding window, 0 for
+// full causal). A wavefront owns one query; lane l holds query elements
+// l, l+64, … (head_dim must be a multiple of 64). grid = (n_heads,
+// ceil(n_rows/BQ)); block = 64·BQ. Dynamic LDS = 2·BK·head_dim f32.
 
 #include <hip/hip_runtime.h>
 
@@ -31,7 +34,8 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
                             unsigned int head_dim,
                             unsigned int window,        // 0 = full causal
                             float        scaling,
-                            unsigned int p_rows)
+                            unsigned int n_rows,        // query rows
+                            unsigned int base_pos)      // abs pos of row 0
 {
     extern __shared__ float lds[];
     float* kt = lds;                       // [BK, head_dim]
@@ -41,20 +45,22 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
     const int lane = threadIdx.x & 63;
     const unsigned int h     = blockIdx.x;
     const unsigned int qbase = blockIdx.y * BQ;
-    const unsigned int q_pos = qbase + wf;
-    const bool active = q_pos < p_rows;
+    const unsigned int q_row = qbase + wf;             // query row
+    const unsigned int q_pos = base_pos + q_row;       // absolute position
+    const bool active = q_row < n_rows;
 
     const int groups = n_heads / n_kv_heads;
     const unsigned int kv_h = h / groups;
-    const unsigned int dpl  = head_dim >> 6;       // dims per lane
+    const unsigned int dpl  = head_dim >> 6;           // dims per lane
     const size_t kv_row = (size_t)n_kv_heads * head_dim;
+    const unsigned int kv_len = base_pos + n_rows;
 
     // This query's Q — lane l holds elements l, l+64, …
     float qreg[DPL_MAX];
     #pragma unroll
     for (int i = 0; i < DPL_MAX; i++) {
         qreg[i] = (active && (unsigned)i < dpl)
-            ? q[((size_t)q_pos * n_heads + h) * head_dim + lane + i * 64] : 0.0f;
+            ? q[((size_t)q_row * n_heads + h) * head_dim + lane + i * 64] : 0.0f;
     }
 
     // Online-softmax running state.
@@ -63,22 +69,23 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
     #pragma unroll
     for (int i = 0; i < DPL_MAX; i++) acc[i] = 0.0f;
 
-    // Causal/window key range. The workgroup loops the union over its BQ
-    // queries: from the smallest query's `lo` to the largest query pos.
+    // Causal/window key range, in absolute cache positions. The workgroup
+    // loops the union over its BQ queries.
     const int total = (int)q_pos + 1;
     const int lo = (window > 0 && total > (int)window) ? (total - (int)window) : 0;
-    const int q0t   = (int)qbase + 1;
+    const int q0_pos = (int)base_pos + (int)qbase;     // smallest query pos
+    const int q0t   = q0_pos + 1;
     const int lo_min = (window > 0 && q0t > (int)window) ? (q0t - (int)window) : 0;
     const int kt_start = (lo_min / BK) * BK;
-    int kt_end = (int)qbase + BQ;
-    if (kt_end > (int)p_rows) kt_end = (int)p_rows;
+    int kt_end = (int)base_pos + (int)qbase + BQ;
+    if (kt_end > (int)kv_len) kt_end = (int)kv_len;
 
     for (int kt0 = kt_start; kt0 < kt_end; kt0 += BK) {
         // Cooperative load of the K/V tile — coalesced over head_dim.
         for (unsigned int e = threadIdx.x; e < BK * head_dim; e += blockDim.x) {
             const unsigned int kk = e / head_dim, dd = e % head_dim;
             const unsigned int kpos = kt0 + kk;
-            if (kpos < p_rows) {
+            if (kpos < kv_len) {
                 const size_t o = (size_t)kpos * kv_row + (size_t)kv_h * head_dim + dd;
                 kt[e] = k[o];
                 vt[e] = v[o];
@@ -125,7 +132,7 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
         #pragma unroll
         for (int i = 0; i < DPL_MAX; i++)
             if ((unsigned)i < dpl)
-                out[((size_t)q_pos * n_heads + h) * head_dim + lane + i * 64]
+                out[((size_t)q_row * n_heads + h) * head_dim + lane + i * 64]
                     = acc[i] * inv;
     }
 }

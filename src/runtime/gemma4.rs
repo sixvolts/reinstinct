@@ -1444,13 +1444,14 @@ impl GpuGemma4 {
         let smem = 2 * BK * head_dim * 4;
         let mut qa=q; let mut ka=k; let mut va=v; let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32;
-        let mut args: [*mut c_void; 10] = [
+        let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=0u32;
+        let mut args: [*mut c_void; 11] = [
             &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void, &mut pr as *mut _ as *mut c_void];
+            &mut sc as *mut _ as *mut c_void, &mut pr as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void];
         unsafe { f.launch((self.n_heads as u32, (p as u32 + BQ - 1) / BQ, 1),
                           (block,1,1), smem, Some(&self.stream), &mut args) }
     }
