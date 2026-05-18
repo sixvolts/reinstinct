@@ -95,26 +95,31 @@ pub fn repacked_n_sub_padded(in_dim: usize) -> usize {
 }
 
 /// Bytes a [`repack_for_matvec`] result occupies for a given matvec shape.
-pub fn repacked_len(_in_dim: usize, out_dim: usize) -> usize {
-    let nsp = repacked_n_sub_padded(_in_dim);
-    out_dim * nsp * 16 + out_dim * nsp * 4
+pub fn repacked_len(in_dim: usize, out_dim: usize) -> usize {
+    let nsp = repacked_n_sub_padded(in_dim);
+    let n_blocks = in_dim / BLOCK_SIZE;
+    out_dim * nsp * 16 + out_dim * nsp * 2 + out_dim * n_blocks * 4
 }
 
-/// Repack a Q4_K matvec weight `[out_dim, in_dim]` into the two-plane
-/// layout the GPU `matvec_q4k_repacked` kernel streams contiguously.
+/// Repack a Q4_K matvec weight `[out_dim, in_dim]` into the three-plane
+/// layout (format v2) the GPU `matvec_q4k_repacked` kernel streams
+/// contiguously. v2 stores the scales at native Q4_K density (the v1
+/// fp16-expanded scale plane was ~11% larger than the on-disk format,
+/// and decode is HBM-bound).
 ///
-/// The output is two planes, concatenated, both with a per-row stride of
-/// `nsp = repacked_n_sub_padded(in_dim)` sub-blocks (the last
-/// `nsp - n_sub` sub-blocks of each row are unused padding):
-///   * **nibble plane** — `out_dim * nsp * 16` bytes. Each 32-weight
-///     sub-block gets its own contiguous 16 bytes, in row-major sub-block
-///     order. Within those 16 bytes the nibbles are permuted so that
-///     `uint32` `j` holds, in its four low nibbles, weights `4j..4j+3`
-///     and in its four high nibbles weights `16+4j..16+4j+3` — the form
-///     `v_dot4_i32_i8` consumes directly against the int8 activation.
-///   * **scale plane** — `out_dim * nsp * 4` bytes. Per sub-block,
-///     `fp16(d·sc)` then `fp16(dmin·m)`, the scale/min pre-multiplied so
-///     the kernel needs no `get_scale_min_k4` unpacking.
+///   * **nibble plane** — `out_dim * nsp * 16` bytes, `nsp =
+///     repacked_n_sub_padded(in_dim)` sub-blocks/row. Each 32-weight
+///     sub-block gets a contiguous 16 bytes; `uint32` `j` holds weights
+///     `4j..4j+3` (low nibbles) and `16+4j..16+4j+3` (high nibbles) —
+///     the form `v_dot4_i32_i8` consumes directly.
+///   * **scale plane** — `out_dim * nsp * 2` bytes. Per sub-block, the
+///     6-bit `sc` then `m` as two `u8` (the `get_scale_min_k4` output).
+///   * **superblock plane** — `out_dim * (in_dim/256) * 4` bytes. Per
+///     256-weight superblock, the raw `fp16` `d` then `dmin`.
+///
+/// The kernel forms `dsc = d·sc` and `deff = dmin·m` on the fly — two
+/// cheap multiplies, vs ~10% more HBM traffic for the v1 pre-multiplied
+/// fp16 plane.
 ///
 /// `in_dim` must be a multiple of 256; `bytes` must hold at least
 /// `out_dim * (in_dim/256)` Q4_K blocks.
@@ -123,16 +128,20 @@ pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8>
     let n_blocks = in_dim / BLOCK_SIZE;
     let nsp      = repacked_n_sub_padded(in_dim);   // padded sub-blocks per row
     let nib_len  = out_dim * nsp * 16;
-    let mut out  = vec![0u8; nib_len + out_dim * nsp * 4];
+    let sm_len   = out_dim * nsp * 2;
+    let mut out  = vec![0u8; nib_len + sm_len + out_dim * n_blocks * 4];
 
     let blocks: &[BlockQ4_K] =
         bytemuck::cast_slice(&bytes[..out_dim * n_blocks * BYTES_PER_BLOCK]);
 
     for row in 0..out_dim {
         for blk in 0..n_blocks {
-            let b    = &blocks[row * n_blocks + blk];
-            let d    = f16_to_f32(b.d);
-            let dmin = f16_to_f32(b.dmin);
+            let b = &blocks[row * n_blocks + blk];
+
+            // Superblock plane: raw fp16 d, dmin once per 256 weights.
+            let dd_off = nib_len + sm_len + (row * n_blocks + blk) * 4;
+            out[dd_off..dd_off + 2].copy_from_slice(&b.d.to_le_bytes());
+            out[dd_off + 2..dd_off + 4].copy_from_slice(&b.dmin.to_le_bytes());
 
             for s in 0..N_SUBBLOCKS {
                 let gsb = blk * N_SUBBLOCKS + s;    // sub-block index within the row
@@ -155,13 +164,11 @@ pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8>
                     }
                 }
 
-                // Pre-multiplied scales as two fp16.
+                // Scale plane: the 6-bit sc, m as two u8.
                 let (sc, m) = get_scale_min_k4(s, &b.scales);
-                let dsc  = f32_to_f16(d * sc as f32);
-                let deff = f32_to_f16(dmin * m as f32);
-                let scl_off = nib_len + (row * nsp + gsb) * 4;
-                out[scl_off..scl_off + 2].copy_from_slice(&dsc.to_le_bytes());
-                out[scl_off + 2..scl_off + 4].copy_from_slice(&deff.to_le_bytes());
+                let sm_off = nib_len + (row * nsp + gsb) * 2;
+                out[sm_off]     = sc;
+                out[sm_off + 1] = m;
             }
         }
     }
@@ -267,16 +274,23 @@ mod tests {
         let packed = repack_for_matvec(&raw, in_dim, out_dim);
         let n_sub = in_dim / SUBBLOCK_SIZE;
         let nib_len = out_dim * repacked_n_sub_padded(in_dim) * 16;
+        let sm_len  = out_dim * repacked_n_sub_padded(in_dim) * 2;
 
-        // Decode the repacked layout exactly as the GPU kernel does.
-        // out_dim == 1 here, so the row stride drops out and sub-block
-        // gsb sits at offset gsb in each plane.
+        // Decode the v2 repacked layout exactly as the GPU kernel does.
+        // out_dim == 1 here, so the row stride drops out: sub-block gsb
+        // sits at offset gsb in the nibble/scale planes and superblock
+        // gsb/8 in the d/dmin plane.
         let mut got = vec![0.0f32; in_dim];
         for gsb in 0..n_sub {
             let nib = &packed[gsb * 16..gsb * 16 + 16];
-            let so = nib_len + gsb * 4;
-            let dsc  = f16_to_f32(u16::from_le_bytes([packed[so], packed[so + 1]]));
-            let deff = f16_to_f32(u16::from_le_bytes([packed[so + 2], packed[so + 3]]));
+            let smo = nib_len + gsb * 2;
+            let sc = packed[smo] as f32;
+            let m  = packed[smo + 1] as f32;
+            let ddo = nib_len + sm_len + (gsb / N_SUBBLOCKS) * 4;
+            let d    = f16_to_f32(u16::from_le_bytes([packed[ddo], packed[ddo + 1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([packed[ddo + 2], packed[ddo + 3]]));
+            let dsc  = d * sc;
+            let deff = dmin * m;
             let (blk, s) = (gsb / N_SUBBLOCKS, gsb % N_SUBBLOCKS);
             let base = blk * 256 + (s / 2) * 64 + (s & 1) * 32;
             for k in 0..32 {

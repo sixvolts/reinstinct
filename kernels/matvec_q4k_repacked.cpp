@@ -8,7 +8,10 @@
 //   * nibble plane — every 32-weight sub-block in its own contiguous 16
 //     bytes, sub-block order, nibbles pre-permuted so uint32 `j` carries
 //     weights 4j..4j+3 (low nibbles) and 16+4j..16+4j+3 (high nibbles).
-//   * scale plane — per sub-block, fp16(d·sc) and fp16(dmin·m).
+//   * scale plane — per sub-block, the 6-bit `sc` then `m` as two u8.
+//   * superblock plane — per 256-weight superblock, fp16 `d` then `dmin`.
+//     dsc = d·sc and deff = dmin·m are formed on the fly (format v2 —
+//     ~10% less HBM traffic than the v1 pre-multiplied fp16 plane).
 //
 // Lane l reads sub-block l's 16 bytes (one uint4) — consecutive lanes,
 // consecutive memory — so the weight read is a fully-coalesced
@@ -50,8 +53,11 @@ void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
     const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
 
     const uint4*    nib = reinterpret_cast<const uint4*>(wbase);
-    const uint32_t* scl = reinterpret_cast<const uint32_t*>(
+    const uint16_t* smp = reinterpret_cast<const uint16_t*>(
         wbase + (size_t)out_dim * nsp * 16);
+    const uint32_t* ddp = reinterpret_cast<const uint32_t*>(
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 2);
+    const unsigned int n_super = n_sub >> 3;     // 256-weight superblocks/row
 
     float acc[ROWS];
     #pragma unroll
@@ -68,12 +74,15 @@ void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
             const int row = row0 + r;
             if (row >= (int)out_dim) continue;
 
-            const uint4    q = nib[(size_t)row * nsp + sb];
-            const uint32_t s = scl[(size_t)row * nsp + sb];
-            const uint16_t dsc_bits  = (uint16_t)(s & 0xFFFF);
-            const uint16_t deff_bits = (uint16_t)(s >> 16);
-            const float dsc  = __half2float(*reinterpret_cast<const __half*>(&dsc_bits));
-            const float deff = __half2float(*reinterpret_cast<const __half*>(&deff_bits));
+            const uint4    q  = nib[(size_t)row * nsp + sb];
+            const uint16_t sm = smp[(size_t)row * nsp + sb];
+            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
+            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
+                               * (float)(sm & 0xFFu);
+            const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
+                               * (float)(sm >> 8);
 
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             int idot = 0;
