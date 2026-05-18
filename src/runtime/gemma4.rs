@@ -50,7 +50,7 @@ const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
-const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill.cpp");
+const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill_flash.cpp");
 const KV_QUANT_PREFILL_SRC:  &str = include_str!("../../kernels/kv_quant_prefill.cpp");
 const MOE_GROUPED_Q6K_SRC:   &str = include_str!("../../kernels/moe_matvec_grouped_q6k.cpp");
 const MOE_GROUPED_Q8_0_SRC:  &str = include_str!("../../kernels/moe_matvec_grouped_q8_0.cpp");
@@ -1096,7 +1096,7 @@ impl GpuGemma4 {
         let handle = Handle::new()?;
         handle.set_stream(&self.stream)?;
         let m_rope = Module::load(&cache.compile("rope_prefill", ROPE_PREFILL_SRC)?)?;
-        let m_attn = Module::load(&cache.compile("attn_prefill", ATTN_PREFILL_SRC)?)?;
+        let m_attn = Module::load(&cache.compile("attn_prefill_flash", ATTN_PREFILL_SRC)?)?;
         let m_kvq  = Module::load(&cache.compile("kv_quant_prefill", KV_QUANT_PREFILL_SRC)?)?;
         // Grouped-MoE prefill scratch (sized for P; tiny/unused on the
         // dense 31B). Each expert's weight is processed in one launch over
@@ -1434,20 +1434,25 @@ impl GpuGemma4 {
                            out: *mut c_void, n_kv: u32, head_dim: u32, window: u32, p: usize)
         -> Result<(), String>
     {
-        let f = m.function("attn_prefill_f32")?;
-        let block: u32 = 256;
-        let smem = (head_dim + p as u32 + block) * 4;
+        // Flash-attention prefill: BQ=8 queries/workgroup (one wavefront
+        // each), BK=8-key tiles staged in LDS. Must match the kernel's
+        // #define BQ / BK.
+        const BQ: u32 = 8;
+        const BK: u32 = 8;
+        let f = m.function("attn_prefill_flash_f32")?;
+        let block: u32 = 64 * BQ;
+        let smem = 2 * BK * head_dim * 4;
         let mut qa=q; let mut ka=k; let mut va=v; let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut wn=window; let mut sc=1.0f32;
-        let mut args: [*mut c_void; 9] = [
+        let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32;
+        let mut args: [*mut c_void; 10] = [
             &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void];
-        unsafe { f.launch((self.n_heads as u32, p as u32, 1),(block,1,1), smem,
-                          Some(&self.stream), &mut args) }
+            &mut sc as *mut _ as *mut c_void, &mut pr as *mut _ as *mut c_void];
+        unsafe { f.launch((self.n_heads as u32, (p as u32 + BQ - 1) / BQ, 1),
+                          (block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
     /// Grouped expert matvec — expert `expert_id`'s weight against the

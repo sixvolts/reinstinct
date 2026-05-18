@@ -44,6 +44,7 @@ const MMQ_GEMM_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q4k
 const MMQ_GEMM_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
+const ATTN_PREFILL_FLASH_SRC: &str = include_str!("../../kernels/attn_prefill_flash.cpp");
 
 /// Batched causal attention over `p` query tokens. Q/K/V are row-major
 /// `[p, n_heads|n_kv, head_dim]`; returns `out [p, n_heads, head_dim]`.
@@ -71,6 +72,40 @@ pub fn attn_prefill_f32(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f32],
         &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
         &mut sc as *mut _ as *mut c_void];
     unsafe { f.launch((n_heads as u32, p as u32, 1), (block,1,1), smem, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0f32; p * n_heads * head_dim];
+    dout.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Flash-attention prefill — same contract as `attn_prefill_f32`, run
+/// through the tiled online-softmax kernel.
+pub fn attn_prefill_flash_f32(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f32],
+                              p: usize, n_heads: usize, n_kv: usize, head_dim: usize,
+                              window: u32) -> Result<Vec<f32>, String>
+{
+    const BQ: u32 = 8;
+    const BK: u32 = 8;
+    let module = Module::load(&cache.compile("attn_prefill_flash", ATTN_PREFILL_FLASH_SRC)?)?;
+    let f = module.function("attn_prefill_flash_f32")?;
+    let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
+    let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k)?;
+    let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v)?;
+    let dout: DeviceBuf<f32> = DeviceBuf::new(p * n_heads * head_dim)?;
+    let block: u32 = 64 * BQ;
+    let smem = 2 * BK * head_dim as u32 * 4;
+    let mut qa=dq.raw_ptr(); let mut ka=dk.raw_ptr(); let mut va=dv.raw_ptr();
+    let mut oa=dout.raw_ptr();
+    let mut nh=n_heads as u32; let mut nkv=n_kv as u32; let mut hd=head_dim as u32;
+    let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32;
+    let mut args: [*mut c_void; 10] = [
+        &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+        &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+        &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+        &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+        &mut sc as *mut _ as *mut c_void, &mut pr as *mut _ as *mut c_void];
+    unsafe { f.launch((n_heads as u32, (p as u32 + BQ - 1) / BQ, 1), (block,1,1),
+                      smem, None, &mut args)?; }
     hip::Device(0).synchronize()?;
     let mut out = vec![0.0f32; p * n_heads * head_dim];
     dout.copy_to_host(&mut out)?;
@@ -1642,6 +1677,30 @@ mod tests {
                                     .wrapping_add(1442695040888963407);
                              ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
         (0..p_rows * in_dim).map(|_| x_rng()).collect()
+    }
+
+    #[test]
+    fn attn_prefill_flash_matches_plain() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (p, n_heads, n_kv, head_dim) = (70usize, 8usize, 2usize, 128usize);
+        let mut s: u64 = 0xA11E_0F1A;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 40) as u32 as f32 / (1u32 << 24) as f32) - 0.5 };
+        let q: Vec<f32> = (0..p*n_heads*head_dim).map(|_| rng()).collect();
+        let k: Vec<f32> = (0..p*n_kv*head_dim).map(|_| rng()).collect();
+        let v: Vec<f32> = (0..p*n_kv*head_dim).map(|_| rng()).collect();
+
+        // window 0 (full causal) and a sliding window narrower than p.
+        for window in [0u32, 24] {
+            let plain = attn_prefill_f32(&cache, &q, &k, &v, p, n_heads, n_kv, head_dim, window)
+                .expect("plain attn_prefill");
+            let flash = attn_prefill_flash_f32(&cache, &q, &k, &v, p, n_heads, n_kv, head_dim, window)
+                .expect("flash attn_prefill");
+            let e = rel_l2(&flash, &plain);
+            eprintln!("attn_prefill_flash window={window}: rel_l2={e:.3e}");
+            assert!(e < 1.0e-3,
+                "flash vs plain attn_prefill window={window}: rel_l2 {e:.3e} too large");
+        }
     }
 
     #[test]
