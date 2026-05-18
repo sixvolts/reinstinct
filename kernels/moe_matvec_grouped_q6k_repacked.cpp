@@ -46,11 +46,15 @@ void moe_matvec_grouped_q6k_repacked_f32(const unsigned char* __restrict__ slab,
     const unsigned int n_sub = in_dim >> 5;
     const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
 
+    const unsigned int n_super = n_sub >> 3;
     const uint4*    nib = reinterpret_cast<const uint4*>(wbase);
     const uint32_t* h2p = reinterpret_cast<const uint32_t*>(
         wbase + (size_t)out_dim * nsp * 16);
-    const uint32_t* scl = reinterpret_cast<const uint32_t*>(
+    const uint16_t* smp = reinterpret_cast<const uint16_t*>(   // v2: sc_lo|sc_hi int8
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8);
+    const uint16_t* ddp = reinterpret_cast<const uint16_t*>(   // v2: d per superblock
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8
+              + (size_t)out_dim * nsp * 2);
 
     float acc[ROWS];
     #pragma unroll
@@ -77,11 +81,11 @@ void moe_matvec_grouped_q6k_repacked_f32(const unsigned char* __restrict__ slab,
             const uint4    q    = nib[idx_w];
             const uint32_t h2lo = h2p[idx_w * 2];
             const uint32_t h2hi = h2p[idx_w * 2 + 1];
-            const uint32_t s    = scl[idx_w];
-            const uint16_t lo_bits = (uint16_t)(s & 0xFFFF);
-            const uint16_t hi_bits = (uint16_t)(s >> 16);
-            const float dsc_lo = __half2float(*reinterpret_cast<const __half*>(&lo_bits));
-            const float dsc_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
+            const uint16_t sm     = smp[idx_w];
+            const uint16_t d_bits = ddp[(size_t)row * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
 
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             int idot0 = 0, idot1 = 0;

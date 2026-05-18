@@ -16,7 +16,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::quant::half::{f16_to_f32, f32_to_f16};
+use crate::quant::half::f16_to_f32;
 
 pub const BLOCK_SIZE: usize = 256;
 pub const BYTES_PER_BLOCK: usize = 176;
@@ -91,23 +91,29 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
 ///     in `q4_k::repack_for_matvec`.
 ///   * qh plane — `nsp*4` B/row. Per sub-block one u32: bit `4g+b` is the
 ///     5th bit of the `b`-th weight of dp4a group `g`.
-///   * scale plane — `nsp*4` B/row: `fp16(d·sc)`, `fp16(dmin·m)`.
+///   * scale plane — `nsp*2` B/row: the 6-bit `sc`, `m` as two u8.
+///   * superblock plane — `(in_dim/256)*4` B/row: raw fp16 `d`, `dmin`.
+/// dsc = d·sc, deff = dmin·m are formed on the fly (format v2).
 pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8> {
     assert_eq!(in_dim % BLOCK_SIZE, 0, "Q5_K in_dim must be a multiple of 256");
     let n_blocks = in_dim / BLOCK_SIZE;
     let nsp      = crate::quant::q4_k::repacked_n_sub_padded(in_dim);
     let nib_len  = out_dim * nsp * 16;
     let qh_len   = out_dim * nsp * 4;
-    let mut out  = vec![0u8; nib_len + qh_len + out_dim * nsp * 4];
+    let sm_len   = out_dim * nsp * 2;
+    let mut out  = vec![0u8; nib_len + qh_len + sm_len + out_dim * n_blocks * 4];
 
     let blocks: &[BlockQ5_K] =
         bytemuck::cast_slice(&bytes[..out_dim * n_blocks * BYTES_PER_BLOCK]);
 
     for row in 0..out_dim {
         for blk in 0..n_blocks {
-            let b    = &blocks[row * n_blocks + blk];
-            let d    = f16_to_f32(b.d);
-            let dmin = f16_to_f32(b.dmin);
+            let b = &blocks[row * n_blocks + blk];
+
+            // Superblock plane: raw fp16 d, dmin once per 256 weights.
+            let dd_off = nib_len + qh_len + sm_len + (row * n_blocks + blk) * 4;
+            out[dd_off..dd_off + 2].copy_from_slice(&b.d.to_le_bytes());
+            out[dd_off + 2..dd_off + 4].copy_from_slice(&b.dmin.to_le_bytes());
 
             for s in 0..8usize {
                 let gsb = blk * 8 + s;
@@ -135,11 +141,9 @@ pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8>
                 out[qh_off..qh_off + 4].copy_from_slice(&qh_packed.to_le_bytes());
 
                 let (sc, m) = get_scale_min_k4(s, &b.scales);
-                let dsc  = f32_to_f16(d * sc as f32);
-                let deff = f32_to_f16(dmin * m as f32);
-                let so = nib_len + qh_len + (row * nsp + gsb) * 4;
-                out[so..so + 2].copy_from_slice(&dsc.to_le_bytes());
-                out[so + 2..so + 4].copy_from_slice(&deff.to_le_bytes());
+                let sm_off = nib_len + qh_len + (row * nsp + gsb) * 2;
+                out[sm_off]     = sc;
+                out[sm_off + 1] = m;
             }
         }
     }

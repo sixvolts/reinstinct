@@ -12,7 +12,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::quant::half::{f16_to_f32, f32_to_f16};
+use crate::quant::half::f16_to_f32;
 
 pub const BLOCK_SIZE: usize = 256;
 pub const BYTES_PER_BLOCK: usize = 144;

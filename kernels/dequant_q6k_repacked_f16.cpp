@@ -23,15 +23,20 @@ void dequant_q6k_repacked_f16(const uint8_t* __restrict__ wbase,
     if (row >= out_dim) return;
     const size_t idx = (size_t)row * nsp + sb;
 
+    const unsigned int n_super = n_sub >> 3;
     const uint8_t*  nib = wbase + idx * 16;
     const uint32_t* h2p = reinterpret_cast<const uint32_t*>(
         wbase + (size_t)out_dim * nsp * 16 + idx * 8);
-    const uint32_t* scl = reinterpret_cast<const uint32_t*>(
-        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8 + idx * 4);
+    // v2 scales: sc_lo|sc_hi (int8) per sub-block, d (fp16) per superblock.
+    const uint16_t* smp = reinterpret_cast<const uint16_t*>(
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8 + idx * 2);
+    const uint16_t* ddp = reinterpret_cast<const uint16_t*>(
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8
+              + (size_t)out_dim * nsp * 2 + ((size_t)row * n_super + (sb >> 3)) * 2);
 
-    const uint16_t sc_bits = (k < 16) ? (uint16_t)(*scl & 0xFFFF)
-                                      : (uint16_t)(*scl >> 16);
-    const float dsc = __half2float(*reinterpret_cast<const __half*>(&sc_bits));
+    const uint16_t sm = *smp;
+    const int sc = (k < 16) ? (int)(int8_t)(sm & 0xFFu) : (int)(int8_t)(sm >> 8);
+    const float dsc = __half2float(*reinterpret_cast<const __half*>(ddp)) * (float)sc;
 
     const uint32_t nibble = (k < 16) ? (nib[k] & 0x0F) : (nib[k - 16] >> 4);
 

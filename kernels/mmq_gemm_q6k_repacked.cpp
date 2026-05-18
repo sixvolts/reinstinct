@@ -45,16 +45,20 @@ void mmq_gemm_q6k_repacked_f32(const unsigned char* __restrict__ wbase,
 
     const unsigned int n_sub = in_dim >> 5;
     const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const unsigned int n_super = n_sub >> 3;
     const uint4*    nib = reinterpret_cast<const uint4*>(wbase);
     const uint2*    h2p = reinterpret_cast<const uint2*>(
         wbase + (size_t)out_dim * nsp * 16);
-    const uint32_t* scl = reinterpret_cast<const uint32_t*>(
+    const uint16_t* smp = reinterpret_cast<const uint16_t*>(   // v2: sc_lo|sc_hi int8
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8);
+    const uint16_t* ddp = reinterpret_cast<const uint16_t*>(   // v2: d per superblock
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 8
+              + (size_t)out_dim * nsp * 2);
 
-    __shared__ uint4    sW  [BM][BK];    // packed nibbles  — 4096 B
-    __shared__ uint2    sWh2[BM][BK];    // high-bit plane  — 2048 B
-    __shared__ uint32_t sWs [BM][BK];    // dsc_lo|dsc_hi   — 1024 B
-    __shared__ BlockQ8  sX  [BN][BK];    // int8 acts       — 10240 B
+    __shared__ uint4    sW  [BM][BK];    // packed nibbles
+    __shared__ uint2    sWh2[BM][BK];    // high-bit plane
+    __shared__ float2   sWs [BM][BK];    // (dsc_lo, dsc_hi) — from the v2 scales
+    __shared__ BlockQ8  sX  [BN][BK];    // int8 acts
 
     float acc[TM][TN];
     #pragma unroll
@@ -71,9 +75,13 @@ void mmq_gemm_q6k_repacked_f32(const unsigned char* __restrict__ wbase,
         if (wrow < out_dim) {
             sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
             sWh2[lr][lk] = h2p[(size_t)wrow * nsp + sb];
-            sWs [lr][lk] = scl[(size_t)wrow * nsp + sb];
+            const uint16_t sm     = smp[(size_t)wrow * nsp + sb];
+            const uint16_t d_bits = ddp[(size_t)wrow * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            sWs[lr][lk] = make_float2(d * (float)(int)(int8_t)(sm & 0xFFu),
+                                      d * (float)(int)(int8_t)(sm >> 8));
         } else {
-            sWs[lr][lk] = 0;
+            sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
         const unsigned int xtok = tok0 + lr;
         if (xtok < p_rows) {
@@ -92,11 +100,9 @@ void mmq_gemm_q6k_repacked_f32(const unsigned char* __restrict__ wbase,
             for (int r = 0; r < TM; r++) {
                 wq[r]  = sW  [ty + r * 16][kk];
                 wh2[r] = sWh2[ty + r * 16][kk];
-                const uint32_t s = sWs[ty + r * 16][kk];
-                const uint16_t lo_bits = (uint16_t)(s & 0xFFFF);
-                const uint16_t hi_bits = (uint16_t)(s >> 16);
-                dlo[r] = __half2float(*reinterpret_cast<const __half*>(&lo_bits));
-                dhi[r] = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
+                const float2 s = sWs[ty + r * 16][kk];
+                dlo[r] = s.x;
+                dhi[r] = s.y;
             }
             #pragma unroll
             for (int n = 0; n < TN; n++) {
