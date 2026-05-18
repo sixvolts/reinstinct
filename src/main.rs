@@ -101,6 +101,29 @@ enum Command {
         #[arg(short, long)]
         token: Option<u32>,
     },
+    /// Run a multi-model HTTP server: Big LLM, Small LLM, and Embedder,
+    /// each on its own port, requests served in order through one GPU.
+    Serve {
+        /// Big model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B).
+        #[arg(long)]
+        big: PathBuf,
+        /// Small model GGUF (Qwen 3.5 4B or Gemma E4B).
+        #[arg(long)]
+        small: PathBuf,
+        /// Embedder GGUF (nomic-embed). Accepted but deferred — its
+        /// port answers 503 until the encoder runtime lands.
+        #[arg(long)]
+        embed: Option<PathBuf>,
+        #[arg(long, default_value_t = 8080)]
+        big_port: u16,
+        #[arg(long, default_value_t = 8081)]
+        small_port: u16,
+        #[arg(long, default_value_t = 8082)]
+        embed_port: u16,
+        /// Context window (prompt + generated tokens) per request.
+        #[arg(long, default_value_t = 4096)]
+        max_seq: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +135,10 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
+        Command::Serve { big, small, embed, big_port, small_port, embed_port, max_seq } =>
+            reinstinct_engine::serve::run(big, small, embed, big_port, small_port,
+                                          embed_port, max_seq)
+                .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, tokens, steps, temperature, top_k, seed, gpu } =>
             generate_text(&path, prompt, tokens, steps, temperature, top_k, seed, gpu),
     }

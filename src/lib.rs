@@ -10,4 +10,5 @@ pub mod model;
 pub mod quant;
 pub mod runtime;
 pub mod sampling;
+pub mod serve;
 pub mod tokenizer;
