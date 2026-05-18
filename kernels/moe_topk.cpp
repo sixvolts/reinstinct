@@ -1,9 +1,10 @@
 // MoE router: softmax over the expert logits, then top-k selection
 // with the selected weights renormalised to sum to 1.
 //
-// One workgroup. The softmax is computed cooperatively; the top-k
-// scan runs on thread 0 (n_expert is small — 128 — so 8 serial
-// argmax passes is negligible and avoids a fiddly parallel reduction).
+// One workgroup per token (grid.x = n_tok; decode launches grid.x = 1).
+// The softmax is computed cooperatively; the top-k scan runs on thread 0
+// (n_expert is small — 128 — so 8 serial argmax passes is negligible and
+// avoids a fiddly parallel reduction).
 //
 // out_ids[k]     = expert index of the k-th largest probability
 // out_weights[k] = its softmax probability, renormalised over the k used
@@ -21,6 +22,11 @@ void moe_topk_f32(const float* __restrict__ logits,
     __shared__ float red[256];
     const int t  = threadIdx.x;
     const int nt = blockDim.x;
+
+    // One block per token: offset logits / outputs by the token index.
+    logits      += (size_t)blockIdx.x * n_expert;
+    out_ids     += (size_t)blockIdx.x * n_used;
+    out_weights += (size_t)blockIdx.x * n_used;
 
     // load + block-max
     float local_max = -INFINITY;

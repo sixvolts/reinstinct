@@ -342,6 +342,12 @@ impl BlockFfn {
 
 /// Model-wide MoE runtime — kernel modules + scratch buffers, built once
 /// for a `qwen35moe` model and shared across all blocks.
+/// Prefill MoE batch size. `step_moe_ffn_batched` processes up to this
+/// many tokens in one set of launches; longer prompts are chunked. The
+/// MoE scratch buffers below are sized for it. 256 keeps the scratch
+/// ~30 MB while still amortising expert-weight reads across the batch.
+const MOE_PREFILL_CHUNK: usize = 256;
+
 struct MoeRuntime {
     n_expert: usize,
     n_used:   usize,
@@ -353,17 +359,19 @@ struct MoeRuntime {
     m_mv_q6k:     Module,
     m_combine:    Module,
     m_shexp_gate: Module,
-    logits:  DeviceBuf<f32>,   // [n_expert] router logits
-    ids:     DeviceBuf<i32>,   // [n_used] selected expert ids
-    weights: DeviceBuf<f32>,   // [n_used] renormalised routing weights
+    // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
+    logits:  DeviceBuf<f32>,   // [n_tok, n_expert] router logits
+    ids:     DeviceBuf<i32>,   // [n_tok, n_used] selected expert ids
+    weights: DeviceBuf<f32>,   // [n_tok, n_used] renormalised routing weights
     ones:    DeviceBuf<f32>,   // [n_expert] = 1.0 (combine has no per-expert scale)
-    xq8_exp: DeviceBuf<u8>,    // [n_used] quantised down-expert activations
-    e_gate:  DeviceBuf<f32>,   // [n_used, expert_ff]
-    e_up:    DeviceBuf<f32>,   // [n_used, expert_ff]
-    e_out:   DeviceBuf<f32>,   // [n_used, hidden]
-    sh_gate: DeviceBuf<f32>,   // [shexp_ff]
-    sh_up:   DeviceBuf<f32>,   // [shexp_ff]
-    sh_out:  DeviceBuf<f32>,   // [hidden]
+    xq8_in:  DeviceBuf<u8>,    // [n_tok, hidden/32] quantised block input
+    xq8_exp: DeviceBuf<u8>,    // [n_tok, n_used, expert_ff/32] quantised down acts
+    e_gate:  DeviceBuf<f32>,   // [n_tok, n_used, expert_ff]
+    e_up:    DeviceBuf<f32>,   // [n_tok, n_used, expert_ff]
+    e_out:   DeviceBuf<f32>,   // [n_tok, n_used, hidden]
+    sh_gate: DeviceBuf<f32>,   // [n_tok, shexp_ff]
+    sh_up:   DeviceBuf<f32>,   // [n_tok, shexp_ff]
+    sh_out:  DeviceBuf<f32>,   // [n_tok, hidden]
 }
 
 impl MoeRuntime {
@@ -375,6 +383,7 @@ impl MoeRuntime {
         let expert_ff = moe.expert_ff as usize;
         let shexp_ff  = moe.shared_expert_ff as usize;
         let ones = DeviceBuf::from_slice(&vec![1.0f32; n_expert])?;
+        let c = MOE_PREFILL_CHUNK;
         Ok(Self {
             n_expert, n_used, expert_ff, shexp_ff,
             m_topk:       Module::load(&cache.compile("moe_topk", MOE_TOPK_SOURCE)?)?,
@@ -386,17 +395,18 @@ impl MoeRuntime {
                               "moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SOURCE)?)?,
             m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
             m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
-            logits:  DeviceBuf::new(n_expert)?,
-            ids:     DeviceBuf::new(n_used)?,
-            weights: DeviceBuf::new(n_used)?,
+            logits:  DeviceBuf::new(c * n_expert)?,
+            ids:     DeviceBuf::new(c * n_used)?,
+            weights: DeviceBuf::new(c * n_used)?,
             ones,
-            xq8_exp: DeviceBuf::new(n_used * (expert_ff / 32).max(1) * 40)?,
-            e_gate:  DeviceBuf::new(n_used * expert_ff)?,
-            e_up:    DeviceBuf::new(n_used * expert_ff)?,
-            e_out:   DeviceBuf::new(n_used * hidden)?,
-            sh_gate: DeviceBuf::new(shexp_ff)?,
-            sh_up:   DeviceBuf::new(shexp_ff)?,
-            sh_out:  DeviceBuf::new(hidden)?,
+            xq8_in:  DeviceBuf::new(c * (hidden / 32).max(1) * 40)?,
+            xq8_exp: DeviceBuf::new(c * n_used * (expert_ff / 32).max(1) * 40)?,
+            e_gate:  DeviceBuf::new(c * n_used * expert_ff)?,
+            e_up:    DeviceBuf::new(c * n_used * expert_ff)?,
+            e_out:   DeviceBuf::new(c * n_used * hidden)?,
+            sh_gate: DeviceBuf::new(c * shexp_ff)?,
+            sh_up:   DeviceBuf::new(c * shexp_ff)?,
+            sh_out:  DeviceBuf::new(c * hidden)?,
         })
     }
 }
@@ -1736,7 +1746,7 @@ impl GpuQwen35 {
 
         // --- Router: logits → top-k expert ids + renormalised weights ---
         self.launch_matvec_dispatch(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
-        self.launch_moe_topk(moe)?;
+        self.launch_moe_topk(moe, 1)?;
 
         // --- Routed experts --- shared int8 activation, quantised once.
         // (Routed result lands in e_out; the combine into `output` is
@@ -1744,16 +1754,16 @@ impl GpuQwen35 {
         //  pass input == output, so the combine would clobber it.)
         self.launch_quantize_q8(input_ptr, h)?;
         self.launch_moe_expert_matvec(moe, &w.gate_exps, self.xq8.raw_ptr(),
-                                      moe.e_gate.raw_ptr(), h, ff, 0)?;
+                                      moe.e_gate.raw_ptr(), h, ff, 1, 0, 0)?;
         self.launch_moe_expert_matvec(moe, &w.up_exps, self.xq8.raw_ptr(),
-                                      moe.e_up.raw_ptr(), h, ff, 0)?;
+                                      moe.e_up.raw_ptr(), h, ff, 1, 0, 0)?;
         self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
                            moe.e_gate.raw_ptr(), n_used * ff)?;
         // down: each expert has its own activation — quantise the batch.
         self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
                                      ff, n_used)?;
         self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
-                                      moe.e_out.raw_ptr(), ff, h, ff / 32)?;
+                                      moe.e_out.raw_ptr(), ff, h, 1, 0, ff / 32)?;
 
         // --- Shared expert --- runs every token, scaled by a sigmoid gate.
         // Reads `input` — must finish before the combine writes `output`.
@@ -1764,15 +1774,67 @@ impl GpuQwen35 {
         self.launch_matvec_dispatch(&w.down_shexp, moe.sh_gate.raw_ptr(),
                                     moe.sh_out.raw_ptr())?;
         self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
-                                   w.gate_inp_shexp.raw_ptr())?;
+                                   w.gate_inp_shexp.raw_ptr(), 1)?;
 
         // `input` fully consumed — combine routed experts, add the shared.
-        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr)?;
+        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr, 1)?;
         self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), h)?;
         Ok(())
     }
 
-    fn launch_moe_topk(&self, moe: &MoeRuntime) -> Result<(), String> {
+    /// Batched MoE FFN — processes `n` (≤ MOE_PREFILL_CHUNK) prefill rows
+    /// in one set of launches. Routed-expert matvecs batch over tokens via
+    /// grid.z; the router and shared expert (shared weights) go through
+    /// rocBLAS GEMMs. Callers pass distinct `input` / `output` buffers.
+    fn step_moe_ffn_batched(&self, input_ptr: *mut c_void, output_ptr: *mut c_void,
+                            w: &GpuMoeFfn, n: usize) -> Result<(), String>
+    {
+        debug_assert!(n <= MOE_PREFILL_CHUNK, "MoE prefill batch exceeds chunk");
+        let moe = self.moe.as_ref().expect("step_moe_ffn_batched on a non-MoE model");
+        let h  = self.hidden as u32;
+        let ff = moe.expert_ff as u32;
+        let shff = moe.shexp_ff as u32;
+        let n_used = moe.n_used as u32;
+        let nt = n as u32;
+
+        // --- Router: GEMM over all rows → logits, then per-token top-k ---
+        self.bmm(&w.gate_inp, input_ptr, n, moe.logits.raw_ptr())?;
+        self.launch_moe_topk(moe, nt)?;
+
+        // --- Routed experts --- one int8 activation per token, then the
+        // expert matvecs batch over tokens (grid.z). gate/up share the
+        // token activation across the 8 experts (slot stride 0); down has
+        // a distinct activation per (token, expert).
+        self.launch_quantize_q8_into(input_ptr, moe.xq8_in.raw_ptr(), h, nt)?;
+        self.launch_moe_expert_matvec(moe, &w.gate_exps, moe.xq8_in.raw_ptr(),
+                                      moe.e_gate.raw_ptr(), h, ff, nt, h / 32, 0)?;
+        self.launch_moe_expert_matvec(moe, &w.up_exps, moe.xq8_in.raw_ptr(),
+                                      moe.e_up.raw_ptr(), h, ff, nt, h / 32, 0)?;
+        self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                           moe.e_gate.raw_ptr(), nt * n_used * ff)?;
+        self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
+                                     ff, nt * n_used)?;
+        self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                                      moe.e_out.raw_ptr(), ff, h, nt,
+                                      n_used * (ff / 32), ff / 32)?;
+
+        // --- Shared expert --- dense, shared weights → batched GEMMs ---
+        self.bmm(&w.gate_shexp, input_ptr, n, moe.sh_gate.raw_ptr())?;
+        self.bmm(&w.up_shexp,   input_ptr, n, moe.sh_up.raw_ptr())?;
+        self.launch_swiglu(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
+                           moe.sh_gate.raw_ptr(), nt * shff)?;
+        self.bmm(&w.down_shexp, moe.sh_gate.raw_ptr(), n, moe.sh_out.raw_ptr())?;
+        self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
+                                   w.gate_inp_shexp.raw_ptr(), nt)?;
+
+        // Combine routed experts into `output`, add the shared expert.
+        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr, nt)?;
+        self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), nt * h)?;
+        Ok(())
+    }
+
+    /// Top-k router selection for `n_tok` tokens (one workgroup per token).
+    fn launch_moe_topk(&self, moe: &MoeRuntime, n_tok: u32) -> Result<(), String> {
         let f = moe.m_topk.function("moe_topk_f32")?;
         let mut la = moe.logits.raw_ptr();
         let mut ne = moe.n_expert as i32;
@@ -1784,14 +1846,18 @@ impl GpuQwen35 {
             &mut nu as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
             &mut wa as *mut _ as *mut c_void];
         let smem = moe.n_expert as u32 * 4;
-        unsafe { f.launch((1,1,1),(128,1,1), smem, Some(&self.stream), &mut args) }
+        unsafe { f.launch((n_tok,1,1),(128,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    /// One launch over all `n_used` routed experts (grid.y = expert slot).
+    /// Routed-expert matvec — grid (out_dim/8, n_used, n_tok). For decode
+    /// pass `n_tok = 1`. `xq` is indexed `tok*xq_tok_stride +
+    /// slot*xq_slot_stride` (BlockQ8 units): gate/up share one activation
+    /// per token (slot stride 0), down has one per (token, expert).
     #[allow(clippy::too_many_arguments)]
     fn launch_moe_expert_matvec(&self, moe: &MoeRuntime, et: &GpuExpertTensor,
                                 xq8: *mut c_void, y: *mut c_void,
-                                in_dim: u32, out_dim: u32, xq_stride: u32)
+                                in_dim: u32, out_dim: u32, n_tok: u32,
+                                xq_tok_stride: u32, xq_slot_stride: u32)
         -> Result<(), String>
     {
         let (module, kname) = match et.dtype {
@@ -1805,18 +1871,21 @@ impl GpuQwen35 {
         let mut sa = et.data.raw_ptr(); let mut ida = moe.ids.raw_ptr();
         let mut xa = xq8; let mut ya = y;
         let mut ia = in_dim; let mut oa = out_dim;
-        let mut bpe = et.bytes_per_expert as u32; let mut st = xq_stride;
-        let mut args: [*mut c_void; 8] = [
+        let mut bpe = et.bytes_per_expert as u32;
+        let mut tst = xq_tok_stride; let mut sst = xq_slot_stride;
+        let mut nu = moe.n_used as u32;
+        let mut args: [*mut c_void; 10] = [
             &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
             &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-            &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
-        unsafe { f.launch((grid_x, moe.n_used as u32, 1), (256,1,1), 0,
+            &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+            &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, moe.n_used as u32, n_tok), (256,1,1), 0,
                           Some(&self.stream), &mut args) }
     }
 
-    fn launch_moe_combine(&self, moe: &MoeRuntime, experts: *mut c_void, out: *mut c_void)
-        -> Result<(), String>
+    fn launch_moe_combine(&self, moe: &MoeRuntime, experts: *mut c_void,
+                          out: *mut c_void, n_tok: u32) -> Result<(), String>
     {
         let f = moe.m_combine.function("moe_combine_f32")?;
         let block: u32 = 256;
@@ -1830,11 +1899,12 @@ impl GpuQwen35 {
             &mut wa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
             &mut nu as *mut _ as *mut c_void];
-        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid,n_tok,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_moe_shexp_gate(&self, moe: &MoeRuntime, sh_out: *mut c_void,
-                             hidden: *mut c_void, gate_w: *mut c_void) -> Result<(), String>
+                             hidden: *mut c_void, gate_w: *mut c_void, n_tok: u32)
+        -> Result<(), String>
     {
         let f = moe.m_shexp_gate.function("moe_shexp_gate_f32")?;
         let block: u32 = 256;
@@ -1843,7 +1913,7 @@ impl GpuQwen35 {
         let mut args: [*mut c_void; 4] = [
             &mut sa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
             &mut ga as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        unsafe { f.launch((1,1,1),(block,1,1), block * 4, Some(&self.stream), &mut args) }
+        unsafe { f.launch((n_tok,1,1),(block,1,1), block * 4, Some(&self.stream), &mut args) }
     }
 
     /// Quantize `n_vec` activation vectors of `in_dim` into `out` (BlockQ8).
@@ -2497,13 +2567,17 @@ impl GpuQwen35 {
                 self.bmm(&d.down, gate.raw_ptr(), n, out_bb.raw_ptr())?;
             }
             BlockFfn::Moe(m) => {
-                // Prefill MoE: each token through the single-token MoE FFN
-                // (routed experts need per-token routing — no batched form).
+                // Prefill MoE: process the rows in MOE_PREFILL_CHUNK-sized
+                // batches — routed-expert matvecs batch over tokens (grid.z),
+                // the router + shared expert go through rocBLAS GEMMs.
                 let h = self.hidden;
-                for t in 0..n {
-                    let inp  = unsafe { (input.raw_ptr()  as *mut f32).add(t * h) as *mut c_void };
-                    let outp = unsafe { (out_bb.raw_ptr() as *mut f32).add(t * h) as *mut c_void };
-                    self.step_moe_ffn(inp, outp, m)?;
+                let mut off = 0;
+                while off < n {
+                    let c = (n - off).min(MOE_PREFILL_CHUNK);
+                    let inp  = unsafe { (input.raw_ptr()  as *mut f32).add(off * h) as *mut c_void };
+                    let outp = unsafe { (out_bb.raw_ptr() as *mut f32).add(off * h) as *mut c_void };
+                    self.step_moe_ffn_batched(inp, outp, m, c)?;
+                    off += c;
                 }
             }
         }

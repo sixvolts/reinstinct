@@ -6,7 +6,8 @@
 // expert-indexing prologue of moe_matvec_q6k_dp4a.
 //
 // 256-thread workgroup: 4 wavefronts, ROWS=2 rows each.
-// grid = (ceil(out_dim/8), n_used).
+// grid = (ceil(out_dim/8), n_used, n_tok) — grid.z batches prefill
+// tokens; decode launches with grid.z = 1.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -34,13 +35,17 @@ void moe_matvec_q6k_repacked_f32(const unsigned char* __restrict__ slab,
                                  unsigned int in_dim,
                                  unsigned int out_dim,
                                  unsigned int bytes_per_expert,
-                                 unsigned int xq_stride)
+                                 unsigned int xq_tok_stride,
+                                 unsigned int xq_slot_stride,
+                                 unsigned int n_used)
 {
+    const int tok  = blockIdx.z;
     const int slot = blockIdx.y;
-    const int eid  = ids[slot];
+    const int eid  = ids[(size_t)tok * n_used + slot];
     const uint8_t* wbase = slab + (size_t)eid * bytes_per_expert;
-    const BlockQ8* xqs = xq + (size_t)slot * xq_stride;
-    float* yo = y + (size_t)slot * out_dim;
+    const BlockQ8* xqs = xq + (size_t)tok * xq_tok_stride
+                            + (size_t)slot * xq_slot_stride;
+    float* yo = y + ((size_t)tok * n_used + slot) * out_dim;
 
     const int wave = threadIdx.x >> 6;
     const int lane = threadIdx.x & 63;

@@ -3,8 +3,9 @@
 //
 //   sh_out[i] *= sigmoid( sum_k hidden[k]·gate_w[k] )
 //
-// One workgroup, block = 256, dynamic shared mem of blockDim.x floats
-// for the dot-product reduction.
+// One workgroup per token (grid.x = n_tok; decode launches grid.x = 1),
+// block = 256, dynamic shared mem of blockDim.x floats for the
+// dot-product reduction. `gate_w` is shared across all tokens.
 
 #include <hip/hip_runtime.h>
 
@@ -17,6 +18,10 @@ void moe_shexp_gate_f32(float*       __restrict__ sh_out,   // [n] in/out
     extern __shared__ float smem[];
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
+
+    // One block per token; gate_w is shared across tokens.
+    sh_out += (size_t)blockIdx.x * n;
+    hidden += (size_t)blockIdx.x * n;
 
     float d = 0.0f;
     for (int i = tid; i < (int)n; i += bs) d += hidden[i] * gate_w[i];
