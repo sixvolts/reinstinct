@@ -18,6 +18,9 @@ use crate::hip::rocblas::{self, Handle, RocblasOp};
 use super::KernelCache;
 
 const CVT_SOURCE: &str = include_str!("../../kernels/cvt_f32_f16.cpp");
+const QUANTIZE_Q8_SOURCE: &str = include_str!("../../kernels/quantize_q8.cpp");
+const MMQ_GEMM_Q4K_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 
 /// Bulk-dequantize a quantized weight tensor to an fp16 device buffer.
 /// `n_elements` is the logical weight count (out_dim * in_dim).
@@ -197,9 +200,12 @@ pub struct PrefillGemm {
     deq_q4k_repacked: Module,
     deq_q5k_repacked: Module,
     deq_q6k_repacked: Module,
+    quantize_q8: Module,
+    mmq_q4k:     Module,
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
     dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
+    xq8:    std::cell::RefCell<DeviceBuf<u8>>,    // int8 activations (MMQ path)
 }
 
 impl PrefillGemm {
@@ -226,9 +232,14 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_q5k_repacked_f16.cpp"))?)?,
             deq_q6k_repacked: Module::load(&cache.compile("dequant_q6k_repacked_f16",
                            include_str!("../../kernels/dequant_q6k_repacked_f16.cpp"))?)?,
+            quantize_q8: Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?,
+            mmq_q4k:     Module::load(&cache.compile("mmq_gemm_q4k_repacked",
+                                                     MMQ_GEMM_Q4K_SOURCE)?)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
             dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
+            // int8 activations: one BlockQ8 (40 B) per 32-element sub-block.
+            xq8:    std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
         })
     }
 
@@ -255,6 +266,16 @@ impl PrefillGemm {
                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<DeviceBuf<f32>, String>
     {
+        // Repacked Q4_K: the int8 MMQ GEMM consumes the quantised weight
+        // directly — no dequant to fp16, no HGEMM. The current MMQ kernel
+        // amortises the weight read across the token tile but re-reads the
+        // activation per row-block; it beats the dequant+HGEMM path only
+        // up to P≈256. Above that the HGEMM's 2D tiling wins, so gate on
+        // P. (A 2D-tiled LDS MMQ would lift this gate — see task 120.)
+        if repacked && dtype == GgmlType::Q4_K && n_rows <= 256 {
+            return self.matmul_mmq_q4k(stream, w_dev, in_dim, out_dim, x, n_rows);
+        }
+
         let n_w = out_dim * in_dim;
         let n_x = n_rows * in_dim;
         let n_y = n_rows * out_dim;
@@ -336,6 +357,46 @@ impl PrefillGemm {
             *buf.borrow_mut() = DeviceBuf::new(n)?;
         }
         Ok(())
+    }
+
+    /// Device-resident `Y = X · Wᵀ` for a repacked Q4_K weight via the
+    /// int8 MMQ GEMM: quantise X → BlockQ8, then one dp4a GEMM straight
+    /// off the quantised weight. All kernels ordered on `stream`.
+    fn matmul_mmq_q4k(&self, stream: &hip::Stream, w_dev: &DeviceBuf<u8>,
+                      in_dim: usize, out_dim: usize,
+                      x: &DeviceBuf<f32>, n_rows: usize)
+        -> Result<DeviceBuf<f32>, String>
+    {
+        let n_xq8 = (n_rows * in_dim / 32) * 40;          // BlockQ8 bytes
+        if self.xq8.borrow().len() < n_xq8 {
+            stream.synchronize()?;
+            *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
+        }
+        let xq8 = self.xq8.borrow();
+
+        // 1. Quantise X → BlockQ8 [n_rows, in_dim/32] (grid.y = row).
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
+
+        // 2. MMQ GEMM → fresh fp32 Y [n_rows, out_dim].
+        let dy: DeviceBuf<f32> = DeviceBuf::new(n_rows * out_dim)?;
+        let gf = self.mmq_q4k.function("mmq_gemm_q4k_repacked_f32")?;
+        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dy.raw_ptr();
+        let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = n_rows as u32;
+        let mut ga: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+        // grid: 8 output rows × TN=32 tokens per workgroup.
+        unsafe { gf.launch(((out_dim as u32 + 7) / 8, (n_rows as u32 + 31) / 32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut ga)?; }
+        Ok(dy)
     }
 }
 

@@ -172,7 +172,6 @@ pub fn run_mmq_gemm_q4k_repacked(cache: &KernelCache, packed: &[u8], x: &[f32],
                                  p_rows: usize, in_dim: usize, out_dim: usize)
     -> Result<Vec<f32>, String>
 {
-    const TN: u32 = 32;
     let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?;
     let qf = qmod.function("quantize_q8_f32")?;
     let gmod = Module::load(&cache.compile("mmq_gemm_q4k_repacked",
@@ -199,7 +198,8 @@ pub fn run_mmq_gemm_q4k_repacked(cache: &KernelCache, packed: &[u8], x: &[f32],
         &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
         &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
         &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
-    unsafe { gf.launch(((out_dim as u32 + 255) / 256, (p_rows as u32 + TN - 1) / TN, 1),
+    // grid: 8 output rows × TN=32 tokens per workgroup.
+    unsafe { gf.launch(((out_dim as u32 + 7) / 8, (p_rows as u32 + 31) / 32, 1),
                        (256, 1, 1), 0, None, &mut gargs)?; }
     hip::Device(0).synchronize()?;
 
