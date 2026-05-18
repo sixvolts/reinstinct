@@ -99,6 +99,7 @@ const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MMQ_GEMM_Q4K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 /// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
@@ -758,6 +759,8 @@ pub struct GpuQwen35 {
     dequant_q6k_repacked_module: Module,
     rope_batched_module:   Module,
     attn_step_batched_module: Module,
+    /// 2D-tiled int8 MMQ GEMM — replaces dequant+HGEMM for repacked Q4_K.
+    mmq_q4k_module:        Module,
 
     // Dimensions.
     hidden:     usize,
@@ -966,6 +969,7 @@ impl GpuQwen35 {
                 "dequant_q6k_repacked_f16", DEQUANT_Q6K_REPACKED_F16_SOURCE)?)?,
             rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
             attn_step_batched_module: Module::load(&cache.compile("attn_step_batched", ATTN_STEP_BATCHED_SOURCE)?)?,
+            mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
             matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
             matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
@@ -2328,6 +2332,12 @@ impl GpuQwen35 {
         let in_d = w.in_dim as usize;
         let out_d = w.out_dim as usize;
 
+        // Repacked Q4_K: the 2D-tiled int8 MMQ GEMM consumes the
+        // quantised weight directly — no dequant to fp16, no HGEMM.
+        if w.repacked && w.dtype == GgmlType::Q4_K {
+            return self.bmm_mmq_q4k(w, x_f32, n_rows, y_f32);
+        }
+
         // W → fp16 (F16 weights are already fp16: use raw bytes directly).
         let dq: Option<DeviceBuf<u16>>;
         let w_ptr: *mut c_void;
@@ -2364,6 +2374,33 @@ impl GpuQwen35 {
         // (hit on the 27B; the 0.8B raced through by luck).
         self.stream.synchronize()?;
         let _ = dq;
+        Ok(())
+    }
+
+    /// Repacked-Q4_K `Y = X · Wᵀ` via the 2D-tiled int8 MMQ GEMM:
+    /// quantise X → BlockQ8, then one dp4a GEMM straight off the
+    /// quantised weight.
+    fn bmm_mmq_q4k(&self, w: &GpuMatvecTensor, x_f32: *mut c_void, n_rows: usize,
+                   y_f32: *mut c_void) -> Result<(), String>
+    {
+        let in_d = w.in_dim as usize;
+        let out_d = w.out_dim as usize;
+        // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
+        let xq8: DeviceBuf<u8> = DeviceBuf::new(n_rows * (in_d / 32) * 40)?;
+        self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
+
+        // MMQ GEMM — BM=64 output rows × BN=64 tokens per workgroup.
+        let f = self.mmq_q4k_module.function("mmq_gemm_q4k_repacked_f32")?;
+        let mut wp = w.data.raw_ptr(); let mut xp = xq8.raw_ptr(); let mut yp = y_f32;
+        let mut ia = in_d as u32; let mut oa = out_d as u32; let mut pa = n_rows as u32;
+        let mut args: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+        unsafe { f.launch(((out_d as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
+                          (256, 1, 1), 0, Some(&self.stream), &mut args)?; }
+        // xq8 is local — sync before it drops, like bmm.
+        self.stream.synchronize()?;
         Ok(())
     }
 
