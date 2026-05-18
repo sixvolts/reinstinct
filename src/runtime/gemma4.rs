@@ -770,15 +770,32 @@ impl GpuGemma4 {
                          bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
     {
         // Repacked Q6_K experts use the contiguous kernel (256-thread, 8
-        // rows/workgroup); others the on-disk dp4a kernels (64-thread, 2).
-        let (module, kname, block, rows): (&Module, &str, u32, u32) = if repacked {
-            (&self.m_moe_mv_q6k_repacked, "moe_matvec_q6k_repacked_f32", 256, 8)
-        } else {
-            match dtype {
-                GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
-                GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
-                other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
-            }
+        // rows/workgroup). It is shared with the qwen runtime, whose
+        // signature carries a token-batch dimension: gemma is single-token,
+        // so xq_tok_stride = 0, xq_slot_stride = xq_stride, grid.z = 1.
+        if repacked {
+            let f = self.m_moe_mv_q6k_repacked.function("moe_matvec_q6k_repacked_f32")?;
+            let grid_x = (out_dim + 7) / 8;
+            let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
+            let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert;
+            let mut tst=0u32; let mut sst=xq_stride; let mut nu=self.n_expert_used as u32;
+            let mut args: [*mut c_void; 10] = [
+                &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+                &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+                &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+                &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+            return unsafe {
+                f.launch((grid_x, self.n_expert_used as u32, 1), (256,1,1), 0,
+                         Some(&self.stream), &mut args)
+            };
+        }
+
+        // Non-repacked experts use the on-disk dp4a kernels (64-thread, 2).
+        let (module, kname, block, rows): (&Module, &str, u32, u32) = match dtype {
+            GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
+            GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
+            other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
         };
         let f = module.function(kname)?;
         let grid_x = (out_dim + rows - 1) / rows;
