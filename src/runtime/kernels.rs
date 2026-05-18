@@ -40,6 +40,7 @@ const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
+const MMQ_GEMM_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 
 /// Batched causal attention over `p` query tokens. Q/K/V are row-major
@@ -160,6 +161,49 @@ pub fn run_repacked_matvec(cache: &KernelCache, compile_name: &str, mv_src: &str
     hip::Device(0).synchronize()?;
 
     let mut out = vec![0.0f32; out_dim];
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// Run the int8 MMQ GEMM (repacked Q4_K weight) over `p_rows` activation
+/// rows. `x` is `[p_rows, in_dim]` f32; returns `Y` `[p_rows, out_dim]`.
+/// The MMQ kernel's TN tile is 32 — keep this grid in sync with it.
+pub fn run_mmq_gemm_q4k_repacked(cache: &KernelCache, packed: &[u8], x: &[f32],
+                                 p_rows: usize, in_dim: usize, out_dim: usize)
+    -> Result<Vec<f32>, String>
+{
+    const TN: u32 = 32;
+    let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?;
+    let qf = qmod.function("quantize_q8_f32")?;
+    let gmod = Module::load(&cache.compile("mmq_gemm_q4k_repacked",
+                                           MMQ_GEMM_Q4K_REPACKED_SRC)?)?;
+    let gf = gmod.function("mmq_gemm_q4k_repacked_f32")?;
+
+    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
+    let dxq: DeviceBuf<u8> = DeviceBuf::new(p_rows * (in_dim / 32) * 40)?;
+    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(packed)?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(p_rows * out_dim)?;
+
+    // Quantize all p_rows activations → BlockQ8 (grid.y = row).
+    let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr();
+    let mut ind = in_dim as u32;
+    let mut qargs: [*mut c_void; 3] = [
+        &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+        &mut ind as *mut _ as *mut c_void];
+    unsafe { qf.launch((((in_dim as u32) + 255) / 256, p_rows as u32, 1), (256, 1, 1),
+                       0, None, &mut qargs)?; }
+
+    let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
+    let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = p_rows as u32;
+    let mut gargs: [*mut c_void; 6] = [
+        &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
+        &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+        &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+    unsafe { gf.launch(((out_dim as u32 + 255) / 256, (p_rows as u32 + TN - 1) / TN, 1),
+                       (256, 1, 1), 0, None, &mut gargs)?; }
+    hip::Device(0).synchronize()?;
+
+    let mut out = vec![0.0f32; p_rows * out_dim];
     dy.copy_to_host(&mut out)?;
     Ok(out)
 }
@@ -1535,6 +1579,57 @@ mod tests {
             assert!(e6 < DP4A_REL_L2_MAX,
                 "q6k repacked rel_l2 {e6:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
         }
+    }
+
+    #[test]
+    fn mmq_gemm_q4k_repacked_matches_matvec() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim  = 2048usize;
+        let out_dim = 384usize;   // 1.5·256 — exercises the out_dim tail
+        let p_rows  = 70usize;    // not a multiple of TN=32 — exercises the tail
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0x9494_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let d    = ((blk % 29) as f32 - 14.0) * 0.003;
+            let dmin = ((blk % 17) as f32 -  8.0) * 0.0015;
+            w_bytes[off..off+2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            w_bytes[off+2..off+4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+            for i in 0..12  { w_bytes[off + 4  + i] = rng_u8(); }
+            for i in 0..128 { w_bytes[off + 16 + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x2468_ACE0;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..p_rows * in_dim).map(|_| x_rng()).collect();
+
+        // fp32 reference — per-row matvec on the dequantised weight.
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::q4_k::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; p_rows * out_dim];
+        for p in 0..p_rows {
+            let mut row = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&x[p*in_dim..(p+1)*in_dim], &w_fp32,
+                                    in_dim, out_dim, &mut row);
+            cpu[p*out_dim..(p+1)*out_dim].copy_from_slice(&row);
+        }
+
+        let packed = crate::quant::q4_k::repack_for_matvec(&w_bytes, in_dim, out_dim);
+        let gpu = run_mmq_gemm_q4k_repacked(&cache, &packed, &x, p_rows, in_dim, out_dim)
+            .expect("mmq gemm q4k");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("mmq_gemm_q4k_repacked {p_rows}x{out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "mmq gemm q4k rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
     #[test]
