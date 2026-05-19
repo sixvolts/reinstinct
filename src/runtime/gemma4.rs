@@ -20,7 +20,7 @@ const RMSNORM_SRC:           &str = include_str!("../../kernels/rmsnorm.cpp");
 const RMSNORM_MULTIHEAD_SRC: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
 const ROPE_SRC:              &str = include_str!("../../kernels/rope_dpos.cpp");
 const ADD_INPLACE_SRC:       &str = include_str!("../../kernels/add_inplace.cpp");
-const MATVEC_F32_W_SRC:      &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
+const MATVEC_F32_B256_SRC:   &str = include_str!("../../kernels/matvec_f32_b256.cpp");
 const MATVEC_Q4K_W_SRC:      &str = include_str!("../../kernels/matvec_q4_k_rowblock.cpp");
 const MATVEC_Q5K_W_SRC:      &str = include_str!("../../kernels/matvec_q5_k_rowblock.cpp");
 const MATVEC_Q6K_W_SRC:      &str = include_str!("../../kernels/matvec_q6_k_rowblock.cpp");
@@ -647,7 +647,7 @@ impl GpuGemma4 {
             m_embed_q6k:  ld("embed_lookup_q6_k", EMBED_Q6K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
             m_embed_f32:  ld("embed_lookup", EMBED_F32_SRC)?,
-            m_mv_f32:     ld("matvec_f32_wave64", MATVEC_F32_W_SRC)?,
+            m_mv_f32:     ld("matvec_f32_b256", MATVEC_F32_B256_SRC)?,
             m_mv_q4k:     ld("matvec_q4_k_rowblock", MATVEC_Q4K_W_SRC)?,
             m_mv_q5k:     ld("matvec_q5_k_rowblock", MATVEC_Q5K_W_SRC)?,
             m_mv_q6k:     ld("matvec_q6_k_rowblock", MATVEC_Q6K_W_SRC)?,
@@ -976,7 +976,7 @@ impl GpuGemma4 {
 
         // Q4/5/6_K use the row-blocked kernel; the rest the wave64 ones.
         let (module, kname, grid) = match dtype {
-            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_wave64",      out_dim),
+            GgmlType::F32    => (&self.m_mv_f32,  "matvec_f32_b256",        out_dim),
             GgmlType::Q4_K   => (&self.m_mv_q4k,  "matvec_q4_k_rowblock_f32",
                                  (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
             GgmlType::Q5_K   => (&self.m_mv_q5k,  "matvec_q5_k_rowblock_f32",
@@ -988,13 +988,16 @@ impl GpuGemma4 {
             other => return Err(format!("gemma4 matvec: no kernel for {other:?}")),
         };
         let f = module.function(kname)?;
+        // The F32 kernel uses a 256-thread block (4 waves/row); the
+        // wave64 kernels use one 64-thread wavefront per row.
+        let kblock = if matches!(dtype, GgmlType::F32) { 256 } else { block };
         let mut wa=w_ptr; let mut xa=x; let mut ya=y;
         let mut ia=in_dim; let mut oa=out_dim;
         let mut args: [*mut c_void; 5] = [
             &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
             &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void];
-        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid,1,1),(kblock,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     /// Router: softmax + top-k over `n_expert` logits → expert ids and
