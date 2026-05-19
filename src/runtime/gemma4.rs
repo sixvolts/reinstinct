@@ -41,6 +41,10 @@ const GEGLU_SRC:             &str = include_str!("../../kernels/geglu.cpp");
 const LOGIT_SOFTCAP_SRC:     &str = include_str!("../../kernels/logit_softcap.cpp");
 const SCALE_INPLACE_SRC:     &str = include_str!("../../kernels/scale_inplace.cpp");
 const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_q8.cpp");
+const ATTN_PARTIAL_Q8_SRC:   &str = include_str!("../../kernels/attn_partial_q8.cpp");
+const ATTN_MERGE_SRC:        &str = include_str!("../../kernels/attn_merge.cpp");
+/// Max split-K splits per KV head — bounds the partial-attention scratch.
+const ATTN_MAX_SPLITS: u32 = 16;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
@@ -51,6 +55,7 @@ const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
 const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill_flash.cpp");
+const PERMUTE_PLE_SRC:       &str = include_str!("../../kernels/permute_ple.cpp");
 const KV_QUANT_PREFILL_SRC:  &str = include_str!("../../kernels/kv_quant_prefill.cpp");
 const MOE_GROUPED_Q6K_SRC:   &str = include_str!("../../kernels/moe_matvec_grouped_q6k.cpp");
 const MOE_GROUPED_Q8_0_SRC:  &str = include_str!("../../kernels/moe_matvec_grouped_q8_0.cpp");
@@ -79,6 +84,57 @@ fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
         .ok_or_else(|| format!("{name}: no data"))?;
     let floats: &[f32] = bytemuck::cast_slice(bytes);
     DeviceBuf::from_slice(floats)
+}
+
+/// Load a 2D BF16 weight, converting it to f32 on the host and wrapping
+/// it as an F32 [`GpuMatvecTensor`] so the plain f32 matvec serves it.
+/// E4B's `per_layer_model_proj` is the only BF16 tensor; converting to
+/// f32 (vs f16) avoids overflowing f16's narrower exponent range.
+fn load_bf16_as_f32_matvec(gguf: &GgufFile, name: &str) -> Result<GpuMatvecTensor, String> {
+    let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+    if info.ggml_type != GgmlType::BF16 {
+        return Err(format!("tensor {name}: expected BF16, got {:?}", info.ggml_type));
+    }
+    let bytes = gguf.tensor_data(name).map_err(|e| format!("{name}: {e}"))?
+        .ok_or_else(|| format!("{name}: no data"))?;
+    let shape = info.shape();
+    if shape.len() != 2 {
+        return Err(format!("tensor {name}: expected 2D, got {shape:?}"));
+    }
+    let src: &[u16] = bytemuck::cast_slice(bytes);
+    let f32s: Vec<f32> = src.iter().map(|&b| crate::quant::half::bf16_to_f32(b)).collect();
+    Ok(GpuMatvecTensor {
+        data:    DeviceBuf::from_slice(bytemuck::cast_slice::<f32, u8>(&f32s))?,
+        dtype:   GgmlType::F32,
+        in_dim:  shape[0] as u32,
+        out_dim: shape[1] as u32,
+        repacked: false,
+    })
+}
+
+/// Global Per-Layer-Embedding weights (E4B only). The per-layer token
+/// embedding is a second, layer-indexed embedding table; it is projected
+/// from the main embedding and gated into each block — see
+/// `enqueue_forward` / `block_forward`.
+struct PleGlobal {
+    /// Q5_K embedding table, one `[n_embd_per_layer · n_layer]` row per
+    /// vocab token — kept in on-disk form for the embed-lookup kernel.
+    tok_embd:   GpuMatvecTensor,
+    /// `[n_embd, n_embd_per_layer · n_layer]` projection of the main
+    /// embedding (BF16 on disk, converted to f32).
+    model_proj: GpuMatvecTensor,
+    /// RMSNorm weight over each layer's `n_embd_per_layer` slice.
+    proj_norm:  DeviceBuf<f32>,
+}
+
+/// Per-block Per-Layer-Embedding weights (E4B only).
+struct PleBlock {
+    /// `[n_embd, n_embd_per_layer]` — gates the hidden state down.
+    inp_gate:  GpuMatvecTensor,
+    /// `[n_embd_per_layer, n_embd]` — projects the gated PLE back up.
+    proj:      GpuMatvecTensor,
+    /// RMSNorm weight applied to the PLE branch output.
+    post_norm: DeviceBuf<f32>,
 }
 
 /// A 3D expert-weight tensor `[in_dim, out_dim, n_expert]` resident on
@@ -178,11 +234,18 @@ pub struct GpuGemma4Block {
     n_kv:     usize,
     /// `Some` on MoE layers — the routed-expert branch.
     moe:      Option<MoeBlock>,
+    /// `Some(donor)` on KV-sharing layers — this layer computes only Q
+    /// and attends against layer `donor`'s KV cache. `None` ⇒ the layer
+    /// owns its KV.
+    kv_donor: Option<usize>,
+    /// `Some` on PLE models (E4B) — the per-layer-embedding gate branch.
+    ple:      Option<PleBlock>,
 }
 
 impl GpuGemma4Block {
     fn from_gguf(gguf: &GgufFile, layer: u32, kind: AttnKind,
-                 head_dim: usize, n_kv: usize, moe: bool) -> Result<Self, String> {
+                 head_dim: usize, n_kv: usize, moe: bool,
+                 kv_donor: Option<usize>, ple: bool) -> Result<Self, String> {
         let p = format!("blk.{layer}.");
         let moe_block = if moe {
             Some(MoeBlock {
@@ -196,8 +259,18 @@ impl GpuGemma4Block {
                 down_exps_s:  load_fp32(gguf, &format!("{p}ffn_down_exps.scale"))?,
             })
         } else { None };
-        let attn_v = if kind == AttnKind::Sliding {
+        // V projection: present on all E4B layers, but only sliding
+        // layers on the 31B (its full layers reuse the K projection).
+        // Load by tensor presence rather than attention kind.
+        let attn_v = if gguf.tensor(&format!("{p}attn_v.weight")).is_some() {
             Some(GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}attn_v.weight"))?)
+        } else { None };
+        let ple_block = if ple {
+            Some(PleBlock {
+                inp_gate:  GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}inp_gate.weight"))?,
+                proj:      GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}proj.weight"))?,
+                post_norm: load_fp32(gguf, &format!("{p}post_norm.weight"))?,
+            })
         } else { None };
         // layer_output_scale is a [1] f32 — read it to host.
         let los_info = gguf.tensor(&format!("{p}layer_output_scale.weight"))
@@ -224,6 +297,8 @@ impl GpuGemma4Block {
             post_ffw_norm:  load_fp32(gguf, &format!("{p}post_ffw_norm.weight"))?,
             layer_output_scale, kind, head_dim, n_kv,
             moe: moe_block,
+            kv_donor,
+            ple: ple_block,
         })
     }
 }
@@ -304,6 +379,19 @@ pub struct GpuGemma4 {
     /// All-ones weight for the plain (unweighted) V RMSNorm.
     ones:        DeviceBuf<f32>,
 
+    /// Per-Layer-Embedding state (E4B). `ple_raw`/`ple_proj` hold the
+    /// `[n_embd_per_layer · n_layer]` per-layer embeddings for the
+    /// current token; `ple_gate`/`ple_tmp` are per-block scratch.
+    ple:        Option<PleGlobal>,
+    ple_raw:    DeviceBuf<f32>,
+    ple_proj:   DeviceBuf<f32>,
+    ple_gate:   DeviceBuf<f32>,
+    ple_tmp:    DeviceBuf<f32>,
+    n_embd_per_layer: usize,
+    /// Layers `[0, n_layer_kv_from_start)` own their KV cache; later
+    /// layers share a donor's. Equals `block_count` with no sharing.
+    n_layer_kv_from_start: usize,
+
     // MoE scratch (allocated for all models; tiny when unused).
     moe_logits:  DeviceBuf<f32>,   // [n_expert]
     moe_ids:     DeviceBuf<i32>,   // [n_expert_used]
@@ -325,6 +413,20 @@ pub struct GpuGemma4 {
     m_softcap:   Module,
     m_scale:     Module,
     m_attn_win:  Module,
+    /// Split-K decode attention (partial + merge) — see attn_partial_q8.cpp.
+    m_attn_partial: Module,
+    m_attn_merge:   Module,
+    /// Partial-attention scratch: [n_heads, ATTN_MAX_SPLITS, head_dim_max]
+    /// and [n_heads, ATTN_MAX_SPLITS] for the running max / denominator.
+    attn_o_partial: DeviceBuf<f32>,
+    attn_m_partial: DeviceBuf<f32>,
+    attn_l_partial: DeviceBuf<f32>,
+    /// `REINSTINCT_OLD_ATTN` — use the original single-block kernel.
+    use_old_attn:   bool,
+    /// `REINSTINCT_MOE_PROFILE` — per-stage decode timing.
+    moe_prof_on:    bool,
+    prof_mark:      std::cell::Cell<std::time::Instant>,
+    prof_buckets:   std::cell::RefCell<Vec<(&'static str, f64)>>,
     m_embed_q5k: Module,
     m_embed_q6k: Module,
     m_embed_q8_0: Module,
@@ -361,6 +463,21 @@ pub struct GpuGemma4 {
     max_seq: usize,
 
     stream: Stream,
+
+    /// Prefill context — rocBLAS handle + kernels built once at load and
+    /// reused by every `prefill_forward` call. Recreating these per call
+    /// (rocBLAS init + ~16 module loads, ~150 ms) dominated small-model
+    /// prefill latency.
+    rocblas:       crate::hip::rocblas::Handle,
+    prefill_gemm:  crate::runtime::prefill::PrefillGemm,
+    m_rope_pf:     Module,
+    m_attn_pf:     Module,
+    m_kvq_pf:      Module,
+    m_permute_pf:  Module,
+    m_g6k_pf:      Module,
+    m_g6k_rp_pf:   Module,
+    m_g8_pf:       Module,
+    m_sc_pf:       Module,
 
     // Dimensions.
     hidden:     usize,
@@ -401,12 +518,24 @@ impl GpuGemma4 {
         let expert_ff_a = (cfg.expert_ff_size as usize).max(32);
         let mut blocks = Vec::with_capacity(cfg.block_count as usize);
         for layer in 0..cfg.block_count {
-            let kind = cfg.attn_kinds[layer as usize];
+            let l = layer as usize;
+            let kind = cfg.attn_kinds[l];
+            let kv_donor = if cfg.layer_has_kv(l) { None } else { Some(cfg.kv_donor(l)) };
             blocks.push(GpuGemma4Block::from_gguf(
                 gguf, layer, kind,
-                cfg.head_dim(layer as usize) as usize,
-                cfg.kv_heads[layer as usize] as usize, moe)?);
+                cfg.head_dim(l) as usize,
+                cfg.kv_heads[l] as usize, moe, kv_donor, cfg.has_ple())?);
         }
+
+        // Per-Layer-Embedding global weights (E4B only).
+        let ple = if cfg.has_ple() {
+            Some(PleGlobal {
+                tok_embd:   GpuMatvecTensor::from_gguf(gguf, "per_layer_token_embd.weight")?,
+                model_proj: load_bf16_as_f32_matvec(gguf, "per_layer_model_proj.weight")?,
+                proj_norm:  load_fp32(gguf, "per_layer_proj_norm.weight")?,
+            })
+        } else { None };
+        let ple_dim = (cfg.n_embd_per_layer as usize * cfg.block_count as usize).max(1);
 
         // RoPE tables for both kinds.
         let build_rope = |rotary: usize, base: f32| -> Result<(DeviceBuf<f32>, DeviceBuf<f32>), String> {
@@ -440,6 +569,39 @@ impl GpuGemma4 {
             .max().unwrap_or(0) as usize;
         let xq8 = DeviceBuf::<u8>::new((max_in_dim / 32) * 40)?;
 
+        // --- Prefill context: built once, reused every prefill call. ---
+        let stream = Stream::new()?;
+        let (mut pmax_w, mut pmax_in, mut pmax_out) = (0usize, 0usize, 0usize);
+        for b in &blocks {
+            let mut ws: Vec<&GpuMatvecTensor> = vec![
+                &b.attn_q, &b.attn_k, &b.attn_output, &b.ffn_gate, &b.ffn_up, &b.ffn_down];
+            if let Some(wv) = &b.attn_v { ws.push(wv); }
+            if let Some(pb) = &b.ple { ws.push(&pb.inp_gate); ws.push(&pb.proj); }
+            for w in ws {
+                pmax_w   = pmax_w.max(w.in_dim as usize * w.out_dim as usize);
+                pmax_in  = pmax_in.max(w.in_dim as usize);
+                pmax_out = pmax_out.max(w.out_dim as usize);
+            }
+        }
+        if let Some(pg) = &ple {
+            let w = &pg.model_proj;
+            pmax_w   = pmax_w.max(w.in_dim as usize * w.out_dim as usize);
+            pmax_in  = pmax_in.max(w.in_dim as usize);
+            pmax_out = pmax_out.max(w.out_dim as usize);
+        }
+        let rocblas = crate::hip::rocblas::Handle::new()?;
+        rocblas.set_stream(&stream)?;
+        let prefill_gemm = crate::runtime::prefill::PrefillGemm::new(
+            cache, pmax_w.max(1), max_seq * pmax_in.max(1), max_seq * pmax_out.max(1))?;
+        let m_rope_pf    = ld("rope_prefill", ROPE_PREFILL_SRC)?;
+        let m_attn_pf    = ld("attn_prefill_flash", ATTN_PREFILL_SRC)?;
+        let m_kvq_pf     = ld("kv_quant_prefill", KV_QUANT_PREFILL_SRC)?;
+        let m_permute_pf = ld("permute_ple", PERMUTE_PLE_SRC)?;
+        let m_g6k_pf     = ld("moe_matvec_grouped_q6k", MOE_GROUPED_Q6K_SRC)?;
+        let m_g6k_rp_pf  = ld("moe_matvec_grouped_q6k_repacked", MOE_GROUPED_Q6K_REPACKED_SRC)?;
+        let m_g8_pf      = ld("moe_matvec_grouped_q8_0", MOE_GROUPED_Q8_0_SRC)?;
+        let m_sc_pf      = ld("moe_scatter_add", MOE_SCATTER_SRC)?;
+
         Ok(Self {
             token_embd, output_norm, blocks,
             rope_cos_swa, rope_sin_swa, rope_cos_full, rope_sin_full,
@@ -455,6 +617,13 @@ impl GpuGemma4 {
             ffn_b:       DeviceBuf::new(ffn)?,
             logits:      DeviceBuf::new(vocab)?,
             ones,
+            ple,
+            ple_raw:  DeviceBuf::new(ple_dim)?,
+            ple_proj: DeviceBuf::new(ple_dim)?,
+            ple_gate: DeviceBuf::new((cfg.n_embd_per_layer as usize).max(1))?,
+            ple_tmp:  DeviceBuf::new(hidden)?,
+            n_embd_per_layer: cfg.n_embd_per_layer as usize,
+            n_layer_kv_from_start: cfg.n_layer_kv_from_start as usize,
             m_rmsnorm:    ld("rmsnorm", RMSNORM_SRC)?,
             m_rmsnorm_mh: ld("rmsnorm_multihead", RMSNORM_MULTIHEAD_SRC)?,
             m_rope:       ld("rope", ROPE_SRC)?,
@@ -463,6 +632,15 @@ impl GpuGemma4 {
             m_softcap:    ld("logit_softcap", LOGIT_SOFTCAP_SRC)?,
             m_scale:      ld("scale_inplace", SCALE_INPLACE_SRC)?,
             m_attn_win:   ld("attn_step_window", ATTN_WINDOW_SRC)?,
+            m_attn_partial: ld("attn_partial_q8", ATTN_PARTIAL_Q8_SRC)?,
+            m_attn_merge:   ld("attn_merge", ATTN_MERGE_SRC)?,
+            attn_o_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize * hd_max)?,
+            attn_m_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?,
+            attn_l_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?,
+            use_old_attn:   std::env::var_os("REINSTINCT_OLD_ATTN").is_some(),
+            moe_prof_on:    std::env::var_os("REINSTINCT_MOE_PROFILE").is_some(),
+            prof_mark:      std::cell::Cell::new(std::time::Instant::now()),
+            prof_buckets:   std::cell::RefCell::new(Vec::new()),
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
             m_embed_q6k:  ld("embed_lookup_q6_k", EMBED_Q6K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
@@ -502,7 +680,10 @@ impl GpuGemma4 {
             expert_outs: DeviceBuf::new(n_used_a * hidden)?,
             xq8_experts: DeviceBuf::<u8>::new(n_used_a * (expert_ff_a / 32).max(1) * 40)?,
             xq8,
-            stream: Stream::new()?,
+            stream,
+            rocblas, prefill_gemm,
+            m_rope_pf, m_attn_pf, m_kvq_pf, m_permute_pf,
+            m_g6k_pf, m_g6k_rp_pf, m_g8_pf, m_sc_pf,
             hidden, ffn, vocab, n_heads,
             rms_eps: cfg.rms_norm_eps,
             softcap: cfg.final_logit_softcapping,
@@ -935,28 +1116,101 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(threads,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    /// int8-KV decode attention: dp4a Q·Kᵀ, f32-accumulate P·V.
+    /// Batched embedding lookup for prefill — one launch over all
+    /// `n_tokens` token ids (resident in `tokens_dev`), writing row `r`
+    /// of `out`. Replaces the per-token launch+sync embed loop.
+    fn launch_embed_batched(&self, table: &GpuMatvecTensor, out: *mut c_void,
+                            tokens_dev: *mut c_void, n_tokens: u32) -> Result<(), String>
+    {
+        let hidden = table.in_dim;
+        let (module, kname, grid_x): (&Module, &str, u32) = match table.dtype {
+            GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_batched_f32", hidden/256),
+            GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_batched_f32",
+                               (hidden + 255)/256),
+            other => return Err(format!("gemma4 batched embed: no kernel for {other:?}")),
+        };
+        let f = module.function(kname)?;
+        let mut t=table.data.raw_ptr(); let mut o=out;
+        let mut row=tokens_dev; let mut h=hidden;
+        let mut args: [*mut c_void; 4] = [
+            &mut t as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void, &mut h as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_tokens, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// int8-KV decode attention. FlashDecoding split-K: one block per
+    /// (kv_head, split) writes a partial (m, l, o) per Q head; a merge
+    /// kernel combines the splits. This keeps every CU busy at depth and
+    /// shortens the serial P·V scan. `REINSTINCT_OLD_ATTN` falls back to
+    /// the original single-block-per-head kernel for A/B comparison.
     fn launch_attn_q8(&self, q: *mut c_void, kq: *mut c_void, ks: *mut c_void,
                       vq: *mut c_void, vs: *mut c_void, out: *mut c_void,
                       n_kv: u32, head_dim: u32, window: u32) -> Result<(), String>
     {
-        let f = self.m_attn_win.function("attn_step_q8_f32")?;
+        let n_heads = self.n_heads as u32;
         let block: u32 = 256;
-        // LDS: qi (head_dim int8) | scores (max_seq f32) | tmp (block f32).
-        let smem = head_dim + (self.max_seq as u32 + block) * 4;
+
+        if self.use_old_attn {
+            let f = self.m_attn_win.function("attn_step_q8_f32")?;
+            let smem = head_dim + (self.max_seq as u32 + block) * 4;
+            let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
+            let mut oa=out;
+            let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
+            let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
+            let mut args: [*mut c_void; 12] = [
+                &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
+                &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
+                &mut vsa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
+                &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
+            return unsafe { f.launch((n_heads,1,1),(block,1,1), smem,
+                                     Some(&self.stream), &mut args) };
+        }
+
+        // Split the context into `n_splits` chunks: grid (n_heads,
+        // n_splits) fills the CUs and shortens the serial P·V scan.
+        // Depends only on max_seq ⇒ a per-model constant ⇒ graph-safe.
+        let n_splits = ((self.max_seq as u32 + 255) / 256).clamp(1, ATTN_MAX_SPLITS);
+        let win_max = if window > 0 { window.min(self.max_seq as u32) }
+                      else { self.max_seq as u32 };
+        let chunk_max = (win_max + n_splits - 1) / n_splits;
+        // LDS: qi[head_dim i8] | scores[chunk_max f32] | tmp[block f32]
+        let smem = head_dim + (chunk_max + block) * 4;
+
+        // --- partial: grid (n_heads, n_splits) ---
+        let fp = self.m_attn_partial.function("attn_partial_q8_f32")?;
         let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
-        let mut oa=out;
-        let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
+        let mut op=self.attn_o_partial.raw_ptr();
+        let mut mp=self.attn_m_partial.raw_ptr();
+        let mut lp=self.attn_l_partial.raw_ptr();
+        let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
         let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
-        let mut args: [*mut c_void; 12] = [
+        let mut ns=n_splits;
+        let mut pargs: [*mut c_void; 15] = [
             &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
             &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
-            &mut vsa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
-            &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
-        unsafe { f.launch((self.n_heads as u32,1,1),(block,1,1), smem,
-                          Some(&self.stream), &mut args) }
+            &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void];
+        unsafe {
+            fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
+        }
+
+        // --- merge: grid (n_heads) ---
+        let fm = self.m_attn_merge.function("attn_merge_f32")?;
+        let mut op2=self.attn_o_partial.raw_ptr();
+        let mut mp2=self.attn_m_partial.raw_ptr();
+        let mut lp2=self.attn_l_partial.raw_ptr();
+        let mut oa=out; let mut hd2=head_dim; let mut ns2=n_splits;
+        let mut margs: [*mut c_void; 6] = [
+            &mut op2 as *mut _ as *mut c_void, &mut mp2 as *mut _ as *mut c_void,
+            &mut lp2 as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void, &mut ns2 as *mut _ as *mut c_void];
+        unsafe { fm.launch((n_heads,1,1),(block,1,1), 0, Some(&self.stream), &mut margs) }
     }
 
     /// One Gemma 4 decode step → vocab-length soft-capped logits.
@@ -968,6 +1222,29 @@ impl GpuGemma4 {
         Ok(())
     }
 
+    /// `REINSTINCT_MOE_PROFILE` per-stage timer (sync-per-lap).
+    fn prof_reset(&self) {
+        if !self.moe_prof_on { return; }
+        let _ = self.stream.synchronize();
+        self.prof_mark.set(std::time::Instant::now());
+    }
+    fn prof_lap(&self, label: &'static str) {
+        if !self.moe_prof_on { return; }
+        let _ = self.stream.synchronize();
+        let now = std::time::Instant::now();
+        let dt  = now.duration_since(self.prof_mark.get()).as_secs_f64();
+        self.prof_mark.set(now);
+        let mut b = self.prof_buckets.borrow_mut();
+        match b.iter_mut().find(|(l, _)| *l == label) {
+            Some(e) => e.1 += dt,
+            None    => b.push((label, dt)),
+        }
+    }
+    /// Accumulated per-stage decode time (ms) — see `REINSTINCT_MOE_PROFILE`.
+    pub fn moe_prof_report(&self) -> Vec<(&'static str, f64)> {
+        self.prof_buckets.borrow().iter().map(|(l, t)| (*l, t * 1e3)).collect()
+    }
+
     /// Enqueue the full forward as a pure async kernel chain on
     /// `self.stream` — no host sync, no readback. Reads `d_token` /
     /// `d_pos`, so it is identical for every token/position and can be
@@ -976,8 +1253,10 @@ impl GpuGemma4 {
         let h = self.hidden as u32;
         self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr())?;
         self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
+        self.enqueue_ple_setup()?;
+        self.prof_reset();
         for (li, block) in self.blocks.iter().enumerate() {
-            self.block_forward(block, &state.caches[li])?;
+            self.block_forward(block, li, state)?;
             if debug {
                 self.stream.synchronize()?;
                 let mut xh = vec![0.0f32; self.hidden];
@@ -992,6 +1271,33 @@ impl GpuGemma4 {
         if self.softcap > 0.0 {
             self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
         }
+        Ok(())
+    }
+
+    /// Per-Layer-Embedding setup (E4B): build `ple_raw`, the
+    /// `[n_embd_per_layer · n_layer]` per-layer embeddings for the
+    /// current token. Mirrors llama.cpp's `build_inp_per_layer` +
+    /// `project_per_layer_inputs`. No-op when the model has no PLE.
+    /// Must run after `hidden_a` holds the scaled token embedding.
+    fn enqueue_ple_setup(&self) -> Result<(), String> {
+        let Some(pg) = &self.ple else { return Ok(()); };
+        let pd = (self.n_embd_per_layer * self.blocks.len()) as u32;
+        // raw per-layer token-embedding lookup, scaled by √n_embd_per_layer.
+        self.launch_embed(&pg.tok_embd, self.ple_raw.raw_ptr())?;
+        self.launch_scale(self.ple_raw.raw_ptr(), pd,
+                          (self.n_embd_per_layer as f32).sqrt())?;
+        // project the main token embedding, scaled by 1/√n_embd.
+        self.launch_matvec(&pg.model_proj, self.hidden_a.raw_ptr(),
+                           self.ple_proj.raw_ptr())?;
+        self.launch_scale(self.ple_proj.raw_ptr(), pd,
+                          1.0 / (self.hidden as f32).sqrt())?;
+        // RMSNorm each layer's n_embd_per_layer slice (one "head" per layer).
+        self.launch_rmsnorm_mh(self.ple_proj.raw_ptr(), pg.proj_norm.raw_ptr(),
+                               self.ple_proj.raw_ptr(), self.blocks.len() as u32,
+                               self.n_embd_per_layer as u32)?;
+        // ple_raw = (proj + raw) · 1/√2
+        self.launch_add(self.ple_raw.raw_ptr(), self.ple_proj.raw_ptr(), pd)?;
+        self.launch_scale(self.ple_raw.raw_ptr(), pd, 1.0 / 2.0f32.sqrt())?;
         Ok(())
     }
 
@@ -1052,9 +1358,10 @@ impl GpuGemma4 {
         ev[0].record(&self.stream)?;
         self.launch_embed(&self.token_embd, self.hidden_a.raw_ptr())?;
         self.launch_scale(self.hidden_a.raw_ptr(), h, (self.hidden as f32).sqrt())?;
+        self.enqueue_ple_setup()?;
         ev[1].record(&self.stream)?;
         for (li, block) in self.blocks.iter().enumerate() {
-            self.block_forward(block, &state.caches[li])?;
+            self.block_forward(block, li, state)?;
             ev[li + 2].record(&self.stream)?;
         }
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
@@ -1083,33 +1390,18 @@ impl GpuGemma4 {
     ///
     /// Handles both the dense 31B and the 26B MoE — on MoE layers the
     /// shared MLP is batched (GEMM) and the routed experts run per token.
-    pub fn prefill_forward(&self, cache: &KernelCache, tokens: &[u32],
-                           state: &mut Gemma4GpuState)
+    pub fn prefill_forward(&self, tokens: &[u32], state: &mut Gemma4GpuState)
         -> Result<Vec<f32>, String>
     {
-        use crate::runtime::prefill::PrefillGemm;
-        use crate::hip::rocblas::Handle;
         let p = tokens.len();
         let h = self.hidden;
         assert!(p > 0 && p <= self.max_seq, "prefill: bad token count");
         assert_eq!(state.caches.len(), self.blocks.len(), "prefill: state/model mismatch");
-        let handle = Handle::new()?;
-        handle.set_stream(&self.stream)?;
-        let m_rope = Module::load(&cache.compile("rope_prefill", ROPE_PREFILL_SRC)?)?;
-        let m_attn = Module::load(&cache.compile("attn_prefill_flash", ATTN_PREFILL_SRC)?)?;
-        let m_kvq  = Module::load(&cache.compile("kv_quant_prefill", KV_QUANT_PREFILL_SRC)?)?;
-        // Grouped-MoE prefill scratch (sized for P; tiny/unused on the
-        // dense 31B). Each expert's weight is processed in one launch over
-        // all its routed tokens — fits in the 4 MB L2, so the weight is
-        // HBM-read once and L2-reused across the tokens.
+        // rocBLAS handle + prefill kernels were built once in new() — see
+        // the prefill-context fields. Per-call grouped-MoE scratch below.
         let moe = self.n_expert > 0;
         let ne_a = self.n_expert.max(1);
         let ff_a = self.expert_ff.max(32);
-        let m_g6k = Module::load(&cache.compile("moe_matvec_grouped_q6k", MOE_GROUPED_Q6K_SRC)?)?;
-        let m_g6k_rp = Module::load(&cache.compile("moe_matvec_grouped_q6k_repacked",
-                                    MOE_GROUPED_Q6K_REPACKED_SRC)?)?;
-        let m_g8  = Module::load(&cache.compile("moe_matvec_grouped_q8_0", MOE_GROUPED_Q8_0_SRC)?)?;
-        let m_sc  = Module::load(&cache.compile("moe_scatter_add", MOE_SCATTER_SRC)?)?;
         let moe_in_all  = DeviceBuf::<f32>::new(p * h)?;
         let cur_mlp     = DeviceBuf::<f32>::new(p * h)?;
         let cur_moe     = DeviceBuf::<f32>::from_slice(&vec![0.0f32; p * h])?;
@@ -1123,36 +1415,61 @@ impl GpuGemma4 {
         let _ = (moe, ne_a);
 
         // --- embed P tokens → x [P, hidden] ---
+        // One batched lookup over the device-resident token ids — no
+        // per-token launch+sync loop.
+        let tokens_dev = DeviceBuf::<u32>::from_slice(tokens)?;
         let x = DeviceBuf::<f32>::new(p * h)?;
         let es = (h as f32).sqrt();
-        for (i, &tok) in tokens.iter().enumerate() {
-            self.d_token.copy_from_host(&[tok])?;
-            self.launch_embed(&self.token_embd, pf_off(x.raw_ptr(), i * h))?;
-            self.launch_scale(pf_off(x.raw_ptr(), i * h), h as u32, es)?;
-            self.stream.synchronize()?;          // d_token is reused next iter
-        }
+        self.launch_embed_batched(&self.token_embd, x.raw_ptr(),
+                                  tokens_dev.raw_ptr(), p as u32)?;
+        self.launch_scale(x.raw_ptr(), (p * h) as u32, es)?;
 
         let normed = DeviceBuf::<f32>::new(p * h)?;
         let hu = h as u32;
-        // Pooled GEMM context — modules + fp16 scratch loaded once,
-        // pre-sized to the largest weight any block will pass.
-        let (mut max_w, mut max_in, mut max_out) = (0usize, 0usize, 0usize);
-        for b in &self.blocks {
-            let mut ws: Vec<&GpuMatvecTensor> = vec![
-                &b.attn_q, &b.attn_k, &b.attn_output, &b.ffn_gate, &b.ffn_up, &b.ffn_down];
-            if let Some(wv) = &b.attn_v { ws.push(wv); }
-            for w in ws {
-                let (id, od) = (w.in_dim as usize, w.out_dim as usize);
-                max_w = max_w.max(id * od);
-                max_in = max_in.max(id);
-                max_out = max_out.max(od);
-            }
-        }
-        let pg = PrefillGemm::new(cache, max_w, p * max_in, p * max_out)?;
+        // The pooled GEMM context (modules + fp16 scratch) is resident in
+        // `self.prefill_gemm`; its scratch grows on demand if P exceeds
+        // the size assumed at construction.
         let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
-            pg.matmul(&handle, &self.stream, &w.data, w.dtype, w.repacked,
+            self.prefill_gemm.matmul(&self.rocblas, &self.stream, &w.data, w.dtype, w.repacked,
                       w.in_dim as usize, w.out_dim as usize, xin, p)
         };
+
+        // --- Per-Layer-Embedding setup (E4B) ---
+        // Build `ple_perm` [n_layer][P][np]: each layer's [P, np] slice
+        // contiguous. Mirrors llama.cpp build_inp_per_layer +
+        // project_per_layer_inputs.
+        let ple_perm: Option<DeviceBuf<f32>> = if let Some(pg_w) = &self.ple {
+            let np = self.n_embd_per_layer;
+            let nl = self.blocks.len();
+            let pd = (np * nl) as u32;          // per-token PLE width
+            // batched lookup of the per-layer token embedding.
+            let ple_raw = DeviceBuf::<f32>::new(p * np * nl)?;
+            self.launch_embed_batched(&pg_w.tok_embd, ple_raw.raw_ptr(),
+                                      tokens_dev.raw_ptr(), p as u32)?;
+            self.launch_scale(ple_raw.raw_ptr(), p as u32 * pd, (np as f32).sqrt())?;
+            // project the (scaled) main embedding, normalise each slice.
+            let ple_proj = gemm(&pg_w.model_proj, &x)?;
+            self.launch_scale(ple_proj.raw_ptr(), p as u32 * pd, 1.0 / (h as f32).sqrt())?;
+            self.launch_rmsnorm_mh_batched(ple_proj.raw_ptr(), pg_w.proj_norm.raw_ptr(),
+                ple_proj.raw_ptr(), nl as u32, np as u32, p as u32)?;
+            // ple_raw = (raw + proj) · 1/√2
+            self.launch_add_batched(ple_raw.raw_ptr(), ple_proj.raw_ptr(), pd, p as u32)?;
+            self.launch_scale(ple_raw.raw_ptr(), p as u32 * pd, 1.0 / 2.0f32.sqrt())?;
+            // permute to layer-major so each layer slice is contiguous.
+            let perm = DeviceBuf::<f32>::new(nl * p * np)?;
+            self.launch_permute_ple(&self.m_permute_pf, ple_raw.raw_ptr(), perm.raw_ptr(),
+                                    p as u32, nl as u32, np as u32)?;
+            self.stream.synchronize()?;
+            Some(perm)
+        } else { None };
+
+        // KV-sharing donors: the SWA / full layers whose post-norm K/V
+        // the later (shared) layers attend against.
+        let sharing = self.n_layer_kv_from_start < self.blocks.len();
+        let donor_swa_idx  = self.n_layer_kv_from_start.saturating_sub(2);
+        let donor_full_idx = self.n_layer_kv_from_start.saturating_sub(1);
+        let mut donor_swa:  Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = None;
+        let mut donor_full: Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = None;
 
         let dbg = std::env::var("REINSTINCT_PREFILL_DEBUG").is_ok();
         // Per-category prefill timing (REINSTINCT_PREFILL_DEBUG). `lap`
@@ -1183,42 +1500,63 @@ impl GpuGemma4 {
                                         normed.raw_ptr(), hu, p as u32)?;
             lap(&t_norm)?;
             let q = gemm(&b.attn_q, &normed)?;
-            let k = gemm(&b.attn_k, &normed)?;
-            let v_gemm;
-            let v_ptr = match &b.attn_v {
-                Some(wv) => { v_gemm = gemm(wv, &normed)?; v_gemm.raw_ptr() }
-                None     => k.raw_ptr(),     // full layers: V is the K projection
-            };
-            lap(&t_gemm)?;
-            // per-head Q/K norm; V plain norm; RoPE (batched over P).
-            let _ = q_dim;
             self.launch_rmsnorm_mh_batched(q.raw_ptr(), b.attn_q_norm.raw_ptr(),
                 q.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
-            self.launch_rope_prefill(&m_rope, q.raw_ptr(), self.n_heads as u32, hd as u32, b.kind, p)?;
-            let k_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
-            let v_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
-            self.launch_rmsnorm_mh_batched(k.raw_ptr(), b.attn_k_norm.raw_ptr(),
-                k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
-            self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
-                v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
-            self.launch_rope_prefill(&m_rope, k_norm.raw_ptr(), n_kv as u32, hd as u32, b.kind, p)?;
-            // Populate this layer's decode KV cache: quantize the P
-            // prompt tokens' K/V (post-rope K, plain-norm V) to int8 at
-            // positions 0..P-1, so decode can continue from position P.
-            let kvc = &state.caches[li];
-            self.launch_kv_quant_prefill(&m_kvq, k_norm.raw_ptr(), kvc.k.raw_ptr(),
-                                         kvc.ks.raw_ptr(), n_kv as u32, hd as u32, p)?;
-            self.launch_kv_quant_prefill(&m_kvq, v_norm.raw_ptr(), kvc.v.raw_ptr(),
-                                         kvc.vs.raw_ptr(), n_kv as u32, hd as u32, p)?;
+            self.launch_rope_prefill(&self.m_rope_pf, q.raw_ptr(), self.n_heads as u32,
+                                     hd as u32, b.kind, p)?;
+
+            // K/V: computed on KV-owning layers; KV-sharing layers reuse
+            // a donor layer's post-norm K/V (see kv_donor).
+            let kv_owned: Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = if b.kv_donor.is_none() {
+                let k = gemm(&b.attn_k, &normed)?;
+                let v_gemm;
+                let v_ptr = match &b.attn_v {
+                    Some(wv) => { v_gemm = gemm(wv, &normed)?; v_gemm.raw_ptr() }
+                    None     => k.raw_ptr(),     // full layers: V is the K projection
+                };
+                lap(&t_gemm)?;
+                let k_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
+                let v_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
+                self.launch_rmsnorm_mh_batched(k.raw_ptr(), b.attn_k_norm.raw_ptr(),
+                    k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
+                self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
+                    v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
+                self.launch_rope_prefill(&self.m_rope_pf, k_norm.raw_ptr(), n_kv as u32,
+                                         hd as u32, b.kind, p)?;
+                // populate this layer's decode KV cache (positions 0..P-1).
+                let kvc = &state.caches[li];
+                self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(), kvc.k.raw_ptr(),
+                                             kvc.ks.raw_ptr(), n_kv as u32, hd as u32, p)?;
+                self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(), kvc.v.raw_ptr(),
+                                             kvc.vs.raw_ptr(), n_kv as u32, hd as u32, p)?;
+                Some((k_norm, v_norm))
+            } else {
+                lap(&t_gemm)?;
+                None
+            };
+            // attention reads either this layer's K/V or the donor's.
+            let (k_attn, v_attn): (&DeviceBuf<f32>, &DeviceBuf<f32>) = match &kv_owned {
+                Some((k, v)) => (k, v),
+                None => {
+                    let d = match b.kind {
+                        AttnKind::Sliding => donor_swa.as_ref(),
+                        AttnKind::Full    => donor_full.as_ref(),
+                    }.ok_or("prefill: KV donor not yet computed")?;
+                    (&d.0, &d.1)
+                }
+            };
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
             };
             lap(&t_norm)?;
             let attn = DeviceBuf::<f32>::new(p * q_dim)?;
-            self.launch_attn_prefill(&m_attn, q.raw_ptr(), k_norm.raw_ptr(), v_norm.raw_ptr(),
+            self.launch_attn_prefill(&self.m_attn_pf, q.raw_ptr(), k_attn.raw_ptr(), v_attn.raw_ptr(),
                                      attn.raw_ptr(), n_kv as u32, hd as u32, window, p)?;
             lap(&t_attn)?;
+            // hand this layer's K/V to the KV-sharing layers that reuse it.
+            if sharing && li == donor_swa_idx       { donor_swa = kv_owned; }
+            else if sharing && li == donor_full_idx { donor_full = kv_owned; }
             let attn_out = gemm(&b.attn_output, &attn)?;
             lap(&t_gemm)?;
             self.launch_rmsnorm_batched(attn_out.raw_ptr(), b.post_attn_norm.raw_ptr(),
@@ -1245,8 +1583,21 @@ impl GpuGemma4 {
                     self.launch_rmsnorm_batched(mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
                         normed.raw_ptr(), hu, p as u32)?;
                     self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
-                    self.launch_scale_batched(x.raw_ptr(), hu, b.layer_output_scale, p as u32)?;
                     lap(&t_norm)?;
+                    // --- Per-Layer Embedding (E4B): gated residual ---
+                    if let (Some(perm), Some(pb)) = (&ple_perm, &b.ple) {
+                        let np = self.n_embd_per_layer as u32;
+                        let gate2 = gemm(&pb.inp_gate, &x)?;
+                        let slice = pf_off(perm.raw_ptr(), li * p * self.n_embd_per_layer);
+                        self.launch_geglu_batched(gate2.raw_ptr(), slice,
+                                                  gate2.raw_ptr(), np, p as u32)?;
+                        let pout = gemm(&pb.proj, &gate2)?;
+                        self.launch_rmsnorm_batched(pout.raw_ptr(), pb.post_norm.raw_ptr(),
+                            normed.raw_ptr(), hu, p as u32)?;
+                        self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
+                        lap(&t_gemm)?;
+                    }
+                    self.launch_scale_batched(x.raw_ptr(), hu, b.layer_output_scale, p as u32)?;
                 }
                 Some(mw) => {
                     // Dual FFN with a grouped-expert GEMM. cur_mlp =
@@ -1297,11 +1648,11 @@ impl GpuGemma4 {
                     // is Q8_0 while the rest are Q6_K).
                     let pick = |dt: GgmlType, rep: bool| -> Result<(&Module, &str), String> {
                         if rep {
-                            return Ok((&m_g6k_rp, "moe_matvec_grouped_q6k_repacked_f32"));
+                            return Ok((&self.m_g6k_rp_pf, "moe_matvec_grouped_q6k_repacked_f32"));
                         }
                         match dt {
-                            GgmlType::Q6_K => Ok((&m_g6k, "moe_matvec_grouped_q6k_f32")),
-                            GgmlType::Q8_0 => Ok((&m_g8,  "moe_matvec_grouped_q8_0_f32")),
+                            GgmlType::Q6_K => Ok((&self.m_g6k_pf, "moe_matvec_grouped_q6k_f32")),
+                            GgmlType::Q8_0 => Ok((&self.m_g8_pf,  "moe_matvec_grouped_q8_0_f32")),
                             o => Err(format!("grouped moe: expert dtype {o:?}")),
                         }
                     };
@@ -1331,7 +1682,7 @@ impl GpuGemma4 {
                             mw.down_exps.data.raw_ptr(), e as u32, ident_e.raw_ptr(),
                             xq8_e.raw_ptr(), expert_dn_p.raw_ptr(), ff_exp, hu,
                             mw.down_exps.bytes_per_expert as u32, ff_exp/32, n_e)?;
-                        self.launch_scatter(&m_sc, expert_dn_p.raw_ptr(), idx_e.raw_ptr(),
+                        self.launch_scatter(&self.m_sc_pf, expert_dn_p.raw_ptr(), idx_e.raw_ptr(),
                             wts_e.raw_ptr(), mw.down_exps_s.raw_ptr(), e as u32,
                             cur_moe.raw_ptr(), hu, n_e)?;
                         keep_i.push(idx_e); keep_i.push(ident_e); keep_f.push(wts_e);
@@ -1456,6 +1807,22 @@ impl GpuGemma4 {
                           (block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
+    /// Permute the per-layer-embedding tensor from token-major
+    /// `[P][n_layer][np]` to layer-major `[n_layer][P][np]`.
+    fn launch_permute_ple(&self, m: &Module, src: *mut c_void, dst: *mut c_void,
+                          p: u32, n_layer: u32, np: u32) -> Result<(), String>
+    {
+        let f = m.function("permute_ple_f32")?;
+        let block: u32 = 256;
+        let mut sa=src; let mut da=dst; let mut pa=p; let mut nl=n_layer; let mut npa=np;
+        let mut args: [*mut c_void; 5] = [
+            &mut sa as *mut _ as *mut c_void, &mut da as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void, &mut nl as *mut _ as *mut c_void,
+            &mut npa as *mut _ as *mut c_void];
+        unsafe { f.launch(((np + block - 1) / block, p, n_layer), (block,1,1),
+                          0, Some(&self.stream), &mut args) }
+    }
+
     /// Grouped expert matvec — expert `expert_id`'s weight against the
     /// `n_tok` tokens routed to it (`idx` maps slot → input row). Each
     /// expert's weight fits in L2, so the n_tok slots HBM-read it once.
@@ -1519,14 +1886,20 @@ impl GpuGemma4 {
     /// One transformer block, in place on `hidden_a`. All position-
     /// dependent work (rope, KV write, attention) reads `d_pos`, so the
     /// chain is identical for every decode step.
-    fn block_forward(&self, b: &GpuGemma4Block, kv: &Gemma4KvCache)
+    fn block_forward(&self, b: &GpuGemma4Block, li: usize, state: &Gemma4GpuState)
         -> Result<(), String>
     {
         let h = self.hidden as u32;
         let head_dim = b.head_dim;
         let n_kv = b.n_kv;
-        let q_dim = (self.n_heads * head_dim) as u32;
-        let kv_dim = (n_kv * head_dim) as u32;
+
+        // KV-sharing: a `kv_donor` layer computes only Q and attends
+        // against the donor's cache. Otherwise it owns `caches[li]`.
+        let own_kv = &state.caches[li];
+        let attn_kv = match b.kv_donor {
+            Some(d) => &state.caches[d],
+            None    => own_kv,
+        };
 
         // --- Attention ---
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.attn_norm.raw_ptr(),
@@ -1537,35 +1910,37 @@ impl GpuGemma4 {
                                self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32)?;
         self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32,
                          b.kind)?;
-        // K: project. V: project, or reuse the K projection.
-        self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
-        let v_src = match &b.attn_v {
-            Some(wv) => {
-                self.launch_matvec(wv, self.normed.raw_ptr(), self.v_norm.raw_ptr())?;
-                self.v_norm.raw_ptr()  // temp holding the raw V projection
-            }
-            None => self.k_proj.raw_ptr(),  // full layers: V is the K projection
-        };
-        // K: per-head weighted norm + RoPE.
-        self.launch_rmsnorm_mh(self.k_proj.raw_ptr(), b.attn_k_norm.raw_ptr(),
-                               self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32)?;
-        self.launch_rope(self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32,
-                         b.kind)?;
-        // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
-        self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
-                               n_kv as u32, head_dim as u32)?;
-        // Quantize (k, v) and append into the int8 cache at d_pos — a
-        // kernel reading d_pos (a pos-offset memcpy can't be captured).
-        self.launch_kv_write_q8(self.k_norm.raw_ptr(), kv.k.raw_ptr(), kv.ks.raw_ptr(),
-                                n_kv as u32, head_dim as u32)?;
-        self.launch_kv_write_q8(self.v_norm.raw_ptr(), kv.v.raw_ptr(), kv.vs.raw_ptr(),
-                                n_kv as u32, head_dim as u32)?;
+        // K/V: computed and written to the cache only on KV-owning layers.
+        if b.kv_donor.is_none() {
+            self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
+            let v_src = match &b.attn_v {
+                Some(wv) => {
+                    self.launch_matvec(wv, self.normed.raw_ptr(), self.v_norm.raw_ptr())?;
+                    self.v_norm.raw_ptr()  // temp holding the raw V projection
+                }
+                None => self.k_proj.raw_ptr(),  // full layers: V is the K projection
+            };
+            // K: per-head weighted norm + RoPE.
+            self.launch_rmsnorm_mh(self.k_proj.raw_ptr(), b.attn_k_norm.raw_ptr(),
+                                   self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32)?;
+            self.launch_rope(self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32,
+                             b.kind)?;
+            // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
+            self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
+                                   n_kv as u32, head_dim as u32)?;
+            // Quantize (k, v) and append into the int8 cache at d_pos — a
+            // kernel reading d_pos (a pos-offset memcpy can't be captured).
+            self.launch_kv_write_q8(self.k_norm.raw_ptr(), own_kv.k.raw_ptr(),
+                                    own_kv.ks.raw_ptr(), n_kv as u32, head_dim as u32)?;
+            self.launch_kv_write_q8(self.v_norm.raw_ptr(), own_kv.v.raw_ptr(),
+                                    own_kv.vs.raw_ptr(), n_kv as u32, head_dim as u32)?;
+        }
         let window = match b.kind {
             AttnKind::Sliding => self.sliding_window as u32,
             AttnKind::Full    => 0,
         };
-        self.launch_attn_q8(self.q_buf.raw_ptr(), kv.k.raw_ptr(), kv.ks.raw_ptr(),
-                            kv.v.raw_ptr(), kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
+        self.launch_attn_q8(self.q_buf.raw_ptr(), attn_kv.k.raw_ptr(), attn_kv.ks.raw_ptr(),
+                            attn_kv.v.raw_ptr(), attn_kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
                             n_kv as u32, head_dim as u32, window)?;
         // Output projection, post-norm, residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
@@ -1573,7 +1948,6 @@ impl GpuGemma4 {
         self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_attn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
-        let _ = (q_dim, kv_dim);
 
         // --- FFN --- (dense GeGLU, or the dual shared-MLP + MoE branch)
         match &b.moe {
@@ -1592,6 +1966,26 @@ impl GpuGemma4 {
             Some(mw) => self.moe_ffn(b, mw)?,
         }
 
+        // --- Per-Layer Embedding (E4B) --- gated residual after the FFN.
+        if let (Some(_), Some(pb)) = (&self.ple, &b.ple) {
+            let np = self.n_embd_per_layer as u32;
+            // gate = inp_gate · hidden_a  (hidden_a kept as the residual)
+            self.launch_matvec(&pb.inp_gate, self.hidden_a.raw_ptr(),
+                               self.ple_gate.raw_ptr())?;
+            // gate = gelu(gate) ⊙ this layer's per-layer embedding slice
+            let slice = unsafe {
+                (self.ple_raw.raw_ptr() as *mut f32)
+                    .add(li * self.n_embd_per_layer) as *mut c_void
+            };
+            self.launch_geglu(self.ple_gate.raw_ptr(), slice,
+                              self.ple_gate.raw_ptr(), np)?;
+            // project back up, post-norm, residual add.
+            self.launch_matvec(&pb.proj, self.ple_gate.raw_ptr(), self.ple_tmp.raw_ptr())?;
+            self.launch_rmsnorm(self.ple_tmp.raw_ptr(), pb.post_norm.raw_ptr(),
+                                self.normed.raw_ptr(), h)?;
+            self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+        }
+
         // Per-layer output scale.
         self.launch_scale(self.hidden_a.raw_ptr(), h, b.layer_output_scale)?;
         Ok(())
@@ -1603,6 +1997,7 @@ impl GpuGemma4 {
     fn moe_ffn(&self, b: &GpuGemma4Block, mw: &MoeBlock) -> Result<(), String> {
         let h = self.hidden as u32;
         let ff_exp = self.expert_ff as u32;
+        self.prof_lap("attn+norm");
 
         // --- Shared MLP --- → cur_mlp (kept live across the MoE branch).
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),
@@ -1614,6 +2009,7 @@ impl GpuGemma4 {
         self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
         self.launch_rmsnorm(self.hidden_b.raw_ptr(), mw.post_ffw_norm_1.raw_ptr(),
                             self.cur_mlp.raw_ptr(), h)?;
+        self.prof_lap("shared_mlp");
 
         // --- Router --- on attn_out: plain RMSNorm scaled by gate_inp_s,
         // then by 1/√hidden, then the F32 projection to expert logits.
@@ -1621,7 +2017,9 @@ impl GpuGemma4 {
                             self.normed.raw_ptr(), h)?;
         self.launch_scale(self.normed.raw_ptr(), h, 1.0 / (self.hidden as f32).sqrt())?;
         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(), self.moe_logits.raw_ptr())?;
+        self.prof_lap("router_matvec");
         self.launch_moe_topk()?;
+        self.prof_lap("router_topk");
 
         // --- Routed experts --- fully device-resident: the expert ids
         // from moe_topk stay on device, and one launch per stage covers
@@ -1636,6 +2034,7 @@ impl GpuGemma4 {
                                self.xq8.raw_ptr(), self.expert_gu.raw_ptr(), h, 2 * ff_exp,
                                mw.gate_up_exps.bytes_per_expert as u32, 0)?;
         self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
+        self.prof_lap("expert_gate_up");
         // down: each expert has its own activation — quantize the batch.
         self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
                                 ff_exp, self.n_expert_used as u32)?;
@@ -1643,16 +2042,17 @@ impl GpuGemma4 {
                                mw.down_exps.data.raw_ptr(),
                                self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
                                mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
+        self.prof_lap("expert_down");
         self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
                                 self.moe_acc.raw_ptr())?;
-        // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2)
+        // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2); combined = cur_mlp + cur_moe.
         self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
-        // combined = cur_mlp + cur_moe → shared post_ffw_norm → residual.
         self.launch_add(self.cur_mlp.raw_ptr(), self.normed.raw_ptr(), h)?;
         self.launch_rmsnorm(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+        self.prof_lap("moe_combine");
         Ok(())
     }
 }

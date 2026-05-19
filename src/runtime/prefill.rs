@@ -310,6 +310,17 @@ impl PrefillGemm {
                 &mut ia    as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void];
             unsafe { f.launch(((n_w / 32) as u32, 1, 1), (32, 1, 1),
                               0, Some(stream), &mut da)?; }
+        } else if dtype == GgmlType::F32 {
+            // F32 weight (e.g. E4B's PLE projections) → convert straight
+            // to the fp16 GEMM scratch.
+            let f = self.cvt.function("cvt_f32_to_f16")?;
+            let block: u32 = 256;
+            let mut nb = n_w as u32;
+            let mut da: [*mut c_void; 3] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut nb    as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_w as u32 + block - 1) / block, 1, 1), (block, 1, 1),
+                              0, Some(stream), &mut da)?; }
         } else {
             let (module, kname, wpb, bt) = self.deq(dtype)?;
             assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");

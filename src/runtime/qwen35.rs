@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
@@ -49,7 +49,12 @@ const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multi
 const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.cpp");
 const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.cpp");
 const ROPE_SOURCE:              &str = include_str!("../../kernels/rope.cpp");
+const KV_WRITE_F32_SOURCE:      &str = include_str!("../../kernels/kv_write_f32.cpp");
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
+const ATTN_PARTIAL_F32_SOURCE:  &str = include_str!("../../kernels/attn_partial_f32.cpp");
+const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cpp");
+/// Max split-K splits — bounds the partial-attention scratch.
+const ATTN_MAX_SPLITS: u32 = 16;
 const ADD_INPLACE_SOURCE:       &str = include_str!("../../kernels/add_inplace.cpp");
 const CONV1D_STEP_SOURCE:           &str = include_str!("../../kernels/conv1d_step.cpp");
 const SILU_INPLACE_SOURCE:          &str = include_str!("../../kernels/silu_inplace.cpp");
@@ -91,6 +96,10 @@ const QUANTIZE_Q8_SOURCE:      &str = include_str!("../../kernels/quantize_q8.cp
 const MOE_TOPK_SOURCE:        &str = include_str!("../../kernels/moe_topk.cpp");
 const MOE_COMBINE_SOURCE:     &str = include_str!("../../kernels/moe_combine.cpp");
 const MOE_MV_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q4k_repacked.cpp");
+const MOE_GATE_UP_SWIGLU_Q4K_SOURCE: &str =
+    include_str!("../../kernels/moe_gate_up_swiglu_q4k_repacked.cpp");
+const MOE_MV_Q5K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_down.cpp");
+const MOE_MV_Q6K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_down.cpp");
 const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_repacked.cpp");
 const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
 const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.cpp");
@@ -360,6 +369,11 @@ struct MoeRuntime {
     m_mv_q4k:     Module,
     m_mv_q5k:     Module,
     m_mv_q6k:     Module,
+    /// Fused gate+up matvec + SwiGLU (Q4_K experts) — decode fast path.
+    m_gate_up_swiglu_q4k: Module,
+    /// Row-packed expert DOWN matvec — all 64 lanes busy at in_dim≈512.
+    m_down_q5k:   Module,
+    m_down_q6k:   Module,
     m_combine:    Module,
     m_shexp_gate: Module,
     // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
@@ -390,6 +404,12 @@ impl MoeRuntime {
         Ok(Self {
             n_expert, n_used, expert_ff, shexp_ff,
             m_topk:       Module::load(&cache.compile("moe_topk", MOE_TOPK_SOURCE)?)?,
+            m_gate_up_swiglu_q4k: Module::load(&cache.compile(
+                              "moe_gate_up_swiglu_q4k_repacked", MOE_GATE_UP_SWIGLU_Q4K_SOURCE)?)?,
+            m_down_q5k:   Module::load(&cache.compile(
+                              "moe_matvec_q5k_down", MOE_MV_Q5K_DOWN_SOURCE)?)?,
+            m_down_q6k:   Module::load(&cache.compile(
+                              "moe_matvec_q6k_down", MOE_MV_Q6K_DOWN_SOURCE)?)?,
             m_mv_q4k:     Module::load(&cache.compile(
                               "moe_matvec_q4k_repacked", MOE_MV_Q4K_REPACKED_SOURCE)?)?,
             m_mv_q5k:     Module::load(&cache.compile(
@@ -670,6 +690,20 @@ pub struct GpuQwen35 {
     attn_concat: DeviceBuf<f32>,   // [q_dim]
     logits:      DeviceBuf<f32>,   // [vocab]
 
+    // Split-K decode-attention scratch (FlashDecoding partials).
+    attn_o_partial: DeviceBuf<f32>,  // [n_heads, ATTN_MAX_SPLITS, head_dim]
+    attn_m_partial: DeviceBuf<f32>,  // [n_heads, ATTN_MAX_SPLITS]
+    attn_l_partial: DeviceBuf<f32>,  // [n_heads, ATTN_MAX_SPLITS]
+    use_old_attn:   bool,            // REINSTINCT_OLD_ATTN
+    /// Decode position, device-resident — lets the rope / KV-write /
+    /// attention kernels read it so the forward is graph-capturable.
+    d_pos:          DeviceBuf<u32>,
+    /// `REINSTINCT_MOE_PROFILE` — per-stage decode timing (sync-per-lap,
+    /// accumulated across layers/steps). See `prof_lap` / `moe_prof_report`.
+    moe_prof_on:    bool,
+    prof_mark:      std::cell::Cell<std::time::Instant>,
+    prof_buckets:   std::cell::RefCell<Vec<(&'static str, f64)>>,
+
     // GDN scratch buffers.
     gdn_qkv:      DeviceBuf<f32>,  // [conv_dim]          mixed_qkv projection
     gdn_conv_out: DeviceBuf<f32>,  // [conv_dim]          conv1d output (post-silu)
@@ -697,6 +731,11 @@ pub struct GpuQwen35 {
     sigmoid_mul_module:      Module,
     rope_module:             Module,
     attn_step_module:        Module,
+    /// Split-K decode attention (FlashDecoding) — partial + merge.
+    attn_partial_module:     Module,
+    attn_merge_module:       Module,
+    /// f32 KV-cache write at the device-resident decode position.
+    kv_write_module:         Module,
     add_inplace_module:      Module,
     conv1d_step_module:           Module,
     silu_inplace_module:          Module,
@@ -815,6 +854,14 @@ impl GpuQwen35 {
         let gdn_key_dim     = cfg.gdn_key_dim()   as usize;
         // conv operates on q ‖ k ‖ v = 2 × key_dim + value_dim.
         let gdn_conv_dim    = cfg.gdn_qkv_concat_dim() as usize;
+        // `xq8` holds the int8-quantised activation for every
+        // launch_matvec_dispatch call — size it for the widest such
+        // activation. The GDN out-projection (in = value_dim) and the
+        // shared-expert down (in = shexp_ff) are wider than ffn/hidden
+        // on the MoE models; omitting them overflowed xq8 → GPU fault.
+        let xq8_max_in = hidden.max(ffn).max(q_dim)
+            .max(gdn_value_dim).max(gdn_conv_dim)
+            .max(cfg.moe.as_ref().map(|m| m.shared_expert_ff as usize).unwrap_or(0));
 
         let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
         let output_norm = load_fp32_tensor(gguf, "output_norm.weight")?;
@@ -836,6 +883,14 @@ impl GpuQwen35 {
         let k_norm      = DeviceBuf::new(kv_dim)?;
         let attn_concat = DeviceBuf::new(q_dim)?;
         let logits      = DeviceBuf::new(vocab)?;
+        let attn_o_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize * head_dim)?;
+        let attn_m_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?;
+        let attn_l_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?;
+        let use_old_attn   = std::env::var_os("REINSTINCT_OLD_ATTN").is_some();
+        let d_pos          = DeviceBuf::new(1)?;
+        let moe_prof_on    = std::env::var_os("REINSTINCT_MOE_PROFILE").is_some();
+        let prof_mark      = std::cell::Cell::new(std::time::Instant::now());
+        let prof_buckets   = std::cell::RefCell::new(Vec::new());
 
         let gdn_qkv      = DeviceBuf::new(gdn_conv_dim)?;
         let gdn_conv_out = DeviceBuf::new(gdn_conv_dim)?;
@@ -870,6 +925,9 @@ impl GpuQwen35 {
         let sigmoid_mul_hsaco       = cache.compile("sigmoid_mul",       SIGMOID_MUL_SOURCE)?;
         let rope_hsaco              = cache.compile("rope",              ROPE_SOURCE)?;
         let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
+        let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
+        let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
+        let kv_write_hsaco          = cache.compile("kv_write_f32",      KV_WRITE_F32_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
         let conv1d_step_hsaco            = cache.compile("conv1d_step",       CONV1D_STEP_SOURCE)?;
         let silu_inplace_hsaco           = cache.compile("silu_inplace",      SILU_INPLACE_SOURCE)?;
@@ -929,6 +987,8 @@ impl GpuQwen35 {
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
+            attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
+            moe_prof_on, prof_mark, prof_buckets,
             rope_cos, rope_sin,
             embed_module:             Module::load(&embed_hsaco)?,
             rmsnorm_module:           Module::load(&rmsnorm_hsaco)?,
@@ -939,6 +999,9 @@ impl GpuQwen35 {
             sigmoid_mul_module:       Module::load(&sigmoid_mul_hsaco)?,
             rope_module:              Module::load(&rope_hsaco)?,
             attn_step_module:         Module::load(&attn_step_hsaco)?,
+            attn_partial_module:      Module::load(&attn_partial_hsaco)?,
+            attn_merge_module:        Module::load(&attn_merge_hsaco)?,
+            kv_write_module:          Module::load(&kv_write_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
             conv1d_step_module:           Module::load(&conv1d_step_hsaco)?,
             silu_inplace_module:          Module::load(&silu_inplace_hsaco)?,
@@ -992,7 +1055,7 @@ impl GpuQwen35 {
             matvec_q4k_repacked_module: Module::load(&matvec_q4k_repacked_hsaco)?,
             matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
             matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
-            xq8: DeviceBuf::new(((ffn.max(hidden) + 31) / 32) * 40)?,
+            xq8: DeviceBuf::new(((xq8_max_in + 31) / 32) * 40)?,
             dp4a_enabled: std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none(),
             blocks,
             stream,
@@ -1374,7 +1437,7 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rope(&self, x: *mut c_void, n_heads: u32, pos: u32) -> Result<(), String> {
+    fn launch_rope(&self, x: *mut c_void, n_heads: u32) -> Result<(), String> {
         let f = self.rope_module.function("rope_apply_f32")?;
         let half = (self.rotary_dim / 2) as u32;
         let block: u32 = 64;
@@ -1385,7 +1448,7 @@ impl GpuQwen35 {
         let mut hd = self.head_dim   as u32;
         let mut rd = self.rotary_dim as u32;
         let mut nh = n_heads;
-        let mut p  = pos;
+        let mut p  = self.d_pos.raw_ptr();
         let mut args: [*mut c_void; 7] = [
             &mut xa as *mut _ as *mut c_void,
             &mut ca as *mut _ as *mut c_void,
@@ -1396,6 +1459,53 @@ impl GpuQwen35 {
             &mut p  as *mut _ as *mut c_void,
         ];
         unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Stage the decode position into the device-resident `d_pos`.
+    fn set_pos(&self, pos: usize) -> Result<(), String> {
+        self.d_pos.copy_from_host(&[pos as u32])
+    }
+
+    /// `REINSTINCT_MOE_PROFILE` per-stage timer. `prof_lap` syncs the
+    /// stream and charges the elapsed time since the last lap to
+    /// `label`'s bucket; `prof_reset` re-marks without charging.
+    fn prof_reset(&self) {
+        if !self.moe_prof_on { return; }
+        let _ = self.stream.synchronize();
+        self.prof_mark.set(std::time::Instant::now());
+    }
+    fn prof_lap(&self, label: &'static str) {
+        if !self.moe_prof_on { return; }
+        let _ = self.stream.synchronize();
+        let now = std::time::Instant::now();
+        let dt  = now.duration_since(self.prof_mark.get()).as_secs_f64();
+        self.prof_mark.set(now);
+        let mut b = self.prof_buckets.borrow_mut();
+        match b.iter_mut().find(|(l, _)| *l == label) {
+            Some(e) => e.1 += dt,
+            None    => b.push((label, dt)),
+        }
+    }
+    /// Accumulated per-stage decode time (ms) — see `REINSTINCT_MOE_PROFILE`.
+    pub fn moe_prof_report(&self) -> Vec<(&'static str, f64)> {
+        self.prof_buckets.borrow().iter().map(|(l, t)| (*l, t * 1e3)).collect()
+    }
+
+    /// Write a K/V row into the cache at the device-resident position
+    /// `d_pos` — a graph-capturable replacement for the host-offset
+    /// memcpy.
+    fn launch_kv_write(&self, src: *mut c_void, cache: *mut c_void, kv_dim: u32)
+        -> Result<(), String>
+    {
+        let f = self.kv_write_module.function("kv_write_f32")?;
+        let block: u32 = 256;
+        let grid = (kv_dim + block - 1) / block;
+        let mut sa = src; let mut ca = cache;
+        let mut pp = self.d_pos.raw_ptr(); let mut kd = kv_dim;
+        let mut args: [*mut c_void; 4] = [
+            &mut sa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
+        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     fn launch_conv1d_step(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
@@ -1642,32 +1752,73 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// Decode attention. FlashDecoding split-K: grid (n_heads, n_splits)
+    /// writes a partial (m, l, o) per head, then a merge kernel combines
+    /// the splits — keeps every CU busy at depth and shortens the serial
+    /// P·V scan. `REINSTINCT_OLD_ATTN` selects the original kernel.
     fn launch_attn_step(&self, q: *mut c_void, k_cache: *mut c_void, v_cache: *mut c_void,
-                        out: *mut c_void, total_len: u32, scaling: f32) -> Result<(), String>
+                        out: *mut c_void, scaling: f32) -> Result<(), String>
     {
-        let f = self.attn_step_module.function("attn_step_f32")?;
         let block: u32 = 256;
-        let grid: u32 = self.n_heads as u32;
+        let n_heads = self.n_heads as u32;
+        let n_kv    = self.n_kv_heads as u32;
         let head_dim = self.head_dim as u32;
-        let smem = ((head_dim + total_len) + block) * std::mem::size_of::<f32>() as u32;
-        let mut qa = q; let mut ka = k_cache; let mut va = v_cache; let mut oa = out;
-        let mut nh = self.n_heads as u32;
-        let mut nkv = self.n_kv_heads as u32;
-        let mut hd = head_dim;
-        let mut tl = total_len;
-        let mut sc = scaling;
-        let mut args: [*mut c_void; 9] = [
-            &mut qa as *mut _ as *mut c_void,
-            &mut ka as *mut _ as *mut c_void,
-            &mut va as *mut _ as *mut c_void,
-            &mut oa as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut tl as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
+        let max_seq = self.max_seq as u32;
+        let mut pp = self.d_pos.raw_ptr();   // decode pos, device-resident
+
+        if self.use_old_attn {
+            let f = self.attn_step_module.function("attn_step_f32")?;
+            // scores[total_len] in LDS — size for the worst case.
+            let smem = (head_dim + max_seq + block) * 4;
+            let mut qa=q; let mut ka=k_cache; let mut va=v_cache; let mut oa=out;
+            let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
+            let mut sc=scaling;
+            let mut args: [*mut c_void; 9] = [
+                &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void];
+            return unsafe { f.launch((n_heads,1,1),(block,1,1), smem,
+                                     Some(&self.stream), &mut args) };
+        }
+
+        // Split count — a per-model constant (depends only on max_seq) so
+        // the grid is fixed ⇒ graph-capture safe; the kernel reads the
+        // live position from `d_pos`.
+        let n_splits = ((max_seq + 255) / 256).clamp(1, ATTN_MAX_SPLITS);
+        let chunk_max = (max_seq + n_splits - 1) / n_splits;
+        // LDS: qf[head_dim f32] | scores[chunk_max f32] | tmp[block f32]
+        let smem = (head_dim + chunk_max + block) * 4;
+
+        let fp = self.attn_partial_module.function("attn_partial_f32")?;
+        let mut qa=q; let mut ka=k_cache; let mut va=v_cache;
+        let mut op=self.attn_o_partial.raw_ptr();
+        let mut mp=self.attn_m_partial.raw_ptr();
+        let mut lp=self.attn_l_partial.raw_ptr();
+        let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
+        let mut sc=scaling; let mut ns=n_splits;
+        let mut pargs: [*mut c_void; 12] = [
+            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+        unsafe {
+            fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
+        }
+
+        let fm = self.attn_merge_module.function("attn_merge_f32")?;
+        let mut op2=self.attn_o_partial.raw_ptr();
+        let mut mp2=self.attn_m_partial.raw_ptr();
+        let mut lp2=self.attn_l_partial.raw_ptr();
+        let mut oa=out; let mut hd2=head_dim; let mut ns2=n_splits;
+        let mut margs: [*mut c_void; 6] = [
+            &mut op2 as *mut _ as *mut c_void, &mut mp2 as *mut _ as *mut c_void,
+            &mut lp2 as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void, &mut ns2 as *mut _ as *mut c_void];
+        unsafe { fm.launch((n_heads,1,1),(block,1,1), 0, Some(&self.stream), &mut margs) }
     }
 
     /// embed → output_norm → output_proj. Returns vocab-length logits.
@@ -1698,7 +1849,6 @@ impl GpuQwen35 {
         assert!(kv_cache.len < kv_cache.max_seq, "KV cache full");
         let h_dim  = self.hidden as u32;
         let q_dim  = self.q_dim()  as u32;
-        let pos = kv_cache.len;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
         // normed → output_ptr (output_ptr serves dual duty: normed first,
@@ -1714,19 +1864,20 @@ impl GpuQwen35 {
         self.launch_rmsnorm_multihead(self.q_buf.raw_ptr(), weights.attn_q_norm.raw_ptr(),
                                       self.q_buf.raw_ptr(),
                                       self.n_heads as u32, self.head_dim as u32, self.rms_eps)?;
-        self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, pos as u32)?;
+        self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32)?;
         self.launch_rmsnorm_multihead(self.k_raw.raw_ptr(), weights.attn_k_norm.raw_ptr(),
                                       self.k_norm.raw_ptr(),
                                       self.n_kv_heads as u32, self.head_dim as u32, self.rms_eps)?;
-        self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32, pos as u32)?;
-        // Async D2D push on the same stream — no host sync needed; ordering
-        // against preceding kernel launches is preserved by stream semantics.
-        kv_cache.k.copy_from_device_at_async(&self.k_norm, pos * kv_cache.kv_dim, &self.stream)?;
-        kv_cache.v.copy_from_device_at_async(&self.v_raw,  pos * kv_cache.kv_dim, &self.stream)?;
-        let total_len = (pos + 1) as u32;
+        self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32)?;
+        // Append this token's K/V into the cache at the device-resident
+        // position — a kernel (not a host-offset memcpy) so the forward
+        // is graph-capturable.
+        let kv_dim = kv_cache.kv_dim as u32;
+        self.launch_kv_write(self.k_norm.raw_ptr(), kv_cache.k.raw_ptr(), kv_dim)?;
+        self.launch_kv_write(self.v_raw.raw_ptr(),  kv_cache.v.raw_ptr(), kv_dim)?;
         self.launch_attn_step(self.q_buf.raw_ptr(),
                               kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr(),
-                              self.attn_concat.raw_ptr(), total_len, scaling)?;
+                              self.attn_concat.raw_ptr(), scaling)?;
         self.launch_sigmoid_mul(self.attn_concat.raw_ptr(), self.gate_buf.raw_ptr(), q_dim)?;
         self.launch_matvec_dispatch(&weights.attn_output, self.attn_concat.raw_ptr(), output_ptr)?;
         kv_cache.len += 1;
@@ -1771,26 +1922,39 @@ impl GpuQwen35 {
         let shff = moe.shexp_ff as u32;
         let n_used = moe.n_used as u32;
 
+        self.prof_lap("attn+norm");
         // --- Router: logits → top-k expert ids + renormalised weights ---
         self.launch_matvec_dispatch(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
+        self.prof_lap("router_matvec");
         self.launch_moe_topk(moe, 1)?;
+        self.prof_lap("router_topk");
 
         // --- Routed experts --- shared int8 activation, quantised once.
         // (Routed result lands in e_out; the combine into `output` is
         //  deferred until the shared expert has read `input` — callers
         //  pass input == output, so the combine would clobber it.)
         self.launch_quantize_q8(input_ptr, h)?;
-        self.launch_moe_expert_matvec(moe, &w.gate_exps, self.xq8.raw_ptr(),
-                                      moe.e_gate.raw_ptr(), h, ff, 1, 0, 0)?;
-        self.launch_moe_expert_matvec(moe, &w.up_exps, self.xq8.raw_ptr(),
-                                      moe.e_up.raw_ptr(), h, ff, 1, 0, 0)?;
-        self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
-                           moe.e_gate.raw_ptr(), n_used * ff)?;
+        self.prof_lap("moe_quant_in");
+        // Fused gate+up+SwiGLU when both expert slabs are Q4_K (one
+        // launch vs three); otherwise the unfused path.
+        if w.gate_exps.dtype == GgmlType::Q4_K && w.up_exps.dtype == GgmlType::Q4_K {
+            self.launch_moe_gate_up_swiglu(moe, &w.gate_exps, &w.up_exps,
+                self.xq8.raw_ptr(), moe.e_gate.raw_ptr(), h, ff, 1, 0, 0)?;
+        } else {
+            self.launch_moe_expert_matvec(moe, &w.gate_exps, self.xq8.raw_ptr(),
+                                          moe.e_gate.raw_ptr(), h, ff, 1, 0, 0)?;
+            self.launch_moe_expert_matvec(moe, &w.up_exps, self.xq8.raw_ptr(),
+                                          moe.e_up.raw_ptr(), h, ff, 1, 0, 0)?;
+            self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                               moe.e_gate.raw_ptr(), n_used * ff)?;
+        }
+        self.prof_lap("moe_gate_up");
         // down: each expert has its own activation — quantise the batch.
         self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
                                      ff, n_used)?;
-        self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
-                                      moe.e_out.raw_ptr(), ff, h, 1, 0, ff / 32)?;
+        self.launch_moe_down(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                             moe.e_out.raw_ptr(), ff, h, 1, 0, ff / 32)?;
+        self.prof_lap("moe_down");
 
         // --- Shared expert --- runs every token, scaled by a sigmoid gate.
         // Reads `input` — must finish before the combine writes `output`.
@@ -1802,10 +1966,12 @@ impl GpuQwen35 {
                                     moe.sh_out.raw_ptr())?;
         self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
                                    w.gate_inp_shexp.raw_ptr(), 1)?;
+        self.prof_lap("moe_shared");
 
         // `input` fully consumed — combine routed experts, add the shared.
         self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr, 1)?;
         self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), h)?;
+        self.prof_lap("moe_combine");
         Ok(())
     }
 
@@ -1907,6 +2073,70 @@ impl GpuQwen35 {
             &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
             &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
             &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, moe.n_used as u32, n_tok), (256,1,1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    /// Expert DOWN matvec — the row-packed kernel (all 64 lanes busy at
+    /// the down projection's small in_dim) for Q5_K/Q6_K experts; the
+    /// generic expert matvec for any other dtype.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_down(&self, moe: &MoeRuntime, et: &GpuExpertTensor,
+                       xq8: *mut c_void, y: *mut c_void,
+                       in_dim: u32, out_dim: u32, n_tok: u32,
+                       xq_tok_stride: u32, xq_slot_stride: u32) -> Result<(), String>
+    {
+        let (module, kname) = match et.dtype {
+            GgmlType::Q5_K => (&moe.m_down_q5k, "moe_matvec_q5k_down_f32"),
+            GgmlType::Q6_K => (&moe.m_down_q6k, "moe_matvec_q6k_down_f32"),
+            _ => return self.launch_moe_expert_matvec(moe, et, xq8, y, in_dim, out_dim,
+                                                      n_tok, xq_tok_stride, xq_slot_stride),
+        };
+        let f = module.function(kname)?;
+        let rpb = (256 / (in_dim / 32)).max(1);
+        let grid_x = (out_dim + rpb - 1) / rpb;
+        let mut sa = et.data.raw_ptr(); let mut ida = moe.ids.raw_ptr();
+        let mut xa = xq8; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut bpe = et.bytes_per_expert as u32;
+        let mut tst = xq_tok_stride; let mut sst = xq_slot_stride;
+        let mut nu = moe.n_used as u32;
+        let mut args: [*mut c_void; 10] = [
+            &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+            &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, moe.n_used as u32, n_tok), (256,1,1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    /// Fused gate+up expert matvec + SwiGLU (Q4_K experts) — one launch
+    /// in place of gate matvec + up matvec + swiglu. `y` receives the
+    /// SwiGLU activation `[n_tok, n_used, out_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_gate_up_swiglu(&self, moe: &MoeRuntime,
+                                 gate_et: &GpuExpertTensor, up_et: &GpuExpertTensor,
+                                 xq8: *mut c_void, y: *mut c_void,
+                                 in_dim: u32, out_dim: u32, n_tok: u32,
+                                 xq_tok_stride: u32, xq_slot_stride: u32)
+        -> Result<(), String>
+    {
+        let f = moe.m_gate_up_swiglu_q4k.function("moe_gate_up_swiglu_q4k_repacked_f32")?;
+        let grid_x = (out_dim + 7) / 8;
+        let mut ga = gate_et.data.raw_ptr(); let mut ua = up_et.data.raw_ptr();
+        let mut ida = moe.ids.raw_ptr(); let mut xa = xq8; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut bpe = gate_et.bytes_per_expert as u32;
+        let mut tst = xq_tok_stride; let mut sst = xq_slot_stride;
+        let mut nu = moe.n_used as u32;
+        let mut args: [*mut c_void; 11] = [
+            &mut ga as *mut _ as *mut c_void, &mut ua as *mut _ as *mut c_void,
+            &mut ida as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut bpe as *mut _ as *mut c_void,
+            &mut tst as *mut _ as *mut c_void, &mut sst as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void];
         unsafe { f.launch((grid_x, moe.n_used as u32, n_tok), (256,1,1), 0,
                           Some(&self.stream), &mut args) }
     }
@@ -2027,6 +2257,7 @@ impl GpuQwen35 {
         let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
 
         // Embed lookup → hidden_a
+        self.set_pos(state.pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
 
         // Walk blocks, but for `traced_block_idx` (which must be a Linear
@@ -2137,6 +2368,7 @@ impl GpuQwen35 {
             .collect::<Result<Vec<_>, _>>()?;
 
         events[0].record(&self.stream)?;
+        self.set_pos(state.pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         events[1].record(&self.stream)?;
 
@@ -2184,15 +2416,13 @@ impl GpuQwen35 {
         Ok((out, trace))
     }
 
-    /// On-device portion of `forward_token`: every kernel launch and
-    /// every async memcpy is enqueued to `self.stream` with no host
-    /// syncs in between. Used both for direct execution (followed by
-    /// stream-sync + D2H of `self.logits`) and for HIP graph capture.
-    fn enqueue_forward_token(&self, token: u32, state: &mut Qwen35GpuState)
-        -> Result<(), String>
-    {
+    /// On-device decode body: transformer blocks + output norm +
+    /// projection. Reads only `d_pos` and persistent device buffers —
+    /// no token id, no host position — so it captures into a HIP graph
+    /// that replays at every decode step. The token-dependent embed
+    /// runs separately, just before this.
+    fn enqueue_decode_body(&self, state: &mut Qwen35GpuState) -> Result<(), String> {
         assert_eq!(state.block_states.len(), self.blocks.len());
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
@@ -2213,42 +2443,42 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    /// Capture the on-device portion of `forward_token(token, state)`
-    /// into a HIP graph and return an executable handle.
-    ///
-    /// **The captured graph encodes the specific `token` and the
-    /// state's position at capture time** — re-launching it advances
-    /// the recorded slot, not whatever position `state` currently has.
-    /// In particular, scalar kernel args (token id, RoPE pos, attn
-    /// total_len) and KV cache write offsets are baked in.
-    ///
-    /// For benchmarking single-step decode latency this is fine;
-    /// production multi-token decode needs parametric capture
-    /// (`hipGraphExecKernelNodeSetParams` + memcpy node updates),
-    /// which lives in a follow-up.
-    pub fn capture_forward_graph(&self, token: u32, state: &mut Qwen35GpuState)
+    /// On-device portion of `forward_token`: stage the position, embed
+    /// the token, run the decode body. No host syncs.
+    fn enqueue_forward_token(&self, token: u32, state: &mut Qwen35GpuState)
+        -> Result<(), String>
+    {
+        self.set_pos(state.pos)?;
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.prof_reset();
+        self.enqueue_decode_body(state)
+    }
+
+    /// Capture the decode body into a replayable HIP graph. The graph
+    /// reads `d_pos` (staged per step) and the persistent KV / GDN
+    /// state buffers, so one capture serves every decode position.
+    pub fn capture_forward_graph(&self, state: &mut Qwen35GpuState)
         -> Result<GraphExec, String>
     {
         Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
-        if let Err(e) = self.enqueue_forward_token(token, state) {
-            // Make a best-effort attempt to leave the stream in a sane state.
+        if let Err(e) = self.enqueue_decode_body(state) {
             let _ = Graph::end_capture(&self.stream);
             return Err(e);
         }
         let graph = Graph::end_capture(&self.stream)?;
         let exec = graph.instantiate()?;
-        // graph (the topology) is free to drop once instantiated; the
-        // GraphExec keeps the executable copy.
         drop(graph);
         Ok(exec)
     }
 
-    /// Launch a previously-captured forward graph and return logits.
-    /// `state.pos` is bumped by 1 — but mutating internal positions
-    /// inside the graph is the caller's contract (see capture warning).
-    pub fn forward_token_via_graph(&self, exec: &GraphExec, state: &mut Qwen35GpuState)
+    /// Decode one token by replaying the captured graph: stage the
+    /// position, embed the token, replay, read back logits.
+    pub fn forward_token_via_graph(&self, exec: &GraphExec, token: u32,
+                                   state: &mut Qwen35GpuState)
         -> Result<Vec<f32>, String>
     {
+        self.set_pos(state.pos)?;
+        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         exec.launch(&self.stream)?;
         self.stream.synchronize()?;
         state.pos += 1;

@@ -182,7 +182,7 @@ impl ServerModel {
     }
 
     /// Run one completion. Returns (text, prompt_tokens, completion_tokens, hit_eos).
-    fn generate(&mut self, cache: &KernelCache, req: &GenReq)
+    fn generate(&mut self, req: &GenReq)
         -> Result<(String, usize, usize, bool), String>
     {
         use crate::sampling::{Rng, sample_temp_topk};
@@ -224,7 +224,7 @@ impl ServerModel {
                         prompt.len(), req.max_tokens, *max_seq));
                 }
                 state.reset();
-                let mut logits = gpu.prefill_forward(cache, &prompt, state)?;
+                let mut logits = gpu.prefill_forward(&prompt, state)?;
                 let mut rng = Rng::new(req.seed);
                 let mut out = Vec::new();
                 let mut hit_eos = false;
@@ -257,7 +257,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, small: PathBuf, max_seq: usize)
         Ok((cache, big_m, small_m))
     })();
 
-    let (cache, mut big_m, mut small_m) = match setup {
+    let (_cache, mut big_m, mut small_m) = match setup {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[serve] FATAL: model load failed: {e}");
@@ -288,7 +288,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, small: PathBuf, max_seq: usize)
                 Target::Big | Target::Small => {
                     let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
                     let t = std::time::Instant::now();
-                    match model.generate(&cache, &req) {
+                    match model.generate(&req) {
                         Ok((text, n_p, n_c, eos)) => {
                             eprintln!("[serve] {} completion: {} prompt + {} gen tok in {:.2}s",
                                 job.target.label(), n_p, n_c, t.elapsed().as_secs_f32());

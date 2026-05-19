@@ -95,6 +95,14 @@ pub struct Gemma4Config {
     pub expert_used_count: u32,
     /// MoE: per-expert FFN intermediate size.
     pub expert_ff_size: u32,
+
+    /// Per-Layer-Embedding width (`embedding_length_per_layer_input`).
+    /// 0 ⇒ no PLE (the 31B/26B); 256 on E4B.
+    pub n_embd_per_layer: u32,
+    /// Layers `[0, n_layer_kv_from_start)` compute their own KV; later
+    /// layers reuse a donor layer's cache. Equals `block_count` when the
+    /// model has no KV sharing.
+    pub n_layer_kv_from_start: u32,
 }
 
 impl Gemma4Config {
@@ -154,6 +162,14 @@ impl Gemma4Config {
         let expert_used_count = optional_u32(gguf, "gemma4.expert_used_count").unwrap_or(0);
         let expert_ff_size    = optional_u32(gguf, "gemma4.expert_feed_forward_length").unwrap_or(0);
 
+        // Per-Layer Embeddings + KV sharing — present on E4B, absent on
+        // the 31B/26B (the keys default to 0 ⇒ feature off).
+        let n_embd_per_layer =
+            optional_u32(gguf, "gemma4.embedding_length_per_layer_input").unwrap_or(0);
+        let n_kv_shared =
+            optional_u32(gguf, "gemma4.attention.shared_kv_layers").unwrap_or(0);
+        let n_layer_kv_from_start = block_count.saturating_sub(n_kv_shared);
+
         Ok(Self {
             block_count, hidden_size, ffn_size, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
@@ -162,12 +178,32 @@ impl Gemma4Config {
             final_logit_softcapping, tied_embeddings,
             kv_heads, attn_kinds,
             expert_count, expert_used_count, expert_ff_size,
+            n_embd_per_layer, n_layer_kv_from_start,
         })
     }
 
     /// True for MoE models (the 26B-A4B); false for the dense 31B.
     pub fn is_moe(&self) -> bool {
         self.expert_count > 0
+    }
+
+    /// True for models with Per-Layer Embeddings (E4B).
+    pub fn has_ple(&self) -> bool {
+        self.n_embd_per_layer > 0
+    }
+
+    /// Whether `layer` computes its own KV (vs reusing a donor's cache).
+    pub fn layer_has_kv(&self, layer: usize) -> bool {
+        (layer as u32) < self.n_layer_kv_from_start
+    }
+
+    /// Donor layer whose KV cache a shared layer reuses. Mirrors
+    /// llama.cpp's gemma4 `reuse` callback: the last full-attention
+    /// layer (`from_start - 1`) for full layers, the last sliding-window
+    /// layer (`from_start - 2`) for sliding layers.
+    pub fn kv_donor(&self, layer: usize) -> usize {
+        let back = if self.attn_kinds[layer] == AttnKind::Sliding { 2 } else { 1 };
+        (self.n_layer_kv_from_start - back) as usize
     }
 
     /// Head dim for the given layer's attention kind.
@@ -211,6 +247,16 @@ impl Gemma4Model {
         for (layer, &kind) in self.config.attn_kinds.iter().enumerate() {
             for name in expected_tensors(layer as u32, kind, moe) {
                 require_tensor(gguf, &name)?;
+            }
+        }
+        if self.config.has_ple() {
+            require_tensor(gguf, "per_layer_token_embd.weight")?;
+            require_tensor(gguf, "per_layer_model_proj.weight")?;
+            require_tensor(gguf, "per_layer_proj_norm.weight")?;
+            for layer in 0..self.config.block_count {
+                require_tensor(gguf, &format!("blk.{layer}.inp_gate.weight"))?;
+                require_tensor(gguf, &format!("blk.{layer}.proj.weight"))?;
+                require_tensor(gguf, &format!("blk.{layer}.post_norm.weight"))?;
             }
         }
         Ok(())

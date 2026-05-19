@@ -193,6 +193,27 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
 
+        // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
+        // print timing + top-10, and exit (skips generation). Mirrors the
+        // gemma4 path so the harness has one interface for both arches.
+        if std::env::var_os("REINSTINCT_PREFILL").is_some() {
+            let t = std::time::Instant::now();
+            let lg = if prompt.len() > 1 {
+                gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
+            } else {
+                gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
+            };
+            let el = t.elapsed().as_secs_f64();
+            println!("batched prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                     el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
+            let mut idx: Vec<usize> = (0..lg.len()).collect();
+            idx.sort_unstable_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            for &t in idx.iter().take(10) {
+                println!("  token {t:>8}  logit {:>9.4}", lg[t]);
+            }
+            return Ok(());
+        }
+
         // Prefill the prompt in one batched pass (rocBLAS GEMM); fall
         // back to the sequential path for a single-token prompt.
         let t_pre = std::time::Instant::now();
@@ -203,6 +224,22 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         };
         println!("prefill       = {:.3} s ({} tokens, batched)",
             t_pre.elapsed().as_secs_f32(), prompt.len());
+        // Capture the decode forward into a parametric HIP graph — the
+        // graph reads `d_pos`, so one capture replays for every step,
+        // eliding the per-kernel launch overhead. `REINSTINCT_NO_GRAPH`
+        // forces the per-kernel path.
+        // REINSTINCT_MOE_PROFILE needs the per-kernel path (its per-stage
+        // timer syncs the stream, which a captured graph can't contain).
+        let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
+                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none();
+        // Capture only when the graph is used — the profiler's per-stage
+        // syncs cannot run inside a stream capture.
+        let graph = if use_graph {
+            Some(gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?)
+        } else {
+            println!("backend mode  = per-kernel");
+            None
+        };
         // Decode timer — steady-state per-token cost, excluding the
         // one-time weight load and the prompt prefill.
         let t_dec = std::time::Instant::now();
@@ -210,13 +247,27 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
             all.push(tok);
             if tok == cfg.eos_token_id { break; }
-            logits = gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+            logits = match &graph {
+                Some(g) => gpu.forward_token_via_graph(g, tok, &mut state)
+                              .map_err(anyhow::Error::msg)?,
+                None    => gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?,
+            };
         }
         let n_dec = all.len() - prompt.len();
         if n_dec > 0 {
             let d = t_dec.elapsed().as_secs_f64();
             println!("decode        = {:.1} ms/token ({:.1} tok/s) over {n_dec} forwards",
                 d * 1e3 / n_dec as f64, n_dec as f64 / d);
+        }
+        let prof = gpu.moe_prof_report();
+        if !prof.is_empty() {
+            let tot: f64 = prof.iter().map(|(_, t)| t).sum();
+            println!("\n--- MoE decode per-stage ({n_dec} steps, sync-per-lap) ---");
+            for (label, ms) in &prof {
+                println!("  {label:<14} {ms:8.1} ms  {:5.1}%  ({:.3} ms/step)",
+                         100.0 * ms / tot, ms / n_dec.max(1) as f64);
+            }
+            println!("  {:<14} {tot:8.1} ms", "TOTAL");
         }
     } else {
         // CPU oracle — needs the f32-dequantized weights.
@@ -302,7 +353,7 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         // print timing + top-10, and exit (skips generation).
         if std::env::var_os("REINSTINCT_PREFILL").is_some() {
             let t = std::time::Instant::now();
-            let lg = gm.prefill_forward(&cache, &prompt, &mut state)
+            let lg = gm.prefill_forward(&prompt, &mut state)
                 .map_err(anyhow::Error::msg)?;
             let el = t.elapsed().as_secs_f64();
             println!("batched prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
@@ -317,23 +368,29 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
 
         // Capture the decode forward once into a parametric HIP graph —
         // decode then replays it with a single submission per token.
-        let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none();
+        // REINSTINCT_MOE_PROFILE needs the per-kernel path (its per-stage
+        // timer syncs the stream, which a captured graph can't contain).
+        let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
+                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none();
         let t_cap = std::time::Instant::now();
-        let graph = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
-        if use_graph {
+        let graph = if use_graph {
+            let g = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
             println!("graph capture = {:.2} s", t_cap.elapsed().as_secs_f32());
+            Some(g)
         } else {
-            println!("backend mode  = per-kernel (REINSTINCT_NO_GRAPH)");
-        }
+            println!("backend mode  = per-kernel");
+            None
+        };
         let fwd = |gm: &GpuGemma4, t: u32, st: &mut Gemma4GpuState| {
-            if use_graph { gm.forward_via_graph(&graph, t, st) }
-            else { gm.forward_token(t, st) }
+            match &graph {
+                Some(g) => gm.forward_via_graph(g, t, st),
+                None    => gm.forward_token(t, st),
+            }
         };
         // Prefill the prompt in one batched pass — this populates every
         // layer's KV cache, so decode continues straight from position P.
         let t_prefill = std::time::Instant::now();
-        let mut lg = gm.prefill_forward(&cache, &prompt, &mut state)
-            .map_err(anyhow::Error::msg)?;
+        let mut lg = gm.prefill_forward(&prompt, &mut state).map_err(anyhow::Error::msg)?;
         let pf = t_prefill.elapsed().as_secs_f64();
         println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token)",
                  pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64);
@@ -350,6 +407,16 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             println!("decode       = {:.1} ms/token ({:.1} tok/s) over {n_gen} forwards",
                 t_decode.elapsed().as_secs_f64() * 1e3 / n_gen as f64,
                 n_gen as f64 / t_decode.elapsed().as_secs_f64());
+        }
+        let prof = gm.moe_prof_report();
+        if !prof.is_empty() {
+            let tot: f64 = prof.iter().map(|(_, t)| t).sum();
+            println!("\n--- MoE decode per-stage ({n_gen} steps, sync-per-lap) ---");
+            for (label, ms) in &prof {
+                println!("  {label:<16} {ms:8.1} ms  {:5.1}%  ({:.3} ms/step)",
+                         100.0 * ms / tot, ms / n_gen.max(1) as f64);
+            }
+            println!("  {:<16} {tot:8.1} ms", "TOTAL");
         }
         // One traced forward for a per-block timing breakdown.
         let probe = *all.last().unwrap();
@@ -538,17 +605,17 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     // valid for every iteration here.
     state.reset().map_err(anyhow::Error::msg)?;
     let t_cap = std::time::Instant::now();
-    let exec = gpu.capture_forward_graph(token, &mut state).map_err(anyhow::Error::msg)?;
+    let exec = gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?;
     println!("\nHIP graph capture + instantiate took {:.3} ms",
         t_cap.elapsed().as_secs_f64() * 1000.0);
     state.reset().map_err(anyhow::Error::msg)?;
-    let _ = gpu.forward_token_via_graph(&exec, &mut state).map_err(anyhow::Error::msg)?;  // warmup
+    let _ = gpu.forward_token_via_graph(&exec, token, &mut state).map_err(anyhow::Error::msg)?;  // warmup
     state.reset().map_err(anyhow::Error::msg)?;
 
     let mut g_times_us = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
-        let _ = gpu.forward_token_via_graph(&exec, &mut state).map_err(anyhow::Error::msg)?;
+        let _ = gpu.forward_token_via_graph(&exec, token, &mut state).map_err(anyhow::Error::msg)?;
         g_times_us.push(t.elapsed().as_micros() as u64);
         state.reset().map_err(anyhow::Error::msg)?;
     }
