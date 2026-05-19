@@ -1941,12 +1941,14 @@ impl GpuGemma4 {
         // --- Attention ---
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.attn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
+        self.prof_lap("a_norm");
         // Q: project, per-head norm, RoPE.
         self.launch_matvec(&b.attn_q, self.normed.raw_ptr(), self.q_buf.raw_ptr())?;
         self.launch_rmsnorm_mh(self.q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
                                self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32)?;
         self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32,
                          b.kind)?;
+        self.prof_lap("a_q_proj");
         // K/V: computed and written to the cache only on KV-owning layers.
         if b.kv_donor.is_none() {
             self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
@@ -1965,12 +1967,14 @@ impl GpuGemma4 {
             // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
             self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
                                    n_kv as u32, head_dim as u32)?;
+            self.prof_lap("a_kv_proj");
             // Quantize (k, v) and append into the int8 cache at d_pos — a
             // kernel reading d_pos (a pos-offset memcpy can't be captured).
             self.launch_kv_write_q8(self.k_norm.raw_ptr(), own_kv.k.raw_ptr(),
                                     own_kv.ks.raw_ptr(), n_kv as u32, head_dim as u32)?;
             self.launch_kv_write_q8(self.v_norm.raw_ptr(), own_kv.v.raw_ptr(),
                                     own_kv.vs.raw_ptr(), n_kv as u32, head_dim as u32)?;
+            self.prof_lap("a_kv_write");
         }
         let window = match b.kind {
             AttnKind::Sliding => self.sliding_window as u32,
@@ -1979,12 +1983,14 @@ impl GpuGemma4 {
         self.launch_attn_q8(self.q_buf.raw_ptr(), attn_kv.k.raw_ptr(), attn_kv.ks.raw_ptr(),
                             attn_kv.v.raw_ptr(), attn_kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
                             n_kv as u32, head_dim as u32, window)?;
+        self.prof_lap("a_kernel");
         // Output projection, post-norm, residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
                            self.hidden_b.raw_ptr())?;
         self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_attn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+        self.prof_lap("a_out_proj");
 
         // --- FFN --- (dense GeGLU, or the dual shared-MLP + MoE branch)
         match &b.moe {
@@ -2034,7 +2040,6 @@ impl GpuGemma4 {
     fn moe_ffn(&self, b: &GpuGemma4Block, mw: &MoeBlock) -> Result<(), String> {
         let h = self.hidden as u32;
         let ff_exp = self.expert_ff as u32;
-        self.prof_lap("attn+norm");
 
         // --- Shared MLP --- → cur_mlp (kept live across the MoE branch).
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),

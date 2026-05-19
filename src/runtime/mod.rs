@@ -39,13 +39,20 @@ pub struct KernelCache {
 impl KernelCache {
     /// Build a cache under `~/.cache/reinstinct/kernels/`. Resolves and
     /// pins the hipcc version up-front so repeated lookups are cheap.
+    /// `REINSTINCT_HIPCC_VERSION` overrides the probe — needed when
+    /// running under rocprof, whose LD_PRELOAD makes hipcc/clang abort
+    /// (LLVM CLI option double-registration). With the cache warm this
+    /// is the only hipcc call, so bypassing it is enough.
     pub fn new() -> Result<Self, String> {
         let arch = std::env::var("REINSTINCT_OFFLOAD_ARCH")
             .unwrap_or_else(|_| DEFAULT_ARCH.to_string());
         let cache_dir = Self::default_cache_dir()?;
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("create cache dir {}: {e}", cache_dir.display()))?;
-        let hipcc_version = Self::hipcc_version()?;
+        let hipcc_version = match std::env::var("REINSTINCT_HIPCC_VERSION") {
+            Ok(v) => v,
+            Err(_) => Self::hipcc_version()?,
+        };
         Ok(Self { cache_dir, arch, hipcc_version })
     }
 
