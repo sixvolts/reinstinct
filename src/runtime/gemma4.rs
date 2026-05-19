@@ -52,6 +52,7 @@ const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
 // MoE kernel sources.
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
+const MATVEC_Q8_0_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q8_0_repacked.cpp");
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
 const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill_flash.cpp");
@@ -443,6 +444,7 @@ pub struct GpuGemma4 {
     m_mv_q5k_dp4a: Module,
     m_mv_q6k_dp4a: Module,
     m_mv_q8_0_dp4a: Module,
+    m_mv_q8_0_repacked: Module,
     m_mv_q4k_repacked: Module,
     m_mv_q5k_repacked: Module,
     m_mv_q6k_repacked: Module,
@@ -658,6 +660,7 @@ impl GpuGemma4 {
             m_mv_q5k_dp4a:  ld("matvec_q5_k_dp4a", MATVEC_Q5K_DP4A_SRC)?,
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
+            m_mv_q8_0_repacked: ld("matvec_q8_0_repacked", MATVEC_Q8_0_REPACKED_SRC)?,
             m_mv_q4k_repacked: ld("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?,
             m_mv_q5k_repacked: ld("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC)?,
             m_mv_q6k_repacked: ld("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC)?,
@@ -904,17 +907,23 @@ impl GpuGemma4 {
     fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
-        // Repacked Q4_K: contiguous two-plane layout, 256-thread workgroup
-        // (4 wavefronts × 2 rows = 8 rows).
+        // Repacked weights all share the quantize-then-dispatch pattern,
+        // but K-quants run at 256-thread/8-row workgroups and Q8_0 runs
+        // at 64-thread/2-row (the existing dp4a Q8_0 footprint, just on
+        // the cleaner two-plane layout).
         if w.repacked {
             self.launch_quantize_q8(x, self.xq8.raw_ptr(), w.in_dim, 1)?;
-            let (module, kname) = match w.dtype {
-                GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32"),
-                GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32"),
-                _              => (&self.m_mv_q4k_repacked, "matvec_q4k_repacked_f32"),
+            let (module, kname, grid, kblock): (&Module, &str, u32, u32) = match w.dtype {
+                GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32",
+                                   (w.out_dim + 7) / 8, 256),
+                GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32",
+                                   (w.out_dim + 7) / 8, 256),
+                GgmlType::Q8_0 => (&self.m_mv_q8_0_repacked, "matvec_q8_0_repacked_f32",
+                                   (w.out_dim + 1) / 2, 64),
+                _              => (&self.m_mv_q4k_repacked, "matvec_q4k_repacked_f32",
+                                   (w.out_dim + 7) / 8, 256),
             };
             let f = module.function(kname)?;
-            let grid = (w.out_dim + 7) / 8;
             let mut wa = w.data.raw_ptr();
             let mut xa = self.xq8.raw_ptr();
             let mut ya = y;
@@ -924,7 +933,7 @@ impl GpuGemma4 {
                 &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
                 &mut oa as *mut _ as *mut c_void];
             return unsafe {
-                f.launch((grid, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut args)
+                f.launch((grid, 1, 1), (kblock, 1, 1), 0, Some(&self.stream), &mut args)
             };
         }
         self.launch_matvec_raw(w.data.raw_ptr(), w.dtype, w.in_dim, w.out_dim, x, y)

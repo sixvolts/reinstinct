@@ -204,6 +204,7 @@ pub struct PrefillGemm {
     deq_q4k_repacked: Module,
     deq_q5k_repacked: Module,
     deq_q6k_repacked: Module,
+    deq_q8_0_repacked: Module,
     quantize_q8: Module,
     mmq_q4k:     Module,
     mmq_q5k:     Module,
@@ -238,6 +239,8 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_q5k_repacked_f16.cpp"))?)?,
             deq_q6k_repacked: Module::load(&cache.compile("dequant_q6k_repacked_f16",
                            include_str!("../../kernels/dequant_q6k_repacked_f16.cpp"))?)?,
+            deq_q8_0_repacked: Module::load(&cache.compile("dequant_q8_0_repacked_f16",
+                           include_str!("../../kernels/dequant_q8_0_repacked.cpp"))?)?,
             quantize_q8: Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?,
             mmq_q4k:     Module::load(&cache.compile("mmq_gemm_q4k_repacked",
                                                      MMQ_GEMM_Q4K_SOURCE)?)?,
@@ -278,6 +281,8 @@ impl PrefillGemm {
     {
         // Repacked K-quants: the 2D-tiled int8 MMQ GEMM consumes the
         // quantised weight directly — no dequant to fp16, no HGEMM.
+        // Repacked Q8_0 falls through to the dequant→HGEMM path below;
+        // an int8-MMQ Q8_0 GEMM would be a follow-up.
         if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
             return self.matmul_mmq(stream, w_dev, dtype, in_dim, out_dim, x, n_rows);
         }
@@ -296,10 +301,11 @@ impl PrefillGemm {
         let mut w_ptr = w_dev.raw_ptr();
         let mut o_ptr = w_f16.raw_ptr();
         if repacked {
-            // Repacked K-quant: one HIP block per 32-weight sub-block.
+            // Repacked weight: one HIP block per 32-weight sub-block.
             let (module, kname) = match dtype {
                 GgmlType::Q5_K => (&self.deq_q5k_repacked, "dequant_q5k_repacked_f16"),
                 GgmlType::Q6_K => (&self.deq_q6k_repacked, "dequant_q6k_repacked_f16"),
+                GgmlType::Q8_0 => (&self.deq_q8_0_repacked, "dequant_q8_0_repacked_f16"),
                 _              => (&self.deq_q4k_repacked, "dequant_q4k_repacked_f16"),
             };
             let f = module.function(kname)?;
