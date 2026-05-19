@@ -66,6 +66,7 @@ const MOE_MV_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/moe_matvec_q6k
 const MOE_GROUPED_Q6K_REPACKED_SRC: &str =
     include_str!("../../kernels/moe_matvec_grouped_q6k_repacked.cpp");
 const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
+const MOE_MATVEC_Q8_0_DOWN_SRC: &str = include_str!("../../kernels/moe_matvec_q8_0_down.cpp");
 const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
 const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
 
@@ -449,6 +450,7 @@ pub struct GpuGemma4 {
     m_moe_mv_q6k:  Module,
     m_moe_mv_q6k_repacked: Module,
     m_moe_mv_q8_0: Module,
+    m_moe_mv_q8_0_down: Module,
     m_moe_geglu:   Module,
     m_moe_combine: Module,
     m_kv_write:    Module,
@@ -663,6 +665,7 @@ impl GpuGemma4 {
             m_moe_mv_q6k:   ld("moe_matvec_q6k_dp4a", MOE_MATVEC_Q6K_SRC)?,
             m_moe_mv_q6k_repacked: ld("moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SRC)?,
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
+            m_moe_mv_q8_0_down: ld("moe_matvec_q8_0_down", MOE_MATVEC_Q8_0_DOWN_SRC)?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
             m_kv_write:     ld("kv_write", KV_WRITE_SRC)?,
@@ -1062,6 +1065,37 @@ impl GpuGemma4 {
             f.launch((grid_x, self.n_expert_used as u32, 1), (block,1,1), 0,
                      Some(&self.stream), &mut args)
         }
+    }
+
+    /// Down projection over the routed experts. The down `in_dim`
+    /// (= expert_ff) is small, so `launch_moe_matvec`'s lane→sub-block
+    /// mapping leaves most of every wavefront idle; the row-packed Q8_0
+    /// kernel keeps all threads busy. Falls back for other dtypes.
+    fn launch_moe_down(&self, dtype: GgmlType, repacked: bool,
+                       slab: *mut c_void, xq: *mut c_void,
+                       y: *mut c_void, in_dim: u32, out_dim: u32,
+                       bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
+    {
+        let n_sub = in_dim >> 5;
+        if dtype == GgmlType::Q8_0 && !repacked && n_sub >= 1 && n_sub <= 256 {
+            let rpb = 256 / n_sub;
+            let f = self.m_moe_mv_q8_0_down.function("moe_matvec_q8_0_down_f32")?;
+            let grid_x = (out_dim + rpb - 1) / rpb;
+            let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
+            let mut ia=in_dim; let mut oa=out_dim;
+            let mut bpe=bytes_per_expert; let mut st=xq_stride;
+            let mut args: [*mut c_void; 8] = [
+                &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
+                &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+                &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
+            return unsafe {
+                f.launch((grid_x, self.n_expert_used as u32, 1), (256,1,1), 0,
+                         Some(&self.stream), &mut args)
+            };
+        }
+        self.launch_moe_matvec(dtype, repacked, slab, xq, y, in_dim, out_dim,
+                               bytes_per_expert, xq_stride)
     }
 
     /// Batched GeGLU over all routed experts: `gu` [n_used, 2·ff_exp] →
@@ -2038,10 +2072,10 @@ impl GpuGemma4 {
         // down: each expert has its own activation — quantize the batch.
         self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
                                 ff_exp, self.n_expert_used as u32)?;
-        self.launch_moe_matvec(mw.down_exps.dtype, mw.down_exps.repacked,
-                               mw.down_exps.data.raw_ptr(),
-                               self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
-                               mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
+        self.launch_moe_down(mw.down_exps.dtype, mw.down_exps.repacked,
+                             mw.down_exps.data.raw_ptr(),
+                             self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
+                             mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
         self.prof_lap("expert_down");
         self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
                                 self.moe_acc.raw_ptr())?;
