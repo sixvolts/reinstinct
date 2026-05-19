@@ -32,3 +32,24 @@ void embed_lookup_q8_0_f32(const BlockQ8_0*    __restrict__ table,
     const float d = __half2float(*reinterpret_cast<const __half*>(&b->d));
     out[i] = d * (float)b->qs[lane];
 }
+
+// Batched: grid.y selects the token, ids come from a device array, and
+// each token's `hidden` outputs are written to row `blockIdx.y`.
+extern "C" __global__
+void embed_lookup_q8_0_batched_f32(const BlockQ8_0*    __restrict__ table,
+                                   float*              __restrict__ out,
+                                   const unsigned int* __restrict__ row_idx,
+                                   unsigned int hidden)
+{
+    const unsigned int r = blockIdx.y;
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+
+    const unsigned int blocks_per_row = hidden >> 5;       // /32
+    const unsigned int blk_idx = i >> 5;
+    const unsigned int lane    = i & 31;
+
+    const BlockQ8_0* b = table + (size_t)row_idx[r] * blocks_per_row + blk_idx;
+    const float d = __half2float(*reinterpret_cast<const __half*>(&b->d));
+    out[(size_t)r * hidden + i] = d * (float)b->qs[lane];
+}

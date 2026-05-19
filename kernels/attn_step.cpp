@@ -26,7 +26,7 @@ void attn_step_f32(const float* __restrict__ q,         // [n_heads, head_dim]
                    unsigned int n_heads,
                    unsigned int n_kv_heads,
                    unsigned int head_dim,
-                   unsigned int total_len,              // cache positions to attend over
+                   const unsigned int* __restrict__ pos_ptr,  // decode pos (device)
                    float        scaling)
 {
     extern __shared__ float lds[];
@@ -36,6 +36,7 @@ void attn_step_f32(const float* __restrict__ q,         // [n_heads, head_dim]
     const int kv_h   = h / groups;
     const int tid    = threadIdx.x;
     const int bs     = blockDim.x;
+    const unsigned int total_len = *pos_ptr + 1;  // cache positions to attend over
 
     float* q_lds  = lds;                               // [head_dim]
     float* scores = q_lds  + head_dim;                 // [total_len]

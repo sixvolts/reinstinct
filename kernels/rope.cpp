@@ -26,8 +26,9 @@ void rope_apply_f32(float*       __restrict__ x,        // [n_heads, head_dim]
                     unsigned int head_dim,
                     unsigned int rotary_dim,
                     unsigned int n_heads,
-                    unsigned int pos)
+                    const unsigned int* __restrict__ pos_ptr)  // decode position (device)
 {
+    const unsigned int pos  = *pos_ptr;
     const unsigned int half = rotary_dim >> 1;
     const unsigned int h    = blockIdx.y;
     if (h >= n_heads) return;

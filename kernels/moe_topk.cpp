@@ -2,9 +2,11 @@
 // with the selected weights renormalised to sum to 1.
 //
 // One workgroup per token (grid.x = n_tok; decode launches grid.x = 1).
-// The softmax is computed cooperatively; the top-k scan runs on thread 0
-// (n_expert is small — 128 — so 8 serial argmax passes is negligible and
-// avoids a fiddly parallel reduction).
+// Both the softmax and the top-k run cooperatively across the block:
+// the top-k is `n_used` rounds of a parallel block-wide argmax (the
+// previous serial scan on thread 0 alone cost ~74 us/layer at decode —
+// it left 255 threads idle and exposed LDS latency on a dependent
+// chain).
 //
 // out_ids[k]     = expert index of the k-th largest probability
 // out_weights[k] = its softmax probability, renormalised over the k used
@@ -20,6 +22,8 @@ void moe_topk_f32(const float* __restrict__ logits,
 {
     extern __shared__ float probs[];        // n_expert floats
     __shared__ float red[256];
+    __shared__ int   ridx[256];
+    __shared__ float chosen[64];            // n_used <= 64
     const int t  = threadIdx.x;
     const int nt = blockDim.x;
 
@@ -56,26 +60,40 @@ void moe_topk_f32(const float* __restrict__ logits,
         if (t < s) red[t] += red[t + s];
         __syncthreads();
     }
-    const float sum = red[0];
+    const float inv_sum = 1.0f / red[0];
     __syncthreads();
-    for (int i = t; i < n_expert; i += nt) probs[i] /= sum;
+    for (int i = t; i < n_expert; i += nt) probs[i] *= inv_sum;
     __syncthreads();
 
-    // top-k on thread 0
+    // top-k: n_used rounds of a parallel block-wide argmax.
+    for (int k = 0; k < n_used; k++) {
+        float bv = -1.0f; int bi = 0;
+        for (int i = t; i < n_expert; i += nt) {
+            const float v = probs[i];
+            if (v > bv) { bv = v; bi = i; }
+        }
+        red[t] = bv; ridx[t] = bi;
+        __syncthreads();
+        for (int s = nt >> 1; s > 0; s >>= 1) {
+            if (t < s && red[t + s] > red[t]) {
+                red[t]  = red[t + s];
+                ridx[t] = ridx[t + s];
+            }
+            __syncthreads();
+        }
+        if (t == 0) {
+            out_ids[k]  = ridx[0];
+            chosen[k]   = red[0];
+            probs[ridx[0]] = -1.0f;        // exclude from later rounds
+        }
+        __syncthreads();
+    }
+
+    // renormalise the selected weights over their sum.
     if (t == 0) {
         float wsum = 0.0f;
-        for (int k = 0; k < n_used; k++) {
-            int   best = 0;
-            float bv   = -1.0f;
-            for (int i = 0; i < n_expert; i++) {
-                if (probs[i] > bv) { bv = probs[i]; best = i; }
-            }
-            out_ids[k]     = best;
-            out_weights[k] = bv;
-            wsum += bv;
-            probs[best] = -1.0f;             // exclude from later passes
-        }
+        for (int k = 0; k < n_used; k++) wsum += chosen[k];
         if (wsum < 6.103515625e-5f) wsum = 6.103515625e-5f;
-        for (int k = 0; k < n_used; k++) out_weights[k] /= wsum;
+        for (int k = 0; k < n_used; k++) out_weights[k] = chosen[k] / wsum;
     }
 }
