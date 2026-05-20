@@ -1550,16 +1550,19 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
             // All K drafts accepted. Per HF spec-decode, in this case the
             // target's last verify logit (= prediction for the position
             // AFTER the last draft) is consumed as a "bonus" token —
-            // generation advances by K+1 in this round, not K. We need to
-            // run `forward_token(bonus)` to populate target's KV at the
-            // bonus position and update hidden_b for the next round's
-            // h_prev seed.
-            let bonus = argmax(verify_batch.last().unwrap());
-            verify_logits = gm.forward_token(bonus, &mut state)
-                .map_err(anyhow::Error::msg)?;
-            generated.push(bonus);
-            last_tok = bonus;
-            hit_eos = bonus == cfg_eos;
+            // generation advances by K+1 in this round, not K. Toggle:
+            // REINSTINCT_DRAFTER_NO_BONUS=1 reverts to the old "advance by K"
+            // behaviour (for measurement only).
+            if std::env::var("REINSTINCT_DRAFTER_NO_BONUS").is_ok() {
+                verify_logits = verify_batch.last().cloned().unwrap();
+            } else {
+                let bonus = argmax(verify_batch.last().unwrap());
+                verify_logits = gm.forward_token(bonus, &mut state)
+                    .map_err(anyhow::Error::msg)?;
+                generated.push(bonus);
+                last_tok = bonus;
+                hit_eos = bonus == cfg_eos;
+            }
         }
         total_drafted += drafted.len();
         total_accepted += accepted_this_round;
