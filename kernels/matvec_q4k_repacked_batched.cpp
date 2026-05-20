@@ -93,6 +93,11 @@ void matvec_q4k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
         }
 
         // Now loop activations once each, doing ROWS dp4a accumulations.
+        // Tried staging xq into LDS once per WG so the 4 waves share the
+        // load instead of each fetching the same super-blocks from HBM
+        // — turned out 3-4% SLOWER because the 26 KB LDS alloc per WG
+        // dropped occupancy from ~8 → 2 WGs/CU. L1 caching across waves
+        // is already cheap enough that LDS sharing doesn't pay.
         for (unsigned int b = 0; b < n_rows; b++) {
             const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
             const float    dx   = xb->d;
@@ -132,3 +137,4 @@ void matvec_q4k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
         }
     }
 }
+
