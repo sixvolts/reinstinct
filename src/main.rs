@@ -1428,40 +1428,56 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
             prev = d;
         }
 
-        // --- VERIFY phase (sequential) ---
-        // `verify_logits` predicts the token AT state.pos (next position
-        // to write). Compare drafted[k] vs that argmax; on match, commit
-        // drafted[k] via target.forward_token and advance. On mismatch,
-        // commit target's argmax instead and end the round.
+        // --- BATCHED VERIFY ---
+        // Target processes the K drafted tokens in ONE forward at
+        // positions [pre_verify_pos, pre_verify_pos+K), returning K
+        // logit vectors. verify_logits_batch[i] predicts position
+        // pre_verify_pos+i+1.
+        let pre_verify_pos = state.pos;
+        let verify_batch = gm.verify_forward(&drafted, &mut state)
+            .map_err(anyhow::Error::msg)?;
+
+        // --- ACCEPTANCE ---
+        // drafted[i] (at pos pre_verify_pos+i) is verified against:
+        //   - argmax(verify_logits)            for i == 0   (target's prediction from BEFORE the round)
+        //   - argmax(verify_batch[i-1])        for i >= 1   (target's prediction conditional on drafted[..i])
+        // On first rejection: keep drafted[..i], commit target's pick at
+        // pos pre_verify_pos+i, truncate the rejected slots.
         let mut accepted_this_round = 0usize;
-        let _ = round_idx;
-        for (i, &d) in drafted.iter().enumerate() {
-            let target_pred = argmax(&verify_logits);
+        let mut rejected = false;
+        for i in 0..drafted.len() {
+            let predicting_logits = if i == 0 { &verify_logits } else { &verify_batch[i - 1] };
+            let target_pred = argmax(predicting_logits);
+            let d = drafted[i];
             if d == target_pred {
-                // Accept the drafted token.
                 generated.push(d);
                 accepted_this_round += 1;
-                if d == cfg_eos || generated.len() >= steps { hit_eos = d == cfg_eos; break; }
-                verify_logits = gm.forward_token(d, &mut state)
-                    .map_err(anyhow::Error::msg)?;
                 last_tok = d;
-                if i == drafted.len() - 1 {
-                    // All K accepted; loop ends naturally.
-                }
+                if d == cfg_eos { hit_eos = true; rejected = true; break; }
+                if generated.len() >= steps { rejected = true; break; }
             } else {
-                // Reject from here; commit target's pick and end round.
+                // Reject. Slots [pre_verify_pos, pre_verify_pos+i) are
+                // accepted; we need slot pre_verify_pos+i to hold the
+                // target's pick instead of drafted[i]; drop the tail.
+                state.truncate(pre_verify_pos + i);
+                let new_verify = gm.forward_token(target_pred, &mut state)
+                    .map_err(anyhow::Error::msg)?;
                 generated.push(target_pred);
-                if target_pred != cfg_eos && generated.len() < steps {
-                    verify_logits = gm.forward_token(target_pred, &mut state)
-                        .map_err(anyhow::Error::msg)?;
-                }
                 last_tok = target_pred;
                 hit_eos = target_pred == cfg_eos;
+                verify_logits = new_verify;
+                rejected = true;
                 break;
             }
         }
+        if !rejected {
+            // All K accepted: verify_batch[K-1] is target's prediction
+            // for the next position (= seed logits for the next round).
+            verify_logits = verify_batch.last().cloned().unwrap();
+        }
         total_drafted += drafted.len();
         total_accepted += accepted_this_round;
+        let _ = round_idx;
         if hit_eos { break; }
     }
 
