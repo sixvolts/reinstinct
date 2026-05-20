@@ -30,20 +30,20 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
-extern "C" __global__
-void attn_step_q8_batched_f32(const float*       __restrict__ q,        // [n_q_rows, n_heads, head_dim]
-                              const signed char* __restrict__ k_cache,  // [max_seq, n_kv, head_dim]
-                              const float*       __restrict__ k_scale,  // [max_seq, n_kv]
-                              const signed char* __restrict__ v_cache,
-                              const float*       __restrict__ v_scale,
-                              float*             __restrict__ out,      // [n_q_rows, n_heads, head_dim]
-                              unsigned int n_heads,
-                              unsigned int n_kv_heads,
-                              unsigned int head_dim,
-                              unsigned int base_pos,
-                              unsigned int n_q_rows,
-                              unsigned int window,
-                              float        scaling)
+__device__ __forceinline__
+void attn_step_q8_batched_body(const float*       __restrict__ q,
+                               const signed char* __restrict__ k_cache,
+                               const float*       __restrict__ k_scale,
+                               const signed char* __restrict__ v_cache,
+                               const float*       __restrict__ v_scale,
+                               float*             __restrict__ out,
+                               unsigned int n_heads,
+                               unsigned int n_kv_heads,
+                               unsigned int head_dim,
+                               unsigned int base_pos,
+                               unsigned int n_q_rows,
+                               unsigned int window,
+                               float        scaling)
 {
     extern __shared__ float lds[];
     const int h     = blockIdx.x;
@@ -147,4 +147,47 @@ void attn_step_q8_batched_f32(const float*       __restrict__ q,        // [n_q_
         }
         out[((size_t)q_row * n_heads + (size_t)h) * head_dim + d] = acc;
     }
+}
+
+extern "C" __global__
+void attn_step_q8_batched_f32(const float*       __restrict__ q,
+                              const signed char* __restrict__ k_cache,
+                              const float*       __restrict__ k_scale,
+                              const signed char* __restrict__ v_cache,
+                              const float*       __restrict__ v_scale,
+                              float*             __restrict__ out,
+                              unsigned int n_heads,
+                              unsigned int n_kv_heads,
+                              unsigned int head_dim,
+                              unsigned int base_pos,
+                              unsigned int n_q_rows,
+                              unsigned int window,
+                              float        scaling)
+{
+    attn_step_q8_batched_body(q, k_cache, k_scale, v_cache, v_scale, out,
+                              n_heads, n_kv_heads, head_dim, base_pos,
+                              n_q_rows, window, scaling);
+}
+
+// Variant that reads `base_pos` from a device-resident uint32 — used
+// by verify_forward when captured into a HIP graph (see the comment in
+// kv_quant_prefill_offset_f32).
+extern "C" __global__
+void attn_step_q8_batched_offset_f32(const float*       __restrict__ q,
+                                     const signed char* __restrict__ k_cache,
+                                     const float*       __restrict__ k_scale,
+                                     const signed char* __restrict__ v_cache,
+                                     const float*       __restrict__ v_scale,
+                                     float*             __restrict__ out,
+                                     unsigned int n_heads,
+                                     unsigned int n_kv_heads,
+                                     unsigned int head_dim,
+                                     const unsigned int* __restrict__ base_pos_ptr,
+                                     unsigned int n_q_rows,
+                                     unsigned int window,
+                                     float        scaling)
+{
+    attn_step_q8_batched_body(q, k_cache, k_scale, v_cache, v_scale, out,
+                              n_heads, n_kv_heads, head_dim, *base_pos_ptr,
+                              n_q_rows, window, scaling);
 }

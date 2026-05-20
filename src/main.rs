@@ -1440,6 +1440,19 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         .map_err(anyhow::Error::msg)?;
     println!("prefill = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
 
+    // Capture the verify_forward kernel chain into a HIP graph so each
+    // round's verify is one `hipGraphLaunch` instead of ~1600 individual
+    // kernel launches. The captured graph reads per-call `v_tokens` and
+    // `v_base_pos` from device-resident slots that we update host-side
+    // before each replay. Captured at this round's K (graph is K-
+    // specific); rejection-rounds with smaller draft sets fall back to
+    // inline verify_forward. Disable with REINSTINCT_NO_VERIFY_GRAPH=1.
+    let verify_graph = if std::env::var("REINSTINCT_NO_VERIFY_GRAPH").is_err() {
+        Some(gm.capture_verify_graph(&state, k).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+
     // The drafter is conditioned on (prev_tok, h_prev=target_hidden_at_pos).
     // After the initial forward_token, the natural last_token is the
     // FINAL prompt token (per HF: "input_ids[:, -1:]"), and h_prev is
@@ -1486,8 +1499,13 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         // logit vectors. verify_logits_batch[i] predicts position
         // pre_verify_pos+i+1.
         let pre_verify_pos = state.pos;
-        let verify_batch = gm.verify_forward(&drafted, &mut state)
-            .map_err(anyhow::Error::msg)?;
+        let verify_batch = match &verify_graph {
+            Some(g) if drafted.len() == k =>
+                gm.forward_verify_via_graph(g, k, &drafted, &mut state)
+                    .map_err(anyhow::Error::msg)?,
+            _ => gm.verify_forward(&drafted, &mut state)
+                    .map_err(anyhow::Error::msg)?,
+        };
 
         // --- ACCEPTANCE ---
         // drafted[i] (at pos pre_verify_pos+i) is verified against:

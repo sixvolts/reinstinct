@@ -614,6 +614,11 @@ pub struct GpuGemma4 {
     v_mlp:      DeviceBuf<f32>,
     v_logits:   DeviceBuf<f32>,
     v_tokens:   DeviceBuf<u32>,
+    /// Device-resident base_pos for verify_forward. Set once per call
+    /// (before kernels are issued / before the captured graph is
+    /// replayed) so the rope-batched, kv-quant-prefill, and attn-step
+    /// kernels can read the per-call value without being re-captured.
+    v_base_pos: DeviceBuf<u32>,
     /// Max K supported per verify_forward call.
     max_verify_k: usize,
 
@@ -866,6 +871,7 @@ impl GpuGemma4 {
             v_mlp:      DeviceBuf::<f32>::new(MAX_VERIFY_K * hidden)?,
             v_logits:   DeviceBuf::<f32>::new(MAX_VERIFY_K * vocab)?,
             v_tokens:   DeviceBuf::<u32>::new(MAX_VERIFY_K)?,
+            v_base_pos: DeviceBuf::<u32>::new(1)?,
             max_verify_k: MAX_VERIFY_K,
             stream,
             rocblas, prefill_gemm,
@@ -2037,6 +2043,21 @@ impl GpuGemma4 {
     pub fn verify_forward(&self, tokens: &[u32], state: &mut Gemma4GpuState)
         -> Result<Vec<Vec<f32>>, String>
     {
+        let p = tokens.len();
+        // Validate + stage tokens / base_pos (host setup).
+        self.verify_setup_host(tokens, state)?;
+        // Kernel chain.
+        self.enqueue_verify_kernels(state, p)?;
+        // Sync + read logits + advance state (host teardown).
+        self.verify_finish_host(state, p)
+    }
+
+    /// Host-side prep shared by `verify_forward` (inline path) and
+    /// `forward_verify_via_graph` (captured-graph path): validate args,
+    /// stage `v_tokens` and `v_base_pos`. Does NOT touch the stream.
+    fn verify_setup_host(&self, tokens: &[u32], state: &Gemma4GpuState)
+        -> Result<(), String>
+    {
         if self.n_expert > 0 {
             return Err("verify_forward: dense-only; MoE not yet wired".into());
         }
@@ -2049,12 +2070,57 @@ impl GpuGemma4 {
             return Err(format!("verify_forward: p={p} > max_verify_k={}", self.max_verify_k));
         }
         let base_pos = state.pos;
-        let h = self.hidden;
-        let hu = h as u32;
         if base_pos + p > self.max_seq {
             return Err(format!("verify_forward: base_pos {base_pos} + p {p} > max_seq {}",
                                self.max_seq));
         }
+        // v_tokens is sized MAX_VERIFY_K; pad with zeros past p.
+        let mut t = vec![0u32; self.max_verify_k];
+        for i in 0..p { t[i] = tokens[i]; }
+        self.v_tokens.copy_from_host(&t)?;
+        // Stage per-call base_pos into the device-resident slot the
+        // _offset kernels read. Lets verify_forward run as a captured
+        // graph and re-execute with different base_pos per round.
+        self.v_base_pos.copy_from_host(&[base_pos as u32])?;
+        Ok(())
+    }
+
+    /// Host-side teardown: sync, advance KV-cache `len` / state.pos,
+    /// DMA the first p × vocab logits back. Shared by inline and
+    /// captured-graph paths.
+    fn verify_finish_host(&self, state: &mut Gemma4GpuState, p: usize)
+        -> Result<Vec<Vec<f32>>, String>
+    {
+        let base_pos = state.pos;
+        self.stream.synchronize()?;
+        for c in &mut state.caches { c.len = base_pos + p; }
+        state.pos = base_pos + p;
+        let mut all = vec![0.0f32; p * self.vocab];
+        self.v_logits.copy_range_to_host(&mut all, 0)?;
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(p);
+        for i in 0..p {
+            out.push(all[i * self.vocab..(i + 1) * self.vocab].to_vec());
+        }
+        Ok(out)
+    }
+
+    /// Pure kernel chain — issues every GPU op of verify_forward to
+    /// `self.stream` and returns. Reads `self.v_tokens` and
+    /// `self.v_base_pos` (caller staged them in `verify_setup_host`).
+    /// No host syncs, no host allocations — captureable into a HIP
+    /// graph that replays for every round at different base_pos.
+    fn enqueue_verify_kernels(&self, state: &Gemma4GpuState, p: usize)
+        -> Result<(), String>
+    {
+        if self.n_expert > 0 {
+            return Err("enqueue_verify_kernels: MoE not wired".into());
+        }
+        if self.ple.is_some() {
+            return Err("enqueue_verify_kernels: PLE/E4B not wired".into());
+        }
+        let base_pos = state.pos;
+        let h = self.hidden;
+        let hu = h as u32;
 
         // All working buffers are preallocated in `self.v_*` — sized to
         // MAX_VERIFY_K rows of the worst-case per-layer dim. Reusing
@@ -2075,11 +2141,7 @@ impl GpuGemma4 {
         let logits_all = &self.v_logits;
 
         // --- embed K tokens → x [K, hidden]  (with √h scale) ---
-        self.v_tokens.copy_from_host(&{
-            let mut t = vec![0u32; self.max_verify_k];
-            for i in 0..p { t[i] = tokens[i]; }
-            t
-        })?;
+        // v_tokens / v_base_pos were staged by verify_setup_host above.
         self.launch_embed_batched(&self.token_embd, x.raw_ptr(),
                                   self.v_tokens.raw_ptr(), p as u32)?;
         self.launch_scale(x.raw_ptr(), (p * h) as u32, (h as f32).sqrt())?;
@@ -2098,15 +2160,14 @@ impl GpuGemma4 {
         for (li, b) in self.blocks.iter().enumerate() {
             let hd = b.head_dim;
             let n_kv = b.n_kv;
-            let kv_dim = n_kv * hd;
 
             self.launch_rmsnorm_batched(x.raw_ptr(), b.attn_norm.raw_ptr(),
                                         normed.raw_ptr(), hu, p as u32)?;
             gemm_into(&b.attn_q, normed, q_buf)?;
             self.launch_rmsnorm_mh_batched(q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
                 q_buf.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
-            self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, hd as u32,
-                                     b.kind, p, base_pos as u32)?;
+            self.launch_rope_batched_offset(q_buf.raw_ptr(), self.n_heads as u32, hd as u32,
+                                            b.kind, p)?;
 
             if b.kv_donor.is_some() {
                 return Err(format!("verify_forward: layer {li} is KV-sharing, not supported"));
@@ -2120,28 +2181,31 @@ impl GpuGemma4 {
                 k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
             self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
                 v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
-            self.launch_rope_batched(k_norm.raw_ptr(), n_kv as u32, hd as u32,
-                                     b.kind, p, base_pos as u32)?;
+            self.launch_rope_batched_offset(k_norm.raw_ptr(), n_kv as u32, hd as u32,
+                                            b.kind, p)?;
 
             let kvc = &state.caches[li];
-            let k_dst_q = unsafe {
-                (kvc.k.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void };
-            let v_dst_q = unsafe {
-                (kvc.v.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void };
-            let k_dst_s = unsafe {
-                (kvc.ks.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void };
-            let v_dst_s = unsafe {
-                (kvc.vs.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void };
-            self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(),
-                                         k_dst_q, k_dst_s, n_kv as u32, hd as u32, p)?;
-            self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(),
-                                         v_dst_q, v_dst_s, n_kv as u32, hd as u32, p)?;
+            // Pass slot-0 KV base pointers; the *offset* kernel reads
+            // base_pos from `self.v_base_pos` and computes the per-call
+            // slot internally — same write pattern as the old code
+            // (host-resolved dst+offset) but graph-safe.
+            self.launch_kv_quant_prefill_offset(k_norm.raw_ptr(),
+                                                 kvc.k.raw_ptr(), kvc.ks.raw_ptr(),
+                                                 n_kv as u32, hd as u32, p)?;
+            self.launch_kv_quant_prefill_offset(v_norm.raw_ptr(),
+                                                 kvc.v.raw_ptr(), kvc.vs.raw_ptr(),
+                                                 n_kv as u32, hd as u32, p)?;
 
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
             };
-            self.launch_attn_step_q8_batched(
+            // Pass the current base_pos as the LDS-sizing upper bound
+            // for the captured launch — the kernel itself reads base_pos
+            // from v_base_pos. Any later replay must have base_pos in
+            // the same magnitude range (which the spec-decode loop
+            // satisfies since rounds advance monotonically by ≤K+1).
+            self.launch_attn_step_q8_batched_offset(
                 q_buf.raw_ptr(),
                 kvc.k.raw_ptr(),  kvc.ks.raw_ptr(),
                 kvc.v.raw_ptr(),  kvc.vs.raw_ptr(),
@@ -2197,28 +2261,67 @@ impl GpuGemma4 {
         // Keep `self.hidden_a` (pre-output-norm) in sync with what a
         // forward_token of the last accepted token would have left
         // (drafter rounds read it).
-        self.hidden_a.copy_range_from_device(x, (p - 1) * h, 0, h)?;
+        // Async stream-ordered D2D — captureable into a HIP graph.
+        self.hidden_a.copy_range_from_device_async(x, (p - 1) * h, 0, h, &self.stream)?;
         // Also keep `self.hidden_b` (post-output-norm) in sync — `normed`
         // already holds the per-row post-output-norm of `x`, so its last
         // row is what `forward_token` would leave in `hidden_b`. The MTP
         // drafter reads `hidden_b` (= POST-norm) as its initial h_prev
         // per HF spec — see `last_hidden_state()`.
-        self.hidden_b.copy_range_from_device(normed, (p - 1) * h, 0, h)?;
-        self.stream.synchronize()?;
+        self.hidden_b.copy_range_from_device_async(normed, (p - 1) * h, 0, h, &self.stream)?;
+        let _ = (base_pos, logits_all);   // silence unused warnings post-extract
+        Ok(())
+    }
 
-        for c in &mut state.caches { c.len = base_pos + p; }
-        state.pos = base_pos + p;
-
-        // DMA only the first p*vocab floats (logits_all is MAX_VERIFY_K
-        // rows × vocab; rows past p are stale scratch). Saves a host
-        // allocation + a memcpy + (MAX_VERIFY_K - p) rows of DMA.
-        let mut all = vec![0.0f32; p * self.vocab];
-        logits_all.copy_range_to_host(&mut all, 0)?;
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(p);
-        for i in 0..p {
-            out.push(all[i * self.vocab..(i + 1) * self.vocab].to_vec());
+    /// Capture `enqueue_verify_kernels` as a HIP graph at a SPECIFIC
+    /// K. The captured graph reads `v_tokens` and `v_base_pos` on
+    /// every replay, so one capture covers every spec-decode round at
+    /// that K — only the host-side staging in `verify_setup_host` and
+    /// the readback in `verify_finish_host` differ per call.
+    pub fn capture_verify_graph(&self, state: &Gemma4GpuState, k: usize)
+        -> Result<GraphExec, String>
+    {
+        if k == 0 || k > self.max_verify_k {
+            return Err(format!("capture_verify_graph: k={k} out of 1..={}",
+                               self.max_verify_k));
         }
-        Ok(out)
+        // Capture-time placeholders: v_base_pos / v_tokens just need
+        // valid bytes for the kernels to read; the values don't affect
+        // the captured graph's structure. (Use state.pos so the LDS
+        // sizing in attn_step_q8_batched_offset matches replay-time
+        // base_pos magnitudes — see launch_attn_step_q8_batched_offset.)
+        self.v_base_pos.copy_from_host(&[state.pos as u32])?;
+        let zeros = vec![0u32; self.max_verify_k];
+        self.v_tokens.copy_from_host(&zeros)?;
+
+        Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
+        if let Err(e) = self.enqueue_verify_kernels(state, k) {
+            let _ = Graph::end_capture(&self.stream);
+            return Err(e);
+        }
+        let graph = Graph::end_capture(&self.stream)?;
+        let exec = graph.instantiate()?;
+        drop(graph);
+        Ok(exec)
+    }
+
+    /// Replay a captured verify graph with new drafted tokens. Same
+    /// host setup/teardown as `verify_forward` but the kernel chain
+    /// runs as one `hipGraphLaunch` instead of ~1600 individual
+    /// kernel launches. K must match the value used at capture time
+    /// (the graph is K-specific).
+    pub fn forward_verify_via_graph(&self, exec: &GraphExec, captured_k: usize,
+                                     tokens: &[u32], state: &mut Gemma4GpuState)
+        -> Result<Vec<Vec<f32>>, String>
+    {
+        let p = tokens.len();
+        if p != captured_k {
+            return Err(format!(
+                "forward_verify_via_graph: K={p} ≠ captured K={captured_k}"));
+        }
+        self.verify_setup_host(tokens, state)?;
+        exec.launch(&self.stream)?;
+        self.verify_finish_host(state, p)
     }
 
     /// Batched (K=2..4) Q5_K dp4a matvec for verify_forward's lm_head.
@@ -2352,6 +2455,93 @@ impl GpuGemma4 {
             &mut hd as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
             &mut nq as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void];
+        unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), smem,
+                           Some(&self.stream), &mut args) }
+    }
+
+    // ===== Offset-variant launchers used by verify_forward =====
+    //
+    // The three kernels below (kv_quant_prefill_offset_f32, rope_apply_
+    // batched_offset_f32, attn_step_q8_batched_offset_f32) read base_pos
+    // from a device-resident uint32 (`self.v_base_pos`) instead of taking
+    // it as a launch-time kernel argument. This lets verify_forward run
+    // either inline OR as a captured HIP graph that's replayed for every
+    // round (different base_pos per call) without re-capturing.
+
+    fn launch_kv_quant_prefill_offset(&self, src: *mut c_void,
+                                       dst_q_base: *mut c_void, dst_s_base: *mut c_void,
+                                       n_kv: u32, head_dim: u32, p: usize)
+        -> Result<(), String>
+    {
+        let f = self.m_kvq_pf.function("kv_quant_prefill_offset_f32")?;
+        let mut sa = src; let mut dqb = dst_q_base; let mut dsb = dst_s_base;
+        let mut bp = self.v_base_pos.raw_ptr();
+        let mut nk = n_kv; let mut hd = head_dim;
+        let mut args: [*mut c_void; 6] = [
+            &mut sa  as *mut _ as *mut c_void, &mut dqb as *mut _ as *mut c_void,
+            &mut dsb as *mut _ as *mut c_void, &mut bp  as *mut _ as *mut c_void,
+            &mut nk  as *mut _ as *mut c_void, &mut hd  as *mut _ as *mut c_void];
+        unsafe { f.launch((n_kv, p as u32, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_rope_batched_offset(&self, x: *mut c_void, n_heads: u32, head_dim: u32,
+                                   kind: AttnKind, p: usize) -> Result<(), String>
+    {
+        let f = self.m_rope_b.function("rope_apply_batched_offset_f32")?;
+        let (cos, sin, rd) = match kind {
+            AttnKind::Sliding => (self.rope_cos_swa.raw_ptr(), self.rope_sin_swa.raw_ptr(),
+                                  self.rope_dim_swa as u32),
+            AttnKind::Full    => (self.rope_cos_full.raw_ptr(), self.rope_sin_full.raw_ptr(),
+                                  self.rope_dim_full as u32),
+        };
+        let block: u32 = 64;
+        let grid_x = ((rd / 2) + block - 1) / block;
+        let mut xa = x; let mut ca = cos; let mut sa = sin;
+        let mut hd = head_dim; let mut rdv = rd; let mut nh = n_heads;
+        let mut bp = self.v_base_pos.raw_ptr();
+        let mut args: [*mut c_void; 7] = [
+            &mut xa  as *mut _ as *mut c_void, &mut ca  as *mut _ as *mut c_void,
+            &mut sa  as *mut _ as *mut c_void, &mut hd  as *mut _ as *mut c_void,
+            &mut rdv as *mut _ as *mut c_void, &mut nh  as *mut _ as *mut c_void,
+            &mut bp  as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_heads, p as u32),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    fn launch_attn_step_q8_batched_offset(&self,
+        q: *mut c_void,
+        k_cache: *mut c_void, k_scale: *mut c_void,
+        v_cache: *mut c_void, v_scale: *mut c_void,
+        out: *mut c_void,
+        n_kv: u32, head_dim: u32,
+        max_base_pos: u32, n_q_rows: u32,
+        window: u32) -> Result<(), String>
+    {
+        let f = self.m_attn_step_q8_b.function("attn_step_q8_batched_offset_f32")?;
+        let n_heads = self.n_heads as u32;
+        let block: u32 = 256;
+        // LDS sized to the worst-case window — `max_base_pos` is a host-
+        // side upper bound on the base_pos value we'll see during this
+        // capture's lifetime (passed in so the LDS size is captured
+        // correctly; if a future caller exceeds it the kernel would OOB
+        // its scores buffer).
+        let max_win = if window > 0 { window.min(max_base_pos + n_q_rows) }
+                      else { max_base_pos + n_q_rows };
+        let smem = head_dim + (max_win + block) * 4;
+        let scaling: f32 = 1.0f32;
+
+        let mut qa = q; let mut kca = k_cache; let mut ksa = k_scale;
+        let mut vca = v_cache; let mut vsa = v_scale; let mut oa = out;
+        let mut nh = n_heads; let mut nkv = n_kv; let mut hd = head_dim;
+        let mut bp = self.v_base_pos.raw_ptr();
+        let mut nq = n_q_rows; let mut wn = window; let mut sc = scaling;
+        let mut args: [*mut c_void; 13] = [
+            &mut qa  as *mut _ as *mut c_void, &mut kca as *mut _ as *mut c_void,
+            &mut ksa as *mut _ as *mut c_void, &mut vca as *mut _ as *mut c_void,
+            &mut vsa as *mut _ as *mut c_void, &mut oa  as *mut _ as *mut c_void,
+            &mut nh  as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd  as *mut _ as *mut c_void, &mut bp  as *mut _ as *mut c_void,
+            &mut nq  as *mut _ as *mut c_void, &mut wn  as *mut _ as *mut c_void,
+            &mut sc  as *mut _ as *mut c_void];
         unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), smem,
                            Some(&self.stream), &mut args) }
     }

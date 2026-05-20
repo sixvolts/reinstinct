@@ -49,3 +49,46 @@ void kv_quant_prefill_f32(const float* __restrict__ src,
     }
     if (tid == 0) dst_s[(size_t)p * n_kv + h] = scale;
 }
+
+// Variant that reads `base_pos` from a device-resident uint32, then
+// writes K = grid.y rows at slots [base_pos, base_pos + K). Used by
+// verify_forward when captured into a HIP graph — the per-call
+// base_pos lives in `v_base_pos` and gets updated host-side between
+// graph replays without re-capturing.
+extern "C" __global__
+void kv_quant_prefill_offset_f32(const float* __restrict__ src,
+                                 signed char* __restrict__ dst_q_base,
+                                 float*       __restrict__ dst_s_base,
+                                 const unsigned int* __restrict__ base_pos_ptr,
+                                 unsigned int n_kv,
+                                 unsigned int head_dim)
+{
+    const unsigned int h = blockIdx.x;
+    const unsigned int p = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int bs  = blockDim.x;
+    const float* sh = src + ((size_t)p * n_kv + h) * head_dim;
+
+    __shared__ float red[256];
+    float a = 0.0f;
+    for (int i = tid; i < (int)head_dim; i += bs) a = fmaxf(a, fabsf(sh[i]));
+    red[tid] = a;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    const float amax  = red[0];
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+
+    const unsigned int base_pos = *base_pos_ptr;
+    const size_t row_idx = (size_t)(base_pos + p);
+    signed char* dq = dst_q_base + (row_idx * n_kv + h) * head_dim;
+    for (int i = tid; i < (int)head_dim; i += bs) {
+        int q = (int)rintf(sh[i] * inv);
+        q = max(-127, min(127, q));
+        dq[i] = (signed char)q;
+    }
+    if (tid == 0) dst_s_base[row_idx * n_kv + h] = scale;
+}

@@ -157,6 +157,27 @@ impl<T: Copy> DeviceBuf<T> {
         }
     }
 
+    /// Stream-ordered D2D range copy. Same semantics as
+    /// `copy_range_from_device` but uses `hipMemcpyAsync` on the
+    /// given stream so the op is captureable into a HIP graph (the
+    /// sync `hipMemcpy` is rejected by `hipStreamBeginCapture` for
+    /// blocking the default stream).
+    pub fn copy_range_from_device_async(&self, src: &DeviceBuf<T>,
+                                         src_offset: usize, dst_offset: usize,
+                                         count: usize, stream: &Stream) -> Result<()> {
+        assert!(src_offset + count <= src.len);
+        assert!(dst_offset + count <= self.len);
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe {
+            let dst_ptr = self.ptr.add(dst_offset) as *mut c_void;
+            let src_ptr = src.ptr.add(src_offset) as *const c_void;
+            ck(api, (api.memcpy_async)(dst_ptr, src_ptr,
+                                        count * std::mem::size_of::<T>(),
+                                        HipMemcpyKind::DeviceToDevice, stream.raw),
+               "hipMemcpyAsync D2D range")
+        }
+    }
+
     /// Partial D2H: copy `dst.len()` elements starting at `src_offset`.
     /// Useful when only a prefix of an oversized scratch buffer is valid
     /// (e.g. verify_forward's logits_all is sized for MAX_VERIFY_K but
