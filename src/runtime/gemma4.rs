@@ -45,6 +45,11 @@ const ATTN_PARTIAL_Q8_SRC:   &str = include_str!("../../kernels/attn_partial_q8.
 const ATTN_MERGE_SRC:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits per KV head — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
+
+/// Max K (drafted tokens per round) supported by `verify_forward`'s
+/// preallocated scratch. Spec-decode rarely exceeds 4-8; sized small
+/// to keep the resident allocation cheap.
+const MAX_VERIFY_K: usize = 8;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
@@ -585,6 +590,27 @@ pub struct GpuGemma4 {
     /// Scratch for the int8-quantized activation feeding the dp4a matvec.
     xq8: DeviceBuf<u8>,
 
+    /// Pre-allocated scratch for `verify_forward` (MTP spec-decode).
+    /// Sized to `MAX_VERIFY_K` rows of the worst-case per-layer dim,
+    /// reused across spec-decode rounds to avoid the ~600 hipMalloc
+    /// per call that would otherwise dominate verify time.
+    v_x:        DeviceBuf<f32>,
+    v_normed:   DeviceBuf<f32>,
+    v_q:        DeviceBuf<f32>,
+    v_k:        DeviceBuf<f32>,
+    v_v:        DeviceBuf<f32>,
+    v_k_norm:   DeviceBuf<f32>,
+    v_v_norm:   DeviceBuf<f32>,
+    v_attn:     DeviceBuf<f32>,
+    v_attn_out: DeviceBuf<f32>,
+    v_gate:     DeviceBuf<f32>,
+    v_up:       DeviceBuf<f32>,
+    v_mlp:      DeviceBuf<f32>,
+    v_logits:   DeviceBuf<f32>,
+    v_tokens:   DeviceBuf<u32>,
+    /// Max K supported per verify_forward call.
+    max_verify_k: usize,
+
     /// Decode token + position, device-resident so the embed / rope /
     /// attention / KV-write kernels read them at execution time — which
     /// makes the whole forward capturable into one parametric HIP graph.
@@ -816,6 +842,23 @@ impl GpuGemma4 {
             expert_outs: DeviceBuf::new(n_used_a * hidden)?,
             xq8_experts: DeviceBuf::<u8>::new(n_used_a * (expert_ff_a / 32).max(1) * 40)?,
             xq8,
+
+            // Verify scratch: sized to MAX_VERIFY_K × worst-case per-layer dim.
+            v_x:        DeviceBuf::<f32>::new(MAX_VERIFY_K * hidden)?,
+            v_normed:   DeviceBuf::<f32>::new(MAX_VERIFY_K * hidden)?,
+            v_q:        DeviceBuf::<f32>::new(MAX_VERIFY_K * q_max)?,
+            v_k:        DeviceBuf::<f32>::new(MAX_VERIFY_K * kv_max)?,
+            v_v:        DeviceBuf::<f32>::new(MAX_VERIFY_K * kv_max)?,
+            v_k_norm:   DeviceBuf::<f32>::new(MAX_VERIFY_K * kv_max)?,
+            v_v_norm:   DeviceBuf::<f32>::new(MAX_VERIFY_K * kv_max)?,
+            v_attn:     DeviceBuf::<f32>::new(MAX_VERIFY_K * q_max)?,
+            v_attn_out: DeviceBuf::<f32>::new(MAX_VERIFY_K * hidden)?,
+            v_gate:     DeviceBuf::<f32>::new(MAX_VERIFY_K * ffn)?,
+            v_up:       DeviceBuf::<f32>::new(MAX_VERIFY_K * ffn)?,
+            v_mlp:      DeviceBuf::<f32>::new(MAX_VERIFY_K * hidden)?,
+            v_logits:   DeviceBuf::<f32>::new(MAX_VERIFY_K * vocab)?,
+            v_tokens:   DeviceBuf::<u32>::new(MAX_VERIFY_K)?,
+            max_verify_k: MAX_VERIFY_K,
             stream,
             rocblas, prefill_gemm,
             m_rope_pf, m_attn_pf, m_kvq_pf, m_permute_pf,
@@ -1989,6 +2032,9 @@ impl GpuGemma4 {
         }
         let p = tokens.len();
         assert!(p > 0, "verify_forward: empty token slice");
+        if p > self.max_verify_k {
+            return Err(format!("verify_forward: p={p} > max_verify_k={}", self.max_verify_k));
+        }
         let base_pos = state.pos;
         let h = self.hidden;
         let hu = h as u32;
@@ -1997,28 +2043,43 @@ impl GpuGemma4 {
                                self.max_seq));
         }
 
+        // All working buffers are preallocated in `self.v_*` — sized to
+        // MAX_VERIFY_K rows of the worst-case per-layer dim. Reusing
+        // them across spec-decode rounds avoids ~600 hipMalloc per call
+        // that would otherwise dominate the verify cost.
+        let x        = &self.v_x;
+        let normed   = &self.v_normed;
+        let q_buf    = &self.v_q;
+        let k_buf    = &self.v_k;
+        let v_buf    = &self.v_v;
+        let k_norm   = &self.v_k_norm;
+        let v_norm   = &self.v_v_norm;
+        let attn     = &self.v_attn;
+        let attn_out = &self.v_attn_out;
+        let gate_buf = &self.v_gate;
+        let up_buf   = &self.v_up;
+        let mlp_buf  = &self.v_mlp;
+        let logits_all = &self.v_logits;
+
         // --- embed K tokens → x [K, hidden]  (with √h scale) ---
-        let tokens_dev = DeviceBuf::<u32>::from_slice(tokens)?;
-        let x = DeviceBuf::<f32>::new(p * h)?;
+        self.v_tokens.copy_from_host(&{
+            let mut t = vec![0u32; self.max_verify_k];
+            for i in 0..p { t[i] = tokens[i]; }
+            t
+        })?;
         self.launch_embed_batched(&self.token_embd, x.raw_ptr(),
-                                  tokens_dev.raw_ptr(), p as u32)?;
+                                  self.v_tokens.raw_ptr(), p as u32)?;
         self.launch_scale(x.raw_ptr(), (p * h) as u32, (h as f32).sqrt())?;
 
-        let normed = DeviceBuf::<f32>::new(p * h)?;
-        // Pre-allocate per-block scratch sized to the worst-case layer.
-        // Without this, repeated DeviceBuf::new in the block loop cost
-        // ~300 ms of hipMalloc overhead per verify_forward call.
-        let max_hd  = self.blocks.iter().map(|b| b.head_dim).max().unwrap_or(0);
-        let max_nkv = self.blocks.iter().map(|b| b.n_kv).max().unwrap_or(0);
-        let max_kv_dim = max_nkv * max_hd;
-        let k_norm = DeviceBuf::<f32>::new(p * max_kv_dim.max(1))?;
-        let v_norm = DeviceBuf::<f32>::new(p * max_kv_dim.max(1))?;
-        let attn   = DeviceBuf::<f32>::new(p * self.n_heads * max_hd.max(1))?;
-
-        let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
-            self.prefill_gemm.matmul(&self.rocblas, &self.stream,
-                                     &w.data, w.dtype, w.repacked,
-                                     w.in_dim as usize, w.out_dim as usize, xin, p)
+        // `matmul_into` writes directly into the caller-owned dst —
+        // no DeviceBuf allocation per call (the dy_f32 alloc inside
+        // the original `matmul` was the bulk of verify_forward cost).
+        let gemm_into = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>, dst: &DeviceBuf<f32>|
+            -> Result<(), String>
+        {
+            self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, dst,
+                                          &w.data, w.dtype, w.repacked,
+                                          w.in_dim as usize, w.out_dim as usize, xin, p)
         };
 
         for (li, b) in self.blocks.iter().enumerate() {
@@ -2026,129 +2087,105 @@ impl GpuGemma4 {
             let n_kv = b.n_kv;
             let kv_dim = n_kv * hd;
 
-            // --- attention: rmsnorm → Q,K,V projections → norm/rope → KV
-            //     write at offset base_pos → batched int8 attention.
             self.launch_rmsnorm_batched(x.raw_ptr(), b.attn_norm.raw_ptr(),
                                         normed.raw_ptr(), hu, p as u32)?;
-            let q = gemm(&b.attn_q, &normed)?;
-            self.launch_rmsnorm_mh_batched(q.raw_ptr(), b.attn_q_norm.raw_ptr(),
-                q.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
-            self.launch_rope_batched(q.raw_ptr(), self.n_heads as u32, hd as u32,
+            gemm_into(&b.attn_q, normed, q_buf)?;
+            self.launch_rmsnorm_mh_batched(q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
+                q_buf.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
+            self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, hd as u32,
                                      b.kind, p, base_pos as u32)?;
 
             if b.kv_donor.is_some() {
-                // KV-sharing not supported in verify yet (E4B-only feature;
-                // 31B target has no sharing).
                 return Err(format!("verify_forward: layer {li} is KV-sharing, not supported"));
             }
-            let k = gemm(&b.attn_k, &normed)?;
-            let v_gemm;
+            gemm_into(&b.attn_k, normed, k_buf)?;
             let v_ptr = match &b.attn_v {
-                Some(wv) => { v_gemm = gemm(wv, &normed)?; v_gemm.raw_ptr() }
-                None     => k.raw_ptr(),    // full layers: V is the K projection
+                Some(wv) => { gemm_into(wv, normed, v_buf)?; v_buf.raw_ptr() }
+                None     => k_buf.raw_ptr(),       // full layers: V is the K projection
             };
-            self.launch_rmsnorm_mh_batched(k.raw_ptr(), b.attn_k_norm.raw_ptr(),
+            self.launch_rmsnorm_mh_batched(k_buf.raw_ptr(), b.attn_k_norm.raw_ptr(),
                 k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
             self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
                 v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
             self.launch_rope_batched(k_norm.raw_ptr(), n_kv as u32, hd as u32,
                                      b.kind, p, base_pos as u32)?;
 
-            // KV write at slot offset = base_pos. The kv_quant_prefill
-            // kernel writes to slots [0, p) of its dst; we offset the
-            // destination pointer to land at slots [base_pos, base_pos+p).
             let kvc = &state.caches[li];
             let k_dst_q = unsafe {
-                (kvc.k.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void
-            };
+                (kvc.k.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void };
             let v_dst_q = unsafe {
-                (kvc.v.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void
-            };
+                (kvc.v.raw_ptr() as *mut i8).add(base_pos * kv_dim) as *mut c_void };
             let k_dst_s = unsafe {
-                (kvc.ks.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void
-            };
+                (kvc.ks.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void };
             let v_dst_s = unsafe {
-                (kvc.vs.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void
-            };
+                (kvc.vs.raw_ptr() as *mut f32).add(base_pos * n_kv) as *mut c_void };
             self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(),
                                          k_dst_q, k_dst_s, n_kv as u32, hd as u32, p)?;
             self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(),
                                          v_dst_q, v_dst_s, n_kv as u32, hd as u32, p)?;
 
-            // Batched int8 attention over the cache — reads slots
-            // [0, base_pos+q_row+1] per query row q_row (causal).
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
             };
             self.launch_attn_step_q8_batched(
-                q.raw_ptr(),
+                q_buf.raw_ptr(),
                 kvc.k.raw_ptr(),  kvc.ks.raw_ptr(),
                 kvc.v.raw_ptr(),  kvc.vs.raw_ptr(),
                 attn.raw_ptr(),
                 n_kv as u32, hd as u32,
                 base_pos as u32, p as u32, window)?;
 
-            let attn_out = gemm(&b.attn_output, &attn)?;
+            gemm_into(&b.attn_output, attn, attn_out)?;
             self.launch_rmsnorm_batched(attn_out.raw_ptr(), b.post_attn_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
 
-            // --- FFN (dense GeGLU; we bailed on MoE above) ---
             let ff = self.ffn as u32;
             self.launch_rmsnorm_batched(x.raw_ptr(), b.ffn_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
-            let gate = gemm(&b.ffn_gate, &normed)?;
-            let up   = gemm(&b.ffn_up,   &normed)?;
-            self.launch_geglu_batched(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(),
-                                      ff, p as u32)?;
-            let mlp = gemm(&b.ffn_down, &gate)?;
-            self.launch_rmsnorm_batched(mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+            gemm_into(&b.ffn_gate, normed, gate_buf)?;
+            gemm_into(&b.ffn_up,   normed, up_buf)?;
+            self.launch_geglu_batched(gate_buf.raw_ptr(), up_buf.raw_ptr(),
+                                      gate_buf.raw_ptr(), ff, p as u32)?;
+            gemm_into(&b.ffn_down, gate_buf, mlp_buf)?;
+            self.launch_rmsnorm_batched(mlp_buf.raw_ptr(), b.post_ffw_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
-
-            // Per-layer output scale.
             self.launch_scale_batched(x.raw_ptr(), hu, b.layer_output_scale, p as u32)?;
         }
 
         // --- output norm + tied vocab head ---
         // token_embd is [hidden, vocab=262144] — too big for the
-        // prefill_gemm scratch path (fp16 dequant would be ~700 MB).
-        // K rows × one launch_matvec each instead; each row is the
-        // standard decode-path single-row matvec, very cheap.
+        // prefill_gemm scratch path. K rows × one launch_matvec each.
         self.launch_rmsnorm_batched(x.raw_ptr(), self.output_norm.raw_ptr(),
                                     normed.raw_ptr(), hu, p as u32)?;
-        let logits_all = DeviceBuf::<f32>::new(p * self.vocab)?;
         for i in 0..p {
-            let in_off  = (i * h) * 4;             // f32 byte offset
+            let in_off  = (i * h) * 4;
             let out_off = (i * self.vocab) * 4;
             let in_ptr  = unsafe {
-                (normed.raw_ptr()    as *mut u8).add(in_off)  as *mut c_void
-            };
+                (normed.raw_ptr()     as *mut u8).add(in_off)  as *mut c_void };
             let out_ptr = unsafe {
-                (logits_all.raw_ptr() as *mut u8).add(out_off) as *mut c_void
-            };
+                (logits_all.raw_ptr() as *mut u8).add(out_off) as *mut c_void };
             self.launch_matvec(&self.token_embd, in_ptr, out_ptr)?;
         }
         if self.softcap > 0.0 {
             self.launch_softcap(logits_all.raw_ptr(), (p * self.vocab) as u32)?;
         }
 
-        // Make `self.hidden_a` hold the LAST row's pre-output_norm
-        // hidden state so a subsequent drafter round picks it up via
-        // `last_hidden_state()` (consistent with what a regular
-        // forward_token of the last accepted token would have left).
-        self.hidden_a.copy_range_from_device(&x, (p - 1) * h, 0, h)?;
-
+        // Keep `self.hidden_a` in sync with what a forward_token of the
+        // last accepted token would have left (drafter rounds read it).
+        self.hidden_a.copy_range_from_device(x, (p - 1) * h, 0, h)?;
         self.stream.synchronize()?;
 
-        // Cache + position advance.
         for c in &mut state.caches { c.len = base_pos + p; }
         state.pos = base_pos + p;
 
-        // Copy K logit rows to host and split.
         let mut all = vec![0.0f32; p * self.vocab];
-        logits_all.copy_to_host(&mut all)?;
+        // Only copy the first p*vocab from logits_all (rest is stale scratch).
+        let mut full = vec![0.0f32; logits_all.len()];
+        logits_all.copy_to_host(&mut full)?;
+        all.copy_from_slice(&full[..p * self.vocab]);
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(p);
         for i in 0..p {
             out.push(all[i * self.vocab..(i + 1) * self.vocab].to_vec());

@@ -372,6 +372,102 @@ impl PrefillGemm {
         Ok(dy_f32)
     }
 
+    /// Like [`matmul`] but writes into a caller-owned `dst` buffer
+    /// (first `n_rows * out_dim` elements) instead of allocating a
+    /// fresh result. Used by `verify_forward`, which is called per
+    /// spec-decode round and cannot afford ~600 hipMallocs each call.
+    /// `dst` must be at least `n_rows * out_dim` long.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_into(&self, handle: &Handle, stream: &hip::Stream,
+                       dst: &DeviceBuf<f32>,
+                       w_dev: &DeviceBuf<u8>, dtype: GgmlType, repacked: bool,
+                       in_dim: usize, out_dim: usize,
+                       x: &DeviceBuf<f32>, n_rows: usize)
+        -> Result<(), String>
+    {
+        let n_y = n_rows * out_dim;
+        if dst.len() < n_y {
+            return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
+        }
+        if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
+        }
+
+        let n_w = out_dim * in_dim;
+        let n_x = n_rows * in_dim;
+        Self::grow(&self.w_f16,  n_w, stream)?;
+        Self::grow(&self.dx_f16, n_x, stream)?;
+        Self::grow(&self.dy_f16, n_y, stream)?;
+        let w_f16  = self.w_f16.borrow();
+        let dx_f16 = self.dx_f16.borrow();
+        let dy_f16 = self.dy_f16.borrow();
+
+        let mut w_ptr = w_dev.raw_ptr();
+        let mut o_ptr = w_f16.raw_ptr();
+        if repacked {
+            let (module, kname) = match dtype {
+                GgmlType::Q5_K => (&self.deq_q5k_repacked, "dequant_q5k_repacked_f16"),
+                GgmlType::Q6_K => (&self.deq_q6k_repacked, "dequant_q6k_repacked_f16"),
+                GgmlType::Q8_0 => (&self.deq_q8_0_repacked, "dequant_q8_0_repacked_f16"),
+                _              => (&self.deq_q4k_repacked, "dequant_q4k_repacked_f16"),
+            };
+            let f = module.function(kname)?;
+            let mut ia = in_dim as u32;
+            let mut oa = out_dim as u32;
+            let mut da: [*mut c_void; 4] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut ia    as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_w / 32) as u32, 1, 1), (32, 1, 1),
+                              0, Some(stream), &mut da)?; }
+        } else if dtype == GgmlType::F32 {
+            let f = self.cvt.function("cvt_f32_to_f16")?;
+            let block: u32 = 256;
+            let mut nb = n_w as u32;
+            let mut da: [*mut c_void; 3] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut nb    as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_w as u32 + block - 1) / block, 1, 1), (block, 1, 1),
+                              0, Some(stream), &mut da)?; }
+        } else {
+            let (module, kname, wpb, bt) = self.deq(dtype)?;
+            assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");
+            let n_blocks = (n_w / wpb) as u32;
+            let f = module.function(kname)?;
+            let mut nb = n_blocks;
+            let mut da: [*mut c_void; 3] = [
+                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut nb    as *mut _ as *mut c_void];
+            unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
+        }
+
+        let to_f16 = self.cvt.function("cvt_f32_to_f16")?;
+        let to_f32 = self.cvt.function("cvt_f16_to_f32")?;
+        let cvt = |f: &crate::hip::Function, src: *mut c_void, ddst: *mut c_void, n: u32|
+            -> Result<(), String> {
+            let block: u32 = 256;
+            let mut i=src; let mut o=ddst; let mut na=n;
+            let mut args: [*mut c_void; 3] = [
+                &mut i as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
+                &mut na as *mut _ as *mut c_void];
+            unsafe { f.launch(((n+block-1)/block,1,1),(block,1,1),0,Some(stream),&mut args) }
+        };
+        cvt(&to_f16, x.raw_ptr(), dx_f16.raw_ptr(), n_x as u32)?;
+
+        unsafe {
+            handle.gemm_f16_f32acc(
+                RocblasOp::Transpose, RocblasOp::None,
+                out_dim as i32, n_rows as i32, in_dim as i32,
+                1.0,
+                w_f16.as_ptr() as *const c_void,  in_dim as i32,
+                dx_f16.as_ptr() as *const c_void, in_dim as i32,
+                0.0,
+                dy_f16.as_ptr() as *mut c_void,   out_dim as i32,
+            )?;
+        }
+        cvt(&to_f32, dy_f16.raw_ptr(), dst.raw_ptr(), n_y as u32)?;
+        Ok(())
+    }
+
     fn grow(buf: &std::cell::RefCell<DeviceBuf<u16>>, n: usize, stream: &hip::Stream)
         -> Result<(), String>
     {
@@ -425,6 +521,46 @@ impl PrefillGemm {
         unsafe { gf.launch(((out_dim as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
                            (256, 1, 1), 0, Some(stream), &mut ga)?; }
         Ok(dy)
+    }
+
+    /// Caller-owned-output sibling of [`matmul_mmq`].
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_mmq_into(&self, stream: &hip::Stream, dst: &DeviceBuf<f32>,
+                       w_dev: &DeviceBuf<u8>, dtype: GgmlType,
+                       in_dim: usize, out_dim: usize,
+                       x: &DeviceBuf<f32>, n_rows: usize)
+        -> Result<(), String>
+    {
+        let (module, kname) = match dtype {
+            GgmlType::Q5_K => (&self.mmq_q5k, "mmq_gemm_q5k_repacked_f32"),
+            GgmlType::Q6_K => (&self.mmq_q6k, "mmq_gemm_q6k_repacked_f32"),
+            _              => (&self.mmq_q4k, "mmq_gemm_q4k_repacked_f32"),
+        };
+        let n_xq8 = (n_rows * in_dim / 32) * 40;
+        if self.xq8.borrow().len() < n_xq8 {
+            stream.synchronize()?;
+            *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
+        }
+        let xq8 = self.xq8.borrow();
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
+
+        let gf = module.function(kname)?;
+        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
+        let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = n_rows as u32;
+        let mut ga: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+        unsafe { gf.launch(((out_dim as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
+                           (256, 1, 1), 0, Some(stream), &mut ga)?; }
+        Ok(())
     }
 }
 
