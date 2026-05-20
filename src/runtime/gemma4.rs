@@ -2201,8 +2201,8 @@ impl GpuGemma4 {
         // Also keep `self.hidden_b` (post-output-norm) in sync — `normed`
         // already holds the per-row post-output-norm of `x`, so its last
         // row is what `forward_token` would leave in `hidden_b`. The MTP
-        // drafter can be configured (env REINSTINCT_DRAFTER_POSTNORM) to
-        // read POST-norm instead of PRE-norm as its initial h_prev.
+        // drafter reads `hidden_b` (= POST-norm) as its initial h_prev
+        // per HF spec — see `last_hidden_state()`.
         self.hidden_b.copy_range_from_device(normed, (p - 1) * h, 0, h)?;
         self.stream.synchronize()?;
 
