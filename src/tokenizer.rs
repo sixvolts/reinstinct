@@ -196,6 +196,13 @@ impl Tokenizer {
         self.tokens.get(id as usize).map(|s| s.as_str()).unwrap_or("<unk>")
     }
 
+    /// Look up a literal vocab entry by string — `None` if it isn't a
+    /// single-piece vocab entry. Mirrors `GemmaTokenizer::token_id`;
+    /// used by the chat-template renderer to resolve role names.
+    pub fn token_id(&self, s: &str) -> Option<u32> {
+        self.vocab_map.get(s).copied()
+    }
+
     /// Decode a sequence of token ids to a UTF-8 string. Token strings
     /// are concatenated and then the GPT2 byte permutation is inverted
     /// to recover the original byte stream, which is finally lossy-UTF-8-

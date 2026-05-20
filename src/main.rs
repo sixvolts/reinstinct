@@ -168,10 +168,9 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         return generate_text_gemma4(&g, path, prompt_text, system, user, tokens,
                                     steps, temperature, top_k, seed, gpu);
     }
-    if system.is_some() || user.is_some() {
-        anyhow::bail!("--system / --user are only supported for gemma4 models \
-                       (this is {arch}); use --prompt for raw text.");
-    }
+    // Both qwen and gemma4 support --system / --user via their respective
+    // chat templates. Other architectures don't have one wired yet.
+    let is_qwen = matches!(arch, "qwen35" | "qwen35moe");
     // Typed model — config + quantized tensor refs only. The f32
     // CPU oracle (Qwen35F32Model) is loaded lazily in the CPU branch;
     // building it for --gpu would needlessly materialise the whole
@@ -179,8 +178,25 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     let model = Qwen35Model::load(&g)?;
     let cfg = &model.config;
 
-    // Prompt resolution: --prompt text (BPE-encoded) > --tokens > [EOS].
-    let prompt: Vec<u32> = if let Some(text) = &prompt_text {
+    // Prompt resolution:
+    //   --system/--user (qwen chat template) > --prompt text > --tokens > [EOS].
+    let prompt: Vec<u32> = if system.is_some() || user.is_some() {
+        if !is_qwen {
+            anyhow::bail!("--system / --user not supported for {arch}; only gemma4 and qwen35.");
+        }
+        use reinstinct_engine::chat::{ChatMessage, Role, format_qwen3};
+        let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+        let user_text = user.clone()
+            .or_else(|| prompt_text.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "--system was set but no user content (pass --user or --prompt)"))?;
+        let mut msgs: Vec<ChatMessage> = Vec::new();
+        if let Some(s) = &system {
+            msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+        }
+        msgs.push(ChatMessage { role: Role::User, content: user_text });
+        format_qwen3(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(text) = &prompt_text {
         let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
         let ids = tok.encode(text);
         if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
