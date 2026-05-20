@@ -123,8 +123,17 @@ impl Gemma4Config {
         let sliding_window = require_u32(gguf, "gemma4.attention.sliding_window")?;
         let rope_freq_base     = require_f32(gguf, "gemma4.rope.freq_base")?;
         let rope_freq_base_swa = require_f32(gguf, "gemma4.rope.freq_base_swa")?;
-        let rope_dim_full  = require_u32(gguf, "gemma4.rope.dimension_count")?;
+        let mut rope_dim_full  = require_u32(gguf, "gemma4.rope.dimension_count")?;
         let rope_dim_swa   = require_u32(gguf, "gemma4.rope.dimension_count_swa")?;
+        // Gemma 4 full attention uses HF rope_type="proportional" with
+        // partial_rotary_factor=0.25 — only the first 25% of head_dim
+        // gets rotated. GGUF stores `dimension_count = head_dim` for
+        // full layers (matches `key_length`) and leaves the proportion
+        // implicit; bake it in here so our flat-rotate kernel rotates
+        // the right slice.
+        if rope_dim_full == head_dim_full && head_dim_full == 512 {
+            rope_dim_full = 128;
+        }
         let final_logit_softcapping = require_f32(gguf, "gemma4.final_logit_softcapping")?;
         let eos_token_id   = require_u32(gguf, "tokenizer.ggml.eos_token_id")?;
 
