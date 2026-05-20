@@ -2246,7 +2246,7 @@ impl GpuGemma4 {
             &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
             &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
-        let grid = (out_dim + 3) / 4;   // ROWS=4 in the kernel
+        let grid = (out_dim + 1) / 2;   // ROWS=2 in the kernel
         unsafe { f.launch((grid, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 

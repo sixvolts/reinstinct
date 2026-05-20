@@ -10,9 +10,10 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS         4     // output rows per wavefront (4 picked as sweet spot:
-                           // ROWS=2 and ROWS=4 measure identical, ROWS=8 slightly
-                           // worse from register pressure)
+#define ROWS         2     // output rows per wavefront (test: drop from 4 →
+                           // 2 so we can apply the (r,b)→(b,r) loop swap
+                           // without hitting the VGPR wall — at ROWS=4 the
+                           // swap hurt by ~3-4%)
 #define N_ROWS_MAX   4     // batch upper bound
 
 struct __attribute__((packed)) BlockQ5_K {
@@ -68,50 +69,53 @@ void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
         const int qhbitpos     = chunk * 2 + is;
         const int shift        = (is == 0) ? 0 : 4;
 
+        // Loop-swap: hoist per-(sb, r) q5 chunks + scales, then dp4a
+        // phase reads each activation row once per (sb, b). At ROWS=2
+        // the per-thread state stays small enough not to blow occupancy.
+        uint32_t q5buf_all[ROWS][8];
+        float    dsc_all[ROWS], deff_all[ROWS];
+        bool     row_valid[ROWS];
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-            const BlockQ5_K* blk = w_blocks + (size_t)row * n_blocks + blk_idx;
+            row_valid[r] = (row < (int)out_dim);
+            if (!row_valid[r]) continue;
 
+            const BlockQ5_K* blk = w_blocks + (size_t)row * n_blocks + blk_idx;
             const float d_w    = __half2float(*reinterpret_cast<const __half*>(&blk->d));
             const float dmin_w = __half2float(*reinterpret_cast<const __half*>(&blk->dmin));
             uint8_t sc, m;
             gsm_q5k_dpb(sub_in_block, blk->scales, sc, m);
-            const float dsc  = d_w    * (float)sc;
-            const float deff = dmin_w * (float)m;
+            dsc_all[r]  = d_w    * (float)sc;
+            deff_all[r] = dmin_w * (float)m;
 
             const uint32_t* qs32 =
                 reinterpret_cast<const uint32_t*>(blk->qs + qs_off);
             const uint32_t* qh32 =
                 reinterpret_cast<const uint32_t*>(blk->qh);
-
-            // Form the 8 q5 chunks ONCE per (sb, row) and reuse across
-            // the N input rows below. Loop-swap (b outer / r inner) was
-            // tried and made this kernel ~3-4% slower — ROWS=4 makes
-            // hoisting q5buf_all + dsc_all blow per-thread VGPRs and
-            // drop occupancy. The FFN kernels (ROWS=2) DO benefit from
-            // the swap; this one stays "r outer".
-            uint32_t q5buf[8];
             #pragma unroll
             for (int g = 0; g < 8; g++) {
                 const uint32_t nib = (qs32[g] >> shift) & 0x0F0F0F0Fu;
                 const uint32_t hib = ((qh32[g] >> qhbitpos) & 0x01010101u) << 4;
-                q5buf[g] = nib | hib;
+                q5buf_all[r][g] = nib | hib;
             }
+        }
 
-            for (unsigned int b = 0; b < n_rows; b++) {
-                const BlockQ8* xb = xq + (size_t)b * n_subblocks + sb;
-                const float dx   = xb->d;
-                const float xsum = xb->xsum;
-                const int*  xq32 = reinterpret_cast<const int*>(xb->qs);
+        for (unsigned int b = 0; b < n_rows; b++) {
+            const BlockQ8* xb = xq + (size_t)b * n_subblocks + sb;
+            const float dx   = xb->d;
+            const float xsum = xb->xsum;
+            const int*  xq32 = reinterpret_cast<const int*>(xb->qs);
 
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (!row_valid[r]) continue;
                 int idot = 0;
                 #pragma unroll
                 for (int g = 0; g < 8; g++) {
-                    idot = __builtin_amdgcn_sdot4((int)q5buf[g], xq32[g], idot, false);
+                    idot = __builtin_amdgcn_sdot4((int)q5buf_all[r][g], xq32[g], idot, false);
                 }
-                acc[r][b] += dsc * dx * (float)idot - deff * xsum;
+                acc[r][b] += dsc_all[r] * dx * (float)idot - deff_all[r] * xsum;
             }
         }
     }
