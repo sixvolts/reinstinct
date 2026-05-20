@@ -2209,11 +2209,11 @@ impl GpuGemma4 {
         for c in &mut state.caches { c.len = base_pos + p; }
         state.pos = base_pos + p;
 
+        // DMA only the first p*vocab floats (logits_all is MAX_VERIFY_K
+        // rows × vocab; rows past p are stale scratch). Saves a host
+        // allocation + a memcpy + (MAX_VERIFY_K - p) rows of DMA.
         let mut all = vec![0.0f32; p * self.vocab];
-        // Only copy the first p*vocab from logits_all (rest is stale scratch).
-        let mut full = vec![0.0f32; logits_all.len()];
-        logits_all.copy_to_host(&mut full)?;
-        all.copy_from_slice(&full[..p * self.vocab]);
+        logits_all.copy_range_to_host(&mut all, 0)?;
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(p);
         for i in 0..p {
             out.push(all[i * self.vocab..(i + 1) * self.vocab].to_vec());

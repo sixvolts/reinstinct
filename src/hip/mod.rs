@@ -157,6 +157,23 @@ impl<T: Copy> DeviceBuf<T> {
         }
     }
 
+    /// Partial D2H: copy `dst.len()` elements starting at `src_offset`.
+    /// Useful when only a prefix of an oversized scratch buffer is valid
+    /// (e.g. verify_forward's logits_all is sized for MAX_VERIFY_K but
+    /// only the first K rows are needed).
+    pub fn copy_range_to_host(&self, dst: &mut [T], src_offset: usize) -> Result<()> {
+        assert!(src_offset + dst.len() <= self.len, "copy_range_to_host out of bounds");
+        if dst.is_empty() { return Ok(()); }
+        let api = hip().map_err(|s| s.to_string())?;
+        let elem_size = std::mem::size_of::<T>();
+        unsafe {
+            let src_ptr = (self.ptr as *const u8).add(src_offset * elem_size) as *const c_void;
+            ck(api, (api.memcpy)(dst.as_mut_ptr() as *mut c_void, src_ptr,
+                                  dst.len() * elem_size, HipMemcpyKind::DeviceToHost),
+               "hipMemcpy D2H range")
+        }
+    }
+
     /// D2D copy: write all of `src` into `self` starting at element index
     /// `dst_offset`. `dst_offset + src.len()` must be within `self.len()`.
     pub fn copy_from_device_at(&self, src: &DeviceBuf<T>, dst_offset: usize) -> Result<()> {
