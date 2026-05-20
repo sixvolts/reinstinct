@@ -125,12 +125,13 @@ impl Gemma4Config {
         let rope_freq_base_swa = require_f32(gguf, "gemma4.rope.freq_base_swa")?;
         let mut rope_dim_full  = require_u32(gguf, "gemma4.rope.dimension_count")?;
         let rope_dim_swa   = require_u32(gguf, "gemma4.rope.dimension_count_swa")?;
-        // Gemma 4 full attention uses HF rope_type="proportional" with
-        // partial_rotary_factor=0.25 — only the first 25% of head_dim
-        // gets rotated. GGUF stores `dimension_count = head_dim` for
-        // full layers (matches `key_length`) and leaves the proportion
-        // implicit; bake it in here so our flat-rotate kernel rotates
-        // the right slice.
+        // Gemma 4 full attention has HF partial_rotary_factor=0.25 on
+        // head_dim=512 ⇒ rotate first 128 dims. GGUF stores
+        // dimension_count=512 (= head_dim) and leaves it implicit; bake
+        // 128 in so our half-split kernel rotates the right slice.
+        // Empirically the converted GGUF weights match the Llama-style
+        // pairing (i, i+rotary/2) — not HF's (i, i+head_dim/2). Switching
+        // to HF "proportional" cos/sin made K=2 accept drop 27%→17%.
         if rope_dim_full == head_dim_full && head_dim_full == 512 {
             rope_dim_full = 128;
         }

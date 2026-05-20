@@ -24,13 +24,29 @@ pub struct RopeCache {
 
 impl RopeCache {
     pub fn new(rotary_dim: usize, max_seq_len: usize, freq_base: f32) -> Self {
+        Self::new_proportional(rotary_dim, rotary_dim / 2, max_seq_len, freq_base)
+    }
+
+    /// HF-style "proportional" RoPE: kernel pairs `(i, i + rotary_dim/2)`
+    /// for every i in `[0, rotary_dim/2)`, BUT inv_freq is non-zero only
+    /// for the first `rope_angles` pairs and zero (= cos 1, sin 0,
+    /// pass-through) for the rest. This is the convention HF uses for
+    /// `rope_type="proportional"` (gemma4 full attention with
+    /// `partial_rotary_factor=0.25` → `rope_angles=64` of 256 pairs).
+    /// Standard fully-rotated RoPE is `rope_angles == rotary_dim/2`.
+    pub fn new_proportional(rotary_dim: usize, rope_angles: usize,
+                            max_seq_len: usize, freq_base: f32) -> Self
+    {
         assert!(rotary_dim % 2 == 0, "rotary_dim must be even");
         let half = rotary_dim / 2;
+        let rope_angles = rope_angles.min(half);
         let mut inv_freq = vec![0.0_f32; half];
-        for i in 0..half {
+        for i in 0..rope_angles {
             inv_freq[i] = freq_base.powf(-2.0 * i as f32 / rotary_dim as f32);
         }
-        let mut cos = vec![0.0_f32; max_seq_len * rotary_dim];
+        // i in [rope_angles, half) stay at inv_freq[i]=0 → theta=0 →
+        // cos=1, sin=0 → identity (the HF "proportional" tail).
+        let mut cos = vec![1.0_f32; max_seq_len * rotary_dim];
         let mut sin = vec![0.0_f32; max_seq_len * rotary_dim];
         for pos in 0..max_seq_len {
             for i in 0..half {
