@@ -816,7 +816,7 @@ impl GpuGemma4 {
 
     // ---- launch helpers ----------------------------------------------------
 
-    fn launch_rmsnorm(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void, n: u32)
+    pub(crate) fn launch_rmsnorm(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void, n: u32)
         -> Result<(), String>
     {
         let f = self.m_rmsnorm.function("rmsnorm_f32")?;
@@ -830,7 +830,7 @@ impl GpuGemma4 {
         unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rmsnorm_mh(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
+    pub(crate) fn launch_rmsnorm_mh(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
                          n_heads: u32, head_dim: u32) -> Result<(), String>
     {
         let f = self.m_rmsnorm_mh.function("rmsnorm_multihead_f32")?;
@@ -845,7 +845,7 @@ impl GpuGemma4 {
         unsafe { f.launch((n_heads,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rope(&self, x: *mut c_void, n_heads: u32, head_dim: u32, kind: AttnKind)
+    pub(crate) fn launch_rope(&self, x: *mut c_void, n_heads: u32, head_dim: u32, kind: AttnKind)
         -> Result<(), String>
     {
         let f = self.m_rope.function("rope_apply_f32")?;
@@ -884,7 +884,7 @@ impl GpuGemma4 {
         unsafe { f.launch((n_kv,1,1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_add(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
+    pub(crate) fn launch_add(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
         let f = self.m_add.function("add_inplace_f32")?;
         let block: u32 = 256;
         let grid = (n + block - 1) / block;
@@ -895,7 +895,7 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_scale(&self, x: *mut c_void, n: u32, s: f32) -> Result<(), String> {
+    pub(crate) fn launch_scale(&self, x: *mut c_void, n: u32, s: f32) -> Result<(), String> {
         let f = self.m_scale.function("scale_inplace_f32")?;
         let block: u32 = 256;
         let grid = (n + block - 1) / block;
@@ -906,7 +906,7 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_geglu(&self, gate: *mut c_void, up: *mut c_void, out: *mut c_void, n: u32)
+    pub(crate) fn launch_geglu(&self, gate: *mut c_void, up: *mut c_void, out: *mut c_void, n: u32)
         -> Result<(), String>
     {
         let f = self.m_geglu.function("geglu_mul_f32")?;
@@ -1003,7 +1003,7 @@ impl GpuGemma4 {
 
     /// Quantize `n_vec` contiguous f32 activations of `in_dim` elements
     /// each into int8 BlockQ8 blocks at `out`, for the dp4a matvec.
-    fn launch_quantize_q8(&self, x: *mut c_void, out: *mut c_void,
+    pub(crate) fn launch_quantize_q8(&self, x: *mut c_void, out: *mut c_void,
                           in_dim: u32, n_vec: u32) -> Result<(), String> {
         let f = self.m_quantize.function("quantize_q8_f32")?;
         let mut xa = x;
@@ -1016,7 +1016,7 @@ impl GpuGemma4 {
                           0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
+    pub(crate) fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
         // Repacked weights all share the quantize-then-dispatch pattern,
@@ -1301,7 +1301,7 @@ impl GpuGemma4 {
     /// kernel combines the splits. This keeps every CU busy at depth and
     /// shortens the serial P·V scan. `REINSTINCT_OLD_ATTN` falls back to
     /// the original single-block-per-head kernel for A/B comparison.
-    fn launch_attn_q8(&self, q: *mut c_void, kq: *mut c_void, ks: *mut c_void,
+    pub(crate) fn launch_attn_q8(&self, q: *mut c_void, kq: *mut c_void, ks: *mut c_void,
                       vq: *mut c_void, vs: *mut c_void, out: *mut c_void,
                       n_kv: u32, head_dim: u32, window: u32) -> Result<(), String>
     {
@@ -1483,7 +1483,7 @@ impl GpuGemma4 {
     /// softcap` chain, so this returns the same activation the HF
     /// reference exposes as `hidden_states[-1]` and feeds to the MTP
     /// drafter's `pre_projection`.
-    pub fn last_hidden_state_ptr(&self) -> *mut c_void { self.hidden_a.raw_ptr() }
+    pub fn last_hidden_state(&self) -> &DeviceBuf<f32> { &self.hidden_a }
 
     /// Embed a single token via the target's `token_embd` table, writing
     /// the raw lookup (no `√hidden` scale) into the caller-provided
@@ -1495,6 +1495,29 @@ impl GpuGemma4 {
         self.launch_embed(&self.token_embd, out)?;
         self.stream.synchronize()?;
         Ok(())
+    }
+
+    /// Stage `pos` into the device-resident position word that rope /
+    /// kv-write / attention kernels read. The MTP drafter pins this to
+    /// the target's last position across an entire spec-decode round
+    /// (`position_ids` is constant for shared-KV layers per the HF
+    /// gemma4_assistant reference).
+    pub fn set_d_pos(&self, pos: usize) -> Result<(), String> {
+        self.d_pos.copy_from_host(&[pos as u32])
+    }
+
+    /// Stream the drafter shares for ordering against this target.
+    pub fn stream(&self) -> &Stream { &self.stream }
+    pub fn n_heads(&self) -> usize { self.n_heads }
+    pub fn vocab_size(&self) -> usize { self.vocab }
+
+    /// Highest-indexed layer that *owns* its KV cache and matches the
+    /// given attention kind — the layer whose KV the MTP drafter
+    /// borrows for its same-kind blocks.
+    pub fn last_kv_owning_layer(&self, kind: AttnKind) -> Option<usize> {
+        self.blocks.iter().enumerate().rev()
+            .find(|(_, b)| b.kv_donor.is_none() && b.kind == kind)
+            .map(|(i, _)| i)
     }
 
     /// Capture the forward as a parametric HIP graph. The graph reads

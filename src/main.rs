@@ -79,6 +79,22 @@ enum Command {
         #[arg(long)]
         gpu: bool,
     },
+    /// Spec-decode smoke test: load a Gemma 4 target + its MTP drafter,
+    /// prefill a prompt, then ask the drafter to propose K tokens at the
+    /// prompt's last position. Prints each drafted token plus the
+    /// target's own next-token prediction so the two can be compared.
+    /// First-cut diagnostic for the MTP drafter — no acceptance loop /
+    /// KV truncate / speedup yet.
+    MtpDraft {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+    },
     /// Multi-turn chat against a Gemma 4 model with KV-cache prefix
     /// reuse: the system message is prefilled and snapshotted once,
     /// then each `--turn` reuses the snapshot — TTFT drops to the
@@ -177,6 +193,8 @@ fn main() -> anyhow::Result<()> {
                           temperature, top_k, seed, gpu),
         Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
             chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
+        Command::MtpDraft { target, drafter, prompt, system, k } =>
+            mtp_draft_cli(&target, &drafter, prompt, system, k),
     }
 }
 
@@ -1177,6 +1195,117 @@ fn chat_gemma4_cli(path: &std::path::Path, system: Option<String>,
     }
 
     Ok(())
+}
+
+/// Spec-decode smoke test for the Gemma 4 MTP drafter. Loads target +
+/// drafter, prefills the prompt on the target (which establishes h_prev
+/// and populates the shared KV the drafter will attend), then runs the
+/// drafter K times printing each proposed token plus the target's own
+/// argmax for comparison.
+fn mtp_draft_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+                 prompt_text: Option<String>, system: Option<String>, k: usize)
+    -> anyhow::Result<()>
+{
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_engine::hip;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::model::gemma4_assistant::Gemma4AssistantModel;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::runtime::gemma4_assistant::GpuGemma4Assistant;
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    // Render the prompt — chat-template path if --system was given.
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("mtp-draft: pass --prompt or --system/--prompt");
+    };
+
+    println!("target   = {}", target_path.display());
+    println!("drafter  = {}", drafter_path.display());
+    println!("prompt   = {} tokens", prompt.len());
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let target_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let max_seq = prompt.len() + k + 16;
+    let t = std::time::Instant::now();
+    let gm = GpuGemma4::new(&target_model, &target_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    println!("target loaded in {:.2} s", t.elapsed().as_secs_f32());
+
+    let drafter_model = Gemma4AssistantModel::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let t = std::time::Instant::now();
+    let drafter = GpuGemma4Assistant::new(&drafter_model, &drafter_gguf, &gm, &cache)
+        .map_err(anyhow::Error::msg)?;
+    println!("drafter loaded in {:.2} s", t.elapsed().as_secs_f32());
+
+    let mut state = Gemma4GpuState::new(&target_model, max_seq).map_err(anyhow::Error::msg)?;
+    state.reset();
+
+    // Prefill the prompt on the target (P-1 positions populate the
+    // shared KV; the final token's forward writes the last KV entry
+    // and leaves `hidden_a` = pre-output_norm hidden at position P-1).
+    let t = std::time::Instant::now();
+    let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let last_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+        .map_err(anyhow::Error::msg)?;
+    println!("target prefill+1 = {:.1} ms ({} tokens)",
+             t.elapsed().as_secs_f64() * 1e3, prompt.len());
+
+    let mut next = argmax(&last_logits);
+    let pos_const = state.pos - 1;
+    println!("target argmax at position {pos_const}: {} ({:?})",
+             next, tok.decode(&[next]));
+
+    // Seed h_prev from the target's last hidden state.
+    drafter.set_h_prev_from_target(&gm).map_err(anyhow::Error::msg)?;
+
+    println!();
+    println!("--- drafter proposals (k = {k}) ---");
+    let mut prev_tok = next;
+    let mut total = std::time::Duration::ZERO;
+    for i in 0..k {
+        let t = std::time::Instant::now();
+        let logits = drafter.forward_step(&gm, &state, prev_tok, pos_const)
+            .map_err(anyhow::Error::msg)?;
+        let dt = t.elapsed();
+        total += dt;
+        next = argmax(&logits);
+        println!("  step {i}: prev={prev_tok:>6} ({:?})  ->  drafted={next:>6} ({:?})  [{:.2} ms]",
+                 tok.decode(&[prev_tok]),
+                 tok.decode(&[next]),
+                 dt.as_secs_f64() * 1e3);
+        prev_tok = next;
+    }
+    println!("drafter mean: {:.2} ms/step over {k} steps",
+             total.as_secs_f64() * 1e3 / k as f64);
+    Ok(())
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    let mut best_i = 0u32;
+    let mut best_v = v[0];
+    for (i, &x) in v.iter().enumerate().skip(1) {
+        if x > best_v { best_v = x; best_i = i as u32; }
+    }
+    best_i
 }
 
 fn inspect(path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
