@@ -87,7 +87,11 @@ void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
                 reinterpret_cast<const uint32_t*>(blk->qh);
 
             // Form the 8 q5 chunks ONCE per (sb, row) and reuse across
-            // the N input rows below.
+            // the N input rows below. Loop-swap (b outer / r inner) was
+            // tried and made this kernel ~3-4% slower — ROWS=4 makes
+            // hoisting q5buf_all + dsc_all blow per-thread VGPRs and
+            // drop occupancy. The FFN kernels (ROWS=2) DO benefit from
+            // the swap; this one stays "r outer".
             uint32_t q5buf[8];
             #pragma unroll
             for (int g = 0; g < 8; g++) {
@@ -96,8 +100,6 @@ void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
                 q5buf[g] = nib | hib;
             }
 
-            // Dot against each of the N input rows. The weight q5 is
-            // already in registers; only the int8 activation changes.
             for (unsigned int b = 0; b < n_rows; b++) {
                 const BlockQ8* xb = xq + (size_t)b * n_subblocks + sb;
                 const float dx   = xb->d;
