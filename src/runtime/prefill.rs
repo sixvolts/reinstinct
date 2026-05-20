@@ -222,11 +222,6 @@ pub struct PrefillGemm {
     dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
     dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
     xq8:    std::cell::RefCell<DeviceBuf<u8>>,    // int8 activations (MMQ path)
-    /// (input ptr, n_rows, in_dim) of whatever was last quantised into
-    /// `xq8`. Consecutive matmul calls that share the input (e.g.
-    /// ffn_gate then ffn_up on the same `normed`) can skip the redundant
-    /// quantize. Reset on any pointer mismatch.
-    xq8_last: std::cell::Cell<Option<(*mut c_void, usize, usize)>>,
 }
 
 impl PrefillGemm {
@@ -272,8 +267,7 @@ impl PrefillGemm {
             dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
             dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
             // int8 activations: one BlockQ8 (40 B) per 32-element sub-block.
-            xq8:      std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
-            xq8_last: std::cell::Cell::new(None),
+            xq8:    std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
         })
     }
 
@@ -532,24 +526,18 @@ impl PrefillGemm {
         if self.xq8.borrow().len() < n_xq8 {
             stream.synchronize()?;
             *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
-            self.xq8_last.set(None);
         }
         let xq8 = self.xq8.borrow();
 
         // 1. Quantise X → BlockQ8 [n_rows, in_dim/32] (grid.y = row).
-        // Skip if same input was just quantized.
-        let key = (x.raw_ptr(), n_rows, in_dim);
-        if self.xq8_last.get() != Some(key) {
-            let qf = self.quantize_q8.function("quantize_q8_f32")?;
-            let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
-            let mut ind = in_dim as u32;
-            let mut qa: [*mut c_void; 3] = [
-                &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
-                &mut ind as *mut _ as *mut c_void];
-            unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
-                               (256, 1, 1), 0, Some(stream), &mut qa)?; }
-            self.xq8_last.set(Some(key));
-        }
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
         // 2. MMQ GEMM → fresh fp32 Y [n_rows, out_dim].
         let dy: DeviceBuf<f32> = DeviceBuf::new(n_rows * out_dim)?;
@@ -596,25 +584,18 @@ impl PrefillGemm {
         if self.xq8.borrow().len() < n_xq8 {
             stream.synchronize()?;
             *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
-            self.xq8_last.set(None);
         }
         let xq8 = self.xq8.borrow();
 
         // 1. Quantise X[n_rows, in_dim] → BlockQ8[n_rows, in_dim/32].
-        // Skip if the SAME input pointer was just quantised at the SAME
-        // shape — e.g. ffn_gate then ffn_up share `normed` as input.
-        let key = (x.raw_ptr(), n_rows, in_dim);
-        if self.xq8_last.get() != Some(key) {
-            let qf = self.quantize_q8.function("quantize_q8_f32")?;
-            let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
-            let mut ind = in_dim as u32;
-            let mut qa: [*mut c_void; 3] = [
-                &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
-                &mut ind as *mut _ as *mut c_void];
-            unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
-                               (256, 1, 1), 0, Some(stream), &mut qa)?; }
-            self.xq8_last.set(Some(key));
-        }
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
         // 2. Batched matvec — grid = ceil(out_dim / rows_per_wg).
         let gf = module.function(kname)?;
@@ -646,22 +627,16 @@ impl PrefillGemm {
         if self.xq8.borrow().len() < n_xq8 {
             stream.synchronize()?;
             *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
-            self.xq8_last.set(None);
         }
         let xq8 = self.xq8.borrow();
-        // Skip re-quantizing if the same input was just quantized.
-        let key = (x.raw_ptr(), n_rows, in_dim);
-        if self.xq8_last.get() != Some(key) {
-            let qf = self.quantize_q8.function("quantize_q8_f32")?;
-            let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
-            let mut ind = in_dim as u32;
-            let mut qa: [*mut c_void; 3] = [
-                &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
-                &mut ind as *mut _ as *mut c_void];
-            unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
-                               (256, 1, 1), 0, Some(stream), &mut qa)?; }
-            self.xq8_last.set(Some(key));
-        }
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
         let gf = module.function(kname)?;
         let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
