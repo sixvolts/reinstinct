@@ -314,6 +314,8 @@ pub struct Gemma4KvCache {
     v:  DeviceBuf<i8>,
     ks: DeviceBuf<f32>,   // [max_seq, n_kv]
     vs: DeviceBuf<f32>,
+    n_kv: usize,
+    head_dim: usize,
     max_seq: usize,
     len: usize,
 }
@@ -326,7 +328,7 @@ impl Gemma4KvCache {
             v:  DeviceBuf::new(max_seq * kv_dim)?,
             ks: DeviceBuf::new(max_seq * n_kv)?,
             vs: DeviceBuf::new(max_seq * n_kv)?,
-            max_seq, len: 0,
+            n_kv, head_dim, max_seq, len: 0,
         })
     }
 }
@@ -353,6 +355,87 @@ impl Gemma4GpuState {
         for c in &mut self.caches { c.len = 0; }
         self.pos = 0;
     }
+
+    /// Snapshot the populated portion of every layer's KV cache plus
+    /// the current decode position. The snapshot lives on the device
+    /// (no host roundtrip) and is sized to exactly the bytes in use,
+    /// so it's cheap to take and restore for prefix-caching workflows.
+    pub fn snapshot(&self) -> Result<Gemma4StateSnapshot, String> {
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for c in &self.caches {
+            let kv_dim = c.n_kv * c.head_dim;
+            let k  = DeviceBuf::new(c.len * kv_dim)?;
+            let v  = DeviceBuf::new(c.len * kv_dim)?;
+            let ks = DeviceBuf::new(c.len * c.n_kv)?;
+            let vs = DeviceBuf::new(c.len * c.n_kv)?;
+            if c.len > 0 {
+                k .copy_range_from_device(&c.k,  0, 0, c.len * kv_dim)?;
+                v .copy_range_from_device(&c.v,  0, 0, c.len * kv_dim)?;
+                ks.copy_range_from_device(&c.ks, 0, 0, c.len * c.n_kv)?;
+                vs.copy_range_from_device(&c.vs, 0, 0, c.len * c.n_kv)?;
+            }
+            layers.push(Gemma4LayerSnapshot {
+                k, v, ks, vs,
+                n_kv: c.n_kv, head_dim: c.head_dim, len: c.len,
+            });
+        }
+        Ok(Gemma4StateSnapshot { layers, pos: self.pos })
+    }
+
+    /// Restore a previously-taken snapshot. The state must have been
+    /// built from a model with the same per-layer (n_kv, head_dim)
+    /// shape — they're checked, and the `max_seq` of the live cache
+    /// must hold at least `snapshot.pos` tokens.
+    pub fn restore(&mut self, snap: &Gemma4StateSnapshot) -> Result<(), String> {
+        if snap.layers.len() != self.caches.len() {
+            return Err(format!("restore: layer count mismatch (snap {}, state {})",
+                               snap.layers.len(), self.caches.len()));
+        }
+        for (i, (c, l)) in self.caches.iter_mut().zip(snap.layers.iter()).enumerate() {
+            if c.n_kv != l.n_kv || c.head_dim != l.head_dim {
+                return Err(format!("restore: layer {i} shape mismatch \
+                    (snap n_kv={} head_dim={}, state n_kv={} head_dim={})",
+                    l.n_kv, l.head_dim, c.n_kv, c.head_dim));
+            }
+            if l.len > c.max_seq {
+                return Err(format!("restore: layer {i} snapshot len {} > cache max_seq {}",
+                                   l.len, c.max_seq));
+            }
+            if l.len > 0 {
+                let kv_dim = c.n_kv * c.head_dim;
+                c.k .copy_range_from_device(&l.k,  0, 0, l.len * kv_dim)?;
+                c.v .copy_range_from_device(&l.v,  0, 0, l.len * kv_dim)?;
+                c.ks.copy_range_from_device(&l.ks, 0, 0, l.len * c.n_kv)?;
+                c.vs.copy_range_from_device(&l.vs, 0, 0, l.len * c.n_kv)?;
+            }
+            c.len = l.len;
+        }
+        self.pos = snap.pos;
+        Ok(())
+    }
+}
+
+/// Device-resident snapshot of a `Gemma4GpuState`, used to reuse a
+/// prefilled prefix (system + saved-user context) across multiple
+/// per-turn completions. Construct with [`Gemma4GpuState::snapshot`]
+/// and apply with [`Gemma4GpuState::restore`].
+pub struct Gemma4StateSnapshot {
+    layers: Vec<Gemma4LayerSnapshot>,
+    pos: usize,
+}
+
+impl Gemma4StateSnapshot {
+    pub fn pos(&self) -> usize { self.pos }
+}
+
+struct Gemma4LayerSnapshot {
+    k:  DeviceBuf<i8>,
+    v:  DeviceBuf<i8>,
+    ks: DeviceBuf<f32>,
+    vs: DeviceBuf<f32>,
+    n_kv: usize,
+    head_dim: usize,
+    len: usize,
 }
 
 pub struct GpuGemma4 {

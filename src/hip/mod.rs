@@ -172,6 +172,31 @@ impl<T: Copy> DeviceBuf<T> {
         }
     }
 
+    /// D2D copy of a sub-range: copies `count` elements from `src`
+    /// starting at `src_offset`, writing into `self` starting at
+    /// `dst_offset`. Bounds-checked on both buffers. Use when you only
+    /// want a slice (e.g. snapshotting the populated prefix of a KV
+    /// cache without copying the trailing free space).
+    pub fn copy_range_from_device(&self, src: &DeviceBuf<T>,
+                                  src_offset: usize, dst_offset: usize,
+                                  count: usize) -> Result<()> {
+        assert!(src_offset + count <= src.len,
+                "copy_range_from_device: src_offset+count ({}) exceeds src.len ({})",
+                src_offset + count, src.len);
+        assert!(dst_offset + count <= self.len,
+                "copy_range_from_device: dst_offset+count ({}) exceeds self.len ({})",
+                dst_offset + count, self.len);
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe {
+            let dst_ptr = self.ptr.add(dst_offset) as *mut c_void;
+            let src_ptr = src.ptr.add(src_offset) as *const c_void;
+            ck(api, (api.memcpy)(dst_ptr, src_ptr,
+                                  count * std::mem::size_of::<T>(),
+                                  HipMemcpyKind::DeviceToDevice),
+               "hipMemcpy D2D range")
+        }
+    }
+
     /// Async D2D copy on `stream` — required for HIP graph capture, where
     /// blocking memcpy on the null stream cannot be captured. Ordering
     /// against preceding kernel launches on the same stream is preserved

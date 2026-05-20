@@ -79,6 +79,30 @@ enum Command {
         #[arg(long)]
         gpu: bool,
     },
+    /// Multi-turn chat against a Gemma 4 model with KV-cache prefix
+    /// reuse: the system message is prefilled and snapshotted once,
+    /// then each `--turn` reuses the snapshot — TTFT drops to the
+    /// per-turn token count instead of the full conversation.
+    Chat {
+        path: PathBuf,
+        /// Gemma 4 system message (rendered with the chat template).
+        #[arg(long)]
+        system: Option<String>,
+        /// Per-turn user input. Pass multiple times to demonstrate
+        /// prefix reuse — turn 2+ restores from the snapshot rather
+        /// than re-prefilling the system.
+        #[arg(long = "turn")]
+        turns: Vec<String>,
+        /// Decode tokens per turn.
+        #[arg(short = 'n', long, default_value_t = 60)]
+        steps: usize,
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
     /// Dump diagnostic stats for the embedding row of one or more tokens.
     DebugEmbed {
         path: PathBuf,
@@ -151,6 +175,8 @@ fn main() -> anyhow::Result<()> {
                                 temperature, top_k, seed, gpu } =>
             generate_text(&path, prompt, system, user, tokens, steps,
                           temperature, top_k, seed, gpu),
+        Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
+            chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
     }
 }
 
@@ -1041,6 +1067,115 @@ fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>
     let mean = (sum / n) as f32;
     let std = ((sum_sq / n) - (mean as f64).powi(2)).sqrt() as f32;
     println!("\nlogit stats   = min {min:.4}  max {max:.4}  mean {mean:.4}  std {std:.4}");
+    Ok(())
+}
+
+/// Multi-turn Gemma 4 chat with KV-cache prefix reuse. Prefills the
+/// system message once, snapshots the state, and reuses that snapshot
+/// for every turn — TTFT for turn N+ is bounded by the per-turn token
+/// count, not the system+history length.
+fn chat_gemma4_cli(path: &std::path::Path, system: Option<String>,
+                   turns: Vec<String>, steps: usize,
+                   temperature: f32, top_k: usize, seed: u64) -> anyhow::Result<()> {
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4, format_gemma4_user_turn};
+    use reinstinct_engine::sampling::{Rng, sample_temp_topk};
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::hip;
+
+    if turns.is_empty() {
+        anyhow::bail!("chat: need at least one --turn");
+    }
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture").and_then(|v| v.as_str()).unwrap_or("?");
+    if arch != "gemma4" {
+        anyhow::bail!("chat is currently gemma4-only (this is {arch})");
+    }
+    let tok = GemmaTokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+
+    // System prefix — rendered with add_generation_prompt = false so
+    // it ends at <turn|>\n, the natural place to splice each turn in.
+    let mut prefix_msgs: Vec<ChatMessage> = Vec::new();
+    if let Some(s) = &system {
+        prefix_msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+    }
+    let prefix_tokens: Vec<u32> = if prefix_msgs.is_empty() {
+        vec![tok.bos_id]
+    } else {
+        format_gemma4(&tok, &prefix_msgs, false).map_err(anyhow::Error::msg)?
+    };
+
+    // Conservative max_seq: prefix + every turn (with its model header
+    // and decoded response) all coresident — `chat` never compacts.
+    let per_turn_cap = 64 + steps + 16;
+    let max_seq = prefix_tokens.len() + turns.len() * per_turn_cap + 32;
+
+    println!("model       = {} (gemma4)", path.display());
+    println!("backend     = GPU (HIP)");
+    println!("system tok  = {} (prefix prefilled + snapshotted once)", prefix_tokens.len());
+    println!("turns       = {}, steps/turn = {steps}", turns.len());
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let model = Gemma4Model::load(&g).map_err(anyhow::Error::msg)?;
+    let cfg_eos = model.config.eos_token_id;
+    let gm = GpuGemma4::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let exec = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
+
+    // 1) Batched prefill of the system prefix → snapshot.
+    let t = std::time::Instant::now();
+    state.reset();
+    let _ = gm.prefill_forward(&prefix_tokens, &mut state).map_err(anyhow::Error::msg)?;
+    let t_prefix = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+    let t_snap = t.elapsed().as_secs_f64();
+    println!("prefix prefill = {:.1} ms ({} tok, snapshot {:.1} ms)",
+             t_prefix * 1e3, prefix_tokens.len(), t_snap * 1e3);
+
+    let mut rng = Rng::new(seed);
+    for (i, turn_text) in turns.iter().enumerate() {
+        // 2) Restore the cached prefix.
+        let t_r = std::time::Instant::now();
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        let t_restore = t_r.elapsed().as_secs_f64();
+        // 3) Sequential prefill of the per-turn tokens (small — typically
+        // tens of tokens; sequential here is simpler than extending
+        // prefill_forward to start at a non-zero position).
+        let turn_tokens = format_gemma4_user_turn(&tok, turn_text).map_err(anyhow::Error::msg)?;
+        let t_t = std::time::Instant::now();
+        let mut logits: Vec<f32> = Vec::new();
+        for &tk in &turn_tokens {
+            logits = gm.forward_via_graph(&exec, tk, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let t_turn = t_t.elapsed().as_secs_f64();
+        let ttft_ms = (t_restore + t_turn) * 1e3;
+
+        // 4) Decode.
+        let t_d = std::time::Instant::now();
+        let mut out_ids: Vec<u32> = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let tk = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            out_ids.push(tk);
+            if tk == cfg_eos { break; }
+            logits = gm.forward_via_graph(&exec, tk, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let t_decode = t_d.elapsed().as_secs_f64();
+        let dec_tps = out_ids.len() as f64 / t_decode;
+
+        let response = tok.decode(&out_ids);
+        println!();
+        println!("--- turn {} ({} user tok) ---", i + 1, turn_tokens.len());
+        println!("  ttft        = {:.1} ms  (restore {:.1} + prefill {:.1})",
+                 ttft_ms, t_restore * 1e3, t_turn * 1e3);
+        println!("  decode      = {:.1} tok/s over {} tokens", dec_tps, out_ids.len());
+        println!("  user        > {}", turn_text);
+        println!("  assistant   > {}", response.trim());
+    }
+
     Ok(())
 }
 

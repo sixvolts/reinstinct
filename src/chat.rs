@@ -73,6 +73,28 @@ pub fn format_gemma4(tok: &GemmaTokenizer, messages: &[ChatMessage],
     Ok(out)
 }
 
+/// Per-turn extension for an already-rendered Gemma 4 prefix: emits
+/// the tokens for `<|turn>user\n{content}<turn|>\n<|turn>model\n`. Use
+/// when a prior conversation prefix is already in the KV cache and
+/// you want to append a new user turn + generation prompt.
+pub fn format_gemma4_user_turn(tok: &GemmaTokenizer, content: &str)
+    -> Result<Vec<u32>, String>
+{
+    let user_id  = tok.token_id("user").ok_or("gemma4 chat: 'user' not in vocab")?;
+    let model_id = tok.token_id("model").ok_or("gemma4 chat: 'model' not in vocab")?;
+    let mut out = Vec::with_capacity(8 + content.len() / 2);
+    out.push(TURN_OPEN);
+    out.push(user_id);
+    out.push(NEWLINE);
+    out.extend(tok.encode(content));
+    out.push(TURN_CLOSE);
+    out.push(NEWLINE);
+    out.push(TURN_OPEN);
+    out.push(model_id);
+    out.push(NEWLINE);
+    Ok(out)
+}
+
 // Qwen 3.5/3.6 chat-template delimiter ids — verified against the
 // `Qwen3.6-*` vocab. (The ids changed vs Qwen 2.x — these are not the
 // 151644/151645 you may see in older Qwen docs.)
