@@ -405,19 +405,24 @@ impl PrefillGemm {
             return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
         }
         if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
-            // K=2..8 small-batch path: a per-dtype batched matvec that
-            // reads each weight sub-block once and dots it against all
-            // N activation rows. MMQ would round N up to its 64-row
-            // tile (~94% wasted work at K=4); the batched matvec scales
-            // with actual N.
             if n_rows >= 2 && n_rows <= 4 {
                 // K=2..4 small-batch: a per-dtype batched matvec that reads
                 // each weight sub-block once and dots against all n_rows
                 // activation rows. Cap at 4 to bound per-thread accumulator
                 // pressure (= ROWS*N_ROWS_MAX VGPRs); higher K falls back
                 // to MMQ. K=4 is the empirical sweet spot for accept × tok/s.
-                // (Confirmed via REINSTINCT_FORCE_MMQ A/B: MMQ at K=4 is
-                // ~3.3x slower because BN=64 wastes 94% of each tile.)
+                //
+                // A/B history on this path at K=4:
+                // - MMQ (REINSTINCT_FORCE_MMQ): ~3.3x slower because BN=64
+                //   wastes 94% of each tile.
+                // - dequant→HGEMM (REINSTINCT_VERIFY_HGEMM): ~20x slower.
+                //   Per-call dequant of a Q4_K [5376, 21504] weight = ~314us
+                //   (reads 79 MB Q4_K, writes 230 MB fp16); 180 FFN GEMMs
+                //   per verify = ~56ms of pure dequant. Caching the dequant
+                //   would need ~40 GB. gfx906 has no tensor cores, so fp16
+                //   GEMM has no compute advantage either — dp4a does 4 int8
+                //   multiplies per cycle vs fp16's 2, and reads ¼ the weight
+                //   bytes. dp4a wins both axes; stay here.
                 return self.matmul_kquant_batched_into(stream, dst, w_dev, dtype,
                                                        in_dim, out_dim, x, n_rows);
             }
