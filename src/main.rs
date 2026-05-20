@@ -52,6 +52,14 @@ enum Command {
         /// Takes precedence over --tokens.
         #[arg(long)]
         prompt: Option<String>,
+        /// Gemma 4 chat-template system message (rendered with the model's
+        /// chat template; only `gemma4` models). Overrides --prompt when set.
+        #[arg(long)]
+        system: Option<String>,
+        /// Gemma 4 chat-template user message (paired with --system). Falls
+        /// back to --prompt's content if not given.
+        #[arg(long)]
+        user: Option<String>,
         /// Comma-separated prompt tokens. Defaults to [eos_token_id].
         #[arg(long, value_delimiter = ',')]
         tokens: Option<Vec<u32>>,
@@ -139,12 +147,15 @@ fn main() -> anyhow::Result<()> {
             reinstinct_engine::serve::run(big, small, embed, big_port, small_port,
                                           embed_port, max_seq)
                 .map_err(anyhow::Error::msg),
-        Command::GenerateText { path, prompt, tokens, steps, temperature, top_k, seed, gpu } =>
-            generate_text(&path, prompt, tokens, steps, temperature, top_k, seed, gpu),
+        Command::GenerateText { path, prompt, system, user, tokens, steps,
+                                temperature, top_k, seed, gpu } =>
+            generate_text(&path, prompt, system, user, tokens, steps,
+                          temperature, top_k, seed, gpu),
     }
 }
 
 fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
+                 system: Option<String>, user: Option<String>,
                  tokens: Option<Vec<u32>>, steps: usize,
                  temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
@@ -154,8 +165,12 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     let arch = g.metadata_get("general.architecture")
         .and_then(|v| v.as_str()).unwrap_or("<unknown>");
     if arch == "gemma4" {
-        return generate_text_gemma4(&g, path, prompt_text, tokens, steps,
-                                    temperature, top_k, seed, gpu);
+        return generate_text_gemma4(&g, path, prompt_text, system, user, tokens,
+                                    steps, temperature, top_k, seed, gpu);
+    }
+    if system.is_some() || user.is_some() {
+        anyhow::bail!("--system / --user are only supported for gemma4 models \
+                       (this is {arch}); use --prompt for raw text.");
     }
     // Typed model — config + quantized tensor refs only. The f32
     // CPU oracle (Qwen35F32Model) is loaded lazily in the CPU branch;
@@ -304,18 +319,35 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
 /// GPT2-style BPE module doesn't cover yet. Prints token ids + top-K.
 fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
                         prompt_text: Option<String>,
+                        system: Option<String>, user: Option<String>,
                         tokens: Option<Vec<u32>>, steps: usize,
                         temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
     use reinstinct_engine::cpu::gemma4::Gemma4CpuModel;
     use reinstinct_engine::model::gemma4::Gemma4Model;
     use reinstinct_engine::tokenizer::GemmaTokenizer;
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
 
     let cfg_eos = Gemma4Model::load(g).map_err(anyhow::Error::msg)?.config.eos_token_id;
     // Gemma 4 SentencePiece tokenizer — encodes --prompt text and
     // decodes the generated ids back to text.
     let tok = GemmaTokenizer::from_gguf(g).ok();
-    let prompt: Vec<u32> = if let Some(text) = &prompt_text {
+    let prompt: Vec<u32> = if system.is_some() || user.is_some() {
+        // Chat mode: assemble messages via the Gemma 4 chat template.
+        // --user falls back to --prompt's text so users can mix conventions.
+        let t = tok.as_ref().ok_or_else(||
+            anyhow::anyhow!("--system / --user: gemma4 tokenizer not available"))?;
+        let user_text = user.clone()
+            .or_else(|| prompt_text.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "--system was set but no user content (pass --user or --prompt)"))?;
+        let mut msgs: Vec<ChatMessage> = Vec::new();
+        if let Some(s) = &system {
+            msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+        }
+        msgs.push(ChatMessage { role: Role::User, content: user_text });
+        format_gemma4(t, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(text) = &prompt_text {
         let t = tok.as_ref().ok_or_else(||
             anyhow::anyhow!("--prompt: this GGUF has no usable gemma4 tokenizer"))?;
         let mut ids = vec![t.bos_id];

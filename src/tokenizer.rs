@@ -359,6 +359,14 @@ impl GemmaTokenizer {
         self.tokens.get(id as usize).map(|s| s.as_str()).unwrap_or("<unk>")
     }
 
+    /// Look up a literal vocab entry by string — `None` if the token isn't
+    /// a single-piece vocab entry. Used by the chat template renderer to
+    /// resolve role names (`system`, `user`, `model`) to their atomic ids
+    /// without going through SPM's leading-metaspace encoding.
+    pub fn token_id(&self, s: &str) -> Option<u32> {
+        self.vocab_map.get(s).copied()
+    }
+
     /// Decode ids to text: byte tokens become raw bytes, the metaspace
     /// char becomes a space, everything else is literal.
     pub fn decode(&self, ids: &[u32]) -> String {
