@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define ROWS         2
-#define N_ROWS_MAX   8
+#define N_ROWS_MAX   4   // K upper bound; see matvec_q4k_repacked_batched.cpp
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;

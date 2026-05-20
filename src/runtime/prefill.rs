@@ -410,7 +410,12 @@ impl PrefillGemm {
             // N activation rows. MMQ would round N up to its 64-row
             // tile (~94% wasted work at K=4); the batched matvec scales
             // with actual N.
-            if n_rows >= 2 && n_rows <= 8 {
+            if n_rows >= 2 && n_rows <= 4 {
+                // K=2..4 small-batch: a per-dtype batched matvec that reads
+                // each weight sub-block once and dots against all n_rows
+                // activation rows. Cap at 4 to bound per-thread accumulator
+                // pressure (= ROWS*N_ROWS_MAX VGPRs); higher K falls back
+                // to MMQ. K=4 is the empirical sweet spot for accept × tok/s.
                 return self.matmul_kquant_batched_into(stream, dst, w_dev, dtype,
                                                        in_dim, out_dim, x, n_rows);
             }
@@ -560,14 +565,17 @@ impl PrefillGemm {
                                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<(), String>
     {
-        debug_assert!(n_rows >= 1 && n_rows <= 8,
-                      "matmul_kquant_batched_into: n_rows must be 1..=8");
+        debug_assert!(n_rows >= 1 && n_rows <= 4,
+                      "matmul_kquant_batched_into: n_rows must be 1..=4 (kernel N_ROWS_MAX=4)");
+        // All three batched k-quant kernels use ROWS=2 per wave × 4 waves
+        // per WG = 8 output rows per WG (see kernel #defines).
         let (module, kname) = match dtype {
             GgmlType::Q5_K => (&self.mv_q5k_batched, "matvec_q5k_repacked_batched_f32"),
             GgmlType::Q6_K => (&self.mv_q6k_batched, "matvec_q6k_repacked_batched_f32"),
             GgmlType::Q4_K => (&self.mv_q4k_batched, "matvec_q4k_repacked_batched_f32"),
             other => return Err(format!("matmul_kquant_batched_into: unsupported {other:?}")),
         };
+        let rows_per_wg: u32 = 8;
 
         // Reuse the MMQ path's int8 activation scratch.
         let n_xq8 = (n_rows * in_dim / 32) * 40;
@@ -587,7 +595,7 @@ impl PrefillGemm {
         unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
                            (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
-        // 2. Batched matvec — grid = ceil(out_dim/8) (8 = 4 waves × 2 rows).
+        // 2. Batched matvec — grid = ceil(out_dim / rows_per_wg).
         let gf = module.function(kname)?;
         let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
         let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut nr = n_rows as u32;
@@ -595,7 +603,7 @@ impl PrefillGemm {
             &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
             &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
-        let grid_x = (out_dim as u32 + 7) / 8;
+        let grid_x = (out_dim as u32 + rows_per_wg - 1) / rows_per_wg;
         unsafe { gf.launch((grid_x, 1, 1), (256, 1, 1), 0, Some(stream), &mut ga)?; }
         Ok(())
     }

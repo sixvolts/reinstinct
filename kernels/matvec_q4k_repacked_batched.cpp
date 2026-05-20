@@ -24,7 +24,10 @@
 #include <stdint.h>
 
 #define ROWS         2     // output rows per wavefront
-#define N_ROWS_MAX   8     // batch upper bound — must match host MAX_VERIFY_K
+#define N_ROWS_MAX   4     // K upper bound the kernel supports (was 8 — bumping
+                           // to 4 halves per-thread VGPR pressure and boosts
+                           // occupancy. K=4 is the sweet spot per the K-curve;
+                           // higher-K verify falls back to the K=1 K-quant kernel).
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
