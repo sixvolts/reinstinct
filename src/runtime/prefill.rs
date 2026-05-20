@@ -422,6 +422,8 @@ impl PrefillGemm {
                 // activation rows. Cap at 4 to bound per-thread accumulator
                 // pressure (= ROWS*N_ROWS_MAX VGPRs); higher K falls back
                 // to MMQ. K=4 is the empirical sweet spot for accept × tok/s.
+                // (Confirmed via REINSTINCT_FORCE_MMQ A/B: MMQ at K=4 is
+                // ~3.3x slower because BN=64 wastes 94% of each tile.)
                 return self.matmul_kquant_batched_into(stream, dst, w_dev, dtype,
                                                        in_dim, out_dim, x, n_rows);
             }
