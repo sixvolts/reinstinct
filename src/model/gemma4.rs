@@ -214,6 +214,16 @@ impl Gemma4Config {
         }
     }
 
+    /// Highest-indexed layer that *owns* its KV cache and matches the
+    /// given attention kind. Used by the MTP drafter: every drafter
+    /// layer attends the target's last-of-its-type KV (sliding drafter
+    /// layers ↔ target's last SWA-owning layer; full ↔ last full).
+    /// `None` if the model has no KV-owning layer of that kind.
+    pub fn last_kv_owning_layer(&self, kind: AttnKind) -> Option<usize> {
+        let n_owning = self.n_layer_kv_from_start as usize;
+        (0..n_owning).rev().find(|&i| self.attn_kinds[i] == kind)
+    }
+
     /// RoPE frequency base for the given layer.
     pub fn rope_base(&self, layer: usize) -> f32 {
         match self.attn_kinds[layer] {

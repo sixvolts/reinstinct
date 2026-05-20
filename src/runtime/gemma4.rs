@@ -415,6 +415,35 @@ impl Gemma4GpuState {
     }
 }
 
+/// Read-only view of one layer's int8 KV cache + scales. Returned by
+/// [`Gemma4GpuState::layer_kv_view`] so an external consumer (e.g. the
+/// MTP drafter, which attends over the target's KV) can launch
+/// attention kernels against the target's cache without touching the
+/// runtime's private fields.
+pub struct LayerKvView<'a> {
+    pub k:  &'a DeviceBuf<i8>,
+    pub v:  &'a DeviceBuf<i8>,
+    pub ks: &'a DeviceBuf<f32>,
+    pub vs: &'a DeviceBuf<f32>,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub len: usize,
+    pub max_seq: usize,
+}
+
+impl Gemma4GpuState {
+    /// View a specific layer's KV cache. Panics if `layer` is out of
+    /// range. `view.len` is the current populated length.
+    pub fn layer_kv_view(&self, layer: usize) -> LayerKvView<'_> {
+        let c = &self.caches[layer];
+        LayerKvView {
+            k: &c.k, v: &c.v, ks: &c.ks, vs: &c.vs,
+            n_kv: c.n_kv, head_dim: c.head_dim,
+            len: c.len, max_seq: c.max_seq,
+        }
+    }
+}
+
 /// Device-resident snapshot of a `Gemma4GpuState`, used to reuse a
 /// prefilled prefix (system + saved-user context) across multiple
 /// per-turn completions. Construct with [`Gemma4GpuState::snapshot`]
@@ -1441,6 +1470,31 @@ impl GpuGemma4 {
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
+    }
+
+    /// Width of the model's residual stream — the size of one
+    /// `last_hidden_state` vector (`hidden_size` in the config). The MTP
+    /// drafter consumes this as its `backbone_hidden_size`.
+    pub fn hidden_size(&self) -> usize { self.hidden }
+
+    /// Pre-`output_norm` hidden state of the last forward, on the
+    /// device. Stable until the next forward. The post-block buffer
+    /// (`hidden_a`) isn't overwritten by the final `rmsnorm → matvec →
+    /// softcap` chain, so this returns the same activation the HF
+    /// reference exposes as `hidden_states[-1]` and feeds to the MTP
+    /// drafter's `pre_projection`.
+    pub fn last_hidden_state_ptr(&self) -> *mut c_void { self.hidden_a.raw_ptr() }
+
+    /// Embed a single token via the target's `token_embd` table, writing
+    /// the raw lookup (no `√hidden` scale) into the caller-provided
+    /// device buffer. Output size = `hidden_size()` floats. Used by the
+    /// MTP drafter to form its `concat(target_embed(prev_token), h_prev)`
+    /// pre-projection input — drafter never invokes its own input embed.
+    pub fn embed_token_raw(&self, token: u32, out: *mut c_void) -> Result<(), String> {
+        self.d_token.copy_from_host(&[token])?;
+        self.launch_embed(&self.token_embd, out)?;
+        self.stream.synchronize()?;
+        Ok(())
     }
 
     /// Capture the forward as a parametric HIP graph. The graph reads
