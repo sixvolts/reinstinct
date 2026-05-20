@@ -13,7 +13,7 @@ quantized in VRAM, kernels are compiled on demand with `hipcc`.
 reinstinct-engine <COMMAND> [OPTIONS]
 ```
 
-Commands: `inspect`, `model`, `generate`, `generate-text`,
+Commands: `inspect`, `model`, `generate`, `generate-text`, `chat`,
 `debug-embed`, `bench`, `hip-info`, `gpu-bench`.
 
 ---
@@ -99,8 +99,9 @@ position.
 ### generate-text
 
 ```
-reinstinct-engine generate-text <PATH> [--prompt <TEXT>] [--tokens <ID,...>]
-                  [-n <N>] [--temperature <F>] [--top-k <N>] [--seed <N>] [--gpu]
+reinstinct-engine generate-text <PATH> [--prompt <TEXT> | --system <TEXT> --user <TEXT>]
+                  [--tokens <ID,...>] [-n <N>] [--temperature <F>] [--top-k <N>]
+                  [--seed <N>] [--gpu]
 ```
 
 Consume a prompt, then autoregressively sample `--steps` new tokens.
@@ -108,6 +109,8 @@ Consume a prompt, then autoregressively sample `--steps` new tokens.
 | Option | Default | Meaning |
 |---|---|---|
 | `--prompt <TEXT>` | — | Prompt text, encoded via the GGUF tokenizer (GPT-2 byte-BPE for `qwen35`, SentencePiece BPE for `gemma4`). A BOS token is prepended. Takes precedence over `--tokens`. |
+| `--system <TEXT>` | — | Chat system message. Rendered with the model's chat template (see below). Implies the chat path; overrides `--prompt`. |
+| `--user <TEXT>` | — | Chat user message paired with `--system`. Falls back to `--prompt`'s text if not given. |
 | `--tokens <ID,...>` | `[eos]` | Comma-separated prompt token ids. |
 | `-n`, `--steps <N>` | 32 | New tokens to sample after the prompt. `-n 0` consumes the prompt only. |
 | `--temperature <F>` | 0.0 | Sampling temperature. `0` = greedy/argmax. |
@@ -122,9 +125,55 @@ captured once and replayed per token. Timing is reported separately for
 the two phases (`prefill` / `decode`), and the generated ids are also
 printed decoded back to text (`output text`).
 
-Special/control tokens (`<start_of_turn>` etc.) typed inside `--prompt`
-text are BPE-encoded as literal characters, not recognized as control
-tokens. For an exact chat-format token sequence, pass `--tokens`.
+**Chat templates.** When `--system` or `--user` is given, the prompt is
+assembled with the model's chat template instead of being passed raw:
+
+- `gemma4`: `<|turn>role\n…<turn|>\n` framing using the model's special
+  token ids (105, 106, 107) plus the literal role tokens (`system`,
+  `user`, `model`). The render ends with `<|turn>model\n` so decode
+  starts on the assistant turn.
+- `qwen35` / `qwen35moe`: `<|im_start|>role\n…<|im_end|>\n` framing
+  with Qwen 3.5/3.6's ids (248045, 248046, 198). No BOS — Qwen's
+  template expects to start at `<|im_start|>`. Ends with
+  `<|im_start|>assistant\n`.
+
+Other architectures reject `--system`/`--user` with a clear error.
+
+Typed `<start_of_turn>` etc. inside a raw `--prompt` are BPE-encoded
+as literal characters — the chat-template path is the supported way
+to get model-recognised chat-format tokens. `--tokens` still works for
+hand-crafted sequences.
+
+### chat
+
+```
+reinstinct-engine chat <PATH> [--system <TEXT>] --turn <TEXT> [--turn <TEXT> ...]
+                  [-n <N>] [--temperature <F>] [--top-k <N>] [--seed <N>]
+```
+
+Multi-turn chat against a Gemma 4 model with **KV-cache prefix reuse**.
+The system message is rendered via the chat template, prefilled, and
+snapshotted once; every subsequent `--turn` restores the snapshot and
+runs only the per-turn tokens before decode. TTFT for turn N+1 is
+bounded by the per-turn user-message length, not by the system or
+conversation history.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--system <TEXT>` | — | Gemma 4 chat system message, prefilled & cached once. |
+| `--turn <TEXT>` | — | Per-turn user input. Repeatable; each turn reuses the cached system prefix. At least one is required. |
+| `-n`, `--steps <N>` | 60 | Decode tokens per turn (stops early on EOS). |
+| `--temperature`, `--top-k`, `--seed` | as `generate-text` | Sampler. |
+
+Each turn prints its TTFT (split into `restore` and `prefill`), decode
+tok/s, and the decoded assistant response. On the 26B-A4B with a
+~270-token system prompt, the snapshot+restore overhead is ~0.5 ms and
+turn TTFT runs ~12× faster than re-prefilling the system every call.
+
+Currently gemma4-only — the qwen runtime's hybrid attention + GDN
+state needs separate snapshot machinery. Single-session in-memory
+snapshot (no disk persistence yet) and a single cached prefix per
+process (no multi-turn history accumulation in the cache).
 
 ### debug-embed
 
@@ -217,6 +266,25 @@ Generate from a text prompt (`--prompt` is tokenized; works for
 `gemma4` and `qwen35`):
 ```
 reinstinct-engine generate-text <model.gguf> --prompt "The capital of France is" -n 32 --gpu
+```
+
+Use the model's chat template (works on `gemma4` and `qwen35` /
+`qwen35moe`):
+```
+reinstinct-engine generate-text <model.gguf> \
+    --system "You are concise. Give one-line answers." \
+    --user "What is the capital of France?" -n 32 --gpu
+```
+
+Multi-turn chat with KV-cache prefix reuse (gemma4 only) — the system
+message is prefilled and snapshotted once, every `--turn` after the
+first restores the cache instead of re-prefilling:
+```
+reinstinct-engine chat <gemma4-model.gguf> \
+    --system "You are a concise assistant." \
+    --turn "Name the planets." \
+    --turn "Capital of France?" \
+    --turn "What is 2+2?" -n 60
 ```
 
 Benchmark the batched prefill on a 128-token prompt:
