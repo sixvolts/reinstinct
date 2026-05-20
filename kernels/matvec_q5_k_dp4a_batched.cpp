@@ -10,7 +10,9 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS         2     // output rows per wavefront (matches K=1 layout)
+#define ROWS         4     // output rows per wavefront (4 picked as sweet spot:
+                           // ROWS=2 and ROWS=4 measure identical, ROWS=8 slightly
+                           // worse from register pressure)
 #define N_ROWS_MAX   4     // batch upper bound
 
 struct __attribute__((packed)) BlockQ5_K {
