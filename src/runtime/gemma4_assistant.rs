@@ -232,8 +232,14 @@ impl GpuGemma4Assistant {
         // round position. (Shared-KV layers don't increment per step.)
         target.set_d_pos(pos)?;
 
-        // 1) target_embed(prev_tok) → embed_buf [5376]
+        // 1) target_embed(prev_tok) → embed_buf [5376], scaled by √backbone.
+        // The target model applies the same √hidden scale to its input
+        // embeddings inside its own forward pass (standard Gemma scaling).
+        // ik_llama.cpp's build_gemma4_mtp does this scale at the drafter's
+        // pre_projection input — without it, the embed half of the concat
+        // sits at norm ~1 while the trained drafter expects ~√backbone.
         target.embed_token_raw(prev_tok, self.embed_buf.raw_ptr())?;
+        target.launch_scale(self.embed_buf.raw_ptr(), backbone, (backbone as f32).sqrt())?;
 
         // 2) concat(embed_buf, h_prev) → concat_buf [10752]
         self.launch_concat2(target, self.embed_buf.raw_ptr(), self.h_prev.raw_ptr(),
