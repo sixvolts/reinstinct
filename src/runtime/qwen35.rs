@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
