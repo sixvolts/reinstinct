@@ -79,6 +79,24 @@ enum Command {
         #[arg(long)]
         gpu: bool,
     },
+    /// Speculative decode against a Gemma 4 target using its MTP drafter.
+    /// Currently sequential-verify (correctness, no speedup) — proves the
+    /// accept/reject loop end-to-end; the batched-verify perf win lands
+    /// when prefill_forward grows incremental positions.
+    MtpGen {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        /// Drafted tokens per spec-decode round.
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+        /// Total tokens to generate (round trip until this many accepted).
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+    },
     /// Spec-decode smoke test: load a Gemma 4 target + its MTP drafter,
     /// prefill a prompt, then ask the drafter to propose K tokens at the
     /// prompt's last position. Prints each drafted token plus the
@@ -195,6 +213,8 @@ fn main() -> anyhow::Result<()> {
             chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
         Command::MtpDraft { target, drafter, prompt, system, k } =>
             mtp_draft_cli(&target, &drafter, prompt, system, k),
+        Command::MtpGen { target, drafter, prompt, system, k, steps } =>
+            mtp_gen_cli(&target, &drafter, prompt, system, k, steps),
     }
 }
 
@@ -1306,6 +1326,157 @@ fn argmax(v: &[f32]) -> u32 {
         if x > best_v { best_v = x; best_i = i as u32; }
     }
     best_i
+}
+
+/// Full speculative-decode generation loop (sequential verify). One
+/// round: drafter proposes K tokens; target sequentially verifies via
+/// greedy argmax acceptance; KV cache advances per accepted token; on
+/// rejection target's own argmax replaces the drafted token. Always
+/// commits ≥1 token per round.
+///
+/// With sequential verify the per-round cost is `K·drafter + (n_acc+1)·target`,
+/// vs the K`drafter + 1`target a batched-verify path would hit. This is
+/// a correctness path, not a speed path — see the MTP memory file.
+fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+               prompt_text: Option<String>, system: Option<String>,
+               k: usize, steps: usize) -> anyhow::Result<()>
+{
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_engine::hip;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::model::gemma4_assistant::Gemma4AssistantModel;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::runtime::gemma4_assistant::GpuGemma4Assistant;
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+
+    if k == 0 { anyhow::bail!("--k must be >= 1"); }
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("mtp-gen: pass --prompt or --system/--prompt");
+    };
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let target_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let cfg_eos = target_model.config.eos_token_id;
+    let max_seq = prompt.len() + steps + k + 16;
+    let gm = GpuGemma4::new(&target_model, &target_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let drafter_model = Gemma4AssistantModel::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let drafter = GpuGemma4Assistant::new(&drafter_model, &drafter_gguf, &gm, &cache)
+        .map_err(anyhow::Error::msg)?;
+    let mut state = Gemma4GpuState::new(&target_model, max_seq).map_err(anyhow::Error::msg)?;
+    state.reset();
+
+    println!("target = {} ({} tok prompt)", target_path.display(), prompt.len());
+    println!("drafter = {}, K = {k}, steps = {steps}", drafter_path.display());
+
+    // Initial prefill: process all prompt tokens; last forward leaves
+    // `hidden_a` = hidden at last prompt position, and `verify_logits`
+    // = target's prediction for the NEXT (un-validated) position.
+    let t_pf = std::time::Instant::now();
+    let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let mut verify_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+        .map_err(anyhow::Error::msg)?;
+    println!("prefill = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
+
+    // The drafter is conditioned on (prev_tok, h_prev=target_hidden_at_pos).
+    // After the initial forward_token, the natural last_token is the
+    // FINAL prompt token (per HF: "input_ids[:, -1:]"), and h_prev is
+    // target.last_hidden_state at that position. For subsequent rounds:
+    // last_token = the last accepted/committed token.
+    let mut last_tok = *prompt.last().unwrap();
+
+    let mut generated: Vec<u32> = Vec::new();
+    let mut total_drafted: usize = 0;
+    let mut total_accepted: usize = 0;
+    let mut hit_eos = false;
+    let t_gen = std::time::Instant::now();
+    let mut round_idx = 0usize;
+
+    while generated.len() < steps {
+        round_idx += 1;
+        // --- DRAFT phase ---
+        // pos_const = state.pos - 1 is the position of the last validated
+        // token. The drafter pins its position to that across the round.
+        let pos_const = state.pos - 1;
+        drafter.set_h_prev_from_target(&gm).map_err(anyhow::Error::msg)?;
+        let mut drafted: Vec<u32> = Vec::with_capacity(k);
+        let mut prev = last_tok;
+        for _ in 0..k {
+            let logits_d = drafter.forward_step(&gm, &state, prev, pos_const)
+                .map_err(anyhow::Error::msg)?;
+            let d = argmax(&logits_d);
+            drafted.push(d);
+            prev = d;
+        }
+
+        // --- VERIFY phase (sequential) ---
+        // `verify_logits` predicts the token AT state.pos (next position
+        // to write). Compare drafted[k] vs that argmax; on match, commit
+        // drafted[k] via target.forward_token and advance. On mismatch,
+        // commit target's argmax instead and end the round.
+        let mut accepted_this_round = 0usize;
+        let _ = round_idx;
+        for (i, &d) in drafted.iter().enumerate() {
+            let target_pred = argmax(&verify_logits);
+            if d == target_pred {
+                // Accept the drafted token.
+                generated.push(d);
+                accepted_this_round += 1;
+                if d == cfg_eos || generated.len() >= steps { hit_eos = d == cfg_eos; break; }
+                verify_logits = gm.forward_token(d, &mut state)
+                    .map_err(anyhow::Error::msg)?;
+                last_tok = d;
+                if i == drafted.len() - 1 {
+                    // All K accepted; loop ends naturally.
+                }
+            } else {
+                // Reject from here; commit target's pick and end round.
+                generated.push(target_pred);
+                if target_pred != cfg_eos && generated.len() < steps {
+                    verify_logits = gm.forward_token(target_pred, &mut state)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                last_tok = target_pred;
+                hit_eos = target_pred == cfg_eos;
+                break;
+            }
+        }
+        total_drafted += drafted.len();
+        total_accepted += accepted_this_round;
+        if hit_eos { break; }
+    }
+
+    let gen_secs = t_gen.elapsed().as_secs_f64();
+    let n_gen = generated.len();
+    println!();
+    println!("--- generation ---");
+    println!("{}", tok.decode(&generated));
+    println!();
+    println!("generated {n_gen} tokens in {:.2} s = {:.1} tok/s", gen_secs, n_gen as f64 / gen_secs);
+    println!("draft accept rate: {} / {} = {:.0}%",
+             total_accepted, total_drafted,
+             100.0 * total_accepted as f64 / total_drafted.max(1) as f64);
+    if hit_eos { println!("(hit EOS)"); }
+    Ok(())
 }
 
 fn inspect(path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
