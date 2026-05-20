@@ -25,6 +25,8 @@ const MMQ_GEMM_Q5K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
+const MV_Q4K_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_q4k_repacked_batched.cpp");
 
 /// Bulk-dequantize a quantized weight tensor to an fp16 device buffer.
 /// `n_elements` is the logical weight count (out_dim * in_dim).
@@ -209,6 +211,7 @@ pub struct PrefillGemm {
     mmq_q4k:     Module,
     mmq_q5k:     Module,
     mmq_q6k:     Module,
+    mv_q4k_batched: Module,    // K=2..8 batched Q4_K matvec for verify
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
     dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
@@ -248,6 +251,8 @@ impl PrefillGemm {
                                                      MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k:     Module::load(&cache.compile("mmq_gemm_q6k_repacked",
                                                      MMQ_GEMM_Q6K_SOURCE)?)?,
+            mv_q4k_batched: Module::load(&cache.compile("matvec_q4k_repacked_batched",
+                                                     MV_Q4K_REPACKED_BATCHED_SOURCE)?)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
             dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
@@ -390,6 +395,16 @@ impl PrefillGemm {
             return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
         }
         if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            // K=2..8 small-batch path: a per-dtype batched matvec that
+            // reads each weight sub-block once and dots it against all
+            // N activation rows. MMQ would round N up to its 64-row
+            // tile (~94% wasted work at K=4); the batched matvec scales
+            // with actual N. Currently only Q4_K is wired — Q5_K and
+            // Q6_K still go through MMQ until their batched kernels land.
+            if n_rows >= 2 && n_rows <= 8 && dtype == GgmlType::Q4_K {
+                return self.matmul_q4k_batched_into(stream, dst, w_dev,
+                                                    in_dim, out_dim, x, n_rows);
+            }
             return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
         }
 
@@ -521,6 +536,51 @@ impl PrefillGemm {
         unsafe { gf.launch(((out_dim as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
                            (256, 1, 1), 0, Some(stream), &mut ga)?; }
         Ok(dy)
+    }
+
+    /// K=2..8 batched Q4_K matvec — the spec-decode-verify path.
+    /// Quantises X to BlockQ8 in shared scratch, then one kernel
+    /// launch reads each weight sub-block once and dots it against
+    /// all `n_rows` activation rows. Output Y is `[n_rows, out_dim]`
+    /// fp32, written to caller-owned `dst`. `n_rows` must be ≤ 8
+    /// (the kernel's accumulator-array bound, N_ROWS_MAX).
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_q4k_batched_into(&self, stream: &hip::Stream, dst: &DeviceBuf<f32>,
+                               w_dev: &DeviceBuf<u8>,
+                               in_dim: usize, out_dim: usize,
+                               x: &DeviceBuf<f32>, n_rows: usize)
+        -> Result<(), String>
+    {
+        debug_assert!(n_rows >= 1 && n_rows <= 8, "matmul_q4k_batched_into: n_rows must be 1..=8");
+        // Reuse the MMQ path's int8 activation scratch.
+        let n_xq8 = (n_rows * in_dim / 32) * 40;
+        if self.xq8.borrow().len() < n_xq8 {
+            stream.synchronize()?;
+            *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
+        }
+        let xq8 = self.xq8.borrow();
+
+        // 1. Quantise X[n_rows, in_dim] → BlockQ8[n_rows, in_dim/32].
+        let qf = self.quantize_q8.function("quantize_q8_f32")?;
+        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut ind = in_dim as u32;
+        let mut qa: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
+                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
+
+        // 2. Batched matvec — grid = ceil(out_dim/8) (8 = 4 waves × 2 rows).
+        let gf = self.mv_q4k_batched.function("matvec_q4k_repacked_batched_f32")?;
+        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
+        let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut nr = n_rows as u32;
+        let mut ga: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
+        let grid_x = (out_dim as u32 + 7) / 8;
+        unsafe { gf.launch((grid_x, 1, 1), (256, 1, 1), 0, Some(stream), &mut ga)?; }
+        Ok(())
     }
 
     /// Caller-owned-output sibling of [`matmul_mmq`].
