@@ -1452,13 +1452,11 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let mut total_accepted: usize = 0;
     let mut hit_eos = false;
     let t_gen = std::time::Instant::now();
-    let mut round_idx = 0usize;
 
     let sampling = temperature > 0.0;
     let mut rng = Rng::new(seed);
 
     while generated.len() < steps {
-        round_idx += 1;
         // --- DRAFT phase ---
         // pos_const = state.pos - 1 is the position of the last validated
         // token. The drafter pins its position to that across the round.
@@ -1490,7 +1488,6 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         let pre_verify_pos = state.pos;
         let verify_batch = gm.verify_forward(&drafted, &mut state)
             .map_err(anyhow::Error::msg)?;
-        let _ = round_idx;
 
         // --- ACCEPTANCE ---
         // drafted[i] (at pos pre_verify_pos+i) is verified against:
@@ -1556,7 +1553,6 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         }
         total_drafted += drafted.len();
         total_accepted += accepted_this_round;
-        let _ = round_idx;
         if hit_eos { break; }
     }
 
