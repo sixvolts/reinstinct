@@ -73,10 +73,17 @@ void matvec_q6k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
             xis1[b] = s1;
         }
 
+        // Hoist per-(sb, r) weight metadata + q6 chunks; then dp4a phase
+        // loops b outermost so activation pointers are read once per
+        // (sb, b) rather than per (sb, r, b).
+        uint32_t q6lo_all[ROWS][4], q6hi_all[ROWS][4];
+        float    dsc_lo_all[ROWS], dsc_hi_all[ROWS];
+        bool     row_valid[ROWS];
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
+            row_valid[r] = (row < (int)out_dim);
+            if (!row_valid[r]) continue;
 
             const size_t idx = (size_t)row * nsp + sb;
             const uint4    q    = nib[idx];
@@ -85,33 +92,37 @@ void matvec_q6k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
             const uint16_t sm     = smp[idx];
             const uint16_t d_bits = ddp[(size_t)row * n_super + (sb >> 3)];
             const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
-            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
+            dsc_lo_all[r] = d * (float)(int)(int8_t)(sm & 0xFFu);
+            dsc_hi_all[r] = d * (float)(int)(int8_t)(sm >> 8);
 
-            // Form the 8 q6 chunks (4 lo + 4 hi) once per (sb, row).
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-            uint32_t q6lo[4], q6hi[4];
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const uint32_t ge = 2 * j;
                 const uint32_t go = 2 * j + 1;
                 const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
                 const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
-                q6lo[j] = ( qa[j]       & 0x0F0F0F0Fu) | spread2(he);
-                q6hi[j] = ((qa[j] >> 4) & 0x0F0F0F0Fu) | spread2(ho);
+                q6lo_all[r][j] = ( qa[j]       & 0x0F0F0F0Fu) | spread2(he);
+                q6hi_all[r][j] = ((qa[j] >> 4) & 0x0F0F0F0Fu) | spread2(ho);
             }
+        }
 
-            for (unsigned int b = 0; b < n_rows; b++) {
-                const int* xq32 = xq32_arr[b];
-                const float dx  = dx_arr[b];
+        for (unsigned int b = 0; b < n_rows; b++) {
+            const int* xq32 = xq32_arr[b];
+            const float dx  = dx_arr[b];
+            const int xis0_b = xis0[b];
+            const int xis1_b = xis1[b];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (!row_valid[r]) continue;
                 int idot0 = 0, idot1 = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    idot0 = __builtin_amdgcn_sdot4((int)q6lo[j], xq32[j],     idot0, false);
-                    idot1 = __builtin_amdgcn_sdot4((int)q6hi[j], xq32[j + 4], idot1, false);
+                    idot0 = __builtin_amdgcn_sdot4((int)q6lo_all[r][j], xq32[j],     idot0, false);
+                    idot1 = __builtin_amdgcn_sdot4((int)q6hi_all[r][j], xq32[j + 4], idot1, false);
                 }
-                acc[r][b] += dsc_lo * dx * (float)(idot0 - 32 * xis0[b])
-                           + dsc_hi * dx * (float)(idot1 - 32 * xis1[b]);
+                acc[r][b] += dsc_lo_all[r] * dx * (float)(idot0 - 32 * xis0_b)
+                           + dsc_hi_all[r] * dx * (float)(idot1 - 32 * xis1_b);
             }
         }
     }

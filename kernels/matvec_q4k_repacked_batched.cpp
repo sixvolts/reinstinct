@@ -27,7 +27,7 @@
 #define N_ROWS_MAX   4     // K upper bound the kernel supports (was 8 — bumping
                            // to 4 halves per-thread VGPR pressure and boosts
                            // occupancy. K=4 is the sweet spot per the K-curve;
-                           // higher-K verify falls back to the K=1 K-quant kernel).
+                           // higher-K verify falls back to MMQ).
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -66,42 +66,51 @@ void matvec_q4k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
         for (int b = 0; b < N_ROWS_MAX; b++) acc[r][b] = 0.0f;
 
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
-        // Read each weight sub-block ONCE (the whole point).
+        // Load the per-(sb, r) weight metadata once for ALL r values up
+        // front, then loop b outermost in the dp4a phase so each
+        // activation row is read exactly ONCE per sb (was ROWS times in
+        // the previous structure, e.g. read twice with ROWS=2).
+        uint32_t qa_all[ROWS][4];
+        float    dsc_all[ROWS], deff_all[ROWS];
+        bool     row_valid[ROWS];
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
+            row_valid[r] = (row < (int)out_dim);
+            if (!row_valid[r]) continue;
 
             const uint4    q  = nib[(size_t)row * nsp + sb];
             const uint16_t sm = smp[(size_t)row * nsp + sb];
             const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
             const uint16_t dmin_bits = (uint16_t)(dd >> 16);
-            const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                               * (float)(sm & 0xFFu);
-            const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                               * (float)(sm >> 8);
+            dsc_all[r]  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
+                          * (float)(sm & 0xFFu);
+            deff_all[r] = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
+                          * (float)(sm >> 8);
+            qa_all[r][0] = q.x; qa_all[r][1] = q.y;
+            qa_all[r][2] = q.z; qa_all[r][3] = q.w;
+        }
 
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+        // Now loop activations once each, doing ROWS dp4a accumulations.
+        for (unsigned int b = 0; b < n_rows; b++) {
+            const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
+            const float    dx   = xb->d;
+            const float    xsum = xb->xsum;
+            const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
 
-            // Dot against each of the N_ROWS activation rows. The
-            // weight nibbles `qa` are reused; only the int8 activation
-            // and (dx, xsum) change between rows.
-            for (unsigned int b = 0; b < n_rows; b++) {
-                const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
-                const float    dx   = xb->d;
-                const float    xsum = xb->xsum;
-                const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (!row_valid[r]) continue;
                 int idot = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    idot = __builtin_amdgcn_sdot4((int)( qa[j]       & 0x0F0F0F0Fu),
-                                                  xq32[j],     idot, false);
-                    idot = __builtin_amdgcn_sdot4((int)((qa[j] >> 4) & 0x0F0F0F0Fu),
-                                                  xq32[j + 4], idot, false);
+                    idot = __builtin_amdgcn_sdot4(
+                        (int)( qa_all[r][j]       & 0x0F0F0F0Fu), xq32[j],     idot, false);
+                    idot = __builtin_amdgcn_sdot4(
+                        (int)((qa_all[r][j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot, false);
                 }
-                acc[r][b] += dsc * dx * (float)idot - deff * xsum;
+                acc[r][b] += dsc_all[r] * dx * (float)idot - deff_all[r] * xsum;
             }
         }
     }

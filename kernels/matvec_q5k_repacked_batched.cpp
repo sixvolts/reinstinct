@@ -54,10 +54,16 @@ void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
         for (int b = 0; b < N_ROWS_MAX; b++) acc[r][b] = 0.0f;
 
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        // Load per-(sb, r) weight + scales up front so the dp4a phase
+        // loops b outermost (each activation row read once per sb).
+        uint32_t lo_all[ROWS][4], hi_all[ROWS][4];
+        float    dsc_all[ROWS], deff_all[ROWS];
+        bool     row_valid[ROWS];
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
+            row_valid[r] = (row < (int)out_dim);
+            if (!row_valid[r]) continue;
 
             const uint4    q  = nib[(size_t)row * nsp + sb];
             const uint32_t qh = qhp[(size_t)row * nsp + sb];
@@ -65,36 +71,37 @@ void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
             const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
             const uint16_t dmin_bits = (uint16_t)(dd >> 16);
-            const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                               * (float)(sm & 0xFFu);
-            const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                               * (float)(sm >> 8);
+            dsc_all[r]  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
+                          * (float)(sm & 0xFFu);
+            deff_all[r] = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
+                          * (float)(sm >> 8);
 
-            // Form the 8 q5 chunks (4 lo + 4 hi) once per sub-block —
-            // they're shared across the n_rows dot products.
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-            uint32_t lo[4], hi[4];
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                lo[j] = ( qa[j]       & 0x0F0F0F0Fu)
+                lo_all[r][j] = ( qa[j]       & 0x0F0F0F0Fu)
                     | spread4((qh >> (4 * (2 * j)))     & 0xFu);
-                hi[j] = ((qa[j] >> 4) & 0x0F0F0F0Fu)
+                hi_all[r][j] = ((qa[j] >> 4) & 0x0F0F0F0Fu)
                     | spread4((qh >> (4 * (2 * j + 1))) & 0xFu);
             }
+        }
 
-            for (unsigned int b = 0; b < n_rows; b++) {
-                const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
-                const float    dx   = xb->d;
-                const float    xsum = xb->xsum;
-                const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
+        for (unsigned int b = 0; b < n_rows; b++) {
+            const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
+            const float    dx   = xb->d;
+            const float    xsum = xb->xsum;
+            const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
 
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (!row_valid[r]) continue;
                 int idot = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    idot = __builtin_amdgcn_sdot4((int)lo[j], xq32[j],     idot, false);
-                    idot = __builtin_amdgcn_sdot4((int)hi[j], xq32[j + 4], idot, false);
+                    idot = __builtin_amdgcn_sdot4((int)lo_all[r][j], xq32[j],     idot, false);
+                    idot = __builtin_amdgcn_sdot4((int)hi_all[r][j], xq32[j + 4], idot, false);
                 }
-                acc[r][b] += dsc * dx * (float)idot - deff * xsum;
+                acc[r][b] += dsc_all[r] * dx * (float)idot - deff_all[r] * xsum;
             }
         }
     }
