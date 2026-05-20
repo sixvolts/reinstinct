@@ -1573,9 +1573,11 @@ impl GpuGemma4 {
     /// pre-projection input — drafter never invokes its own input embed.
     pub fn embed_token_raw(&self, token: u32, out: *mut c_void) -> Result<(), String> {
         self.d_token.copy_from_host(&[token])?;
-        self.launch_embed(&self.token_embd, out)?;
-        self.stream.synchronize()?;
-        Ok(())
+        self.launch_embed(&self.token_embd, out)
+        // No stream.synchronize() — the only caller (MTP drafter
+        // forward_step) immediately chains more kernels on the same
+        // stream, which see the embed output via stream ordering. The
+        // final readback in forward_step is the natural sync point.
     }
 
     /// Stage `pos` into the device-resident position word that rope /
