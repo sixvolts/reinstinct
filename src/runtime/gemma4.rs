@@ -1545,7 +1545,12 @@ impl GpuGemma4 {
     /// softcap` chain, so this returns the same activation the HF
     /// reference exposes as `hidden_states[-1]` and feeds to the MTP
     /// drafter's `pre_projection`.
-    pub fn last_hidden_state(&self) -> &DeviceBuf<f32> { &self.hidden_a }
+    /// Hidden state at the position of the last forward, POST-output-norm
+    /// — what HF returns as `outputs.hidden_states[-1]`, used by the MTP
+    /// drafter as its initial `h_prev` per round. `forward_token` leaves
+    /// the post-norm result in `hidden_b`; `verify_forward` syncs the
+    /// last verify row's post-norm into `hidden_b` too.
+    pub fn last_hidden_state(&self) -> &DeviceBuf<f32> { &self.hidden_b }
 
     /// Embed a single token via the target's `token_embd` table, writing
     /// the raw lookup (no `√hidden` scale) into the caller-provided
@@ -2173,9 +2178,16 @@ impl GpuGemma4 {
             self.launch_softcap(logits_all.raw_ptr(), (p * self.vocab) as u32)?;
         }
 
-        // Keep `self.hidden_a` in sync with what a forward_token of the
-        // last accepted token would have left (drafter rounds read it).
+        // Keep `self.hidden_a` (pre-output-norm) in sync with what a
+        // forward_token of the last accepted token would have left
+        // (drafter rounds read it).
         self.hidden_a.copy_range_from_device(x, (p - 1) * h, 0, h)?;
+        // Also keep `self.hidden_b` (post-output-norm) in sync — `normed`
+        // already holds the per-row post-output-norm of `x`, so its last
+        // row is what `forward_token` would leave in `hidden_b`. The MTP
+        // drafter can be configured (env REINSTINCT_DRAFTER_POSTNORM) to
+        // read POST-norm instead of PRE-norm as its initial h_prev.
+        self.hidden_b.copy_range_from_device(normed, (p - 1) * h, 0, h)?;
         self.stream.synchronize()?;
 
         for c in &mut state.caches { c.len = base_pos + p; }
