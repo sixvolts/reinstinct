@@ -27,6 +27,8 @@ const MATVEC_Q6K_W_SRC:      &str = include_str!("../../kernels/matvec_q6_k_rowb
 const QUANTIZE_Q8_SRC:       &str = include_str!("../../kernels/quantize_q8.cpp");
 const MATVEC_Q4K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
+const MATVEC_Q5K_DP4A_BATCHED_SRC: &str =
+    include_str!("../../kernels/matvec_q5_k_dp4a_batched.cpp");
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
@@ -573,6 +575,10 @@ pub struct GpuGemma4 {
     m_quantize:  Module,
     m_mv_q4k_dp4a: Module,
     m_mv_q5k_dp4a: Module,
+    /// Batched (K=2..4 input rows) Q5_K dp4a matvec — used by
+    /// verify_forward's lm_head to compute all K logits rows in one
+    /// kernel launch instead of K separate calls.
+    m_mv_q5k_dp4a_batched: Module,
     m_mv_q6k_dp4a: Module,
     m_mv_q8_0_dp4a: Module,
     m_mv_q8_0_repacked: Module,
@@ -814,6 +820,8 @@ impl GpuGemma4 {
             m_quantize:     ld("quantize_q8", QUANTIZE_Q8_SRC)?,
             m_mv_q4k_dp4a:  ld("matvec_q4_k_dp4a", MATVEC_Q4K_DP4A_SRC)?,
             m_mv_q5k_dp4a:  ld("matvec_q5_k_dp4a", MATVEC_Q5K_DP4A_SRC)?,
+            m_mv_q5k_dp4a_batched: ld("matvec_q5_k_dp4a_batched",
+                                       MATVEC_Q5K_DP4A_BATCHED_SRC)?,
             m_mv_q6k_dp4a:  ld("matvec_q6_k_dp4a", MATVEC_Q6K_DP4A_SRC)?,
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
             m_mv_q8_0_repacked: ld("matvec_q8_0_repacked", MATVEC_Q8_0_REPACKED_SRC)?,
@@ -2162,17 +2170,25 @@ impl GpuGemma4 {
 
         // --- output norm + tied vocab head ---
         // token_embd is [hidden, vocab=262144] — too big for the
-        // prefill_gemm scratch path. K rows × one launch_matvec each.
+        // prefill_gemm scratch path. For Q5_K (31B) we have a batched
+        // dp4a kernel that handles all K input rows in one launch
+        // (saves ~6 ms / verify by reading the weight matrix once
+        // instead of K times); otherwise fall back to K serial calls.
         self.launch_rmsnorm_batched(x.raw_ptr(), self.output_norm.raw_ptr(),
                                     normed.raw_ptr(), hu, p as u32)?;
-        for i in 0..p {
-            let in_off  = (i * h) * 4;
-            let out_off = (i * self.vocab) * 4;
-            let in_ptr  = unsafe {
-                (normed.raw_ptr()     as *mut u8).add(in_off)  as *mut c_void };
-            let out_ptr = unsafe {
-                (logits_all.raw_ptr() as *mut u8).add(out_off) as *mut c_void };
-            self.launch_matvec(&self.token_embd, in_ptr, out_ptr)?;
+        if self.token_embd.dtype == GgmlType::Q5_K && p >= 2 && p <= 4 {
+            self.launch_lm_head_q5k_batched(normed.raw_ptr(), logits_all.raw_ptr(),
+                                            p as u32)?;
+        } else {
+            for i in 0..p {
+                let in_off  = (i * h) * 4;
+                let out_off = (i * self.vocab) * 4;
+                let in_ptr  = unsafe {
+                    (normed.raw_ptr()     as *mut u8).add(in_off)  as *mut c_void };
+                let out_ptr = unsafe {
+                    (logits_all.raw_ptr() as *mut u8).add(out_off) as *mut c_void };
+                self.launch_matvec(&self.token_embd, in_ptr, out_ptr)?;
+            }
         }
         if self.softcap > 0.0 {
             self.launch_softcap(logits_all.raw_ptr(), (p * self.vocab) as u32)?;
@@ -2203,6 +2219,35 @@ impl GpuGemma4 {
             out.push(all[i * self.vocab..(i + 1) * self.vocab].to_vec());
         }
         Ok(out)
+    }
+
+    /// Batched (K=2..4) Q5_K dp4a matvec for verify_forward's lm_head.
+    /// Quantizes K input rows of `normed` to `self.xq8`, then launches one
+    /// batched kernel that reads each weight superblock once and dots it
+    /// against all K rows. Saves K-1 weight-stream reads of the 880 MB
+    /// token_embd matrix vs K separate matvec calls.
+    fn launch_lm_head_q5k_batched(&self, in_ptr: *mut c_void, out_ptr: *mut c_void,
+                                   p: u32) -> Result<(), String>
+    {
+        debug_assert!(self.token_embd.dtype == GgmlType::Q5_K);
+        debug_assert!(p >= 2 && p <= 4, "batched lm_head supports K=2..4");
+        let in_dim = self.token_embd.in_dim;     // hidden (5376 for 31B)
+        let out_dim = self.token_embd.out_dim;   // vocab (262144)
+        // 1) Quantize K input rows → BlockQ8 [K, in_dim/32] in self.xq8.
+        self.launch_quantize_q8(in_ptr, self.xq8.raw_ptr(), in_dim, p)?;
+        // 2) Batched matvec. Grid = ceil(out_dim / ROWS=2) — matches
+        //    the K=1 dp4a layout for fair per-row work.
+        let f = self.m_mv_q5k_dp4a_batched.function("matvec_q5_k_dp4a_batched_f32")?;
+        let mut wp = self.token_embd.data.raw_ptr();
+        let mut xp = self.xq8.raw_ptr();
+        let mut yp = out_ptr;
+        let mut ia = in_dim; let mut oa = out_dim; let mut nr = p;
+        let mut args: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
+        let grid = (out_dim + 1) / 2;   // ROWS=2 in the kernel
+        unsafe { f.launch((grid, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     /// Batched per-(token,head) int8 quantization of a prefill K or V
