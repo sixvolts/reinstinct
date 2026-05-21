@@ -890,6 +890,12 @@ impl GpuGemma4 {
         })
     }
 
+    /// `true` for the 26B-A4B MoE target, `false` for the dense 31B.
+    /// Callers (e.g. mtp-gen) use this to skip HIP-graph capture of the
+    /// verify path — the MoE branch has host-side bucket-by-expert syncs
+    /// that aren't graph-capturable.
+    pub fn is_moe(&self) -> bool { self.n_expert > 0 }
+
     // ---- launch helpers ----------------------------------------------------
 
     pub(crate) fn launch_rmsnorm(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void, n: u32)
@@ -1199,7 +1205,12 @@ impl GpuGemma4 {
 
     /// Router: softmax + top-k over `n_expert` logits → expert ids and
     /// renormalised weights (device buffers `moe_ids` / `moe_weights`).
-    fn launch_moe_topk(&self) -> Result<(), String> {
+    /// Routing top-k over `n_tok` tokens. The kernel offsets logits /
+    /// out_ids / out_weights by `blockIdx.x * stride` so the input
+    /// `moe_logits` must be `[n_tok, n_expert]` row-major and the
+    /// outputs land at `moe_ids[n_tok, n_expert_used]` and
+    /// `moe_weights[n_tok, n_expert_used]`. Decode passes n_tok=1.
+    fn launch_moe_topk(&self, n_tok: usize) -> Result<(), String> {
         let f = self.m_moe_topk.function("moe_topk_f32")?;
         let mut la = self.moe_logits.raw_ptr();
         let mut ne = self.n_expert as i32;
@@ -1212,57 +1223,47 @@ impl GpuGemma4 {
             &mut wa as *mut _ as *mut c_void];
         let block: u32 = 128;
         let smem = self.n_expert as u32 * 4;
-        unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
+        unsafe { f.launch((n_tok as u32,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
-    /// One launch covering all `n_expert_used` routed experts: grid.y is
-    /// the expert slot, the expert id is read from `self.moe_ids` on
-    /// device. `xq_stride` is the BlockQ8 count per slot (0 ⇒ all slots
-    /// share one activation, the fused gate_up case).
+    /// One launch covering `n_used × n_tok` routed (expert, token)
+    /// pairs: grid.y = expert slot, grid.z = token. Expert IDs are read
+    /// from `self.moe_ids[tok * n_used + slot]` on device. Decode passes
+    /// `n_tok=1, xq_tok_stride=0`. Verify-MoE passes `n_tok=p,
+    /// xq_tok_stride=in_dim/32` (one BlockQ8 sequence per token).
+    /// `xq_slot_stride=0` ⇒ all slots within a token share one activation
+    /// (fused gate_up). `xq_slot_stride>0` ⇒ per-slot activation (down).
+    #[allow(clippy::too_many_arguments)]
     fn launch_moe_matvec(&self, dtype: GgmlType, repacked: bool,
                          slab: *mut c_void, xq: *mut c_void,
                          y: *mut c_void, in_dim: u32, out_dim: u32,
-                         bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
+                         bytes_per_expert: u32,
+                         xq_tok_stride: u32, xq_slot_stride: u32,
+                         n_tok: usize) -> Result<(), String>
     {
-        // Repacked Q6_K experts use the contiguous kernel (256-thread, 8
-        // rows/workgroup). It is shared with the qwen runtime, whose
-        // signature carries a token-batch dimension: gemma is single-token,
-        // so xq_tok_stride = 0, xq_slot_stride = xq_stride, grid.z = 1.
-        if repacked {
-            let f = self.m_moe_mv_q6k_repacked.function("moe_matvec_q6k_repacked_f32")?;
-            let grid_x = (out_dim + 7) / 8;
-            let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
-            let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert;
-            let mut tst=0u32; let mut sst=xq_stride; let mut nu=self.n_expert_used as u32;
-            let mut args: [*mut c_void; 10] = [
-                &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
-                &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
-                &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-                &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
-                &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
-            return unsafe {
-                f.launch((grid_x, self.n_expert_used as u32, 1), (256,1,1), 0,
-                         Some(&self.stream), &mut args)
-            };
-        }
-
-        // Non-repacked experts use the on-disk dp4a kernels (64-thread, 2).
-        let (module, kname, block, rows): (&Module, &str, u32, u32) = match dtype {
-            GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
-            GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
-            other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+        let nu = self.n_expert_used as u32;
+        let (module, kname, block, rows): (&Module, &str, u32, u32) = if repacked {
+            (&self.m_moe_mv_q6k_repacked, "moe_matvec_q6k_repacked_f32", 256, 8)
+        } else {
+            match dtype {
+                GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
+                GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
+                other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+            }
         };
         let f = module.function(kname)?;
         let grid_x = (out_dim + rows - 1) / rows;
         let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
-        let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert; let mut st=xq_stride;
-        let mut args: [*mut c_void; 8] = [
+        let mut ia=in_dim; let mut oa=out_dim; let mut bpe=bytes_per_expert;
+        let mut tst=xq_tok_stride; let mut sst=xq_slot_stride; let mut nu_a=nu;
+        let mut args: [*mut c_void; 10] = [
             &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
             &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-            &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
+            &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+            &mut sst as *mut _ as *mut c_void, &mut nu_a as *mut _ as *mut c_void];
         unsafe {
-            f.launch((grid_x, self.n_expert_used as u32, 1), (block,1,1), 0,
+            f.launch((grid_x, nu, n_tok as u32), (block,1,1), 0,
                      Some(&self.stream), &mut args)
         }
     }
@@ -1271,10 +1272,15 @@ impl GpuGemma4 {
     /// (= expert_ff) is small, so `launch_moe_matvec`'s lane→sub-block
     /// mapping leaves most of every wavefront idle; the row-packed Q8_0
     /// kernel keeps all threads busy. Falls back for other dtypes.
+    /// Same batched signature as `launch_moe_matvec` — n_tok=1 for
+    /// decode, n_tok=p for verify-MoE.
+    #[allow(clippy::too_many_arguments)]
     fn launch_moe_down(&self, dtype: GgmlType, repacked: bool,
                        slab: *mut c_void, xq: *mut c_void,
                        y: *mut c_void, in_dim: u32, out_dim: u32,
-                       bytes_per_expert: u32, xq_stride: u32) -> Result<(), String>
+                       bytes_per_expert: u32,
+                       xq_tok_stride: u32, xq_slot_stride: u32,
+                       n_tok: usize) -> Result<(), String>
     {
         let n_sub = in_dim >> 5;
         if dtype == GgmlType::Q8_0 && !repacked && n_sub >= 1 && n_sub <= 256 {
@@ -1283,39 +1289,50 @@ impl GpuGemma4 {
             let grid_x = (out_dim + rpb - 1) / rpb;
             let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
             let mut ia=in_dim; let mut oa=out_dim;
-            let mut bpe=bytes_per_expert; let mut st=xq_stride;
-            let mut args: [*mut c_void; 8] = [
+            let mut bpe=bytes_per_expert;
+            let mut tst=xq_tok_stride; let mut sst=xq_slot_stride;
+            let mut nu=self.n_expert_used as u32;
+            let mut args: [*mut c_void; 10] = [
                 &mut sa as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
                 &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
                 &mut ia as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-                &mut bpe as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void];
+                &mut bpe as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+                &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
             return unsafe {
-                f.launch((grid_x, self.n_expert_used as u32, 1), (256,1,1), 0,
+                f.launch((grid_x, self.n_expert_used as u32, n_tok as u32), (256,1,1), 0,
                          Some(&self.stream), &mut args)
             };
         }
         self.launch_moe_matvec(dtype, repacked, slab, xq, y, in_dim, out_dim,
-                               bytes_per_expert, xq_stride)
+                               bytes_per_expert, xq_tok_stride, xq_slot_stride, n_tok)
     }
 
-    /// Batched GeGLU over all routed experts: `gu` [n_used, 2·ff_exp] →
-    /// `act` [n_used, ff_exp].
-    fn launch_moe_geglu(&self, gu: *mut c_void, act: *mut c_void) -> Result<(), String> {
+    /// Batched GeGLU over all routed experts across `n_tok` tokens:
+    /// `gu` [n_tok, n_used, 2·ff_exp] → `act` [n_tok, n_used, ff_exp].
+    /// The kernel just iterates the flat product, so we pass
+    /// `n_slot = n_tok * n_used` and let the existing kernel handle it.
+    fn launch_moe_geglu(&self, gu: *mut c_void, act: *mut c_void, n_tok: usize)
+        -> Result<(), String>
+    {
         let f = self.m_moe_geglu.function("moe_geglu_f32")?;
         let block: u32 = 256;
-        let total = (self.n_expert_used * self.expert_ff) as u32;
+        let total = (n_tok * self.n_expert_used * self.expert_ff) as u32;
         let grid = (total + block - 1) / block;
         let mut ga=gu; let mut aa=act;
-        let mut ff=self.expert_ff as u32; let mut ns=self.n_expert_used as u32;
+        let mut ff=self.expert_ff as u32;
+        let mut ns=(n_tok * self.n_expert_used) as u32;
         let mut args: [*mut c_void; 4] = [
             &mut ga as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
             &mut ff as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    /// Weighted sum of the per-expert down outputs into `out` [hidden].
+    /// Weighted sum of per-expert down outputs into `out`. For decode
+    /// `out` is `[hidden]` and `n_tok=1`. For verify-MoE `out` is
+    /// `[n_tok, hidden]`, `experts` is `[n_tok, n_used, hidden]`, and
+    /// `moe_ids/weights` are `[n_tok, n_used]`. grid.y = n_tok.
     fn launch_moe_combine(&self, experts: *mut c_void, down_exps_s: *mut c_void,
-                          out: *mut c_void) -> Result<(), String>
+                          out: *mut c_void, n_tok: usize) -> Result<(), String>
     {
         let f = self.m_moe_combine.function("moe_combine_f32")?;
         let block: u32 = 256;
@@ -1329,7 +1346,7 @@ impl GpuGemma4 {
             &mut wa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut ha as *mut _ as *mut c_void,
             &mut nu as *mut _ as *mut c_void];
-        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid,n_tok as u32,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
     /// Embedding lookup — the token row is read from `d_token` on device
@@ -1912,9 +1929,13 @@ impl GpuGemma4 {
                         self.launch_scale(self.normed.raw_ptr(), hu, inv_sqrt_h)?;
                         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(),
                                            self.moe_logits.raw_ptr())?;
-                        self.launch_moe_topk()?;
-                        all_ids.copy_from_device_at_async(&self.moe_ids, i*nu, &self.stream)?;
-                        all_wts.copy_from_device_at_async(&self.moe_weights, i*nu, &self.stream)?;
+                        self.launch_moe_topk(1)?;
+                        // Copy only the first n_used entries (moe_ids /
+                        // moe_weights are now sized [MAX_VERIFY_K, n_used]).
+                        all_ids.copy_range_from_device_async(
+                            &self.moe_ids, 0, i*nu, nu, &self.stream)?;
+                        all_wts.copy_range_from_device_async(
+                            &self.moe_weights, 0, i*nu, nu, &self.stream)?;
                     }
                     self.stream.synchronize()?;
                     let mut ids_h = vec![0i32; p*nu];
@@ -2038,20 +2059,58 @@ impl GpuGemma4 {
     /// (one per query position). The KV cache is APPENDED to (not
     /// overwritten from 0). Used by MTP spec-decode verify.
     ///
-    /// Dense-only for now — bails on MoE models (the 26B-A4B target
-    /// would need the routed-expert branch wired here too). Also no
-    /// PLE (E4B) support; the 31B target the MTP drafter ships for
-    /// has neither.
+    /// Dispatch: dense targets (31B) use the prefill-style batched verify
+    /// kernel chain (one launch per stage, HIP-graph-capturable). MoE
+    /// targets (26B-A4B) loop the decode `forward_token` K times.
+    ///
+    /// History: a batched MoE verify path (`enqueue_verify_kernels` w/
+    /// `b.moe = Some`) exists and is correct (smoke MATCHES), but on
+    /// MI50 it lost to the decode-loop by ~3× (13.6 vs 40.3 tok/s on
+    /// "The capital of France is", K=4). Why: the per-WG `(out, slot,
+    /// tok)` grid in the batched moe_matvec kernels reads each expert's
+    /// weights cold for every (slot, tok) pair (no cross-token weight
+    /// sharing since adjacent toks route to different experts), so
+    /// batched-K=4 MoE matvec costs ~4× K=1 MoE matvec — same as four
+    /// sequential decodes, plus extra dispatch overhead. To actually
+    /// win we need a bin-by-expert MoE kernel that loads each expert's
+    /// weights once and accumulates dot products for ALL routed (token,
+    /// slot) pairs (the prefill MoE branch's idea, but on-device).
+    /// Until that kernel exists, decode-loop is the win.
     pub fn verify_forward(&self, tokens: &[u32], state: &mut Gemma4GpuState)
         -> Result<Vec<Vec<f32>>, String>
     {
+        if self.n_expert > 0 {
+            // MoE: decode-loop wins on MI50. See docstring for why.
+            return self.verify_forward_via_decode(tokens, state);
+        }
         let p = tokens.len();
-        // Validate + stage tokens / base_pos (host setup).
         self.verify_setup_host(tokens, state)?;
-        // Kernel chain.
         self.enqueue_verify_kernels(state, p)?;
-        // Sync + read logits + advance state (host teardown).
         self.verify_finish_host(state, p)
+    }
+
+    /// MoE verify: K sequential `forward_token` calls. Each call writes
+    /// its token's KV at `state.pos`, advances `pos`, and returns
+    /// logits for the NEXT position. After K calls `state.pos` is
+    /// `base_pos + K` and `hidden_a`/`hidden_b` hold the last token's
+    /// pre/post-output-norm hidden — same end-state as the batched
+    /// verify_forward path. Drafter `set_h_prev_from_target` reads
+    /// `hidden_b`, so the K+1th round seeds correctly.
+    fn verify_forward_via_decode(&self, tokens: &[u32], state: &mut Gemma4GpuState)
+        -> Result<Vec<Vec<f32>>, String>
+    {
+        let p = tokens.len();
+        if p == 0 { return Err("verify_forward_via_decode: empty token slice".into()); }
+        let base_pos = state.pos;
+        if base_pos + p > self.max_seq {
+            return Err(format!("verify_forward_via_decode: base_pos {base_pos} + p {p} > \
+                                max_seq {}", self.max_seq));
+        }
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(p);
+        for &t in tokens {
+            out.push(self.forward_token(t, state)?);
+        }
+        Ok(out)
     }
 
     /// Host-side prep shared by `verify_forward` (inline path) and
@@ -2060,9 +2119,6 @@ impl GpuGemma4 {
     fn verify_setup_host(&self, tokens: &[u32], state: &Gemma4GpuState)
         -> Result<(), String>
     {
-        if self.n_expert > 0 {
-            return Err("verify_forward: dense-only; MoE not yet wired".into());
-        }
         if self.ple.is_some() {
             return Err("verify_forward: PLE/E4B not yet wired".into());
         }
@@ -2114,11 +2170,15 @@ impl GpuGemma4 {
     fn enqueue_verify_kernels(&self, state: &Gemma4GpuState, p: usize)
         -> Result<(), String>
     {
-        if self.n_expert > 0 {
-            return Err("enqueue_verify_kernels: MoE not wired".into());
-        }
         if self.ple.is_some() {
             return Err("enqueue_verify_kernels: PLE/E4B not wired".into());
+        }
+        // MoE targets go through `verify_forward_via_decode` — see
+        // `verify_forward`'s dispatch. Defensive bail in case a future
+        // caller bypasses verify_forward and calls us directly.
+        if self.n_expert > 0 {
+            return Err("enqueue_verify_kernels: dense-only path (MoE uses \
+                        verify_forward_via_decode)".into());
         }
         let base_pos = state.pos;
         let h = self.hidden;
@@ -2228,6 +2288,9 @@ impl GpuGemma4 {
             self.launch_geglu_batched(gate_buf.raw_ptr(), up_buf.raw_ptr(),
                                       gate_buf.raw_ptr(), ff, p as u32)?;
             gemm_into(&b.ffn_down, gate_buf, mlp_buf)?;
+
+            // Dense FFN: shared MLP is the whole feed-forward. MoE
+            // targets early-returned at the top of this function.
             self.launch_rmsnorm_batched(mlp_buf.raw_ptr(), b.post_ffw_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
@@ -2242,7 +2305,7 @@ impl GpuGemma4 {
         // instead of K times); otherwise fall back to K serial calls.
         self.launch_rmsnorm_batched(x.raw_ptr(), self.output_norm.raw_ptr(),
                                     normed.raw_ptr(), hu, p as u32)?;
-        if self.token_embd.dtype == GgmlType::Q5_K && p >= 2 && p <= 4 {
+        if self.token_embd.dtype == GgmlType::Q5_K && p >= 1 && p <= 4 {
             self.launch_lm_head_q5k_batched(normed.raw_ptr(), logits_all.raw_ptr(),
                                             p as u32)?;
         } else {
@@ -2280,9 +2343,18 @@ impl GpuGemma4 {
     /// every replay, so one capture covers every spec-decode round at
     /// that K — only the host-side staging in `verify_setup_host` and
     /// the readback in `verify_finish_host` differ per call.
+    ///
+    /// Dense-only — MoE targets dispatch via `verify_forward_via_decode`
+    /// (the batched-MoE verify path benchmarked ~3.5× slower than K
+    /// sequential `forward_token` calls on MI50; see the gemma4-mtp
+    /// memory file).
     pub fn capture_verify_graph(&self, state: &Gemma4GpuState, k: usize)
         -> Result<GraphExec, String>
     {
+        if self.is_moe() {
+            return Err("capture_verify_graph: MoE targets dispatch via \
+                        verify_forward_via_decode (use is_moe() to skip)".into());
+        }
         if k == 0 || k > self.max_verify_k {
             return Err(format!("capture_verify_graph: k={k} out of 1..={}",
                                self.max_verify_k));
@@ -2335,7 +2407,7 @@ impl GpuGemma4 {
                                    p: u32) -> Result<(), String>
     {
         debug_assert!(self.token_embd.dtype == GgmlType::Q5_K);
-        debug_assert!(p >= 2 && p <= 4, "batched lm_head supports K=2..4");
+        debug_assert!(p >= 1 && p <= 4, "batched lm_head supports K=1..4");
         let in_dim = self.token_embd.in_dim;     // hidden (5376 for 31B)
         let out_dim = self.token_embd.out_dim;   // vocab (262144)
         // 1) Quantize K input rows → BlockQ8 [K, in_dim/32] in self.xq8.
@@ -2790,7 +2862,7 @@ impl GpuGemma4 {
         self.launch_scale(self.normed.raw_ptr(), h, 1.0 / (self.hidden as f32).sqrt())?;
         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(), self.moe_logits.raw_ptr())?;
         self.prof_lap("router_matvec");
-        self.launch_moe_topk()?;
+        self.launch_moe_topk(1)?;
         self.prof_lap("router_topk");
 
         // --- Routed experts --- fully device-resident: the expert ids
@@ -2804,8 +2876,11 @@ impl GpuGemma4 {
         self.launch_moe_matvec(mw.gate_up_exps.dtype, mw.gate_up_exps.repacked,
                                mw.gate_up_exps.data.raw_ptr(),
                                self.xq8.raw_ptr(), self.expert_gu.raw_ptr(), h, 2 * ff_exp,
-                               mw.gate_up_exps.bytes_per_expert as u32, 0)?;
-        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr())?;
+                               mw.gate_up_exps.bytes_per_expert as u32,
+                               /*xq_tok_stride*/ 0,
+                               /*xq_slot_stride*/ 0,
+                               /*n_tok*/ 1)?;
+        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr(), 1)?;
         self.prof_lap("expert_gate_up");
         // down: each expert has its own activation — quantize the batch.
         self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
@@ -2813,10 +2888,13 @@ impl GpuGemma4 {
         self.launch_moe_down(mw.down_exps.dtype, mw.down_exps.repacked,
                              mw.down_exps.data.raw_ptr(),
                              self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
-                             mw.down_exps.bytes_per_expert as u32, ff_exp / 32)?;
+                             mw.down_exps.bytes_per_expert as u32,
+                             /*xq_tok_stride*/ 0,
+                             /*xq_slot_stride*/ ff_exp / 32,
+                             /*n_tok*/ 1)?;
         self.prof_lap("expert_down");
         self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
-                                self.moe_acc.raw_ptr())?;
+                                self.moe_acc.raw_ptr(), 1)?;
         // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2); combined = cur_mlp + cur_moe.
         self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
                             self.normed.raw_ptr(), h)?;

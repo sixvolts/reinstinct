@@ -1,8 +1,10 @@
 // MoE expert matvec — Q8_0 weights, dp4a. Same expert-indexing scheme
 // as moe_matvec_q6k_dp4a; used for the down projection, where each
-// expert slot has its own activation (xq_stride > 0).
+// expert slot has its own activation (xq_slot_stride > 0).
 //
-// grid = (ceil(out_dim/ROWS), n_used); block = 64.
+// grid = (ceil(out_dim/ROWS), n_used, n_tok); block = 64. grid.z
+// batches verify tokens; decode launches with grid.z = 1 + tok_stride
+// = 0. Mirrors moe_matvec_q6k_repacked's batched signature.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -31,14 +33,18 @@ void moe_matvec_q8_0_dp4a_f32(const unsigned char* __restrict__ slab,
                               unsigned int in_dim,
                               unsigned int out_dim,
                               unsigned int bytes_per_expert,
-                              unsigned int xq_stride)
+                              unsigned int xq_tok_stride,
+                              unsigned int xq_slot_stride,
+                              unsigned int n_used)
 {
+    const int tok  = blockIdx.z;
     const int slot = blockIdx.y;
-    const int eid  = ids[slot];
+    const int eid  = ids[(size_t)tok * n_used + slot];
     const BlockQ8_0* w_blocks =
         reinterpret_cast<const BlockQ8_0*>(slab + (size_t)eid * bytes_per_expert);
-    const BlockQ8* xqs = xq + (size_t)slot * xq_stride;
-    float* yo = y + (size_t)slot * out_dim;
+    const BlockQ8* xqs = xq + (size_t)tok * xq_tok_stride
+                            + (size_t)slot * xq_slot_stride;
+    float* yo = y + ((size_t)tok * n_used + slot) * out_dim;
 
     const int row0 = blockIdx.x * ROWS;
     const int lane = threadIdx.x;

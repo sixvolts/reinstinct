@@ -405,12 +405,19 @@ impl PrefillGemm {
             return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
         }
         if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
-            if n_rows >= 2 && n_rows <= 4 {
-                // K=2..4 small-batch: a per-dtype batched matvec that reads
+            if n_rows >= 1 && n_rows <= 4 {
+                // K=1..4 small-batch: a per-dtype batched matvec that reads
                 // each weight sub-block once and dots against all n_rows
                 // activation rows. Cap at 4 to bound per-thread accumulator
                 // pressure (= ROWS*N_ROWS_MAX VGPRs); higher K falls back
                 // to MMQ. K=4 is the empirical sweet spot for accept × tok/s.
+                //
+                // K=1 used to fall through to MMQ (BN=64 row tile wastes
+                // 98% of each workgroup → 390 ms verify(K=1) on 31B).
+                // Letting the batched kernel handle K=1 drops it to the
+                // ~50 ms range. The kernel always reserves N_ROWS_MAX=4
+                // per-thread accumulator slots regardless of actual K, but
+                // the wasted slots cost a few VGPRs, not bandwidth.
                 //
                 // A/B history on this path at K=4:
                 // - MMQ (REINSTINCT_FORCE_MMQ): ~3.3x slower because BN=64

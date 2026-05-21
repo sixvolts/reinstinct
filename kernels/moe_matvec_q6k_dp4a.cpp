@@ -1,12 +1,14 @@
 // MoE expert matvec — Q6_K weights, dp4a. One launch handles all
-// `n_used` routed experts: grid.y selects the expert slot, the expert
-// id is read from the device `ids` buffer (no host round-trip), and the
-// weight base is offset into the 3D expert slab. The activation can be
-// shared across slots (xq_stride = 0, the fused gate_up case) or
-// per-slot (xq_stride > 0).
+// `n_used` routed experts across all `n_tok` verify tokens: grid.y =
+// expert slot, grid.z = token. The expert id is read from
+// `ids[tok * n_used + slot]`, and the weight base is offset into the
+// 3D expert slab. The activation can be shared across slots
+// (xq_slot_stride = 0, the fused gate_up case) or per-slot
+// (xq_slot_stride > 0).
 //
 // Body is matvec_q6_k_dp4a's Q6_K dp4a with an expert-indexing prologue.
-// grid = (ceil(out_dim/ROWS), n_used); block = 64.
+// grid = (ceil(out_dim/ROWS), n_used, n_tok); block = 64. Decode
+// launches with grid.z = 1 + xq_tok_stride = 0.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -37,14 +39,18 @@ void moe_matvec_q6k_dp4a_f32(const unsigned char* __restrict__ slab,
                              unsigned int in_dim,
                              unsigned int out_dim,
                              unsigned int bytes_per_expert,
-                             unsigned int xq_stride)
+                             unsigned int xq_tok_stride,
+                             unsigned int xq_slot_stride,
+                             unsigned int n_used)
 {
+    const int tok  = blockIdx.z;
     const int slot = blockIdx.y;
-    const int eid  = ids[slot];
+    const int eid  = ids[(size_t)tok * n_used + slot];
     const BlockQ6_K* w_blocks =
         reinterpret_cast<const BlockQ6_K*>(slab + (size_t)eid * bytes_per_expert);
-    const BlockQ8* xqs = xq + (size_t)slot * xq_stride;
-    float* yo = y + (size_t)slot * out_dim;
+    const BlockQ8* xqs = xq + (size_t)tok * xq_tok_stride
+                            + (size_t)slot * xq_slot_stride;
+    float* yo = y + ((size_t)tok * n_used + slot) * out_dim;
 
     const int row0 = blockIdx.x * ROWS;
     const int lane = threadIdx.x;

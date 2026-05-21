@@ -9,7 +9,8 @@
 // partials are summed through LDS. Q8_0 has no super-block scale plane,
 // so n_sub need not be a power of two.
 //
-// grid = (ceil(out_dim / rows_per_block), n_used); block 256.
+// grid = (ceil(out_dim / rows_per_block), n_used, n_tok); block 256.
+// grid.z batches verify tokens; decode launches grid.z = 1.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -36,15 +37,19 @@ void moe_matvec_q8_0_down_f32(const unsigned char* __restrict__ slab,
                               unsigned int in_dim,
                               unsigned int out_dim,
                               unsigned int bytes_per_expert,
-                              unsigned int xq_stride)
+                              unsigned int xq_tok_stride,
+                              unsigned int xq_slot_stride,
+                              unsigned int n_used)
 {
     __shared__ float red[256];
+    const int tok  = blockIdx.z;
     const int slot = blockIdx.y;
-    const int eid  = ids[slot];
+    const int eid  = ids[(size_t)tok * n_used + slot];
     const BlockQ8_0* w_blocks =
         reinterpret_cast<const BlockQ8_0*>(slab + (size_t)eid * bytes_per_expert);
-    const BlockQ8* xqs = xq + (size_t)slot * xq_stride;
-    float* yo = y + (size_t)slot * out_dim;
+    const BlockQ8* xqs = xq + (size_t)tok * xq_tok_stride
+                            + (size_t)slot * xq_slot_stride;
+    float* yo = y + ((size_t)tok * n_used + slot) * out_dim;
 
     const unsigned int n_sub = in_dim >> 5;
     const unsigned int rpb   = 256u / n_sub;          // rows per block

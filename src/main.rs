@@ -1447,11 +1447,86 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     // before each replay. Captured at this round's K (graph is K-
     // specific); rejection-rounds with smaller draft sets fall back to
     // inline verify_forward. Disable with REINSTINCT_NO_VERIFY_GRAPH=1.
-    let verify_graph = if std::env::var("REINSTINCT_NO_VERIFY_GRAPH").is_err() {
+    let verify_graph = if std::env::var("REINSTINCT_NO_VERIFY_GRAPH").is_err()
+                          && !gm.is_moe()
+    {
         Some(gm.capture_verify_graph(&state, k).map_err(anyhow::Error::msg)?)
     } else {
+        // MoE targets dispatch via verify_forward_via_decode (K
+        // sequential forward_token calls); no captured graph needed.
         None
     };
+
+    // REINSTINCT_VERIFY_BENCH: warm + time verify_forward(K) across N
+    // calls, print per-call ms. Use to compare verify implementations
+    // head-to-head on a fixed token batch.
+    if std::env::var_os("REINSTINCT_VERIFY_BENCH").is_some() {
+        let n_iter = std::env::var("REINSTINCT_VERIFY_BENCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(20usize);
+        // Build a batch of K decode tokens to use as drafted.
+        let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+        let mut cur = argmax(&verify_logits);
+        let mut batch: Vec<u32> = Vec::with_capacity(k);
+        for _ in 0..k {
+            batch.push(cur);
+            let lg = gm.forward_token(cur, &mut state).map_err(anyhow::Error::msg)?;
+            cur = argmax(&lg);
+        }
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        // Warm
+        let _ = gm.verify_forward(&batch, &mut state).map_err(anyhow::Error::msg)?;
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        // Timed
+        let t = std::time::Instant::now();
+        for _ in 0..n_iter {
+            let _ = gm.verify_forward(&batch, &mut state).map_err(anyhow::Error::msg)?;
+            state.restore(&snap).map_err(anyhow::Error::msg)?;
+        }
+        let el = t.elapsed().as_secs_f64();
+        println!("verify_forward(K={k}) × {n_iter}: {:.2} ms/call (avg)",
+                 el * 1e3 / n_iter as f64);
+        return Ok(());
+    }
+
+    // REINSTINCT_VERIFY_SMOKE: parity check verify_forward(K tokens) vs K
+    // sequential forward_token calls. Both run from the same post-prefill
+    // state via KV-cache snapshot/restore (hidden_a/hidden_b are written
+    // fresh by each forward, so don't need restoring). The K forward_token
+    // results define the ground truth; verify_forward should match.
+    if std::env::var_os("REINSTINCT_VERIFY_SMOKE").is_some() {
+        let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+        let smoke_k = k;
+        // Decode path: K sequential forward_token calls.
+        let mut decode_tokens: Vec<u32> = Vec::with_capacity(smoke_k);
+        let mut decode_logits: Vec<Vec<f32>> = Vec::with_capacity(smoke_k);
+        let mut cur = argmax(&verify_logits);
+        for _ in 0..smoke_k {
+            decode_tokens.push(cur);
+            let lg = gm.forward_token(cur, &mut state).map_err(anyhow::Error::msg)?;
+            cur = argmax(&lg);
+            decode_logits.push(lg);
+        }
+        // Restore KV state, run verify_forward on the K decoded tokens.
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        let verify_logits_arr = gm.verify_forward(&decode_tokens, &mut state)
+            .map_err(anyhow::Error::msg)?;
+        println!("\n=== verify-smoke (K={smoke_k}) ===");
+        let mut all_match = true;
+        for i in 0..smoke_k {
+            let a_d = argmax(&decode_logits[i]);
+            let a_v = argmax(&verify_logits_arr[i]);
+            let l1: f32 = decode_logits[i].iter().zip(verify_logits_arr[i].iter())
+                .map(|(a,b)| (a-b).abs()).sum::<f32>() / decode_logits[i].len() as f32;
+            let mx: f32 = decode_logits[i].iter().zip(verify_logits_arr[i].iter())
+                .map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            if a_d != a_v { all_match = false; }
+            println!("  pos {i}: decode-argmax={a_d}  verify-argmax={a_v}  \
+                    {}  mean|Δ|={l1:.4}  max|Δ|={mx:.4}",
+                    if a_d == a_v { "MATCH" } else { "MISMATCH" });
+        }
+        println!("smoke result: {}", if all_match { "PASS" } else { "FAIL" });
+        return Ok(());
+    }
 
     // The drafter is conditioned on (prev_tok, h_prev=target_hidden_at_pos).
     // After the initial forward_token, the natural last_token is the

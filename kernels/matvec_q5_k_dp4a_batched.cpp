@@ -10,10 +10,7 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define ROWS         2     // output rows per wavefront (test: drop from 4 →
-                           // 2 so we can apply the (r,b)→(b,r) loop swap
-                           // without hitting the VGPR wall — at ROWS=4 the
-                           // swap hurt by ~3-4%)
+#define ROWS         2     // output rows per wavefront
 #define N_ROWS_MAX   4     // batch upper bound
 
 struct __attribute__((packed)) BlockQ5_K {
