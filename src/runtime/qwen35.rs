@@ -61,6 +61,7 @@ const L2NORM_QK_SOURCE:             &str = include_str!("../../kernels/l2norm_qk
 const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
 
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
+const MATVEC_F32_B256_SOURCE: &str = include_str!("../../kernels/matvec_f32_b256.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
 const EMBED_LOOKUP_Q8_0_SOURCE: &str = include_str!("../../kernels/embed_lookup_q8_0_v.cpp");
@@ -107,7 +108,6 @@ const MATVEC_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q8_
 /// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
 const DP4A_ROWBLOCK: u32 = 2;
 
-const MATVEC_F32_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f32_wave64.cpp");
 const MATVEC_Q4_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k_wave64.cpp");
 const MATVEC_Q5_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k_wave64.cpp");
 const MATVEC_Q6_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k_wave64.cpp");
@@ -780,10 +780,13 @@ pub struct GpuQwen35 {
     rmsnorm_gated_multihead_module: Module,
 
     matvec_f16_module:     Module,
+    /// 256-thread/block fp32 matvec — wins over the wave64 path on
+    /// small `out_dim` matvecs where wave64 starves the GPU. Used by
+    /// the GDN `ssm_alpha` / `ssm_beta` projections (out_dim=n_heads=48).
+    matvec_f32_b256_module: Module,
     embed_lookup_q6_k_module: Module,
     embed_lookup_q4_k_module: Module,
     embed_lookup_q8_0_module: Module,
-    matvec_f32_wave64_module:    Module,
     matvec_q4_k_wave64_module:   Module,
     matvec_q5_k_wave64_module:   Module,
     matvec_q6_k_wave64_module:   Module,
@@ -964,10 +967,10 @@ impl GpuQwen35 {
         let l2norm_qk_hsaco              = cache.compile("l2norm_qk",        L2NORM_QK_SOURCE)?;
         let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
+        let matvec_f32_b256_hsaco = cache.compile("matvec_f32_b256", MATVEC_F32_B256_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
         let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
         let embed_lookup_q8_0_hsaco = cache.compile("embed_lookup_q8_0_v", EMBED_LOOKUP_Q8_0_SOURCE)?;
-        let matvec_f32_wave64_hsaco    = cache.compile("matvec_f32_wave64",    MATVEC_F32_WAVE64_SOURCE)?;
         let matvec_q4_k_wave64_hsaco   = cache.compile("matvec_q4_k_wave64",   MATVEC_Q4_K_WAVE64_SOURCE)?;
         let matvec_q5_k_wave64_hsaco   = cache.compile("matvec_q5_k_wave64",   MATVEC_Q5_K_WAVE64_SOURCE)?;
         let matvec_q6_k_wave64_hsaco   = cache.compile("matvec_q6_k_wave64",   MATVEC_Q6_K_WAVE64_SOURCE)?;
@@ -1033,6 +1036,7 @@ impl GpuQwen35 {
             l2norm_qk_module:             Module::load(&l2norm_qk_hsaco)?,
             rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
+            matvec_f32_b256_module: Module::load(&matvec_f32_b256_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
             embed_lookup_q4_k_module: Module::load(&embed_lookup_q4_k_hsaco)?,
             embed_lookup_q8_0_module: Module::load(&embed_lookup_q8_0_hsaco)?,
@@ -1056,7 +1060,6 @@ impl GpuQwen35 {
             mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
             mmq_q5k_module:           Module::load(&cache.compile("mmq_gemm_q5k_repacked", MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k_module:           Module::load(&cache.compile("mmq_gemm_q6k_repacked", MMQ_GEMM_Q6K_SOURCE)?)?,
-            matvec_f32_wave64_module:    Module::load(&matvec_f32_wave64_hsaco)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
             matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
             matvec_q6_k_wave64_module:   Module::load(&matvec_q6_k_wave64_hsaco)?,
@@ -1255,6 +1258,26 @@ impl GpuQwen35 {
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// 256-thread-block fp32 matvec — one block per output row, 4 waves
+    /// of 64 each reduce through a 4-element LDS slot. Wins on small
+    /// `out_dim` where the wave64 layout (one wavefront per row) leaves
+    /// the GPU idle. See kernels/matvec_f32_b256.cpp.
+    fn launch_matvec_f32_b256(&self, w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                              in_dim: u32, out_dim: u32) -> Result<(), String>
+    {
+        let f = self.matvec_f32_b256_module.function("matvec_f32_b256")?;
+        let mut wa = w; let mut xa = x; let mut ya = y;
+        let mut ia = in_dim; let mut oa = out_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut wa as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((out_dim, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
     /// Force the fp32 or int8-dp4a matvec path. Used by the GPU-vs-CPU
     /// consistency tests to compare against the fp32 CPU oracle.
     pub fn set_dp4a(&mut self, on: bool) { self.dp4a_enabled = on; }
@@ -1355,8 +1378,11 @@ impl GpuQwen35 {
         }
 
         match w.dtype {
-            GgmlType::F32    => self.launch_matvec_wave64(&self.matvec_f32_wave64_module,
-                                    "matvec_f32_wave64", wp, x, y, in_d, out_d),
+            // 256-thread/block fp32 — the wave64 alternative starves the
+            // GPU on small `out_dim` matvecs (qwen GDN's ssm_alpha/beta
+            // are [hidden, n_heads=48], so wave64 launches only 48
+            // wavefronts ≈ 0.8/CU. b256 launches 4× more in flight).
+            GgmlType::F32    => self.launch_matvec_f32_b256(wp, x, y, in_d, out_d),
             GgmlType::Q8_0   => self.launch_matvec_wave64(&self.matvec_q8_0_wave64_module,
                                     "matvec_q8_0_wave64_f32", wp, x, y, in_d, out_d),
             GgmlType::Q4_K   => self.launch_matvec_wave64(&self.matvec_q4_k_wave64_module,
