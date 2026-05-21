@@ -96,6 +96,10 @@ impl Qwen35F32Weights {
                 BlockKind::FullAttention => BlockWeights::FullAttention(
                     load_full_attention(gguf, layer)?
                 ),
+                BlockKind::NextN => unreachable!(
+                    "NextN blocks live outside model.block_kinds; loader \
+                     skipped them at model.block_kinds construction time"
+                ),
             });
         }
 
@@ -556,6 +560,10 @@ impl Qwen35F32State {
                         config.gdn_conv_kernel as usize,
                     )));
                 }
+                BlockKind::NextN => unreachable!(
+                    "NextN blocks live outside block_kinds (MTP head, \
+                     not run in main forward)"
+                ),
             }
         }
         let rope = RopeCache::new(

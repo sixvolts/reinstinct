@@ -94,6 +94,14 @@ pub struct Qwen35Config {
 
     /// `Some` on `qwen35moe`.
     pub moe: Option<MoeConfig>,
+
+    /// Number of trailing blocks that are MTP "next-N" predictor heads.
+    /// 0 for the base model; 1 for Unsloth's Qwen 3.6 MTP release
+    /// (block_count = 65 with the last block being the MTP layer:
+    /// full-attention transformer block + `nextn.{eh_proj, enorm,
+    /// hnorm, shared_head_norm}` weights, run separately from the
+    /// main forward as a 1-token drafter).
+    pub nextn_predict_layers: u32,
 }
 
 impl Qwen35Config {
@@ -123,6 +131,8 @@ impl Qwen35Config {
         let full_attention_interval = require_u32(gguf, &k(p, "full_attention_interval"))?;
         let eos_token_id            = require_u32(gguf, "tokenizer.ggml.eos_token_id")?;
         let rope_dim_sections       = read_u32_array(gguf, &k(p, "rope.dimension_sections"))?;
+        let nextn_predict_layers    = gguf.metadata_get(&k(p, "nextn_predict_layers"))
+            .and_then(|v| v.as_u32()).unwrap_or(0);
 
         // Dense FFN width — absent on the MoE arch.
         let ffn_size = gguf.metadata_get(&k(p, "feed_forward_length"))
@@ -159,13 +169,18 @@ impl Qwen35Config {
             attn_n_heads, attn_n_kv_heads, attn_head_dim,
             gdn_value_dim, gdn_n_heads, gdn_n_k_heads, gdn_head_dim, gdn_conv_kernel,
             rope_freq_base, rope_dim_count, rope_dim_sections,
+            nextn_predict_layers,
             full_attention_interval, tied_embeddings, moe,
         })
     }
 
-    /// Per-layer block type. Blocks where `(idx+1) % interval == 0` are
-    /// full attention, the rest linear (GDN).
+    /// Per-layer block type. The trailing `nextn_predict_layers` blocks
+    /// are MTP next-N heads (NextN); blocks before that follow the
+    /// `(idx+1) % interval == 0 ⇒ FullAttention` schedule.
     pub fn block_kind(&self, layer_idx: u32) -> BlockKind {
+        if layer_idx >= self.block_count - self.nextn_predict_layers {
+            return BlockKind::NextN;
+        }
         if (layer_idx + 1) % self.full_attention_interval == 0 {
             BlockKind::FullAttention
         } else {
@@ -174,6 +189,15 @@ impl Qwen35Config {
     }
 
     pub fn is_moe(&self) -> bool { self.moe.is_some() }
+
+    /// True for models with one or more trailing MTP next-N predictor
+    /// blocks (Unsloth's Qwen 3.6 MTP release).
+    pub fn has_nextn(&self) -> bool { self.nextn_predict_layers > 0 }
+
+    /// Number of "main forward" blocks — total minus any trailing NextN
+    /// MTP heads. The drafter loop runs blocks 0..n_main_blocks for the
+    /// main step and the trailing block(s) only on demand.
+    pub fn n_main_blocks(&self) -> u32 { self.block_count - self.nextn_predict_layers }
 
     /// Linear-attention key/value head dim (K/Q and V share it).
     pub fn gdn_value_head_dim(&self) -> u32 { self.gdn_head_dim }
@@ -191,6 +215,11 @@ impl Qwen35Config {
 pub enum BlockKind {
     LinearAttention,
     FullAttention,
+    /// MTP next-N predictor head. Same tensor layout as `FullAttention`
+    /// plus the `nextn.{eh_proj, enorm, hnorm, shared_head_norm}`
+    /// weights. Not run during the main forward — invoked by the
+    /// spec-decode drafter to produce a +2 token candidate.
+    NextN,
 }
 
 /// Loaded model: config + per-layer block schedule. Tensor data stays in
@@ -198,18 +227,30 @@ pub enum BlockKind {
 #[derive(Debug, Clone)]
 pub struct Qwen35Model {
     pub config: Qwen35Config,
+    /// Block kinds for the MAIN FORWARD only — size `n_main_blocks()`.
+    /// On MTP-enabled GGUFs (`nextn_predict_layers > 0`) the trailing
+    /// NextN blocks are NOT in this vec; load them via
+    /// `mtp_block_kinds()` / `expected_tensors(idx, NextN, ...)`.
     pub block_kinds: Vec<BlockKind>,
 }
 
 impl Qwen35Model {
     pub fn load(gguf: &GgufFile) -> Result<Self> {
         let config = Qwen35Config::from_gguf(gguf)?;
-        let block_kinds: Vec<BlockKind> = (0..config.block_count)
+        let block_kinds: Vec<BlockKind> = (0..config.n_main_blocks())
             .map(|i| config.block_kind(i))
             .collect();
         let model = Self { config, block_kinds };
         model.validate_tensor_presence(gguf)?;
         Ok(model)
+    }
+
+    /// Layer indices and kinds for the trailing MTP NextN blocks.
+    /// Empty on base models.
+    pub fn mtp_block_kinds(&self) -> Vec<(u32, BlockKind)> {
+        (self.config.n_main_blocks()..self.config.block_count)
+            .map(|i| (i, self.config.block_kind(i)))
+            .collect()
     }
 
     fn validate_tensor_presence(&self, gguf: &GgufFile) -> Result<()> {
@@ -218,8 +259,15 @@ impl Qwen35Model {
         if !self.config.tied_embeddings {
             require_tensor(gguf, "output.weight")?;
         }
+        // Main-forward blocks.
         for (i, &kind) in self.block_kinds.iter().enumerate() {
             for name in expected_tensors(i as u32, kind, self.config.is_moe()) {
+                require_tensor(gguf, &name)?;
+            }
+        }
+        // MTP NextN blocks (if any).
+        for (i, kind) in self.mtp_block_kinds() {
+            for name in expected_tensors(i, kind, self.config.is_moe()) {
                 require_tensor(gguf, &name)?;
             }
         }
@@ -275,6 +323,23 @@ pub fn expected_tensors(layer: u32, kind: BlockKind, moe: bool) -> Vec<String> {
                 format!("blk.{layer}.attn_q_norm.weight"),
                 format!("blk.{layer}.attn_k_norm.weight"),
                 format!("blk.{layer}.attn_output.weight"),
+            ]);
+        }
+        BlockKind::NextN => {
+            // Same attention layout as FullAttention plus the MTP-specific
+            // weights. The eh_proj concatenates (enorm(embed), hnorm(prev
+            // hidden)) — output dim is 2*hidden, input is hidden.
+            names.extend([
+                format!("blk.{layer}.attn_q.weight"),
+                format!("blk.{layer}.attn_k.weight"),
+                format!("blk.{layer}.attn_v.weight"),
+                format!("blk.{layer}.attn_q_norm.weight"),
+                format!("blk.{layer}.attn_k_norm.weight"),
+                format!("blk.{layer}.attn_output.weight"),
+                format!("blk.{layer}.nextn.eh_proj.weight"),
+                format!("blk.{layer}.nextn.enorm.weight"),
+                format!("blk.{layer}.nextn.hnorm.weight"),
+                format!("blk.{layer}.nextn.shared_head_norm.weight"),
             ]);
         }
     }
@@ -347,6 +412,7 @@ mod tests {
             gdn_head_dim: 128, gdn_conv_kernel: 4,
             rope_freq_base: 1e7, rope_dim_count: 64, rope_dim_sections: [11, 11, 10, 0],
             full_attention_interval: 4, tied_embeddings: true, moe: None,
+            nextn_predict_layers: 0,
         }
     }
 

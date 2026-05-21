@@ -488,6 +488,44 @@ impl GpuFullAttnWeights {
     }
 }
 
+/// MTP next-N predictor head — Unsloth's Qwen 3.6 MTP layout
+/// ("DeepSeek-V3 style"). One full-attention transformer block plus the
+/// MTP-specific tensors. Invoked once per spec-decode round to produce
+/// a +2 token candidate from `(prev_hidden, embed(next_tok))`:
+///
+///     concat(enorm(embed_next), hnorm(prev_hidden))   ─ [2·hidden]
+///       → eh_proj → hidden                            ─ [hidden]
+///       → full transformer block (attn + ffn)         ─ [hidden]
+///       → shared_head_norm                            ─ [hidden]
+///       → tied lm_head                                ─ [vocab]
+///
+/// Loaded once at startup and stashed on `GpuQwen35.mtp`; doesn't
+/// participate in `forward_token` / `prefill_forward`.
+pub struct GpuMtpHead {
+    pub block:            GpuFullAttnBlock,
+    pub eh_proj:          GpuMatvecTensor,   // [2·hidden, hidden]
+    pub enorm:            DeviceBuf<f32>,    // [hidden] — RMSNorm on embed_next
+    pub hnorm:            DeviceBuf<f32>,    // [hidden] — RMSNorm on prev_hidden
+    pub shared_head_norm: DeviceBuf<f32>,    // [hidden] — pre-lm_head RMSNorm
+}
+
+impl GpuMtpHead {
+    pub fn from_gguf(gguf: &GgufFile, layer: u32, repack: bool, moe: bool)
+        -> Result<Self, String>
+    {
+        let pre = format!("blk.{layer}.");
+        let mv = |n: &str| if repack { GpuMatvecTensor::from_gguf_matvec(gguf, n) }
+                           else      { GpuMatvecTensor::from_gguf(gguf, n) };
+        Ok(Self {
+            block:            GpuFullAttnBlock::from_gguf(gguf, layer, repack, moe)?,
+            eh_proj:          mv(&format!("{pre}nextn.eh_proj.weight"))?,
+            enorm:            load_fp32_tensor(gguf, &format!("{pre}nextn.enorm.weight"))?,
+            hnorm:            load_fp32_tensor(gguf, &format!("{pre}nextn.hnorm.weight"))?,
+            shared_head_norm: load_fp32_tensor(gguf, &format!("{pre}nextn.shared_head_norm.weight"))?,
+        })
+    }
+}
+
 /// Linear-attention (GDN) block weights, resident on device.
 pub struct GpuLinAttnWeights {
     pub attn_norm:   DeviceBuf<f32>,    // [hidden]
@@ -594,6 +632,10 @@ impl GpuBlock {
                 GpuBlock::Full(GpuFullAttnBlock::from_gguf(gguf, layer, repack, moe)?),
             BlockKind::LinearAttention =>
                 GpuBlock::Linear(GpuLinAttnBlock::from_gguf(gguf, layer, repack, moe)?),
+            BlockKind::NextN => unreachable!(
+                "NextN blocks aren't loaded into GpuBlock — they're MTP \
+                 heads tracked separately on the runtime"
+            ),
         })
     }
 }
@@ -641,6 +683,9 @@ impl Qwen35GpuState {
                     conv_dim,
                     cfg.gdn_conv_kernel as usize,
                 )?),
+                BlockKind::NextN => unreachable!(
+                    "NextN blocks have no main-forward state (MTP drafter)"
+                ),
             });
         }
         Ok(Self { block_states, pos: 0 })
@@ -835,6 +880,12 @@ pub struct GpuQwen35 {
 
     /// `Some` for a `qwen35moe` model — MoE FFN kernels + scratch.
     moe: Option<MoeRuntime>,
+
+    /// MTP next-N predictor heads (Unsloth Qwen 3.6 MTP release). One
+    /// entry per `nextn_predict_layers` — usually 1 if present.
+    /// Loaded once at startup; invoked from a separate `mtp_forward`
+    /// entry point for the drafter step in spec-decode rounds.
+    mtp: Vec<GpuMtpHead>,
 }
 
 impl GpuQwen35 {
@@ -981,6 +1032,11 @@ impl GpuQwen35 {
         for (i, &kind) in model.block_kinds.iter().enumerate() {
             blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind, true, model.config.is_moe())?);
         }
+        // MTP next-N predictor heads (Unsloth Qwen 3.6 MTP). Loaded once
+        // here; invoked only by the spec-decode drafter.
+        let mtp: Vec<GpuMtpHead> = model.mtp_block_kinds().iter()
+            .map(|&(i, _kind)| GpuMtpHead::from_gguf(gguf, i, true, model.config.is_moe()))
+            .collect::<Result<_, _>>()?;
         let moe_runtime = match &cfg.moe {
             Some(mc) => Some(MoeRuntime::new(mc, hidden, cache)?),
             None => None,
@@ -1079,8 +1135,16 @@ impl GpuQwen35 {
             rms_eps: cfg.rms_norm_eps,
             max_seq,
             moe: moe_runtime,
+            mtp,
         })
     }
+
+    /// `true` when this GGUF carries one or more MTP next-N predictor
+    /// heads — the spec-decode drafter can call `mtp_forward`.
+    pub fn has_mtp(&self) -> bool { !self.mtp.is_empty() }
+
+    /// Number of MTP heads available (= `nextn_predict_layers`).
+    pub fn n_mtp_heads(&self) -> usize { self.mtp.len() }
 
     /// q_dim = n_heads * head_dim
     pub fn q_dim(&self) -> usize { self.n_heads * self.head_dim }

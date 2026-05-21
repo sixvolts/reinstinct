@@ -680,6 +680,7 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
         match kind {
             BlockKind::LinearAttention => { sum_lin += avg; count_lin += 1; }
             BlockKind::FullAttention   => { sum_full += avg; count_full += 1; }
+            BlockKind::NextN           => {} // MTP head, not run in main forward
         }
     }
     let pct = |x: f32| 100.0 * x / total;
@@ -988,6 +989,7 @@ fn bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Re
             match m.model.block_kinds[i] {
                 BlockKind::LinearAttention => { sum_blocks_lin += b; count_lin += 1; }
                 BlockKind::FullAttention   => { sum_blocks_full += b; count_full += 1; }
+                BlockKind::NextN           => {} // MTP head, not run in main forward
             }
         }
     }
@@ -1018,6 +1020,7 @@ fn bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Re
         let kind = match m.model.block_kinds[i] {
             BlockKind::LinearAttention => "L",
             BlockKind::FullAttention   => "F",
+            BlockKind::NextN           => "N",  // shouldn't appear in main block_kinds
         };
         println!("  block {i:>2} {kind}  {:>7.3}", (s / n) as f64 / 1.0e6);
     }
@@ -1785,6 +1788,7 @@ fn print_qwen35(m: &Qwen35Model) {
         let tag = match k {
             BlockKind::LinearAttention => "L",
             BlockKind::FullAttention   => "F",
+            BlockKind::NextN           => "N",
         };
         print!("  {i:2}:{tag}");
         if (i + 1) % 8 == 0 { println!(); }
