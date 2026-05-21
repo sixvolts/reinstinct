@@ -90,8 +90,12 @@ enum Command {
         prompt: Option<String>,
         #[arg(long)]
         system: Option<String>,
-        /// Drafted tokens per spec-decode round.
-        #[arg(long, default_value_t = 4)]
+        /// Drafted tokens per spec-decode round. K=3 is the empirical
+        /// sweet spot on Gemma 31B + MI50: best tok/s on capital /
+        /// primes / tea prompts, only marginally behind K=2 on math
+        /// (100% accept) and K=4 on haiku (where the drafter struggles
+        /// regardless). See scripts/bench-all.sh output for the sweep.
+        #[arg(long, default_value_t = 3)]
         k: usize,
         /// Total tokens to generate (round trip until this many accepted).
         #[arg(short = 'n', long, default_value_t = 64)]
