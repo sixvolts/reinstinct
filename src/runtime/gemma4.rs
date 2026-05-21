@@ -54,8 +54,6 @@ const ATTN_MAX_SPLITS: u32 = 16;
 const MAX_VERIFY_K: usize = 8;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
-const EMBED_Q6K_SRC:         &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
-const EMBED_F32_SRC:         &str = include_str!("../../kernels/embed_lookup.cpp");
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
 // MoE kernel sources.
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
@@ -563,9 +561,7 @@ pub struct GpuGemma4 {
     prof_mark:      std::cell::Cell<std::time::Instant>,
     prof_buckets:   std::cell::RefCell<Vec<(&'static str, f64)>>,
     m_embed_q5k: Module,
-    m_embed_q6k: Module,
     m_embed_q8_0: Module,
-    m_embed_f32: Module,
     m_mv_f32:    Module,
     m_mv_q4k:    Module,
     m_mv_q5k:    Module,
@@ -813,9 +809,7 @@ impl GpuGemma4 {
             prof_mark:      std::cell::Cell::new(std::time::Instant::now()),
             prof_buckets:   std::cell::RefCell::new(Vec::new()),
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
-            m_embed_q6k:  ld("embed_lookup_q6_k", EMBED_Q6K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
-            m_embed_f32:  ld("embed_lookup", EMBED_F32_SRC)?,
             m_mv_f32:     ld("matvec_f32_b256", MATVEC_F32_B256_SRC)?,
             m_mv_q4k:     ld("matvec_q4_k_rowblock", MATVEC_Q4K_W_SRC)?,
             m_mv_q5k:     ld("matvec_q5_k_rowblock", MATVEC_Q5K_W_SRC)?,
@@ -2469,70 +2463,6 @@ impl GpuGemma4 {
     /// `[base_pos, base_pos+p)` rotate at their absolute sequence
     /// positions. Used by `verify_forward` when we batch process
     /// K candidate tokens starting from a non-zero state.pos.
-    fn launch_rope_batched(&self, x: *mut c_void, n_heads: u32, head_dim: u32,
-                           kind: AttnKind, p: usize, base_pos: u32) -> Result<(), String>
-    {
-        let f = self.m_rope_b.function("rope_apply_batched_f32")?;
-        let (cos, sin, rd) = match kind {
-            AttnKind::Sliding => (self.rope_cos_swa.raw_ptr(), self.rope_sin_swa.raw_ptr(),
-                                  self.rope_dim_swa as u32),
-            AttnKind::Full    => (self.rope_cos_full.raw_ptr(), self.rope_sin_full.raw_ptr(),
-                                  self.rope_dim_full as u32),
-        };
-        let block: u32 = 64;
-        let grid_x = ((rd / 2) + block - 1) / block;
-        let mut xa=x; let mut ca=cos; let mut sa=sin;
-        let mut hd=head_dim; let mut rdv=rd; let mut nh=n_heads; let mut bp=base_pos;
-        let mut args: [*mut c_void; 7] = [
-            &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
-            &mut sa as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
-            &mut rdv as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void];
-        unsafe { f.launch((grid_x, n_heads, p as u32),(block,1,1), 0, Some(&self.stream), &mut args) }
-    }
-
-    /// Batched int8 attention over the decode KV cache — K queries at
-    /// positions `[base_pos, base_pos+n_q_rows)`, each with its own
-    /// causal range. The MTP spec-decode verify path.
-    fn launch_attn_step_q8_batched(&self,
-        q: *mut c_void,
-        k_cache: *mut c_void, k_scale: *mut c_void,
-        v_cache: *mut c_void, v_scale: *mut c_void,
-        out: *mut c_void,
-        n_kv: u32, head_dim: u32,
-        base_pos: u32, n_q_rows: u32,
-        window: u32) -> Result<(), String>
-    {
-        let f = self.m_attn_step_q8_b.function("attn_step_q8_batched_f32")?;
-        let n_heads = self.n_heads as u32;
-        let block: u32 = 256;
-        // LDS: head_dim int8 + (base_pos+n_q_rows) f32 scores + block f32 tmp
-        let max_win = if window > 0 { window.min(base_pos + n_q_rows) }
-                      else { base_pos + n_q_rows };
-        let smem = head_dim + (max_win + block) * 4;
-        // Gemma 4's attn_q_norm has 1/√head_dim baked into its weights
-        // (`query_pre_attn_scalar`), so the attention kernel takes the
-        // raw int8 dp4a Q·Kᵀ without extra scaling — same convention
-        // as launch_attn_q8 / launch_attn_prefill.
-        let scaling: f32 = 1.0f32;
-
-        let mut qa=q; let mut kca=k_cache; let mut ksa=k_scale;
-        let mut vca=v_cache; let mut vsa=v_scale; let mut oa=out;
-        let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut bp=base_pos; let mut nq=n_q_rows; let mut wn=window;
-        let mut sc=scaling;
-        let mut args: [*mut c_void; 13] = [
-            &mut qa as *mut _ as *mut c_void, &mut kca as *mut _ as *mut c_void,
-            &mut ksa as *mut _ as *mut c_void, &mut vca as *mut _ as *mut c_void,
-            &mut vsa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
-            &mut nq as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void];
-        unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), smem,
-                           Some(&self.stream), &mut args) }
-    }
-
     // ===== Offset-variant launchers used by verify_forward =====
     //
     // The three kernels below (kv_quant_prefill_offset_f32, rope_apply_

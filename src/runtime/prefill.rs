@@ -32,54 +32,6 @@ const MV_Q5K_REPACKED_BATCHED_SOURCE: &str =
 const MV_Q6K_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q6k_repacked_batched.cpp");
 
-/// Bulk-dequantize a quantized weight tensor to an fp16 device buffer.
-/// `n_elements` is the logical weight count (out_dim * in_dim).
-fn dequant_to_f16(cache: &KernelCache, w_bytes: &[u8], dtype: GgmlType, n_elements: usize)
-    -> Result<DeviceBuf<u16>, String>
-{
-    // F16 weights need no dequant — the bytes are already fp16.
-    if dtype == GgmlType::F16 {
-        assert_eq!(w_bytes.len(), n_elements * 2, "F16 byte count mismatch");
-        let words: &[u16] = bytemuck::cast_slice(w_bytes);
-        return DeviceBuf::from_slice(words);
-    }
-
-    let (src, kname, weights_per_block, block_threads): (&str, &str, usize, u32) = match dtype {
-        GgmlType::Q4_K   => (include_str!("../../kernels/dequant_q4_k_f16.cpp"),
-                             "dequant_q4_k_f16", 256, 256),
-        GgmlType::Q5_K   => (include_str!("../../kernels/dequant_q5_k_f16.cpp"),
-                             "dequant_q5_k_f16", 256, 256),
-        GgmlType::Q6_K   => (include_str!("../../kernels/dequant_q6_k_f16.cpp"),
-                             "dequant_q6_k_f16", 256, 256),
-        GgmlType::Q8_0   => (include_str!("../../kernels/dequant_q8_0_f16.cpp"),
-                             "dequant_q8_0_f16", 32, 32),
-        GgmlType::IQ4_XS => (include_str!("../../kernels/dequant_iq4_xs_f16.cpp"),
-                             "dequant_iq4_xs_f16", 256, 256),
-        other => return Err(format!("dequant_to_f16: unsupported dtype {other:?}")),
-    };
-    assert_eq!(n_elements % weights_per_block, 0,
-        "n_elements not a multiple of block size");
-    let n_blocks = n_elements / weights_per_block;
-
-    let hsaco = cache.compile(kname, src)?;
-    let module = Module::load(&hsaco)?;
-    let f = module.function(kname)?;
-
-    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(w_bytes)?;
-    let out: DeviceBuf<u16> = DeviceBuf::new(n_elements)?;
-    let mut w_ptr = dw.raw_ptr();
-    let mut o_ptr = out.raw_ptr();
-    let mut nb = n_blocks as u32;
-    let mut args: [*mut c_void; 3] = [
-        &mut w_ptr as *mut _ as *mut c_void,
-        &mut o_ptr as *mut _ as *mut c_void,
-        &mut nb    as *mut _ as *mut c_void,
-    ];
-    unsafe { f.launch((n_blocks as u32, 1, 1), (block_threads, 1, 1), 0, None, &mut args)?; }
-    hip::Device(0).synchronize()?;
-    Ok(out)
-}
-
 /// Dequantize a quantized weight already resident on device to fp16.
 /// Same kernels as `dequant_to_f16`, but the input bytes are not
 /// re-uploaded — for the prefill forward, weights are already resident.

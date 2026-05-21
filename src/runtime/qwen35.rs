@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
@@ -43,7 +43,6 @@ use super::KernelCache;
 
 const EMBED_LOOKUP_SOURCE:      &str = include_str!("../../kernels/embed_lookup.cpp");
 const RMSNORM_SOURCE:           &str = include_str!("../../kernels/rmsnorm.cpp");
-const MATVEC_SOURCE:            &str = include_str!("../../kernels/matvec.cpp");
 const SWIGLU_SOURCE:            &str = include_str!("../../kernels/swiglu.cpp");
 const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
 const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.cpp");
@@ -56,22 +55,11 @@ const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cp
 /// Max split-K splits — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
 const ADD_INPLACE_SOURCE:       &str = include_str!("../../kernels/add_inplace.cpp");
-const CONV1D_STEP_SOURCE:           &str = include_str!("../../kernels/conv1d_step.cpp");
-const SILU_INPLACE_SOURCE:          &str = include_str!("../../kernels/silu_inplace.cpp");
-const L2NORM_MULTIHEAD_SOURCE:      &str = include_str!("../../kernels/l2norm_multihead.cpp");
-const GDN_DECAY_BETA_SOURCE:        &str = include_str!("../../kernels/gdn_decay_beta.cpp");
-const GDN_RECURRENT_STEP_SOURCE:    &str = include_str!("../../kernels/gdn_recurrent_step.cpp");
-const GDN_RECURRENT_STEP_LDS_SOURCE:&str = include_str!("../../kernels/gdn_recurrent_step_lds.cpp");
 const GDN_RECURRENT_STEP_FUSED_SOURCE: &str = include_str!("../../kernels/gdn_recurrent_step_fused.cpp");
 const CONV1D_STEP_SILU_SOURCE:      &str = include_str!("../../kernels/conv1d_step_silu.cpp");
 const L2NORM_QK_SOURCE:             &str = include_str!("../../kernels/l2norm_qk.cpp");
 const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
 
-const MATVEC_Q8_0_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0.cpp");
-const MATVEC_Q4_K_SOURCE:   &str = include_str!("../../kernels/matvec_q4_k.cpp");
-const MATVEC_Q5_K_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k.cpp");
-const MATVEC_Q6_K_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k.cpp");
-const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
@@ -762,10 +750,7 @@ pub struct GpuQwen35 {
     gdn_b:        DeviceBuf<f32>,  // [n_heads]           ssm_beta projection
     gdn_q:        DeviceBuf<f32>,  // [value_dim]         L2-normed Q (scaled)
     gdn_k:        DeviceBuf<f32>,  // [value_dim]         L2-normed K
-    gdn_decay:    DeviceBuf<f32>,  // [n_heads]
-    gdn_beta:     DeviceBuf<f32>,  // [n_heads]
     gdn_core_out: DeviceBuf<f32>,  // [value_dim]         core attn out / normed_out
-    gdn_delta:    DeviceBuf<f32>,  // [n_heads, head_dim] cross-thread delta for LDS recurrent kernel
 
     // RoPE tables resident on device.
     rope_cos: DeviceBuf<f32>,      // [max_seq, rotary_dim]
@@ -774,7 +759,6 @@ pub struct GpuQwen35 {
     // Compiled kernel modules — keep alive for the lifetime of self.
     embed_module:            Module,
     rmsnorm_module:          Module,
-    matvec_module:           Module,
     swiglu_module:           Module,
     rmsnorm_multihead_module: Module,
     split_q_gate_module:     Module,
@@ -787,22 +771,11 @@ pub struct GpuQwen35 {
     /// f32 KV-cache write at the device-resident decode position.
     kv_write_module:         Module,
     add_inplace_module:      Module,
-    conv1d_step_module:           Module,
-    silu_inplace_module:          Module,
-    l2norm_multihead_module:      Module,
-    gdn_decay_beta_module:        Module,
-    gdn_recurrent_step_module:    Module,
-    gdn_recurrent_step_lds_module: Module,
     gdn_recurrent_step_fused_module: Module,
     conv1d_step_silu_module:      Module,
     l2norm_qk_module:             Module,
     rmsnorm_gated_multihead_module: Module,
 
-    matvec_q8_0_module:    Module,
-    matvec_q4_k_module:    Module,
-    matvec_q5_k_module:    Module,
-    matvec_q6_k_module:    Module,
-    matvec_iq4_xs_module:  Module,
     matvec_f16_module:     Module,
     embed_lookup_q6_k_module: Module,
     embed_lookup_q4_k_module: Module,
@@ -957,10 +930,7 @@ impl GpuQwen35 {
         let gdn_b        = DeviceBuf::new(gdn_n_heads)?;
         let gdn_q        = DeviceBuf::new(gdn_key_dim)?;
         let gdn_k        = DeviceBuf::new(gdn_key_dim)?;
-        let gdn_decay    = DeviceBuf::new(gdn_n_heads)?;
-        let gdn_beta     = DeviceBuf::new(gdn_n_heads)?;
         let gdn_core_out = DeviceBuf::new(gdn_value_dim)?;
-        let gdn_delta    = DeviceBuf::new(gdn_n_heads * gdn_head_dim)?;
 
         // Build RoPE tables host-side once and upload.
         let rope = crate::cpu::rope::RopeCache::new(rotary_dim, max_seq, cfg.rope_freq_base);
@@ -976,7 +946,6 @@ impl GpuQwen35 {
 
         let embed_hsaco             = cache.compile("embed_lookup",      EMBED_LOOKUP_SOURCE)?;
         let rmsnorm_hsaco           = cache.compile("rmsnorm",           RMSNORM_SOURCE)?;
-        let matvec_hsaco            = cache.compile("matvec",            MATVEC_SOURCE)?;
         let swiglu_hsaco            = cache.compile("swiglu",            SWIGLU_SOURCE)?;
         let rmsnorm_multihead_hsaco = cache.compile("rmsnorm_multihead", RMSNORM_MULTIHEAD_SOURCE)?;
         let split_q_gate_hsaco      = cache.compile("split_q_gate",      SPLIT_Q_GATE_SOURCE)?;
@@ -987,21 +956,10 @@ impl GpuQwen35 {
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
         let kv_write_hsaco          = cache.compile("kv_write_f32",      KV_WRITE_F32_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
-        let conv1d_step_hsaco            = cache.compile("conv1d_step",       CONV1D_STEP_SOURCE)?;
-        let silu_inplace_hsaco           = cache.compile("silu_inplace",      SILU_INPLACE_SOURCE)?;
-        let l2norm_multihead_hsaco       = cache.compile("l2norm_multihead",  L2NORM_MULTIHEAD_SOURCE)?;
-        let gdn_decay_beta_hsaco         = cache.compile("gdn_decay_beta",    GDN_DECAY_BETA_SOURCE)?;
-        let gdn_recurrent_step_hsaco     = cache.compile("gdn_recurrent_step", GDN_RECURRENT_STEP_SOURCE)?;
-        let gdn_recurrent_step_lds_hsaco = cache.compile("gdn_recurrent_step_lds", GDN_RECURRENT_STEP_LDS_SOURCE)?;
         let gdn_recurrent_step_fused_hsaco = cache.compile("gdn_recurrent_step_fused", GDN_RECURRENT_STEP_FUSED_SOURCE)?;
         let conv1d_step_silu_hsaco       = cache.compile("conv1d_step_silu", CONV1D_STEP_SILU_SOURCE)?;
         let l2norm_qk_hsaco              = cache.compile("l2norm_qk",        L2NORM_QK_SOURCE)?;
         let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
-        let matvec_q8_0_hsaco   = cache.compile("matvec_q8_0",   MATVEC_Q8_0_SOURCE)?;
-        let matvec_q4_k_hsaco   = cache.compile("matvec_q4_k",   MATVEC_Q4_K_SOURCE)?;
-        let matvec_q5_k_hsaco   = cache.compile("matvec_q5_k",   MATVEC_Q5_K_SOURCE)?;
-        let matvec_q6_k_hsaco   = cache.compile("matvec_q6_k",   MATVEC_Q6_K_SOURCE)?;
-        let matvec_iq4_xs_hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
         let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
@@ -1057,7 +1015,6 @@ impl GpuQwen35 {
             rope_cos, rope_sin,
             embed_module:             Module::load(&embed_hsaco)?,
             rmsnorm_module:           Module::load(&rmsnorm_hsaco)?,
-            matvec_module:            Module::load(&matvec_hsaco)?,
             swiglu_module:            Module::load(&swiglu_hsaco)?,
             rmsnorm_multihead_module: Module::load(&rmsnorm_multihead_hsaco)?,
             split_q_gate_module:      Module::load(&split_q_gate_hsaco)?,
@@ -1068,21 +1025,10 @@ impl GpuQwen35 {
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
             kv_write_module:          Module::load(&kv_write_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
-            conv1d_step_module:           Module::load(&conv1d_step_hsaco)?,
-            silu_inplace_module:          Module::load(&silu_inplace_hsaco)?,
-            l2norm_multihead_module:      Module::load(&l2norm_multihead_hsaco)?,
-            gdn_decay_beta_module:        Module::load(&gdn_decay_beta_hsaco)?,
-            gdn_recurrent_step_module:    Module::load(&gdn_recurrent_step_hsaco)?,
-            gdn_recurrent_step_lds_module: Module::load(&gdn_recurrent_step_lds_hsaco)?,
             gdn_recurrent_step_fused_module: Module::load(&gdn_recurrent_step_fused_hsaco)?,
             conv1d_step_silu_module:      Module::load(&conv1d_step_silu_hsaco)?,
             l2norm_qk_module:             Module::load(&l2norm_qk_hsaco)?,
             rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
-            matvec_q8_0_module:   Module::load(&matvec_q8_0_hsaco)?,
-            matvec_q4_k_module:   Module::load(&matvec_q4_k_hsaco)?,
-            matvec_q5_k_module:   Module::load(&matvec_q5_k_hsaco)?,
-            matvec_q6_k_module:   Module::load(&matvec_q6_k_hsaco)?,
-            matvec_iq4_xs_module: Module::load(&matvec_iq4_xs_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
             embed_lookup_q4_k_module: Module::load(&embed_lookup_q4_k_hsaco)?,
@@ -1131,7 +1077,7 @@ impl GpuQwen35 {
             gdn_value_dim, gdn_key_dim, gdn_conv_dim, gdn_n_heads, gdn_n_k_heads,
             gdn_head_dim, gdn_conv_kernel,
             gdn_qkv, gdn_conv_out, gdn_z, gdn_a, gdn_b, gdn_q, gdn_k,
-            gdn_decay, gdn_beta, gdn_core_out, gdn_delta,
+            gdn_core_out,
             rms_eps: cfg.rms_norm_eps,
             max_seq,
             moe: moe_runtime,
@@ -1265,27 +1211,8 @@ impl GpuQwen35 {
         unsafe { f.launch((1, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
-    fn launch_matvec(&self, w: *mut c_void, x: *mut c_void, y: *mut c_void,
-                     in_dim: u32, out_dim: u32) -> Result<(), String>
-    {
-        let f = self.matvec_module.function("matvec_f32")?;
-        let block: u32 = 256;
-        let mut wa = w; let mut xa = x; let mut ya = y;
-        let mut ia = in_dim; let mut oa = out_dim;
-        let mut args: [*mut c_void; 5] = [
-            &mut wa as *mut _ as *mut c_void,
-            &mut xa as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut ia as *mut _ as *mut c_void,
-            &mut oa as *mut _ as *mut c_void,
-        ];
-        let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
-    }
-
-    /// Per-quant-type matvec launchers — same signature as launch_matvec.
-    /// All five fused dequant+GEMV kernels share the (W bytes, x f32, y f32,
-    /// in_dim, out_dim) interface.
+    /// Per-quant-type matvec launchers. All fused dequant+GEMV kernels
+    /// share the (W bytes, x f32, y f32, in_dim, out_dim) interface.
     fn launch_matvec_q_kernel(&self, module: &Module, kname: &str,
                               w: *mut c_void, x: *mut c_void, y: *mut c_void,
                               in_dim: u32, out_dim: u32) -> Result<(), String>
@@ -1589,136 +1516,6 @@ impl GpuQwen35 {
             &mut sa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
             &mut pp as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_conv1d_step(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
-                          y: *mut c_void, n_channels: u32, kernel_size: u32)
-        -> Result<(), String>
-    {
-        let f = self.conv1d_step_module.function("conv1d_step_f32")?;
-        let block: u32 = 256;
-        let grid = (n_channels + block - 1) / block;
-        let mut xa = x_new; let mut wa = w; let mut ha = hist; let mut ya = y;
-        let mut nc = n_channels; let mut ks = kernel_size;
-        let mut args: [*mut c_void; 6] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut wa as *mut _ as *mut c_void,
-            &mut ha as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-            &mut ks as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_silu_inplace(&self, x: *mut c_void, n: u32) -> Result<(), String> {
-        let f = self.silu_inplace_module.function("silu_inplace_f32")?;
-        let block: u32 = 256;
-        let grid = (n + block - 1) / block;
-        let mut xa = x; let mut na = n;
-        let mut args: [*mut c_void; 2] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut na as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_l2norm_multihead(&self, x: *mut c_void, y: *mut c_void,
-                                n_heads: u32, head_dim: u32, eps: f32, scale: f32)
-        -> Result<(), String>
-    {
-        let f = self.l2norm_multihead_module.function("l2norm_multihead_f32")?;
-        let block: u32 = 128;
-        let mut xa = x; let mut ya = y; let mut nh = n_heads; let mut hd = head_dim;
-        let mut ea = eps; let mut sa = scale;
-        let mut args: [*mut c_void; 6] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ea as *mut _ as *mut c_void,
-            &mut sa as *mut _ as *mut c_void,
-        ];
-        let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_gdn_decay_beta(&self, a: *mut c_void, b: *mut c_void,
-                             ssm_a: *mut c_void, dt_bias: *mut c_void,
-                             decay: *mut c_void, beta: *mut c_void, n_heads: u32)
-        -> Result<(), String>
-    {
-        let f = self.gdn_decay_beta_module.function("gdn_decay_beta_f32")?;
-        let block: u32 = 64;
-        let grid = (n_heads + block - 1) / block;
-        let mut aa = a; let mut bb = b; let mut sa = ssm_a; let mut da = dt_bias;
-        let mut dca = decay; let mut beta_a = beta; let mut nh = n_heads;
-        let mut args: [*mut c_void; 7] = [
-            &mut aa     as *mut _ as *mut c_void,
-            &mut bb     as *mut _ as *mut c_void,
-            &mut sa     as *mut _ as *mut c_void,
-            &mut da     as *mut _ as *mut c_void,
-            &mut dca    as *mut _ as *mut c_void,
-            &mut beta_a as *mut _ as *mut c_void,
-            &mut nh     as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_gdn_recurrent_step(&self,
-        q: *mut c_void, k: *mut c_void, v: *mut c_void,
-        decay: *mut c_void, beta: *mut c_void,
-        state: *mut c_void, out: *mut c_void,
-        n_heads: u32, head_dim: u32) -> Result<(), String>
-    {
-        let f = self.gdn_recurrent_step_module.function("gdn_recurrent_step_f32")?;
-        let block: u32 = head_dim;
-        let smem = 4 * head_dim * std::mem::size_of::<f32>() as u32;
-        let mut qa = q; let mut ka = k; let mut va = v;
-        let mut da = decay; let mut ba = beta;
-        let mut sa = state; let mut oa = out;
-        let mut nh = n_heads; let mut hd = head_dim;
-        let mut args: [*mut c_void; 9] = [
-            &mut qa as *mut _ as *mut c_void,
-            &mut ka as *mut _ as *mut c_void,
-            &mut va as *mut _ as *mut c_void,
-            &mut da as *mut _ as *mut c_void,
-            &mut ba as *mut _ as *mut c_void,
-            &mut sa as *mut _ as *mut c_void,
-            &mut oa as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
-    }
-
-    fn launch_gdn_recurrent_step_lds(&self,
-        q: *mut c_void, k: *mut c_void, v: *mut c_void,
-        decay: *mut c_void, beta: *mut c_void,
-        state: *mut c_void, out: *mut c_void, delta_scratch: *mut c_void,
-        n_heads: u32, head_dim: u32) -> Result<(), String>
-    {
-        let f = self.gdn_recurrent_step_lds_module.function("gdn_recurrent_step_lds_f32")?;
-        let block: u32 = head_dim;
-        // Dynamic LDS = state matrix only (head_dim * head_dim floats).
-        let smem = head_dim * head_dim * std::mem::size_of::<f32>() as u32;
-        let mut qa = q; let mut ka = k; let mut va = v;
-        let mut da = decay; let mut ba = beta;
-        let mut sa = state; let mut oa = out; let mut dla = delta_scratch;
-        let mut nh = n_heads; let mut hd = head_dim;
-        let mut args: [*mut c_void; 10] = [
-            &mut qa  as *mut _ as *mut c_void,
-            &mut ka  as *mut _ as *mut c_void,
-            &mut va  as *mut _ as *mut c_void,
-            &mut da  as *mut _ as *mut c_void,
-            &mut ba  as *mut _ as *mut c_void,
-            &mut sa  as *mut _ as *mut c_void,
-            &mut oa  as *mut _ as *mut c_void,
-            &mut dla as *mut _ as *mut c_void,
-            &mut nh  as *mut _ as *mut c_void,
-            &mut hd  as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
     fn launch_conv1d_step_silu(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,

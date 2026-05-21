@@ -17,8 +17,9 @@ Cargo.lock.bak
 *.swo
 .DS_Store
 
-# Per-user Claude Code settings (team-shared settings.json may be committed)
+# Per-user Claude Code state (team-shared settings.json may be committed)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Profiling output
 *.csv
@@ -27,3 +28,6 @@ perf.data*
 
 # Compiled golden-logits helper (built per-host via tests/golden/build.sh)
 /tests/golden/dump_logits
+
+# Test artifacts (built from external sources e.g. llama.cpp)
+/tests/golden/llama_bench

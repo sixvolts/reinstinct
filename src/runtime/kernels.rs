@@ -33,16 +33,6 @@ const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp
 const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 
 const QUANTIZE_Q8_SOURCE:   &str = include_str!("../../kernels/quantize_q8.cpp");
-const MATVEC_Q4_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
-const MATVEC_Q5_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
-const MATVEC_Q6_K_DP4A_SRC: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
-const MATVEC_Q8_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
-const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
-const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
-const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
-const MMQ_GEMM_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
-const MMQ_GEMM_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
-const MMQ_GEMM_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 const ATTN_PREFILL_FLASH_SRC: &str = include_str!("../../kernels/attn_prefill_flash.cpp");
 
