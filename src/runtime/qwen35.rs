@@ -2669,17 +2669,41 @@ impl GpuQwen35 {
             self.launch_embed_lookup_dispatch(&self.token_embd, row_ptr, tok)?;
         }
 
-        // 2) Every block.
+        // 2) Every block. Optional per-block timing trace
+        //    (REINSTINCT_PREFILL_TRACE=1) — syncs after each block, so
+        //    only use for diagnosis, not steady-state benchmarking.
+        let trace = std::env::var_os("REINSTINCT_PREFILL_TRACE").is_some();
+        let mut block_ms: Vec<(char, f64)> = Vec::with_capacity(self.blocks.len());
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
+            let t0 = if trace { Some(std::time::Instant::now()) } else { None };
+            let kind: char;
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
                     self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?;
+                    kind = 'F';
                 }
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
                     self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?;
+                    kind = 'L';
                 }
                 _ => return Err("block kind mismatch".into()),
             }
+            if let Some(t0) = t0 {
+                self.stream.synchronize()?;
+                block_ms.push((kind, t0.elapsed().as_secs_f64() * 1e3));
+            }
+        }
+        if trace {
+            let (mut sf, mut nf, mut sl, mut nl) = (0.0, 0usize, 0.0, 0usize);
+            for &(k, ms) in &block_ms {
+                if k == 'F' { sf += ms; nf += 1; } else { sl += ms; nl += 1; }
+            }
+            eprintln!("[prefill-trace] {} tokens × {} blocks  ({}F + {}L)",
+                n, block_ms.len(), nf, nl);
+            eprintln!("[prefill-trace]   full-attn  {:>7.1} ms total  ({:>5.2} ms/block)",
+                sf, if nf > 0 { sf / nf as f64 } else { 0.0 });
+            eprintln!("[prefill-trace]   GDN linear {:>7.1} ms total  ({:>5.2} ms/block)",
+                sl, if nl > 0 { sl / nl as f64 } else { 0.0 });
         }
         let _ = (q_dim, kv_dim, vdim, cdim);
 
