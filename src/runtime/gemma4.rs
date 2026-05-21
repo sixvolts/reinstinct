@@ -885,9 +885,11 @@ impl GpuGemma4 {
     }
 
     /// `true` for the 26B-A4B MoE target, `false` for the dense 31B.
-    /// Callers (e.g. mtp-gen) use this to skip HIP-graph capture of the
-    /// verify path — the MoE branch has host-side bucket-by-expert syncs
-    /// that aren't graph-capturable.
+    /// Callers (e.g. mtp-gen) use this to skip `capture_verify_graph` —
+    /// MoE targets dispatch through `verify_forward_via_decode` (K
+    /// sequential `forward_token` calls, each replayed from the
+    /// already-captured decode graph), so there's no batched-verify
+    /// chain to capture.
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
 
     // ---- launch helpers ----------------------------------------------------
@@ -2057,24 +2059,21 @@ impl GpuGemma4 {
     /// kernel chain (one launch per stage, HIP-graph-capturable). MoE
     /// targets (26B-A4B) loop the decode `forward_token` K times.
     ///
-    /// History: a batched MoE verify path (`enqueue_verify_kernels` w/
-    /// `b.moe = Some`) exists and is correct (smoke MATCHES), but on
-    /// MI50 it lost to the decode-loop by ~3× (13.6 vs 40.3 tok/s on
-    /// "The capital of France is", K=4). Why: the per-WG `(out, slot,
-    /// tok)` grid in the batched moe_matvec kernels reads each expert's
-    /// weights cold for every (slot, tok) pair (no cross-token weight
-    /// sharing since adjacent toks route to different experts), so
-    /// batched-K=4 MoE matvec costs ~4× K=1 MoE matvec — same as four
-    /// sequential decodes, plus extra dispatch overhead. To actually
-    /// win we need a bin-by-expert MoE kernel that loads each expert's
-    /// weights once and accumulates dot products for ALL routed (token,
-    /// slot) pairs (the prefill MoE branch's idea, but on-device).
-    /// Until that kernel exists, decode-loop is the win.
+    /// A batched verify path for MoE was prototyped and benchmarked
+    /// ~3.5× slower than the decode-loop on MI50: the per-WG
+    /// `(out_row, slot, tok)` grid in the batched moe_matvec kernels
+    /// reads each expert's weights cold for every (slot, tok) pair —
+    /// adjacent toks route to different experts so there's no cross-
+    /// token weight sharing. K=4 batched MoE matvec ends up costing
+    /// ~4× K=1 MoE matvec, same as four sequential decodes plus extra
+    /// dispatch overhead. Beating decode-loop needs a bin-by-expert
+    /// MoE kernel (one WG per (out_row, expert) accumulating dots for
+    /// ALL routed tokens) — see the gemma4-mtp memory file for the
+    /// sketch. Until then, decode-loop is the win.
     pub fn verify_forward(&self, tokens: &[u32], state: &mut Gemma4GpuState)
         -> Result<Vec<Vec<f32>>, String>
     {
         if self.n_expert > 0 {
-            // MoE: decode-loop wins on MI50. See docstring for why.
             return self.verify_forward_via_decode(tokens, state);
         }
         let p = tokens.len();
@@ -2114,7 +2113,7 @@ impl GpuGemma4 {
         -> Result<(), String>
     {
         if self.ple.is_some() {
-            return Err("verify_forward: PLE/E4B not yet wired".into());
+            return Err("verify_forward: PLE/E4B not wired".into());
         }
         let p = tokens.len();
         assert!(p > 0, "verify_forward: empty token slice");

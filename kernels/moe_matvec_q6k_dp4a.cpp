@@ -1,14 +1,18 @@
 // MoE expert matvec — Q6_K weights, dp4a. One launch handles all
-// `n_used` routed experts across all `n_tok` verify tokens: grid.y =
+// `n_used` routed experts across all `n_tok` tokens: grid.y =
 // expert slot, grid.z = token. The expert id is read from
 // `ids[tok * n_used + slot]`, and the weight base is offset into the
-// 3D expert slab. The activation can be shared across slots
-// (xq_slot_stride = 0, the fused gate_up case) or per-slot
-// (xq_slot_stride > 0).
+// 3D expert slab. The activation can be shared across slots within a
+// token (xq_slot_stride = 0, the fused gate_up case) or per-slot
+// (xq_slot_stride > 0). Across tokens, `xq_tok_stride` advances the
+// activation pointer to the next token's BlockQ8 sequence.
 //
 // Body is matvec_q6_k_dp4a's Q6_K dp4a with an expert-indexing prologue.
 // grid = (ceil(out_dim/ROWS), n_used, n_tok); block = 64. Decode
-// launches with grid.z = 1 + xq_tok_stride = 0.
+// launches with n_tok=1, xq_tok_stride=0 (single token, no cross-
+// token offset needed). All current callers pass n_tok=1; the
+// batched signature is in place as scaffolding for a future bin-by-
+// expert MoE verify path — see the gemma4-mtp memory file.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

@@ -1,10 +1,10 @@
 // MoE expert matvec — Q8_0 weights, dp4a. Same expert-indexing scheme
-// as moe_matvec_q6k_dp4a; used for the down projection, where each
-// expert slot has its own activation (xq_slot_stride > 0).
+// as moe_matvec_q6k_dp4a (see that file's comment for the n_tok /
+// xq_tok_stride / xq_slot_stride contract). Used by the 26B-A4B
+// layer-29 gate_up which is Q8_0 (rest of the experts are Q6_K).
 //
-// grid = (ceil(out_dim/ROWS), n_used, n_tok); block = 64. grid.z
-// batches verify tokens; decode launches with grid.z = 1 + tok_stride
-// = 0. Mirrors moe_matvec_q6k_repacked's batched signature.
+// grid = (ceil(out_dim/ROWS), n_used, n_tok); block = 64.
+// Decode callers pass n_tok=1.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

@@ -478,8 +478,8 @@ impl GpuFullAttnWeights {
 
 /// MTP next-N predictor head — Unsloth's Qwen 3.6 MTP layout
 /// ("DeepSeek-V3 style"). One full-attention transformer block plus the
-/// MTP-specific tensors. Invoked once per spec-decode round to produce
-/// a +2 token candidate from `(prev_hidden, embed(next_tok))`:
+/// MTP-specific tensors. Designed to produce a +2 token candidate from
+/// `(prev_hidden, embed(next_tok))`:
 ///
 ///     concat(enorm(embed_next), hnorm(prev_hidden))   ─ [2·hidden]
 ///       → eh_proj → hidden                            ─ [hidden]
@@ -487,8 +487,11 @@ impl GpuFullAttnWeights {
 ///       → shared_head_norm                            ─ [hidden]
 ///       → tied lm_head                                ─ [vocab]
 ///
-/// Loaded once at startup and stashed on `GpuQwen35.mtp`; doesn't
-/// participate in `forward_token` / `prefill_forward`.
+/// Currently loaded but inert — no forward path written; the K=1
+/// MTP spec-decode round arithmetic on MI50 caps the best-case win at
+/// ~5% over baseline, which doesn't justify the ~800 LOC of qwen
+/// batched verify_forward work needed to make it real. See the
+/// gemma4-mtp memory file for the analysis and wire-up sketch.
 pub struct GpuMtpHead {
     pub block:            GpuFullAttnBlock,
     pub eh_proj:          GpuMatvecTensor,   // [2·hidden, hidden]
@@ -856,8 +859,8 @@ pub struct GpuQwen35 {
 
     /// MTP next-N predictor heads (Unsloth Qwen 3.6 MTP release). One
     /// entry per `nextn_predict_layers` — usually 1 if present.
-    /// Loaded once at startup; invoked from a separate `mtp_forward`
-    /// entry point for the drafter step in spec-decode rounds.
+    /// Loaded once at startup so the GGUF parses cleanly; not yet
+    /// wired into any forward path. See `GpuMtpHead` for the reason.
     mtp: Vec<GpuMtpHead>,
 }
 

@@ -10,7 +10,8 @@
 // so n_sub need not be a power of two.
 //
 // grid = (ceil(out_dim / rows_per_block), n_used, n_tok); block 256.
-// grid.z batches verify tokens; decode launches grid.z = 1.
+// All current callers pass n_tok=1; see moe_matvec_q6k_dp4a.cpp
+// for the n_tok / xq_tok_stride / xq_slot_stride contract.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
