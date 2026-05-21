@@ -36,9 +36,20 @@ impl Target {
     }
 }
 
-/// A parsed `/v1/completions` request.
+/// What the client sent as the prompt — either a raw text completion
+/// (`/v1/completions` POST `prompt`) or a chat-completions message
+/// array (`/v1/chat/completions` POST `messages`). The worker uses
+/// this variant to pick the response shape (`text_completion` vs
+/// `chat.completion`) AND, for the chat path, to apply the right
+/// per-architecture chat template before tokenization.
+enum PromptInput {
+    Raw(String),
+    Chat(Vec<crate::chat::ChatMessage>),
+}
+
+/// A parsed `/v1/completions` or `/v1/chat/completions` request.
 struct GenReq {
-    prompt: String,
+    prompt: PromptInput,
     max_tokens: usize,
     temperature: f32,
     top_k: usize,
@@ -51,6 +62,10 @@ struct GenReq {
     /// Per-request K override for spec-decode. `None` ⇒ server default
     /// (currently 3). Ignored when spec-decode is off.
     speculative_k: Option<usize>,
+}
+
+impl GenReq {
+    fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_)) }
 }
 
 /// A unit of work handed from a connection thread to the GPU worker.
@@ -69,13 +84,9 @@ struct HttpReply {
 
 // --- request parsing ---------------------------------------------------
 
-/// Parse an OpenAI `/v1/completions` body into a `GenReq`.
-fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
-    let bad = |m: String| (400u16, "Bad Request", m);
-    let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
-    let prompt = j.get("prompt").and_then(Json::as_str)
-        .ok_or_else(|| bad("missing string field 'prompt'".into()))?
-        .to_string();
+/// Common decode + sampling fields shared by both endpoint parsers.
+/// Returns (max_tokens, temperature, top_k, seed, use_speculative, speculative_k).
+fn parse_common_fields(j: &Json) -> (usize, f32, usize, u64, Option<bool>, Option<usize>) {
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
         .map(|n| n as usize).unwrap_or(256).clamp(1, 4096);
     let temperature = j.get("temperature").and_then(Json::as_f64)
@@ -87,8 +98,58 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let use_speculative = j.get("use_speculative").and_then(Json::as_bool);
     let speculative_k = j.get("speculative_k").and_then(Json::as_f64)
         .map(|n| (n as usize).clamp(1, 4));
-    Ok(GenReq { prompt, max_tokens, temperature, top_k, seed,
-                use_speculative, speculative_k })
+    (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+}
+
+/// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
+/// path; no chat template is applied server-side.
+fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
+    let bad = |m: String| (400u16, "Bad Request", m);
+    let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
+    let prompt = j.get("prompt").and_then(Json::as_str)
+        .ok_or_else(|| bad("missing string field 'prompt'".into()))?
+        .to_string();
+    let (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+        = parse_common_fields(&j);
+    Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, temperature, top_k,
+                seed, use_speculative, speculative_k })
+}
+
+/// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
+/// `messages` array becomes a `PromptInput::Chat`; the worker's
+/// model knows which per-architecture chat template to apply.
+fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
+    use crate::chat::{ChatMessage, Role};
+    let bad = |m: String| (400u16, "Bad Request", m);
+    let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
+    let messages_arr = j.get("messages")
+        .ok_or_else(|| bad("missing array field 'messages'".into()))?;
+    let arr = match messages_arr {
+        Json::Arr(a) => a,
+        _ => return Err(bad("'messages' must be an array".into())),
+    };
+    if arr.is_empty() {
+        return Err(bad("'messages' must contain at least one message".into()));
+    }
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(arr.len());
+    for (i, m) in arr.iter().enumerate() {
+        let role_s = m.get("role").and_then(Json::as_str)
+            .ok_or_else(|| bad(format!("messages[{i}]: missing string 'role'")))?;
+        let content = m.get("content").and_then(Json::as_str)
+            .ok_or_else(|| bad(format!("messages[{i}]: missing string 'content'")))?;
+        let role = match role_s {
+            "system"    => Role::System,
+            "user"      => Role::User,
+            "assistant" => Role::Assistant,
+            other => return Err(bad(format!(
+                "messages[{i}]: unknown role '{other}' (want system|user|assistant)"))),
+        };
+        messages.push(ChatMessage { role, content: content.to_string() });
+    }
+    let (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+        = parse_common_fields(&j);
+    Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, temperature, top_k,
+                seed, use_speculative, speculative_k })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -112,6 +173,36 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
     Json::Obj(vec![
         ("id".into(),      Json::Str(id)),
         ("object".into(),  Json::Str("text_completion".into())),
+        ("created".into(), Json::Num(unix_now() as f64)),
+        ("model".into(),   Json::Str(model.to_string())),
+        ("choices".into(), Json::Arr(vec![choice])),
+        ("usage".into(),   Json::Obj(vec![
+            ("prompt_tokens".into(),     Json::Num(n_prompt as f64)),
+            ("completion_tokens".into(), Json::Num(n_completion as f64)),
+            ("total_tokens".into(),      Json::Num((n_prompt + n_completion) as f64)),
+        ])),
+    ]).to_string()
+}
+
+/// OpenAI-shaped `chat.completion` response. Same usage stats as the
+/// raw-completion shape, but the choice carries a `message` object
+/// instead of a flat `text` field — what every chat SDK expects.
+fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
+                            n_completion: usize, hit_eos: bool) -> String {
+    let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let message = Json::Obj(vec![
+        ("role".into(),    Json::Str("assistant".into())),
+        ("content".into(), Json::Str(text.to_string())),
+    ]);
+    let choice = Json::Obj(vec![
+        ("index".into(),         Json::Num(0.0)),
+        ("message".into(),       message),
+        ("finish_reason".into(), Json::Str(
+            if hit_eos { "stop" } else { "length" }.to_string())),
+    ]);
+    Json::Obj(vec![
+        ("id".into(),      Json::Str(id)),
+        ("object".into(),  Json::Str("chat.completion".into())),
         ("created".into(), Json::Num(unix_now() as f64)),
         ("model".into(),   Json::Str(model.to_string())),
         ("choices".into(), Json::Arr(vec![choice])),
@@ -239,7 +330,15 @@ impl ServerModel {
 
         match self {
             ServerModel::Qwen { gpu, state, tok, eos, max_seq, .. } => {
-                let prompt = tok.encode(&req.prompt);
+                let prompt = match &req.prompt {
+                    PromptInput::Raw(text) => tok.encode(text),
+                    PromptInput::Chat(msgs) => {
+                        // Qwen 3.5/3.6: render via the qwen template
+                        // (no BOS — qwen expects to start at <|im_start|>),
+                        // with assistant turn primed.
+                        crate::chat::format_qwen3(tok, msgs, true)?
+                    }
+                };
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
@@ -266,8 +365,21 @@ impl ServerModel {
                 Ok((tok.decode(&out), prompt.len(), out.len(), hit_eos))
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, .. } => {
-                let mut prompt = vec![*bos];
-                prompt.extend(tok.encode(&req.prompt));
+                let prompt = match &req.prompt {
+                    PromptInput::Raw(text) => {
+                        let mut p = vec![*bos];
+                        p.extend(tok.encode(text));
+                        p
+                    }
+                    PromptInput::Chat(msgs) => {
+                        // Gemma 4: BOS + per-turn <|turn>role\n…<turn|>\n
+                        // with assistant turn primed. The drafter was
+                        // trained on this format — chat-templated input
+                        // typically gets +30-40 percentage points of
+                        // accept rate over raw user text.
+                        crate::chat::format_gemma4(tok, msgs, true)?
+                    }
+                };
                 if prompt.len() + req.max_tokens + 8 > *max_seq {
                     return Err(format!(
                         "prompt ({}) + max_tokens ({}) exceeds context window ({})",
@@ -379,14 +491,19 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                 Target::Big | Target::Small => {
                     let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
                     let t = std::time::Instant::now();
+                    let is_chat = req.is_chat();
                     match model.generate(&req) {
                         Ok((text, n_p, n_c, eos)) => {
-                            eprintln!("[serve] {} completion: {} prompt + {} gen tok in {:.2}s",
-                                job.target.label(), n_p, n_c, t.elapsed().as_secs_f32());
-                            HttpReply {
-                                status: 200, status_text: "OK",
-                                body: completion_response(model.name(), &text, n_p, n_c, eos),
-                            }
+                            eprintln!("[serve] {} {}: {} prompt + {} gen tok in {:.2}s",
+                                job.target.label(),
+                                if is_chat { "chat" } else { "completion" },
+                                n_p, n_c, t.elapsed().as_secs_f32());
+                            let body = if is_chat {
+                                chat_completion_response(model.name(), &text, n_p, n_c, eos)
+                            } else {
+                                completion_response(model.name(), &text, n_p, n_c, eos)
+                            };
+                            HttpReply { status: 200, status_text: "OK", body }
                         }
                         Err(e) => HttpReply {
                             status: 400, status_text: "Bad Request",
@@ -412,22 +529,35 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target, tx: mpsc::Sender
         }
     };
 
-    // Route. LLM ports take /v1/completions; the embed port /v1/embeddings.
-    let want = if target == Target::Embed { "embeddings" } else { "completions" };
-    let routed = request.method.eq_ignore_ascii_case("POST")
-        && request.path.trim_end_matches('/').ends_with(want);
-
-    let req = if !routed {
-        Err((404u16, "Not Found",
-             format!("no route for {} {} (expected POST /v1/{want})",
-                     request.method, request.path)))
-    } else if target == Target::Embed {
-        // Parse is irrelevant — the worker answers 503 — but keep the shape.
-        Ok(GenReq { prompt: String::new(), max_tokens: 0,
-                    temperature: 0.0, top_k: 0, seed: 0,
-                    use_speculative: None, speculative_k: None })
+    // Route. LLM ports take /v1/completions (raw) or /v1/chat/completions
+    // (messages, chat template applied server-side). Embed port takes
+    // /v1/embeddings (answers 503 until the encoder lands).
+    let path = request.path.trim_end_matches('/');
+    let is_post = request.method.eq_ignore_ascii_case("POST");
+    let route = if target == Target::Embed {
+        if is_post && path.ends_with("/v1/embeddings") { Some("embed") } else { None }
+    } else if is_post && path.ends_with("/v1/chat/completions") {
+        Some("chat")
+    } else if is_post && path.ends_with("/v1/completions") {
+        Some("completions")
     } else {
-        parse_completions(&request.body)
+        None
+    };
+
+    let req = match route {
+        None => Err((404u16, "Not Found",
+            format!("no route for {} {} (expected POST /v1/completions or \
+                     /v1/chat/completions on this port)",
+                    request.method, request.path))),
+        Some("embed") => {
+            // Worker answers 503; keep the shape.
+            Ok(GenReq { prompt: PromptInput::Raw(String::new()), max_tokens: 0,
+                        temperature: 0.0, top_k: 0, seed: 0,
+                        use_speculative: None, speculative_k: None })
+        }
+        Some("chat") => parse_chat_completions(&request.body),
+        Some("completions") => parse_completions(&request.body),
+        Some(other) => unreachable!("unknown route tag {other}"),
     };
 
     let (rtx, rrx) = mpsc::channel();
