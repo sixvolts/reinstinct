@@ -22,6 +22,13 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+# Brief cool-down between models. Without this the late-sequence models
+# (positions 8+) get systematically depressed numbers (e.g. qwen-3.6-27B
+# at script-position 9 measured 16.7 tok/s vs 22.6 standalone — 30%
+# throttle). For most accurate numbers also pin clocks high once before
+# the run: `sudo rocm-smi --setperflevel high`.
+COOLDOWN_S="${COOLDOWN_S:-10}"
+
 # Decode bench: greedy generate N tokens, parse the "decode  = X tok/s" line.
 # Returns "<rate>" or "ERR" on failure / model missing.
 bench_decode() {
@@ -86,21 +93,27 @@ echo
 if [[ "$MODE" == "quick" ]]; then
     printf "| %-22s | %10s |\n" "Model" "Decode tok/s"
     printf "| %-22s | %10s |\n" "----------------------" "----------:"
+    first=1
     for entry in "${TARGETS[@]}"; do
         label="${entry%% *}"
         gguf="${entry##* }"
+        if [[ $first -eq 0 ]]; then sleep "$COOLDOWN_S"; fi
         d=$(bench_decode "$gguf" "$DECODE_PROMPT" "$DECODE_STEPS")
         printf "| %-22s | %10s |\n" "$label" "$d"
+        first=0
     done
 else
     printf "| %-22s | %10s | %14s |\n" "Model" "Decode tok/s" "Prefill ms/tok"
     printf "| %-22s | %10s | %14s |\n" "----------------------" "----------:" "-------------:"
+    first=1
     for entry in "${TARGETS[@]}"; do
         label="${entry%% *}"
         gguf="${entry##* }"
+        if [[ $first -eq 0 ]]; then sleep "$COOLDOWN_S"; fi
         d=$(bench_decode "$gguf" "$DECODE_PROMPT" "$DECODE_STEPS")
         p=$(bench_prefill_msptok "$gguf" "$PREFILL_PROMPT")
         printf "| %-22s | %10s | %14s |\n" "$label" "$d" "${p:-ERR}"
+        first=0
     done
 fi
 
