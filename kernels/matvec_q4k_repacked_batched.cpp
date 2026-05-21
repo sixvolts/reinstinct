@@ -24,10 +24,14 @@
 #include <stdint.h>
 
 #define ROWS         2     // output rows per wavefront
-#define N_ROWS_MAX   4     // K upper bound the kernel supports (was 8 — bumping
-                           // to 4 halves per-thread VGPR pressure and boosts
-                           // occupancy. K=4 is the sweet spot per the K-curve;
-                           // higher-K verify falls back to MMQ).
+#define N_ROWS_MAX   4     // K upper bound; the verify-cost-vs-K experiment
+                           // (commit: HEAD~1 of this revert) confirmed K=8
+                           // verify is 177ms vs K=4 108ms — linear in K with
+                           // ~62ms fixed cost. Tree drafting at any reasonable
+                           // shape loses against chain K=4 because the extra
+                           // verify cost outweighs the token-gain from branching.
+                           // Keeping the K≤4 cap to preserve the 9% occupancy
+                           // win we got from N_ROWS_MAX=4.
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
