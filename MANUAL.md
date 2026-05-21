@@ -14,7 +14,8 @@ reinstinct-engine <COMMAND> [OPTIONS]
 ```
 
 Commands: `inspect`, `model`, `generate`, `generate-text`, `chat`,
-`debug-embed`, `bench`, `hip-info`, `gpu-bench`.
+`mtp-draft`, `mtp-gen`, `serve`, `debug-embed`, `bench`, `hip-info`,
+`gpu-bench`.
 
 ---
 
@@ -175,6 +176,93 @@ state needs separate snapshot machinery. Single-session in-memory
 snapshot (no disk persistence yet) and a single cached prefix per
 process (no multi-turn history accumulation in the cache).
 
+### mtp-draft
+
+```
+reinstinct-engine mtp-draft <TARGET> <DRAFTER>
+                  [--prompt <TEXT> | --system <TEXT> --prompt <TEXT>]
+                  [--k <N>]
+```
+
+Diagnostic: load a Gemma 4 target + its MTP drafter, prefill the
+prompt, then ask the drafter to propose `K` tokens at the prompt's
+last position. Prints each drafted token alongside the target's argmax
+for comparison so you can eyeball whether the drafter is aligned with
+the target's distribution. No acceptance loop / KV truncation — that's
+`mtp-gen`.
+
+Drafter checkpoints are the Unsloth `gemma-4-*-it-assistant.Q8_0.gguf`
+files (`Q4_K_M` also works but accepts ~5pp lower; see PERFORMANCE).
+
+### mtp-gen
+
+```
+reinstinct-engine mtp-gen <TARGET> <DRAFTER>
+                  [--prompt <TEXT> | --system <TEXT> --prompt <TEXT>]
+                  [--k <N>] [-n <STEPS>] [--temperature <F>] [--seed <N>]
+```
+
+Speculative-decoding generation against a Gemma 4 target using its MTP
+drafter. Each round: drafter proposes K tokens autoregressively (each
+takes ~1.5 ms — a 4-layer mini-transformer conditioned on the target's
+last hidden state), target verifies them in one batched forward, the
+longest accepted prefix is committed. On a full accept the target's
+post-batch logit is consumed as a bonus token (advances by K+1 per
+round, not K). On rejection the round commits everything up to the
+first mismatch plus the target's replacement pick.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--k <N>` | 3 | Drafted tokens per round. K=3 is the empirical sweet spot on Gemma 31B (best avg over factual / agentic prompts); K=2 wins narrowly on math, K=4 on creative-writing prompts where the drafter struggles regardless. Clamped to 1..=4 by the kernel cap. |
+| `-n`, `--steps <N>` | 64 | Tokens to generate. |
+| `--temperature <F>` | 0.0 | `0` = greedy argmax acceptance. `> 0` switches to rejection-sampling acceptance (HF-style `min(1, p_target/p_draft)` with residual sampling on reject). |
+| `--seed <N>` | `0xC0FFEE` | PRNG seed (sampling mode only). |
+
+Prints the generated text plus accept-rate stats (`accepted / drafted = %`).
+With the recommended Q8_0 drafter and chat-templated prompts on 31B, accept
+ranges 65–90% on factual/math/code, 35–55% on creative writing.
+**Diagnostic env vars:**
+- `REINSTINCT_NO_VERIFY_GRAPH=1` — skip HIP graph capture of the verify
+  kernel chain (use the inline path instead).
+- `REINSTINCT_VERIFY_SMOKE=1` — parity check `verify_forward(K)` vs K
+  sequential `forward_token` calls from a snapshotted state. Prints
+  argmax-match and L1/Linf diff per position; exits without generation.
+- `REINSTINCT_VERIFY_BENCH=N` — warm-then-time `verify_forward(K)` over
+  N calls; prints per-call average ms.
+- `REINSTINCT_DRAFTER_NO_BONUS=1` — disable the K+1 bonus-token
+  semantics (advance by exactly K on full accept; measurement only).
+
+### serve
+
+```
+reinstinct-engine serve --big <PATH> --small <PATH> [--big-drafter <PATH>]
+                  [--embed <PATH>] [--big-port <N>] [--small-port <N>]
+                  [--embed-port <N>] [--max-seq <N>]
+```
+
+Multi-model HTTP server. Three ports — **Big LLM**, **Small LLM**,
+**Embedder** — each its own listener. Every request is pushed onto one
+shared FIFO; a single worker thread owns the GPU, pulls jobs in order,
+runs the target model, and replies. Models never run concurrently
+(one GPU), so the worker just blocks per job.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--big <PATH>` | required | Big-model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B). |
+| `--big-drafter <PATH>` | — | Optional MTP drafter for the big model (Gemma 4 only). When present, the big port accepts `use_speculative: bool` on requests; default-on. |
+| `--small <PATH>` | required | Small-model GGUF (Qwen 3.5 4B or Gemma E4B). |
+| `--embed <PATH>` | — | Embedder GGUF (nomic-embed). Accepted but deferred — the port answers 503 until the encoder runtime lands. |
+| `--big-port <N>` | 8080 | TCP port for the big LLM. |
+| `--small-port <N>` | 8081 | TCP port for the small LLM. |
+| `--embed-port <N>` | 8082 | TCP port for the embedder. |
+| `--max-seq <N>` | 4096 | Context window (prompt + generated tokens) per request. |
+
+Each port answers `POST /v1/completions` and `POST /v1/chat/completions`
+(or `POST /v1/embeddings` on the embed port — currently 503).
+Request/response schemas live in `## API` below. Logs each request as
+`[serve] {target} {chat|completion}: {n_p} prompt + {n_c} gen tok in {wall}s`
+on stderr; spec-decode logs also include the per-call accept rate.
+
 ### debug-embed
 
 ```
@@ -212,6 +300,131 @@ reinstinct-engine gpu-bench <PATH> [-n <N>] [-t <ID>]
 
 Time GPU `forward_token` over `--iters` iterations (default 20) and
 compare against the CPU baseline.
+
+---
+
+## API
+
+OpenAI-shaped JSON HTTP, exposed by the `serve` command. Two endpoints
+on each LLM port:
+
+### POST /v1/completions
+
+Raw-prompt text completion. The server does **no** chat templating —
+whatever you POST in `prompt` is BPE-encoded as-is and a BOS is
+prepended on Gemma. Use this when your client already formats prompts.
+
+```json
+{
+  "prompt": "The capital of France is",
+  "max_tokens": 256,
+  "temperature": 0.0,
+  "top_k": 40,
+  "seed": 0,
+  "use_speculative": true,
+  "speculative_k": 3
+}
+```
+
+Response:
+
+```json
+{
+  "id": "cmpl-N",
+  "object": "text_completion",
+  "created": 1717000000,
+  "model": "gemma-4-31B-it-UD-Q4_K_XL",
+  "choices": [{
+    "text": "...generated text...",
+    "index": 0,
+    "logprobs": null,
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 48,
+    "total_tokens": 54
+  }
+}
+```
+
+### POST /v1/chat/completions
+
+Chat-templated completion. The server applies the per-architecture
+chat template (`gemma4` → Gemma 4 `<|turn>role\n…<turn|>\n`,
+`qwen35` → Qwen 3 `<|im_start|>role\n…<|im_end|>\n`) before tokenizing.
+Use this for chat-system integration where you want the engine to own
+the templating.
+
+```json
+{
+  "messages": [
+    {"role": "system",    "content": "You are concise."},
+    {"role": "user",      "content": "What is 17 × 23?"},
+    {"role": "assistant", "content": "..."}
+  ],
+  "max_tokens": 256,
+  "temperature": 0.0,
+  "top_k": 40,
+  "seed": 0,
+  "use_speculative": true,
+  "speculative_k": 3
+}
+```
+
+Response is OpenAI `chat.completion`-shaped — `choices[i].message.{role,content}`
+instead of the flat `text` field on text_completion. Same `usage` block.
+
+### Shared request fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `prompt` / `messages` | string / array | — | One required, depending on endpoint. |
+| `max_tokens` | int | 256 | Decode-token budget. Clamped to `[1, 4096]`. |
+| `temperature` | float | 0.8 | `0` ⇒ greedy. |
+| `top_k` | int | 40 | `0` ⇒ no filter. |
+| `seed` | int | 0 | PRNG seed. |
+| `use_speculative` | bool | drafter-present | Opt in/out of MTP spec-decode per request. `true` errors with 400 if no drafter was loaded (see `--big-drafter`). |
+| `speculative_k` | int | 3 | K override for spec-decode. Clamped to `[1, 4]`. Ignored when spec-decode is off. |
+
+`use_speculative` is the per-turn knob for chat systems that classify
+incoming turns: leave it default-on for technical / agentic /
+formulaic work, set `false` on creative / open-ended turns where the
+drafter's accept rate is too low to pay for the verify overhead. See
+**Drafter accept rate vs prompt format** below for the empirical
+break-even point on Gemma 31B.
+
+### Drafter accept rate vs prompt format (Gemma 31B + Q8 drafter, MI50)
+
+The MTP drafter was trained on chat-templated text. Feeding it raw
+user prompts drops accept rate below the break-even point and makes
+spec-decode net-negative. Measured smoke:
+
+| Endpoint | Prompt | Accept | Wall (48 tok) | vs plain |
+|---|---|---|---|---|
+| `/v1/completions` | "What is 17 times 23?" (raw) | 38% | 3.03 s | **-31%** |
+| `/v1/completions` | "List the first 10 prime numbers." (raw) | 79% | 2.04 s | +9% |
+| `/v1/chat/completions` | `{role: user, content: "What is 17 × 23?"}` | 69% | 2.24 s | +4% |
+| `/v1/chat/completions` | `{system, user: "List 5 primes."}` | 73% | 1.55 s | +8% |
+
+Rule of thumb: **accept ≥ 65% breaks even on this hardware**. Below
+that, set `use_speculative: false` for the turn. The cheapest way to
+keep accept high is to use `/v1/chat/completions` (server applies the
+template), or pre-template raw prompts on the client side.
+
+### Errors
+
+OpenAI-shaped error body on non-2xx:
+
+```json
+{"error": {"message": "...", "type": "invalid_request_error"}}
+```
+
+- `400` for malformed JSON, missing required fields, `use_speculative=true`
+  with no drafter loaded, or a wrong role in `messages[].role`.
+- `404` for any path other than `/v1/{completions,chat/completions,embeddings}`.
+- `503` for `/v1/embeddings` (deferred), or when the GPU worker has
+  crashed / the model failed to load at startup.
 
 ---
 
@@ -285,6 +498,53 @@ reinstinct-engine chat <gemma4-model.gguf> \
     --turn "Name the planets." \
     --turn "Capital of France?" \
     --turn "What is 2+2?" -n 60
+```
+
+Speculative-decode generation with the MTP drafter on Gemma 31B (best
+ROI on factual / agentic prompts; chat-templated input is strongly
+recommended for the drafter):
+```
+reinstinct-engine mtp-gen \
+    ~/models/gemma4-31b/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    ~/models/gemma4-mtp/gemma-4-31B-it-assistant.Q8_0.gguf \
+    --system "" --prompt "What is 17 × 23? Show your work." --k 3 -n 64
+```
+
+Boot the multi-model server with a drafter on the big port — clients
+can opt in/out of MTP per request via `use_speculative`:
+```
+reinstinct-engine serve \
+    --big         ~/models/gemma4-31b/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    --big-drafter ~/models/gemma4-mtp/gemma-4-31B-it-assistant.Q8_0.gguf \
+    --small       ~/models/qwen-3.5-4B/Qwen3.5-4B-UD-Q4_K_XL.gguf
+```
+
+Hit it with a chat-completions call (template applied server-side,
+spec-decode default-on because a drafter was loaded):
+```
+curl http://localhost:8080/v1/chat/completions \
+    -H 'content-type: application/json' \
+    -d '{
+      "messages": [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user",   "content": "What is 17 × 23?"}
+      ],
+      "max_tokens": 64,
+      "temperature": 0
+    }'
+```
+
+Or opt out of MTP per request — e.g. when a classifier flagged this
+as a creative turn where the drafter would just waste verify cycles:
+```
+curl http://localhost:8080/v1/chat/completions \
+    -H 'content-type: application/json' \
+    -d '{
+      "messages": [{"role": "user", "content": "Write a haiku about coffee."}],
+      "max_tokens": 64,
+      "temperature": 0.8,
+      "use_speculative": false
+    }'
 ```
 
 Benchmark the batched prefill on a 128-token prompt:
