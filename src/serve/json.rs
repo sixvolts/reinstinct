@@ -28,6 +28,9 @@ impl Json {
     pub fn as_bool(&self) -> Option<bool> {
         match self { Json::Bool(b) => Some(*b), _ => None }
     }
+    pub fn as_array(&self) -> Option<&[Json]> {
+        match self { Json::Arr(a) => Some(a.as_slice()), _ => None }
+    }
 
     /// Parse a complete JSON document.
     pub fn parse(s: &str) -> Result<Json, String> {

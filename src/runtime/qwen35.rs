@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
-use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
@@ -59,6 +59,17 @@ const GDN_RECURRENT_STEP_FUSED_SOURCE: &str = include_str!("../../kernels/gdn_re
 const CONV1D_STEP_SILU_SOURCE:      &str = include_str!("../../kernels/conv1d_step_silu.cpp");
 const L2NORM_QK_SOURCE:             &str = include_str!("../../kernels/l2norm_qk.cpp");
 const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
+// Batched variants — one launch covers all `n_rows` of a prefill,
+// internally iterating with the recurrent state threaded through.
+// Decode (n_rows=1) keeps using the single-row kernels above.
+const CONV1D_STEP_SILU_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/conv1d_step_silu_batched.cpp");
+const L2NORM_QK_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/l2norm_qk_batched.cpp");
+const GDN_RECURRENT_STEP_FUSED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/gdn_recurrent_step_fused_batched.cpp");
+const RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/rmsnorm_gated_multihead_batched.cpp");
 
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const MATVEC_F32_B256_SOURCE: &str = include_str!("../../kernels/matvec_f32_b256.cpp");
@@ -778,6 +789,12 @@ pub struct GpuQwen35 {
     conv1d_step_silu_module:      Module,
     l2norm_qk_module:             Module,
     rmsnorm_gated_multihead_module: Module,
+    // Batched (n_rows-collapsed) variants used by forward_tokens_batched
+    // to replace the per-row launch loops.
+    conv1d_step_silu_batched_module: Module,
+    l2norm_qk_batched_module: Module,
+    gdn_recurrent_step_fused_batched_module: Module,
+    rmsnorm_gated_multihead_batched_module: Module,
 
     matvec_f16_module:     Module,
     /// 256-thread/block fp32 matvec — wins over the wave64 path on
@@ -966,6 +983,14 @@ impl GpuQwen35 {
         let conv1d_step_silu_hsaco       = cache.compile("conv1d_step_silu", CONV1D_STEP_SILU_SOURCE)?;
         let l2norm_qk_hsaco              = cache.compile("l2norm_qk",        L2NORM_QK_SOURCE)?;
         let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
+        let conv1d_step_silu_batched_hsaco = cache.compile(
+            "conv1d_step_silu_batched", CONV1D_STEP_SILU_BATCHED_SOURCE)?;
+        let l2norm_qk_batched_hsaco = cache.compile(
+            "l2norm_qk_batched", L2NORM_QK_BATCHED_SOURCE)?;
+        let gdn_recurrent_step_fused_batched_hsaco = cache.compile(
+            "gdn_recurrent_step_fused_batched", GDN_RECURRENT_STEP_FUSED_BATCHED_SOURCE)?;
+        let rmsnorm_gated_multihead_batched_hsaco = cache.compile(
+            "rmsnorm_gated_multihead_batched", RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let matvec_f32_b256_hsaco = cache.compile("matvec_f32_b256", MATVEC_F32_B256_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
@@ -1035,6 +1060,14 @@ impl GpuQwen35 {
             conv1d_step_silu_module:      Module::load(&conv1d_step_silu_hsaco)?,
             l2norm_qk_module:             Module::load(&l2norm_qk_hsaco)?,
             rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
+            conv1d_step_silu_batched_module:
+                Module::load(&conv1d_step_silu_batched_hsaco)?,
+            l2norm_qk_batched_module:
+                Module::load(&l2norm_qk_batched_hsaco)?,
+            gdn_recurrent_step_fused_batched_module:
+                Module::load(&gdn_recurrent_step_fused_batched_hsaco)?,
+            rmsnorm_gated_multihead_batched_module:
+                Module::load(&rmsnorm_gated_multihead_batched_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
             matvec_f32_b256_module: Module::load(&matvec_f32_b256_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
@@ -1256,6 +1289,119 @@ impl GpuQwen35 {
             &mut oa as *mut _ as *mut c_void,
         ];
         unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    // ===== batched (n_rows-collapsed) GDN launchers, used by prefill =====
+    // Each of these replaces a per-row launch loop with a single launch
+    // whose kernel loops over n_rows internally. State (conv history,
+    // recurrent matrix) threads through the inner loop on-GPU.
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_conv1d_step_silu_batched(&self,
+        x_new_batch: *mut c_void, w: *mut c_void, history: *mut c_void,
+        y_batch: *mut c_void, n_channels: u32, kernel_size: u32, n_rows: u32)
+        -> Result<(), String>
+    {
+        let f = self.conv1d_step_silu_batched_module.function("conv1d_step_silu_batched_f32")?;
+        let block: u32 = 256;
+        let grid = (n_channels + block - 1) / block;
+        let mut xa=x_new_batch; let mut wa=w; let mut ha=history; let mut ya=y_batch;
+        let mut nc=n_channels; let mut ks=kernel_size; let mut nr=n_rows;
+        let mut args: [*mut c_void; 7] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ha as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void, &mut ks as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_l2norm_qk_batched(&self,
+        q_in: *mut c_void, q_out: *mut c_void,
+        k_in: *mut c_void, k_out: *mut c_void,
+        n_heads: u32, head_dim: u32, eps: f32, q_scale: f32,
+        n_rows: u32,
+        q_in_row_stride: u32, q_out_row_stride: u32,
+        k_in_row_stride: u32, k_out_row_stride: u32)
+        -> Result<(), String>
+    {
+        let f = self.l2norm_qk_batched_module.function("l2norm_qk_batched_f32")?;
+        let block: u32 = 128;
+        let mut qa=q_in; let mut qo=q_out; let mut ka=k_in; let mut ko=k_out;
+        let mut nh=n_heads; let mut hd=head_dim; let mut ep=eps; let mut sc=q_scale;
+        let mut nr=n_rows;
+        let mut qis=q_in_row_stride; let mut qos=q_out_row_stride;
+        let mut kis=k_in_row_stride; let mut kos=k_out_row_stride;
+        let mut args: [*mut c_void; 13] = [
+            &mut qa as *mut _ as *mut c_void, &mut qo as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void, &mut ko as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut qis as *mut _ as *mut c_void, &mut qos as *mut _ as *mut c_void,
+            &mut kis as *mut _ as *mut c_void, &mut kos as *mut _ as *mut c_void];
+        let smem = block * 4;
+        unsafe { f.launch((n_heads, 2, n_rows), (block, 1, 1), smem,
+                          Some(&self.stream), &mut args) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gdn_recurrent_step_fused_batched(&self,
+        q_in: *mut c_void, k_in: *mut c_void, v_in: *mut c_void,
+        a_in: *mut c_void, b_in: *mut c_void,
+        ssm_a: *mut c_void, dt_bias: *mut c_void,
+        state: *mut c_void, out: *mut c_void,
+        n_heads: u32, head_dim: u32, n_k_heads: u32, n_rows: u32,
+        qk_row_stride: u32, v_row_stride: u32, ab_row_stride: u32,
+        out_row_stride: u32) -> Result<(), String>
+    {
+        let f = self.gdn_recurrent_step_fused_batched_module
+            .function("gdn_recurrent_step_fused_batched_f32")?;
+        const COLS: u32 = 16;
+        let block: u32 = 64;
+        let smem = 2 * head_dim * 4;
+        let mut qa=q_in; let mut ka=k_in; let mut va=v_in;
+        let mut aa=a_in; let mut ba=b_in;
+        let mut sa=ssm_a; let mut dta=dt_bias;
+        let mut st=state; let mut ou=out;
+        let mut nh=n_heads; let mut hd=head_dim; let mut nkh=n_k_heads; let mut nr=n_rows;
+        let mut qrs=qk_row_stride; let mut vrs=v_row_stride;
+        let mut abs_=ab_row_stride; let mut ors=out_row_stride;
+        let mut args: [*mut c_void; 17] = [
+            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+            &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+            &mut dta as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void,
+            &mut ou as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void, &mut qrs as *mut _ as *mut c_void,
+            &mut vrs as *mut _ as *mut c_void, &mut abs_ as *mut _ as *mut c_void,
+            &mut ors as *mut _ as *mut c_void];
+        unsafe { f.launch((n_heads, head_dim / COLS, 1), (block, 1, 1), smem,
+                          Some(&self.stream), &mut args) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_rmsnorm_gated_multihead_batched(&self,
+        x_batch: *mut c_void, z_batch: *mut c_void, w: *mut c_void,
+        y_batch: *mut c_void, n_heads: u32, head_dim: u32, eps: f32,
+        n_rows: u32, row_stride: u32) -> Result<(), String>
+    {
+        let f = self.rmsnorm_gated_multihead_batched_module
+            .function("rmsnorm_gated_multihead_batched_f32")?;
+        let block: u32 = 128;
+        let mut xa=x_batch; let mut za=z_batch; let mut wa=w; let mut ya=y_batch;
+        let mut nh=n_heads; let mut hd=head_dim; let mut ep=eps;
+        let mut nr=n_rows; let mut rs=row_stride;
+        let mut args: [*mut c_void; 9] = [
+            &mut xa as *mut _ as *mut c_void, &mut za as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void];
+        let smem = block * 4;
+        unsafe { f.launch((n_heads, n_rows, 1), (block, 1, 1), smem,
+                          Some(&self.stream), &mut args) }
     }
 
     /// 256-thread-block fp32 matvec — one block per output row, 4 waves
@@ -2851,40 +2997,51 @@ impl GpuQwen35 {
         self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr())?;
         self.bmm(&w.attn.ssm_beta,  bnorm.raw_ptr(), n, b.raw_ptr())?;
 
-        // conv1d + SiLU, sequential per row (conv history threads through).
+        // conv1d + SiLU, batched: one launch over all n rows (the kernel
+        // threads the conv history through the rows internally).
         let conv_out: DeviceBuf<f32> = DeviceBuf::new(n * cdim)?;
-        for r in 0..n {
-            let in_ptr  = unsafe { (qkv.raw_ptr()      as *mut f32).add(r * cdim) } as *mut c_void;
-            let out_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(r * cdim) } as *mut c_void;
-            self.launch_conv1d_step_silu(in_ptr, w.attn.ssm_conv1d.raw_ptr(),
-                                         st.conv_hist.raw_ptr(), out_ptr,
-                                         cdim as u32, self.gdn_conv_kernel as u32)?;
-        }
+        self.launch_conv1d_step_silu_batched(
+            qkv.raw_ptr(), w.attn.ssm_conv1d.raw_ptr(),
+            st.conv_hist.raw_ptr(), conv_out.raw_ptr(),
+            cdim as u32, self.gdn_conv_kernel as u32, n as u32)?;
 
-        // Per-row: L2-norm Q/K, recurrent step, gated rmsnorm.
+        // L2-norm Q/K → q_all/k_all [n, kdim]. The conv output is
+        // [n, cdim] with layout (q | k | v) per row; the batched kernel
+        // strides by cdim to walk rows.
+        let q_all: DeviceBuf<f32> = DeviceBuf::new(n * kdim)?;
+        let k_all: DeviceBuf<f32> = DeviceBuf::new(n * kdim)?;
+        let conv_q_ptr = conv_out.raw_ptr();
+        let conv_k_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(kdim) } as *mut c_void;
+        self.launch_l2norm_qk_batched(
+            conv_q_ptr, q_all.raw_ptr(),
+            conv_k_ptr, k_all.raw_ptr(),
+            nkh, hd, 1e-6, q_scale, n as u32,
+            cdim as u32,   // q_in_row_stride  — q half of conv_out, stride cdim
+            kdim as u32,   // q_out_row_stride — q_all is dense [n, kdim]
+            cdim as u32,   // k_in_row_stride
+            kdim as u32)?; // k_out_row_stride
+
+        // Recurrent step + decay/beta — single launch over all n rows;
+        // the kernel loops internally with state threaded through.
+        // v_in points at the v half of conv_out (offset 2*kdim per row).
         let core: DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
-        let q_buf: DeviceBuf<f32> = DeviceBuf::new(kdim)?;
-        let k_buf: DeviceBuf<f32> = DeviceBuf::new(kdim)?;
-        for r in 0..n {
-            let conv_ptr = conv_out.raw_ptr() as *mut f32;
-            let q_in = unsafe { conv_ptr.add(r * cdim)                } as *mut c_void;
-            let k_in = unsafe { conv_ptr.add(r * cdim + kdim)         } as *mut c_void;
-            let v_in = unsafe { conv_ptr.add(r * cdim + 2 * kdim)     } as *mut c_void;
-            self.launch_l2norm_qk(q_in, q_buf.raw_ptr(), k_in, k_buf.raw_ptr(),
-                                  nkh, hd, 1e-6, q_scale)?;
-            let a_row = unsafe { (a.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
-            let b_row = unsafe { (b.raw_ptr() as *mut f32).add(r * self.gdn_n_heads) } as *mut c_void;
-            let core_row = unsafe { (core.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
-            self.launch_gdn_recurrent_step_fused(q_buf.raw_ptr(), k_buf.raw_ptr(), v_in,
-                                                 a_row, b_row,
-                                                 w.attn.ssm_a.raw_ptr(),
-                                                 w.attn.ssm_dt_bias.raw_ptr(),
-                                                 st.recurrent.raw_ptr(), core_row,
-                                                 nh, hd, nkh)?;
-            let z_row = unsafe { (z.raw_ptr() as *mut f32).add(r * vdim) } as *mut c_void;
-            self.launch_rmsnorm_gated_multihead(core_row, z_row, w.attn.ssm_norm.raw_ptr(),
-                                                core_row, nh, hd, self.rms_eps)?;
-        }
+        let conv_v_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(2 * kdim) } as *mut c_void;
+        self.launch_gdn_recurrent_step_fused_batched(
+            q_all.raw_ptr(), k_all.raw_ptr(), conv_v_ptr,
+            a.raw_ptr(), b.raw_ptr(),
+            w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
+            st.recurrent.raw_ptr(), core.raw_ptr(),
+            nh, hd, nkh, n as u32,
+            kdim as u32,                                // qk_row_stride
+            cdim as u32,                                // v_row_stride (conv layout)
+            self.gdn_n_heads as u32,                    // ab_row_stride
+            vdim as u32)?;                              // out_row_stride
+
+        // Gated RMSNorm with z = attn_gate output (already [n, vdim]).
+        self.launch_rmsnorm_gated_multihead_batched(
+            core.raw_ptr(), z.raw_ptr(), w.attn.ssm_norm.raw_ptr(),
+            core.raw_ptr(), nh, hd, self.rms_eps,
+            n as u32, vdim as u32)?;
 
         // ssm_out projection, batched.
         self.bmm(&w.attn.ssm_out, core.raw_ptr(), n, bb.raw_ptr())?;
