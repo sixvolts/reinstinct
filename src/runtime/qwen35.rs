@@ -113,6 +113,7 @@ const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_
 const MMQ_GEMM_Q4K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const MMQ_GEMM_Q5K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
+const MMQ_GEMM_Q8_0_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q8_0_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 const MATVEC_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_repacked.cpp");
@@ -849,10 +850,11 @@ pub struct GpuQwen35 {
     rope_batched_module:   Module,
     attn_step_batched_module: Module,
     /// 2D-tiled int8 MMQ GEMM — replaces dequant+HGEMM for repacked
-    /// K-quants in the dense prefill.
+    /// K-quants AND repacked Q8_0 in the dense prefill.
     mmq_q4k_module:        Module,
     mmq_q5k_module:        Module,
     mmq_q6k_module:        Module,
+    mmq_q8_0_module:       Module,
 
     // Dimensions.
     hidden:     usize,
@@ -1091,6 +1093,7 @@ impl GpuQwen35 {
             rope_batched_module:      Module::load(&cache.compile("rope_batched", ROPE_BATCHED_SOURCE)?)?,
             attn_step_batched_module: Module::load(&cache.compile("attn_prefill_flash", ATTN_STEP_BATCHED_SOURCE)?)?,
             mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
+            mmq_q8_0_module:          Module::load(&cache.compile("mmq_gemm_q8_0_repacked", MMQ_GEMM_Q8_0_SOURCE)?)?,
             mmq_q5k_module:           Module::load(&cache.compile("mmq_gemm_q5k_repacked", MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k_module:           Module::load(&cache.compile("mmq_gemm_q6k_repacked", MMQ_GEMM_Q6K_SOURCE)?)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
@@ -2641,10 +2644,12 @@ impl GpuQwen35 {
         let in_d = w.in_dim as usize;
         let out_d = w.out_dim as usize;
 
-        // Repacked K-quants: the 2D-tiled int8 MMQ GEMM consumes the
-        // quantised weight directly — no dequant to fp16, no HGEMM.
+        // Repacked K-quants AND repacked Q8_0: the 2D-tiled int8 MMQ
+        // GEMM consumes the quantised weight directly — no dequant to
+        // fp16, no HGEMM. Q8_0 covers the GDN ssm_out weights (and
+        // Unsloth's per-tensor Q8_0 layer overrides).
         if w.repacked && matches!(w.dtype,
-            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0) {
             return self.bmm_mmq(w, x_f32, n_rows, y_f32);
         }
 
@@ -2698,6 +2703,7 @@ impl GpuQwen35 {
         let (module, kname) = match w.dtype {
             GgmlType::Q5_K => (&self.mmq_q5k_module, "mmq_gemm_q5k_repacked_f32"),
             GgmlType::Q6_K => (&self.mmq_q6k_module, "mmq_gemm_q6k_repacked_f32"),
+            GgmlType::Q8_0 => (&self.mmq_q8_0_module, "mmq_gemm_q8_0_repacked_f32"),
             _              => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
         };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
