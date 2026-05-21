@@ -184,6 +184,13 @@ enum Command {
         /// Big model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B).
         #[arg(long)]
         big: PathBuf,
+        /// Optional MTP drafter for the big model (Gemma 4 only).
+        /// When present, /v1/completions on the big port accepts a
+        /// `use_speculative: bool` JSON field (default: true). Set false
+        /// to opt out per-request — e.g. for creative-writing turns
+        /// where the drafter typically has low accept rate.
+        #[arg(long)]
+        big_drafter: Option<PathBuf>,
         /// Small model GGUF (Qwen 3.5 4B or Gemma E4B).
         #[arg(long)]
         small: PathBuf,
@@ -212,9 +219,10 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
-        Command::Serve { big, small, embed, big_port, small_port, embed_port, max_seq } =>
-            reinstinct_engine::serve::run(big, small, embed, big_port, small_port,
-                                          embed_port, max_seq)
+        Command::Serve { big, big_drafter, small, embed,
+                         big_port, small_port, embed_port, max_seq } =>
+            reinstinct_engine::serve::run(big, big_drafter, small, embed,
+                                          big_port, small_port, embed_port, max_seq)
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
                                 temperature, top_k, seed, gpu } =>
@@ -1333,49 +1341,7 @@ fn mtp_draft_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     Ok(())
 }
 
-fn argmax(v: &[f32]) -> u32 {
-    let mut best_i = 0u32;
-    let mut best_v = v[0];
-    for (i, &x) in v.iter().enumerate().skip(1) {
-        if x > best_v { best_v = x; best_i = i as u32; }
-    }
-    best_i
-}
-
-/// Standard temperature-softmax: subtract max for stability, exp, normalize.
-/// `temperature` must be > 0 (caller checks).
-fn softmax_with_temp(logits: &[f32], temperature: f32) -> Vec<f32> {
-    let inv_t = 1.0 / temperature;
-    let mut max_v = f32::NEG_INFINITY;
-    for &x in logits { if x > max_v { max_v = x; } }
-    let mut out: Vec<f32> = logits.iter()
-        .map(|&x| ((x - max_v) * inv_t).exp())
-        .collect();
-    let s: f32 = out.iter().sum();
-    if s > 0.0 { for x in &mut out { *x /= s; } }
-    out
-}
-
-/// Sample a token id from a logits vector by temperature-softmax.
-fn sample_from_logits(logits: &[f32], temperature: f32,
-                      rng: &mut reinstinct_engine::sampling::Rng) -> u32
-{
-    let p = softmax_with_temp(logits, temperature);
-    sample_from_probs(&p, rng)
-}
-
-/// Sample from a vector of probabilities (must sum ~1.0).
-fn sample_from_probs(probs: &[f32],
-                     rng: &mut reinstinct_engine::sampling::Rng) -> u32
-{
-    let r = rng.next_f32();
-    let mut acc = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        acc += p;
-        if r < acc { return i as u32; }
-    }
-    (probs.len() - 1) as u32
-}
+use reinstinct_engine::sampling::argmax;
 
 /// Full speculative-decode generation loop (sequential verify). One
 /// round: drafter proposes K tokens; target sequentially verifies via
@@ -1396,7 +1362,6 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     use reinstinct_engine::model::gemma4_assistant::Gemma4AssistantModel;
     use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
     use reinstinct_engine::runtime::gemma4_assistant::GpuGemma4Assistant;
-    use reinstinct_engine::sampling::Rng;
     use reinstinct_engine::tokenizer::GemmaTokenizer;
 
     if k == 0 { anyhow::bail!("--k must be >= 1"); }
@@ -1443,7 +1408,7 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let t_pf = std::time::Instant::now();
     let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
         .map_err(anyhow::Error::msg)?;
-    let mut verify_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+    let verify_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
         .map_err(anyhow::Error::msg)?;
     println!("prefill = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
 
@@ -1535,151 +1500,31 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         return Ok(());
     }
 
-    // The drafter is conditioned on (prev_tok, h_prev=target_hidden_at_pos).
-    // After the initial forward_token, the natural last_token is the
-    // FINAL prompt token (per HF: "input_ids[:, -1:]"), and h_prev is
-    // target.last_hidden_state at that position. For subsequent rounds:
-    // last_token = the last accepted/committed token.
-    let mut last_tok = *prompt.last().unwrap();
-
-    let mut generated: Vec<u32> = Vec::new();
-    let mut total_drafted: usize = 0;
-    let mut total_accepted: usize = 0;
-    let mut hit_eos = false;
+    // Hand off to the shared spec-decode loop. The drafter is
+    // conditioned on (prev_tok, h_prev=target_hidden_at_pos); the
+    // natural starting `last_tok` is the FINAL prompt token (per HF:
+    // "input_ids[:, -1:]"), and h_prev gets refreshed per round inside
+    // the loop via `drafter.set_h_prev_from_target(target)`.
     let t_gen = std::time::Instant::now();
-
-    let sampling = temperature > 0.0;
-    let mut rng = Rng::new(seed);
-
-    while generated.len() < steps {
-        // --- DRAFT phase ---
-        // pos_const = state.pos - 1 is the position of the last validated
-        // token. The drafter pins its position to that across the round.
-        let pos_const = state.pos - 1;
-        drafter.set_h_prev_from_target(&gm).map_err(anyhow::Error::msg)?;
-        let mut drafted: Vec<u32> = Vec::with_capacity(k);
-        // Drafter logits per step, kept around for the sampling-acceptance
-        // ratio p_target/p_draft. Greedy mode doesn't read them.
-        let mut drafter_logits_arr: Vec<Vec<f32>> = Vec::with_capacity(k);
-        let mut prev = last_tok;
-        for _ in 0..k {
-            let logits_d = drafter.forward_step(&gm, &state, prev, pos_const)
-                .map_err(anyhow::Error::msg)?;
-            let d = if sampling {
-                sample_from_logits(&logits_d, temperature, &mut rng)
-            } else {
-                argmax(&logits_d)
-            };
-            drafted.push(d);
-            drafter_logits_arr.push(logits_d);
-            prev = d;
-        }
-
-        // --- BATCHED VERIFY ---
-        // Target processes the K drafted tokens in ONE forward at
-        // positions [pre_verify_pos, pre_verify_pos+K), returning K
-        // logit vectors. verify_logits_batch[i] predicts position
-        // pre_verify_pos+i+1.
-        let pre_verify_pos = state.pos;
-        let verify_batch = match &verify_graph {
-            Some(g) if drafted.len() == k =>
-                gm.forward_verify_via_graph(g, k, &drafted, &mut state)
-                    .map_err(anyhow::Error::msg)?,
-            _ => gm.verify_forward(&drafted, &mut state)
-                    .map_err(anyhow::Error::msg)?,
-        };
-
-        // --- ACCEPTANCE ---
-        // drafted[i] (at pos pre_verify_pos+i) is verified against:
-        //   - argmax(verify_logits)            for i == 0   (target's prediction from BEFORE the round)
-        //   - argmax(verify_batch[i-1])        for i >= 1   (target's prediction conditional on drafted[..i])
-        // On first rejection: keep drafted[..i], commit target's pick at
-        // pos pre_verify_pos+i, truncate the rejected slots.
-        let mut accepted_this_round = 0usize;
-        let mut rejected = false;
-        for i in 0..drafted.len() {
-            let predicting_logits = if i == 0 { &verify_logits } else { &verify_batch[i - 1] };
-            let d = drafted[i];
-            let (accept, replacement) = if sampling {
-                // Rejection-sampling acceptance: accept drafted[i] with
-                // probability min(1, p_target[d] / p_draft[d]); on reject
-                // sample replacement from the residual (p_target -
-                // p_draft)^+ , normalised.
-                let p_t = softmax_with_temp(predicting_logits, temperature);
-                let p_d = softmax_with_temp(&drafter_logits_arr[i], temperature);
-                let r = rng.next_f32();
-                let ratio = if p_d[d as usize] > 0.0 {
-                    (p_t[d as usize] / p_d[d as usize]).min(1.0)
-                } else { 0.0 };
-                if r < ratio {
-                    (true, d)
-                } else {
-                    let mut residual: Vec<f32> = p_t.iter().zip(p_d.iter())
-                        .map(|(t, d)| (t - d).max(0.0))
-                        .collect();
-                    let s: f32 = residual.iter().sum();
-                    if s > 0.0 { for x in &mut residual { *x /= s; } }
-                    else { residual.copy_from_slice(&p_t); }
-                    let repl = sample_from_probs(&residual, &mut rng);
-                    (false, repl)
-                }
-            } else {
-                let target_pred = argmax(predicting_logits);
-                if d == target_pred { (true, d) } else { (false, target_pred) }
-            };
-
-            if accept {
-                generated.push(d);
-                accepted_this_round += 1;
-                last_tok = d;
-                if d == cfg_eos { hit_eos = true; rejected = true; break; }
-                if generated.len() >= steps { rejected = true; break; }
-            } else {
-                state.truncate(pre_verify_pos + i);
-                let new_verify = gm.forward_token(replacement, &mut state)
-                    .map_err(anyhow::Error::msg)?;
-                generated.push(replacement);
-                last_tok = replacement;
-                hit_eos = replacement == cfg_eos;
-                verify_logits = new_verify;
-                rejected = true;
-                break;
-            }
-        }
-        if !rejected {
-            // All K drafts accepted. Per HF spec-decode, in this case the
-            // target's last verify logit (= prediction for the position
-            // AFTER the last draft) is consumed as a "bonus" token —
-            // generation advances by K+1 in this round, not K. Toggle:
-            // REINSTINCT_DRAFTER_NO_BONUS=1 reverts to the old "advance by K"
-            // behaviour (for measurement only).
-            if std::env::var("REINSTINCT_DRAFTER_NO_BONUS").is_ok() {
-                verify_logits = verify_batch.last().cloned().unwrap();
-            } else {
-                let bonus = argmax(verify_batch.last().unwrap());
-                verify_logits = gm.forward_token(bonus, &mut state)
-                    .map_err(anyhow::Error::msg)?;
-                generated.push(bonus);
-                last_tok = bonus;
-                hit_eos = bonus == cfg_eos;
-            }
-        }
-        total_drafted += drafted.len();
-        total_accepted += accepted_this_round;
-        if hit_eos { break; }
-    }
+    let (generated, stats) = reinstinct_engine::runtime::spec_decode::spec_decode_generate(
+        &gm, &drafter, &mut state,
+        verify_graph.as_ref(), k,
+        verify_logits,
+        *prompt.last().unwrap(),
+        cfg_eos,
+        steps, k, temperature, seed,
+    ).map_err(anyhow::Error::msg)?;
 
     let gen_secs = t_gen.elapsed().as_secs_f64();
-    let n_gen = generated.len();
     println!();
     println!("--- generation ---");
     println!("{}", tok.decode(&generated));
     println!();
-    println!("generated {n_gen} tokens in {:.2} s = {:.1} tok/s", gen_secs, n_gen as f64 / gen_secs);
+    println!("generated {} tokens in {:.2} s = {:.1} tok/s",
+             generated.len(), gen_secs, generated.len() as f64 / gen_secs);
     println!("draft accept rate: {} / {} = {:.0}%",
-             total_accepted, total_drafted,
-             100.0 * total_accepted as f64 / total_drafted.max(1) as f64);
-    if hit_eos { println!("(hit EOS)"); }
+             stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
+    if stats.hit_eos { println!("(hit EOS)"); }
     Ok(())
 }
 

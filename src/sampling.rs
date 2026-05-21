@@ -97,6 +97,42 @@ pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rn
     top.last().unwrap().0 as u32
 }
 
+/// Standard temperature-softmax over the full vocab. Subtract max for
+/// stability, exp, normalize. `temperature` must be > 0 (caller checks).
+/// Used by the MTP spec-decode acceptance loop, which needs full
+/// distributions for the rejection-sampling test.
+pub fn softmax_with_temp(logits: &[f32], temperature: f32) -> Vec<f32> {
+    let inv_t = 1.0 / temperature;
+    let mut max_v = f32::NEG_INFINITY;
+    for &x in logits { if x > max_v { max_v = x; } }
+    let mut out: Vec<f32> = logits.iter()
+        .map(|&x| ((x - max_v) * inv_t).exp())
+        .collect();
+    let s: f32 = out.iter().sum();
+    if s > 0.0 { for x in &mut out { *x /= s; } }
+    out
+}
+
+/// Sample a token id from a logits vector via temperature-softmax over
+/// the full vocab. Companion to `softmax_with_temp` for callers that
+/// need the distribution.
+pub fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
+    let p = softmax_with_temp(logits, temperature);
+    sample_from_probs(&p, rng)
+}
+
+/// Sample from a vector of probabilities (assumed to sum ≈ 1.0). Linear
+/// scan; fine for the small distributions used in spec-decode acceptance.
+pub fn sample_from_probs(probs: &[f32], rng: &mut Rng) -> u32 {
+    let r = rng.next_f32();
+    let mut acc = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if r < acc { return i as u32; }
+    }
+    (probs.len() - 1) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
