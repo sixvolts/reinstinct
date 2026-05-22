@@ -383,6 +383,56 @@ const MOE_PREFILL_CHUNK: usize = 256;
 /// also uses it. 16 covers any sane k.
 const VERIFY_MAX_TOKENS: usize = 16;
 
+/// A free-list pool of `DeviceBuf<T>` keyed by element count. Replaces
+/// per-call `hipMalloc` in the batched prefill / verify path: the first
+/// pass allocates, every later pass reuses. `take` hands out a
+/// `PooledBuf` that returns its buffer to the pool on drop. Pooled
+/// buffers are never freed mid-run, so kernels still reading them on the
+/// single engine stream stay safe without a per-call sync — which is
+/// what makes the per-round spec-decode verify cheap.
+struct DeviceBufPool<T> {
+    free: std::cell::RefCell<std::collections::HashMap<usize, Vec<DeviceBuf<T>>>>,
+}
+
+impl<T: Copy> DeviceBufPool<T> {
+    fn new() -> Self {
+        Self { free: std::cell::RefCell::new(std::collections::HashMap::new()) }
+    }
+
+    /// A buffer of exactly `len` elements — reused from the pool when
+    /// available, freshly allocated otherwise. Contents are unspecified
+    /// (same contract as `DeviceBuf::new`).
+    fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
+        let reused = self.free.borrow_mut().get_mut(&len).and_then(|v| v.pop());
+        let buf = match reused {
+            Some(b) => b,
+            None    => DeviceBuf::new(len)?,
+        };
+        Ok(PooledBuf { buf: Some(buf), pool: self, len })
+    }
+}
+
+/// A `DeviceBuf` borrowed from a `DeviceBufPool`; returns to the pool
+/// when dropped. Derefs to `DeviceBuf<T>` so call sites are unchanged.
+struct PooledBuf<'a, T> {
+    buf:  Option<DeviceBuf<T>>,
+    pool: &'a DeviceBufPool<T>,
+    len:  usize,
+}
+
+impl<T> Drop for PooledBuf<'_, T> {
+    fn drop(&mut self) {
+        if let Some(b) = self.buf.take() {
+            self.pool.free.borrow_mut().entry(self.len).or_default().push(b);
+        }
+    }
+}
+
+impl<T> std::ops::Deref for PooledBuf<'_, T> {
+    type Target = DeviceBuf<T>;
+    fn deref(&self) -> &DeviceBuf<T> { self.buf.as_ref().unwrap() }
+}
+
 struct MoeRuntime {
     n_expert: usize,
     n_used:   usize,
@@ -869,6 +919,10 @@ pub struct GpuQwen35 {
     /// `forward_tokens_verify` — the MTP spec-decode loop reads a row as
     /// the next round's `prev_hidden`.
     verify_hidden: DeviceBuf<f32>, // [VERIFY_MAX_TOKENS * hidden]
+    /// Buffer pools for the batched prefill / verify path — replace
+    /// per-call `hipMalloc` so the per-round spec-decode verify is cheap.
+    pool_f32: DeviceBufPool<f32>,
+    pool_u8:  DeviceBufPool<u8>,
     ffn_a:       DeviceBuf<f32>,   // [ffn]
     ffn_b:       DeviceBuf<f32>,   // [ffn]
     q_raw:       DeviceBuf<f32>,   // [2 * q_dim]
@@ -1069,6 +1123,8 @@ impl GpuQwen35 {
         let mtp_scratch = DeviceBuf::new(3 * hidden)?;
         let mtp_chain_hid = DeviceBuf::new(hidden)?;
         let verify_hidden = DeviceBuf::new(VERIFY_MAX_TOKENS * hidden)?;
+        let pool_f32      = DeviceBufPool::new();
+        let pool_u8       = DeviceBufPool::new();
         let ffn_a       = DeviceBuf::new(ffn)?;
         let ffn_b       = DeviceBuf::new(ffn)?;
         let q_raw       = DeviceBuf::new(2 * q_dim)?;
@@ -1181,7 +1237,8 @@ impl GpuQwen35 {
 
         Ok(Self {
             token_embd, output_norm, output_proj,
-            hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden, ffn_a, ffn_b,
+            hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
+            pool_f32, pool_u8, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
             moe_prof_on, prof_mark, prof_buckets,
@@ -3279,7 +3336,7 @@ impl GpuQwen35 {
             _              => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
         };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
-        let xq8: DeviceBuf<u8> = DeviceBuf::new(n_rows * (in_d / 32) * 40)?;
+        let xq8 = self.pool_u8.take(n_rows * (in_d / 32) * 40)?;
         self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
 
         // MMQ GEMM — BM=64 output rows × BN=64 tokens per workgroup.
@@ -3292,8 +3349,8 @@ impl GpuQwen35 {
             &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
         unsafe { f.launch(((out_d as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
                           (256, 1, 1), 0, Some(&self.stream), &mut args)?; }
-        // xq8 is local — sync before it drops, like bmm.
-        self.stream.synchronize()?;
+        // xq8 is pooled (not freed) — no per-call sync; the single
+        // engine stream orders any later reuse after this kernel.
         Ok(())
     }
 
@@ -3383,9 +3440,9 @@ impl GpuQwen35 {
         let scaling = (self.head_dim as f32).powf(-0.5);
 
         // Per-call batched activation buffers.
-        let ba: DeviceBuf<f32> = DeviceBuf::new(n * h)?;        // running hidden
-        let bb: DeviceBuf<f32> = DeviceBuf::new(n * h)?;        // scratch
-        let bnorm: DeviceBuf<f32> = DeviceBuf::new(n * h)?;     // normed scratch
+        let ba    = self.pool_f32.take(n * h)?;        // running hidden
+        let bb    = self.pool_f32.take(n * h)?;        // scratch
+        let bnorm = self.pool_f32.take(n * h)?;        // normed scratch
 
         // 1) Embed all tokens into ba (one row each).
         for (r, &tok) in tokens.iter().enumerate() {
@@ -3465,9 +3522,9 @@ impl GpuQwen35 {
         let h = self.hidden;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
-        let ba:    DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // running hidden
-        let bb:    DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // scratch
-        let bnorm: DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // normed scratch
+        let ba    = self.pool_f32.take(n * h)?;   // running hidden
+        let bb    = self.pool_f32.take(n * h)?;   // scratch
+        let bnorm = self.pool_f32.take(n * h)?;   // normed scratch
 
         for (r, &tok) in tokens.iter().enumerate() {
             let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
@@ -3490,7 +3547,7 @@ impl GpuQwen35 {
         // Output norm (all rows) + projection (per row → logits_all).
         self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
-        let logits_all: DeviceBuf<f32> = DeviceBuf::new(n * self.vocab)?;
+        let logits_all = self.pool_f32.take(n * self.vocab)?;
         for r in 0..n {
             let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
             let out_ptr = unsafe {
@@ -3523,17 +3580,17 @@ impl GpuQwen35 {
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
 
         // QKV projections, batched.
-        let q_raw: DeviceBuf<f32> = DeviceBuf::new(n * 2 * q_dim)?;
-        let k_raw: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
-        let v_raw: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
+        let q_raw = self.pool_f32.take(n * 2 * q_dim)?;
+        let k_raw = self.pool_f32.take(n * kv_dim)?;
+        let v_raw = self.pool_f32.take(n * kv_dim)?;
         self.bmm(&w.attn.attn_q, bnorm.raw_ptr(), n, q_raw.raw_ptr())?;
         self.bmm(&w.attn.attn_k, bnorm.raw_ptr(), n, k_raw.raw_ptr())?;
         self.bmm(&w.attn.attn_v, bnorm.raw_ptr(), n, v_raw.raw_ptr())?;
 
         // split q_raw → q, gate. The split kernel walks n_heads*head_dim
         // elements; passing n*n_heads covers all rows.
-        let q_buf:   DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
-        let gate:    DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
+        let q_buf = self.pool_f32.take(n * q_dim)?;
+        let gate  = self.pool_f32.take(n * q_dim)?;
         self.launch_split_q_gate(q_raw.raw_ptr(), q_buf.raw_ptr(), gate.raw_ptr(),
                                  (n * self.n_heads) as u32, self.head_dim as u32)?;
         // per-head Q-norm (n*n_heads independent heads).
@@ -3543,7 +3600,7 @@ impl GpuQwen35 {
                                       self.rms_eps)?;
         self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
         // per-kv-head K-norm.
-        let k_norm: DeviceBuf<f32> = DeviceBuf::new(n * kv_dim)?;
+        let k_norm = self.pool_f32.take(n * kv_dim)?;
         self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
                                       k_norm.raw_ptr(),
                                       (n * self.n_kv_heads) as u32, self.head_dim as u32,
@@ -3555,7 +3612,7 @@ impl GpuQwen35 {
         kv.v.copy_from_device_at_async(&v_raw,  base_pos * kv_dim, &self.stream)?;
 
         // Batched causal attention → attn_concat.
-        let attn: DeviceBuf<f32> = DeviceBuf::new(n * q_dim)?;
+        let attn = self.pool_f32.take(n * q_dim)?;
         self.launch_attn_step_batched(q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
                                       attn.raw_ptr(), base_pos as u32, n as u32, scaling)?;
         // output gate + projection.
@@ -3580,8 +3637,8 @@ impl GpuQwen35 {
         match ffn {
             BlockFfn::Dense(d) => {
                 let f = self.ffn;
-                let gate: DeviceBuf<f32> = DeviceBuf::new(n * f)?;
-                let up:   DeviceBuf<f32> = DeviceBuf::new(n * f)?;
+                let gate = self.pool_f32.take(n * f)?;
+                let up   = self.pool_f32.take(n * f)?;
                 self.bmm(&d.gate, input.raw_ptr(), n, gate.raw_ptr())?;
                 self.bmm(&d.up,   input.raw_ptr(), n, up.raw_ptr())?;
                 self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
@@ -3627,10 +3684,10 @@ impl GpuQwen35 {
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
 
         // Four projections, batched.
-        let qkv: DeviceBuf<f32> = DeviceBuf::new(n * cdim)?;
-        let z:   DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
-        let a:   DeviceBuf<f32> = DeviceBuf::new(n * self.gdn_n_heads)?;
-        let b:   DeviceBuf<f32> = DeviceBuf::new(n * self.gdn_n_heads)?;
+        let qkv = self.pool_f32.take(n * cdim)?;
+        let z   = self.pool_f32.take(n * vdim)?;
+        let a   = self.pool_f32.take(n * self.gdn_n_heads)?;
+        let b   = self.pool_f32.take(n * self.gdn_n_heads)?;
         self.bmm(&w.attn.attn_qkv,  bnorm.raw_ptr(), n, qkv.raw_ptr())?;
         self.bmm(&w.attn.attn_gate, bnorm.raw_ptr(), n, z.raw_ptr())?;
         self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr())?;
@@ -3638,7 +3695,7 @@ impl GpuQwen35 {
 
         // conv1d + SiLU, batched: one launch over all n rows (the kernel
         // threads the conv history through the rows internally).
-        let conv_out: DeviceBuf<f32> = DeviceBuf::new(n * cdim)?;
+        let conv_out = self.pool_f32.take(n * cdim)?;
         self.launch_conv1d_step_silu_batched(
             qkv.raw_ptr(), w.attn.ssm_conv1d.raw_ptr(),
             st.conv_hist.raw_ptr(), conv_out.raw_ptr(),
@@ -3647,8 +3704,8 @@ impl GpuQwen35 {
         // L2-norm Q/K → q_all/k_all [n, kdim]. The conv output is
         // [n, cdim] with layout (q | k | v) per row; the batched kernel
         // strides by cdim to walk rows.
-        let q_all: DeviceBuf<f32> = DeviceBuf::new(n * kdim)?;
-        let k_all: DeviceBuf<f32> = DeviceBuf::new(n * kdim)?;
+        let q_all = self.pool_f32.take(n * kdim)?;
+        let k_all = self.pool_f32.take(n * kdim)?;
         let conv_q_ptr = conv_out.raw_ptr();
         let conv_k_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(kdim) } as *mut c_void;
         self.launch_l2norm_qk_batched(
@@ -3663,7 +3720,7 @@ impl GpuQwen35 {
         // Recurrent step + decay/beta — single launch over all n rows;
         // the kernel loops internally with state threaded through.
         // v_in points at the v half of conv_out (offset 2*kdim per row).
-        let core: DeviceBuf<f32> = DeviceBuf::new(n * vdim)?;
+        let core = self.pool_f32.take(n * vdim)?;
         let conv_v_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(2 * kdim) } as *mut c_void;
         self.launch_gdn_recurrent_step_fused_batched(
             q_all.raw_ptr(), k_all.raw_ptr(), conv_v_ptr,
