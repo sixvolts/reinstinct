@@ -220,6 +220,17 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 64)]
         steps: usize,
     },
+    /// QMTP-2 check: verify that `forward_tokens_verify` (the batched
+    /// K-token verify forward) produces the same per-position argmax as
+    /// decoding those tokens one at a time. Self-consistency gate for
+    /// the MTP spec-decode verify path.
+    QwenVerifyCheck {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 8)]
+        k: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -248,6 +259,8 @@ fn main() -> anyhow::Result<()> {
             mtp_gen_cli(&target, &drafter, prompt, system, k, steps, temperature, seed),
         Command::QwenMtpProbe { path, prompt, steps } =>
             qwen_mtp_probe_cli(&path, prompt, steps),
+        Command::QwenVerifyCheck { path, prompt, k } =>
+            qwen_verify_check_cli(&path, prompt, k),
     }
 }
 
@@ -1206,6 +1219,91 @@ fn qwen_mtp_probe_cli(path: &std::path::Path, prompt: Option<String>,
     println!("\nNOTE: the MTP block's KV cache is built cold (it does not");
     println!("mirror the prefill), so early steps under-report — QMTP-2");
     println!("warms it. A healthy drafter should still clear ~50%+ here.");
+    Ok(())
+}
+
+/// QMTP-2 check — confirm the batched K-token verify forward agrees
+/// with sequential single-token decode (same per-position argmax).
+fn qwen_verify_check_cli(path: &std::path::Path, prompt: Option<String>,
+                         k: usize) -> anyhow::Result<()> {
+    use reinstinct_engine::hip;
+    use reinstinct_engine::tokenizer::Tokenizer;
+    use reinstinct_engine::sampling::argmax;
+    use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-verify-check is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + k + 4;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+
+    let prefill = |st: &mut Qwen35GpuState| -> anyhow::Result<Vec<f32>> {
+        if prompt_ids.len() > 1 {
+            gpu.forward_tokens_batched(&prompt_ids, st).map_err(anyhow::Error::msg)
+        } else {
+            gpu.forward_tokens(&prompt_ids, st).map_err(anyhow::Error::msg)
+        }
+    };
+
+    println!("model   = {}", path.display());
+    println!("arch    = {arch}");
+    println!("prompt  = {} tokens   k = {k}", prompt_ids.len());
+
+    // Run A — sequential decode, record per-position logits + inputs.
+    let mut state_a = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre = prefill(&mut state_a)?;
+    let mut inputs: Vec<u32> = vec![argmax(&pre)];
+    let mut seq_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+    for i in 0..k {
+        let lg = gpu.forward_token(inputs[i], &mut state_a).map_err(anyhow::Error::msg)?;
+        if i + 1 < k { inputs.push(argmax(&lg)); }
+        seq_logits.push(lg);
+    }
+
+    // Run B — batched verify over the same token sequence, fresh state.
+    let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let _ = prefill(&mut state_b)?;
+    let verify = gpu.forward_tokens_verify(&inputs, &mut state_b)
+        .map_err(anyhow::Error::msg)?;
+
+    // Compare per position.
+    println!("\n  pos   input    seq_argmax   verify_argmax   max|Δlogit|");
+    let mut all_match = true;
+    let mut worst = 0.0f32;
+    for i in 0..k {
+        let a = argmax(&seq_logits[i]);
+        let b = argmax(&verify[i]);
+        let d = seq_logits[i].iter().zip(&verify[i])
+            .map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        worst = worst.max(d);
+        let mark = if a == b { "" } else { all_match = false; "  <-- MISMATCH" };
+        println!("  {i:>3}   {:>6}   {a:>10}   {b:>13}   {d:>11.4}{mark}", inputs[i]);
+    }
+    println!("\n  argmax {} at every position   worst |Δlogit| = {worst:.4}",
+             if all_match { "MATCHES" } else { "DIFFERS" });
+    if all_match {
+        println!("  QMTP-2 verify forward: PASS");
+    } else {
+        println!("  QMTP-2 verify forward: argmax drift — int8 matvec vs batched");
+        println!("  GEMM precision can flip a close call; inspect the |Δlogit|.");
+    }
     Ok(())
 }
 

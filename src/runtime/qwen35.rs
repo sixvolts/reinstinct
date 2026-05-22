@@ -3225,6 +3225,61 @@ impl GpuQwen35 {
         Ok(out)
     }
 
+    /// QMTP-2 — K-token verify forward. Runs `tokens` through the main
+    /// model in one batched pass (the same block kernels as
+    /// `forward_tokens_batched`) but projects EVERY row, returning the
+    /// logits at every position rather than only the last.
+    ///
+    /// Used by the MTP spec-decode loop to verify a block of drafted
+    /// tokens in a single forward. `state` advances by `tokens.len()`
+    /// positions (KV caches + GDN state stepped once per token) — the
+    /// caller (QMTP-3) is responsible for rolling back rejected tail
+    /// positions. Works from any mid-sequence state: full-attn blocks
+    /// append at `kv.len`, GDN blocks thread their state forward.
+    pub fn forward_tokens_verify(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+        -> Result<Vec<Vec<f32>>, String>
+    {
+        assert!(!tokens.is_empty(), "forward_tokens_verify needs ≥1 token");
+        let n = tokens.len();
+        let h = self.hidden;
+        let scaling = (self.head_dim as f32).powf(-0.5);
+
+        let ba:    DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // running hidden
+        let bb:    DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // scratch
+        let bnorm: DeviceBuf<f32> = DeviceBuf::new(n * h)?;   // normed scratch
+
+        for (r, &tok) in tokens.iter().enumerate() {
+            let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
+            self.launch_embed_lookup_dispatch(&self.token_embd, row_ptr, tok)?;
+        }
+        for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
+            match (block, st) {
+                (GpuBlock::Full(w), GpuBlockState::Full(kv)) =>
+                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?,
+                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) =>
+                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?,
+                _ => return Err("block kind mismatch".into()),
+            }
+        }
+
+        // Output norm (all rows) + projection (per row → logits_all).
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        let logits_all: DeviceBuf<f32> = DeviceBuf::new(n * self.vocab)?;
+        for r in 0..n {
+            let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
+            let out_ptr = unsafe {
+                (logits_all.raw_ptr() as *mut f32).add(r * self.vocab) } as *mut c_void;
+            self.launch_matvec_dispatch(self.output_proj_tensor(), in_ptr, out_ptr)?;
+        }
+        self.stream.synchronize()?;
+        state.pos += n;
+
+        let mut flat = vec![0.0f32; n * self.vocab];
+        logits_all.copy_to_host(&mut flat)?;
+        Ok(flat.chunks(self.vocab).map(|c| c.to_vec()).collect())
+    }
+
     /// One full-attention block over a batch of `n` rows. `ba` is the
     /// running hidden (mutated in place); `bb` / `bnorm` are scratch.
     fn batched_full_block(&self, ba: &DeviceBuf<f32>, bb: &DeviceBuf<f32>,
