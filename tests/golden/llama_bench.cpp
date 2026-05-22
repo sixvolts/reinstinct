@@ -64,16 +64,22 @@ int main(int argc, char ** argv) {
         llama_token w = 1;
         llama_batch b = llama_batch_get_one(&w, 1);
         llama_decode(ctx, b);
+        llama_synchronize(ctx);
         llama_memory_clear(llama_get_memory(ctx), true);
     }
 
     // --- Prefill: one batched llama_decode of all n_prompt tokens. ---
+    // llama_decode only *enqueues* GPU work; llama_synchronize blocks
+    // until it finishes. Without it the timer catches only the enqueue
+    // (the prefill reads as absurdly fast) and the real compute spills
+    // into the decode window.
     auto t0 = clk::now();
     {
         llama_batch b = llama_batch_get_one(prompt.data(), n_prompt);
         if (llama_decode(ctx, b) != 0) {
             fprintf(stderr, "prefill llama_decode failed\n"); return 1;
         }
+        llama_synchronize(ctx);
     }
     auto t1 = clk::now();
     double prefill_s = secs(t0, t1);
@@ -93,6 +99,7 @@ int main(int argc, char ** argv) {
         }
         tok = pick_argmax(llama_get_logits(ctx));
     }
+    llama_synchronize(ctx);
     auto t3 = clk::now();
     double decode_s = secs(t2, t3);
 
