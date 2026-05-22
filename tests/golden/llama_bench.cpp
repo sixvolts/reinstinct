@@ -67,15 +67,12 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(ctx), true);
     }
 
-    // --- Prefill: decode the prompt token-by-token. ---
-    // (A single batched decode would exercise llama.cpp's "chunked GDN"
-    // path, which segfaults in this build — only the autoregressive
-    // path is stable here. So prefill is measured sequentially too.)
+    // --- Prefill: one batched llama_decode of all n_prompt tokens. ---
     auto t0 = clk::now();
-    for (int i = 0; i < n_prompt; ++i) {
-        llama_batch b = llama_batch_get_one(&prompt[i], 1);
+    {
+        llama_batch b = llama_batch_get_one(prompt.data(), n_prompt);
         if (llama_decode(ctx, b) != 0) {
-            fprintf(stderr, "prefill llama_decode failed at %d\n", i); return 1;
+            fprintf(stderr, "prefill llama_decode failed\n"); return 1;
         }
     }
     auto t1 = clk::now();
