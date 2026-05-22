@@ -82,7 +82,7 @@ void mmq_gemm_q6k_grouped_f32(const unsigned char* __restrict__ slab,
         for (int e2 = t; e2 < BM * BK; e2 += 256) {
             const int lr = e2 / BK, lk = e2 % BK;
             const unsigned int wrow = row0 + lr;
-            if (wrow < out_dim) {
+            if (wrow < out_dim && sb0 + (unsigned int)lk < n_sub) {
                 const unsigned int sb = sb0 + lk;
                 sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
                 sWh2[lr][lk] = h2p[(size_t)wrow * nsp + sb];
@@ -98,7 +98,7 @@ void mmq_gemm_q6k_grouped_f32(const unsigned char* __restrict__ slab,
         for (int e2 = t; e2 < BN * BK; e2 += 256) {
             const int lr = e2 / BK, lk = e2 % BK;
             const unsigned int xtok = tok0 + lr;
-            if (xtok < tok_end) {
+            if (xtok < tok_end && sb0 + (unsigned int)lk < n_sub) {
                 sX[lr][lk] = xq[(size_t)xtok * n_sub + sb0 + lk];
             } else {
                 sX[lr][lk].d = 0.0f;
