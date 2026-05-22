@@ -2292,8 +2292,9 @@ impl GpuQwen35 {
         // GEMM per expert (weight read once per expert, not once per
         // routed token). The whole FFN — gate, up, down — runs in
         // expert-sorted order; only a single scatter at the end returns
-        // to [token, slot] order. Gated by REINSTINCT_MOE_GROUPED.
-        let grouped = std::env::var_os("REINSTINCT_MOE_GROUPED").is_some()
+        // to [token, slot] order. Default-on for MoE; opt out with
+        // `REINSTINCT_MOE_NO_GROUPED=1`.
+        let grouped = std::env::var_os("REINSTINCT_MOE_NO_GROUPED").is_none()
             && w.gate_exps.dtype == GgmlType::Q4_K && w.gate_exps.repacked
             && w.up_exps.dtype == GgmlType::Q4_K && w.up_exps.repacked
             && matches!(w.down_exps.dtype, GgmlType::Q5_K | GgmlType::Q6_K)

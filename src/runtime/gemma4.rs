@@ -2103,10 +2103,12 @@ impl GpuGemma4 {
                     let inv_sqrt_h = 1.0 / (self.hidden as f32).sqrt();
                     let ne = self.n_expert;
                     let nu = self.n_expert_used;
-                    // Grouped-expert GEMM for the fused gate_up — only when
-                    // the experts are repacked Q6_K (the common case; the
-                    // 26B's last-layer Q8_0 gate_up falls back to matvec).
-                    let grouped = std::env::var_os("REINSTINCT_MOE_GROUPED").is_some()
+                    // Grouped-expert GEMM for the fused gate_up + down —
+                    // default-on for MoE; `REINSTINCT_MOE_NO_GROUPED=1`
+                    // forces the per-token matvec fallback. The 26B's
+                    // last-layer Q8_0 gate_up still falls back (the
+                    // grouped path here is gated on repacked Q6_K gate_up).
+                    let grouped = std::env::var_os("REINSTINCT_MOE_NO_GROUPED").is_none()
                         && mw.gate_up_exps.dtype == GgmlType::Q6_K
                         && mw.gate_up_exps.repacked;
                     // cur_mlp = post_ffw_norm_1(shared MLP); expert input
