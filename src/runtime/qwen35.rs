@@ -377,6 +377,12 @@ impl BlockFfn {
 /// ~30 MB while still amortising expert-weight reads across the batch.
 const MOE_PREFILL_CHUNK: usize = 256;
 
+/// Upper bound on the batch size of `forward_tokens_verify` — sizes the
+/// resident `verify_hidden` stash. The MTP spec-decode verify batch is
+/// `k + 1` tokens (k drafts + the certain token); `qwen-verify-check`
+/// also uses it. 16 covers any sane k.
+const VERIFY_MAX_TOKENS: usize = 16;
+
 struct MoeRuntime {
     n_expert: usize,
     n_used:   usize,
@@ -742,6 +748,87 @@ impl Qwen35GpuState {
     }
 }
 
+/// A rollback checkpoint for `Qwen35GpuState`, used by the MTP
+/// spec-decode loop. Captures the GDN recurrent + conv state (a content
+/// copy — they are mutated in place and cannot otherwise be recovered)
+/// plus the per-block KV lengths and the position counter. KV cache
+/// *contents* are NOT copied: slots past the restored length are simply
+/// overwritten by the next forward. Allocate once with `new`, then
+/// `save` before a speculative verify and `restore` to roll it back.
+pub struct Qwen35Snapshot {
+    /// Per Linear block (block order): (recurrent copy, conv_hist copy).
+    /// `None` for Full blocks — their rollback is just the KV `len`.
+    gdn:    Vec<Option<(DeviceBuf<f32>, DeviceBuf<f32>)>>,
+    kv_len: Vec<usize>,   // per block (block order); meaningful for Full
+    pos:    usize,
+}
+
+impl Qwen35Snapshot {
+    pub fn new(state: &Qwen35GpuState) -> Result<Self, String> {
+        let mut gdn = Vec::with_capacity(state.block_states.len());
+        for bs in &state.block_states {
+            gdn.push(match bs {
+                GpuBlockState::Full(_)   => None,
+                GpuBlockState::Linear(s) => Some((
+                    DeviceBuf::new(s.recurrent.len())?,
+                    DeviceBuf::new(s.conv_hist.len())?,
+                )),
+            });
+        }
+        Ok(Self { gdn, kv_len: vec![0; state.block_states.len()], pos: state.pos })
+    }
+
+    /// Capture `state` into this snapshot (reuses the allocated buffers).
+    pub fn save(&mut self, state: &Qwen35GpuState) -> Result<(), String> {
+        self.pos = state.pos;
+        for (i, bs) in state.block_states.iter().enumerate() {
+            match bs {
+                GpuBlockState::Full(kv)  => self.kv_len[i] = kv.len,
+                GpuBlockState::Linear(s) => {
+                    let (r, c) = self.gdn[i].as_ref()
+                        .ok_or("snapshot/state block-kind mismatch")?;
+                    r.copy_from_device_at(&s.recurrent, 0)?;
+                    c.copy_from_device_at(&s.conv_hist, 0)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Roll `state` back to the captured checkpoint.
+    pub fn restore(&self, state: &mut Qwen35GpuState) -> Result<(), String> {
+        state.pos = self.pos;
+        for (i, bs) in state.block_states.iter_mut().enumerate() {
+            match bs {
+                GpuBlockState::Full(kv)  => kv.len = self.kv_len[i],
+                GpuBlockState::Linear(s) => {
+                    let (r, c) = self.gdn[i].as_ref()
+                        .ok_or("snapshot/state block-kind mismatch")?;
+                    s.recurrent.copy_from_device_at(r, 0)?;
+                    s.conv_hist.copy_from_device_at(c, 0)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-call stats from `mtp_spec_generate`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QwenSpecStats {
+    pub rounds:   usize,   // spec-decode rounds executed
+    pub drafted:  usize,   // total MTP drafts proposed
+    pub accepted: usize,   // drafts that survived verification
+    pub hit_eos:  bool,
+}
+
+impl QwenSpecStats {
+    pub fn accept_rate(&self) -> f64 {
+        if self.drafted == 0 { 0.0 }
+        else { self.accepted as f64 / self.drafted as f64 }
+    }
+}
+
 /// Per-block KV cache resident on device.
 pub struct GpuKvCache {
     pub k: DeviceBuf<f32>,     // [max_seq, n_kv_heads, head_dim]
@@ -775,6 +862,13 @@ pub struct GpuQwen35 {
     hidden_b:    DeviceBuf<f32>,   // [hidden]
     /// MTP-head scratch: [0..2h] = concat(enorm·emb | hnorm·prev), [2h..3h] = block hidden.
     mtp_scratch: DeviceBuf<f32>,   // [3 * hidden]
+    /// Holds the previous MTP block-hidden across a chained draft (the
+    /// `prev_hidden` for chain link i+1). See `mtp_draft_chain`.
+    mtp_chain_hid: DeviceBuf<f32>, // [hidden]
+    /// Per-position hidden states (pre output-norm) stashed by the last
+    /// `forward_tokens_verify` — the MTP spec-decode loop reads a row as
+    /// the next round's `prev_hidden`.
+    verify_hidden: DeviceBuf<f32>, // [VERIFY_MAX_TOKENS * hidden]
     ffn_a:       DeviceBuf<f32>,   // [ffn]
     ffn_b:       DeviceBuf<f32>,   // [ffn]
     q_raw:       DeviceBuf<f32>,   // [2 * q_dim]
@@ -973,6 +1067,8 @@ impl GpuQwen35 {
         let hidden_a    = DeviceBuf::new(hidden)?;
         let hidden_b    = DeviceBuf::new(hidden)?;
         let mtp_scratch = DeviceBuf::new(3 * hidden)?;
+        let mtp_chain_hid = DeviceBuf::new(hidden)?;
+        let verify_hidden = DeviceBuf::new(VERIFY_MAX_TOKENS * hidden)?;
         let ffn_a       = DeviceBuf::new(ffn)?;
         let ffn_b       = DeviceBuf::new(ffn)?;
         let q_raw       = DeviceBuf::new(2 * q_dim)?;
@@ -1085,7 +1181,7 @@ impl GpuQwen35 {
 
         Ok(Self {
             token_embd, output_norm, output_proj,
-            hidden_a, hidden_b, mtp_scratch, ffn_a, ffn_b,
+            hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
             moe_prof_on, prof_mark, prof_buckets,
@@ -2629,6 +2725,129 @@ impl GpuQwen35 {
         Ok((rate, matches, total))
     }
 
+    /// Device pointer to row `r` of the hidden states stashed by the
+    /// most recent `forward_tokens_verify`.
+    fn verify_hidden_row(&self, r: usize) -> *mut c_void {
+        unsafe { (self.verify_hidden.raw_ptr() as *mut f32)
+            .add(r * self.hidden) as *mut c_void }
+    }
+
+    /// Chain the MTP head `k` times to produce `k` speculative drafts.
+    /// Link 0 drafts from `(prev_hidden, first_embed)`; each later link
+    /// feeds the previous link's block-hidden and drafted token. The MTP
+    /// block's KV cache advances by `k` (drafts occupy MTP positions
+    /// `mtp_pos .. mtp_pos+k`). Returns the `k` drafted token ids.
+    fn mtp_draft_chain(&self, mtp: &GpuMtpHead, prev_hidden: *mut c_void,
+                       first_embed: u32, mtp_kv: &mut GpuKvCache,
+                       k: usize, mtp_pos: usize) -> Result<Vec<u32>, String>
+    {
+        let h = self.hidden;
+        let mut drafts = Vec::with_capacity(k);
+        let mut logits_host = vec![0.0f32; self.vocab];
+        let mut embed = first_embed;
+        for i in 0..k {
+            let prev = if i == 0 { prev_hidden } else { self.mtp_chain_hid.raw_ptr() };
+            self.set_pos(mtp_pos + i)?;
+            self.mtp_draft_forward(mtp, prev, embed, mtp_kv)?;
+            if i + 1 < k {
+                // Preserve this link's block-hidden (mtp_scratch[2h..3h])
+                // as the next link's prev_hidden.
+                self.mtp_chain_hid.copy_range_from_device_async(
+                    &self.mtp_scratch, 2 * h, 0, h, &self.stream)?;
+            }
+            self.stream.synchronize()?;
+            self.logits.copy_to_host(&mut logits_host)?;
+            embed = crate::sampling::argmax(&logits_host);
+            drafts.push(embed);
+        }
+        Ok(drafts)
+    }
+
+    /// QMTP-3 — MTP speculative-decode generation loop.
+    ///
+    /// `state` must be prefilled; `first_token` is the first token to
+    /// emit (typically the argmax of the prefill logits). It is
+    /// committed with a normal decode to bootstrap, then each round:
+    /// chain `k` MTP drafts, batch-verify `[t, d1..dk]` in one forward,
+    /// and accept all-or-nothing — on any mismatch the round is rolled
+    /// back via `snapshot` and the certain token `t` re-decoded.
+    ///
+    /// Returns the generated tokens (stopping at `eos` or `max_tokens`)
+    /// and per-call stats.
+    pub fn mtp_spec_generate(&self,
+        state: &mut Qwen35GpuState,
+        mtp_kv: &mut GpuKvCache,
+        snapshot: &mut Qwen35Snapshot,
+        first_token: u32,
+        eos: u32, max_tokens: usize, k: usize,
+    ) -> Result<(Vec<u32>, QwenSpecStats), String>
+    {
+        if self.mtp.is_empty() {
+            return Err("model has no MTP (nextn) head".into());
+        }
+        assert!(k >= 1 && k + 1 <= VERIFY_MAX_TOKENS, "mtp_spec_generate: bad k");
+        let mtp = &self.mtp[0];
+        let mut stats = QwenSpecStats::default();
+        let mut mtp_pos = 0usize;
+
+        // Bootstrap: commit `first_token` with a normal decode so the
+        // loop starts with its logits + hidden state.
+        let mut verify_logits = self.forward_token(first_token, state)?;
+        let mut prev_hidden = self.hidden_a.raw_ptr();
+        let mut generated: Vec<u32> = vec![first_token];
+        if first_token == eos {
+            stats.hit_eos = true;
+            return Ok((generated, stats));
+        }
+
+        while generated.len() < max_tokens {
+            let t = crate::sampling::argmax(&verify_logits);
+            snapshot.save(state)?;
+
+            // Chain k MTP drafts, then batch-verify [t, d1..dk].
+            let drafts = self.mtp_draft_chain(mtp, prev_hidden, t, mtp_kv, k, mtp_pos)?;
+            mtp_pos += k;
+            let mut batch = Vec::with_capacity(k + 1);
+            batch.push(t);
+            batch.extend_from_slice(&drafts);
+            let verify_out = self.forward_tokens_verify(&batch, state)?;
+
+            // All-or-nothing: draft[i] must equal the main model's
+            // prediction for the slot immediately after batch[i].
+            let all_ok = (0..k).all(|i|
+                crate::sampling::argmax(&verify_out[i]) == drafts[i]);
+
+            stats.rounds  += 1;
+            stats.drafted += k;
+
+            if all_ok {
+                stats.accepted += k;
+                generated.push(t);
+                generated.extend_from_slice(&drafts);
+                verify_logits = verify_out[k].clone();
+                prev_hidden   = self.verify_hidden_row(k);
+            } else {
+                // Reject every draft: roll the verify back and commit
+                // only `t` with a normal single-token decode.
+                snapshot.restore(state)?;
+                verify_logits = self.forward_token(t, state)?;
+                generated.push(t);
+                prev_hidden = self.hidden_a.raw_ptr();
+            }
+
+            if let Some(p) = generated.iter().position(|&g| g == eos) {
+                generated.truncate(p + 1);
+                stats.hit_eos = true;
+                break;
+            }
+            if generated.len() >= max_tokens {
+                generated.truncate(max_tokens);
+                break;
+            }
+        }
+        Ok((generated, stats))
+    }
+
     /// End-to-end forward pass for one decode token. Mirrors
     /// `cpu::qwen3_5::Qwen35F32Model::forward_token`.
     ///
@@ -3241,6 +3460,8 @@ impl GpuQwen35 {
     {
         assert!(!tokens.is_empty(), "forward_tokens_verify needs ≥1 token");
         let n = tokens.len();
+        assert!(n <= VERIFY_MAX_TOKENS,
+                "forward_tokens_verify: {n} tokens exceeds VERIFY_MAX_TOKENS");
         let h = self.hidden;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
@@ -3261,6 +3482,10 @@ impl GpuQwen35 {
                 _ => return Err("block kind mismatch".into()),
             }
         }
+
+        // Stash the per-position hidden states (pre output-norm) — the
+        // MTP spec-decode loop reads a row as the next `prev_hidden`.
+        self.verify_hidden.copy_from_device_at(&ba, 0)?;
 
         // Output norm (all rows) + projection (per row → logits_all).
         self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),

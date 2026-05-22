@@ -231,6 +231,20 @@ enum Command {
         #[arg(short = 'k', long, default_value_t = 8)]
         k: usize,
     },
+    /// QMTP-3: generate text with MTP speculative decoding on a Qwen
+    /// MTP model — chained drafts, batched all-or-nothing verify, GDN
+    /// state rollback. Reports accept rate + decode tok/s against a
+    /// plain single-token-decode baseline.
+    QwenMtpGen {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 128)]
+        tokens: usize,
+        /// MTP drafts chained per round.
+        #[arg(short = 'k', long, default_value_t = 2)]
+        k: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -261,6 +275,8 @@ fn main() -> anyhow::Result<()> {
             qwen_mtp_probe_cli(&path, prompt, steps),
         Command::QwenVerifyCheck { path, prompt, k } =>
             qwen_verify_check_cli(&path, prompt, k),
+        Command::QwenMtpGen { path, prompt, tokens, k } =>
+            qwen_mtp_gen_cli(&path, prompt, tokens, k),
     }
 }
 
@@ -1304,6 +1320,98 @@ fn qwen_verify_check_cli(path: &std::path::Path, prompt: Option<String>,
         println!("  QMTP-2 verify forward: argmax drift — int8 matvec vs batched");
         println!("  GEMM precision can flip a close call; inspect the |Δlogit|.");
     }
+    Ok(())
+}
+
+/// QMTP-3 — generate text with MTP speculative decoding, reporting the
+/// accept rate and decode tok/s against a plain single-token baseline.
+fn qwen_mtp_gen_cli(path: &std::path::Path, prompt: Option<String>,
+                    n_tokens: usize, k: usize) -> anyhow::Result<()> {
+    use reinstinct_engine::hip;
+    use reinstinct_engine::tokenizer::Tokenizer;
+    use reinstinct_engine::sampling::argmax;
+    use reinstinct_engine::runtime::{KernelCache, qwen35::{
+        GpuQwen35, Qwen35GpuState, GpuKvCache, Qwen35Snapshot}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-mtp-gen is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + n_tokens + k + 8;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    if gpu.n_mtp_heads() == 0 {
+        anyhow::bail!("model has no MTP (nextn) head — not an MTP build");
+    }
+    let eos = model.config.eos_token_id;
+
+    let prefill = |st: &mut Qwen35GpuState| -> anyhow::Result<Vec<f32>> {
+        if prompt_ids.len() > 1 {
+            gpu.forward_tokens_batched(&prompt_ids, st).map_err(anyhow::Error::msg)
+        } else {
+            gpu.forward_tokens(&prompt_ids, st).map_err(anyhow::Error::msg)
+        }
+    };
+
+    println!("model   = {}", path.display());
+    println!("prompt  = {} tokens   k = {k}   max new = {n_tokens}", prompt_ids.len());
+
+    // --- MTP spec-decode run ---
+    let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre = prefill(&mut state)?;
+    let first = argmax(&pre);
+    let mut mtp_kv = GpuKvCache::new(
+        k * n_tokens + 16,
+        model.config.attn_n_kv_heads as usize,
+        model.config.attn_head_dim as usize,
+    ).map_err(anyhow::Error::msg)?;
+    let mut snapshot = Qwen35Snapshot::new(&state).map_err(anyhow::Error::msg)?;
+    let t_spec = std::time::Instant::now();
+    let (out, stats) = gpu.mtp_spec_generate(&mut state, &mut mtp_kv, &mut snapshot,
+        first, eos, n_tokens, k).map_err(anyhow::Error::msg)?;
+    let spec_el = t_spec.elapsed().as_secs_f64();
+
+    // --- plain-decode baseline, same token count ---
+    let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre_b = prefill(&mut state_b)?;
+    let t_plain = std::time::Instant::now();
+    let mut cur = argmax(&pre_b);
+    for _ in 0..out.len() {
+        let lg = gpu.forward_token(cur, &mut state_b).map_err(anyhow::Error::msg)?;
+        cur = argmax(&lg);
+    }
+    let plain_el = t_plain.elapsed().as_secs_f64();
+
+    let text = tok.decode(&out);
+    println!("\n--- generated ({} tokens) ---\n{text}", out.len());
+    println!("\n--- MTP spec-decode (k={k}) ---");
+    println!("  rounds        = {}", stats.rounds);
+    println!("  drafts        = {} / {} accepted = {:.1}%",
+             stats.accepted, stats.drafted, stats.accept_rate() * 100.0);
+    println!("  tokens/round  = {:.2}",
+             out.len() as f64 / stats.rounds.max(1) as f64);
+    let n = out.len() as f64;
+    let spec_tps  = n / spec_el;
+    let plain_tps = n / plain_el;
+    println!("  spec decode   = {spec_tps:.1} tok/s  ({spec_el:.2} s)");
+    println!("  plain decode  = {plain_tps:.1} tok/s  ({plain_el:.2} s)");
+    println!("  speedup       = {:.2}x", spec_tps / plain_tps);
+    if stats.hit_eos { println!("  (stopped at EOS)"); }
     Ok(())
 }
 
