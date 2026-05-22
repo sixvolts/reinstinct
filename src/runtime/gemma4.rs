@@ -80,6 +80,7 @@ const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
 const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
 const MOE_EXPERT_SORT_SRC:   &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MMQ_Q6K_GROUPED_SRC:   &str = include_str!("../../kernels/mmq_gemm_q6k_grouped.cpp");
+const MMQ_Q8_0_GROUPED_SRC:  &str = include_str!("../../kernels/mmq_gemm_q8_0_grouped.cpp");
 /// Grouped-expert GEMM token-tile width — must match `BN` in the
 /// `mmq_gemm_*_grouped` kernels.
 const MOE_GEMM_BN: u32 = 32;
@@ -206,6 +207,41 @@ impl ExpertTensor {
         })
     }
 
+    /// Load an expert tensor and repack every expert slice into the
+    /// contiguous matvec layout — Q8_0 too (unlike `from_gguf`, which
+    /// leaves Q8_0 on-disk). Used to build the grouped-GEMM down slab.
+    fn from_gguf_repacked(gguf: &GgufFile, name: &str) -> Result<Self, String> {
+        let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+        let bytes = gguf.tensor_data(name)
+            .map_err(|e| format!("read {name}: {e}"))?
+            .ok_or_else(|| format!("tensor {name} has no data"))?;
+        let shape = info.shape();
+        if shape.len() != 3 {
+            return Err(format!("expert tensor {name}: expected 3D, got {shape:?}"));
+        }
+        let in_dim   = shape[0] as usize;
+        let out_dim  = shape[1] as usize;
+        let n_expert = shape[2] as usize;
+        let bpe = bytes.len() / n_expert;
+        let mut packed = Vec::new();
+        for e in 0..n_expert {
+            let slice = &bytes[e * bpe..(e + 1) * bpe];
+            let rep = match info.ggml_type {
+                GgmlType::Q6_K => crate::quant::q6_k::repack_for_matvec(slice, in_dim, out_dim),
+                GgmlType::Q8_0 => crate::quant::q8_0::repack_for_matvec(slice, in_dim, out_dim),
+                other => return Err(format!(
+                    "from_gguf_repacked: unsupported expert dtype {other:?} for {name}")),
+            };
+            packed.extend_from_slice(&rep);
+        }
+        Ok(Self {
+            bytes_per_expert: packed.len() / n_expert,
+            dtype: info.ggml_type,
+            data: DeviceBuf::from_slice(&packed)?,
+            repacked: true,
+        })
+    }
+
 }
 
 /// MoE-layer weights: the routed-expert branch that runs alongside the
@@ -222,6 +258,10 @@ pub struct MoeBlock {
     gate_up_exps: ExpertTensor,
     /// Down experts, [expert_ff, hidden, n_expert].
     down_exps:    ExpertTensor,
+    /// Repacked-Q8_0 copy of the down experts for the grouped-GEMM
+    /// prefill path. `down_exps` stays on-disk for decode + the matvec
+    /// fallback, so the verified decode path is untouched.
+    down_grouped: ExpertTensor,
     /// Per-expert down-output scalar, F32 [n_expert] — device-resident
     /// so the combine kernel can index it by the device expert id.
     down_exps_s:  DeviceBuf<f32>,
@@ -237,6 +277,7 @@ struct MoeGroupedScratch {
     perm:   DeviceBuf<i32>,   // [cw*n_used]  entries grouped by expert
     g_in:   DeviceBuf<u8>,    // [cw*n_used, hidden/32] gathered gate_up input
     e_act:  DeviceBuf<f32>,   // [cw*n_used, expert_ff] sorted GeGLU output
+    g_out:  DeviceBuf<f32>,   // [cw*n_used, hidden] sorted grouped-down output
 }
 
 /// All weights for one Gemma 4 transformer block on device.
@@ -283,6 +324,8 @@ impl GpuGemma4Block {
                 gate_inp_s:  load_fp32(gguf, &format!("{p}ffn_gate_inp.scale"))?,
                 gate_up_exps: ExpertTensor::from_gguf(gguf, &format!("{p}ffn_gate_up_exps.weight"))?,
                 down_exps:    ExpertTensor::from_gguf(gguf, &format!("{p}ffn_down_exps.weight"))?,
+                down_grouped: ExpertTensor::from_gguf_repacked(
+                                  gguf, &format!("{p}ffn_down_exps.weight"))?,
                 down_exps_s:  load_fp32(gguf, &format!("{p}ffn_down_exps.scale"))?,
             })
         } else { None };
@@ -609,6 +652,7 @@ pub struct GpuGemma4 {
     /// Grouped-expert GEMM modules (MoE prefill, `REINSTINCT_MOE_GROUPED`).
     m_expert_sort: Module,
     m_grouped_q6k: Module,
+    m_grouped_q8_0: Module,
     m_kv_write:    Module,
     /// Scratch for the int8-quantized activation feeding the dp4a matvec.
     xq8: DeviceBuf<u8>,
@@ -849,6 +893,7 @@ impl GpuGemma4 {
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
             m_expert_sort:  ld("moe_expert_sort", MOE_EXPERT_SORT_SRC)?,
             m_grouped_q6k:  ld("mmq_gemm_q6k_grouped", MMQ_Q6K_GROUPED_SRC)?,
+            m_grouped_q8_0: ld("mmq_gemm_q8_0_grouped", MMQ_Q8_0_GROUPED_SRC)?,
             m_kv_write:     ld("kv_write", KV_WRITE_SRC)?,
             d_token: DeviceBuf::new(1)?,
             d_pos:   DeviceBuf::new(1)?,
@@ -1460,7 +1505,8 @@ impl GpuGemma4 {
                                n_entries: u32, n_expert: u32) -> Result<(), String>
     {
         let (module, kname) = match et.dtype {
-            GgmlType::Q6_K => (&self.m_grouped_q6k, "mmq_gemm_q6k_grouped_f32"),
+            GgmlType::Q6_K => (&self.m_grouped_q6k,  "mmq_gemm_q6k_grouped_f32"),
+            GgmlType::Q8_0 => (&self.m_grouped_q8_0, "mmq_gemm_q8_0_grouped_f32"),
             other => return Err(format!("grouped GEMM: unsupported dtype {other:?}")),
         };
         let f = module.function(kname)?;
@@ -1860,6 +1906,7 @@ impl GpuGemma4 {
             perm:   DeviceBuf::new(cw * nu_a)?,
             g_in:   DeviceBuf::new(cw * nu_a * (h / 32) * 40)?,
             e_act:  DeviceBuf::new(cw * nu_a * ff_a)?,
+            g_out:  DeviceBuf::new(cw * nu_a * h)?,
         };
 
         // --- embed P tokens → x [P, hidden] ---
@@ -2092,11 +2139,11 @@ impl GpuGemma4 {
                             (xq8_moe.raw_ptr() as *mut u8).add(c0 * (h / 32) * 40) as *mut c_void
                         };
                         if grouped {
-                            // Sort routing entries by expert, gather the
-                            // per-token activations into sorted order, one
-                            // tiled GEMM over the fused gate_up, GeGLU, then
-                            // scatter back so the down matvec sees
-                            // [token,slot] order.
+                            // Whole FFN stays expert-sorted: sort entries by
+                            // expert, gather activations, one tiled GEMM over
+                            // the fused gate_up, GeGLU, quantize, one tiled
+                            // GEMM over the down experts, then a single
+                            // scatter back to [token,slot] order.
                             let n_entries = (cn * nu) as u32;
                             self.launch_moe_sort(&gs, self.moe_ids.raw_ptr(),
                                                  ne as u32, n_entries)?;
@@ -2106,8 +2153,13 @@ impl GpuGemma4 {
                                 gs.g_in.raw_ptr(), pf_gu.raw_ptr(),
                                 hu, 2 * ff_exp, n_entries, ne as u32)?;
                             self.launch_moe_geglu(pf_gu.raw_ptr(), gs.e_act.raw_ptr(), cn)?;
-                            self.launch_moe_scatter_rows(&gs, gs.e_act.raw_ptr(),
-                                pf_act.raw_ptr(), ff_exp, n_entries)?;
+                            self.launch_quantize_q8(gs.e_act.raw_ptr(), pf_xq8_e.raw_ptr(),
+                                                    ff_exp, (cn * nu) as u32)?;
+                            self.launch_moe_grouped_gemm(&mw.down_grouped, &gs,
+                                pf_xq8_e.raw_ptr(), gs.g_out.raw_ptr(),
+                                ff_exp, hu, n_entries, ne as u32)?;
+                            self.launch_moe_scatter_rows(&gs, gs.g_out.raw_ptr(),
+                                pf_dn.raw_ptr(), hu, n_entries)?;
                         } else {
                             self.launch_moe_matvec(mw.gate_up_exps.dtype,
                                 mw.gate_up_exps.repacked,
@@ -2115,13 +2167,14 @@ impl GpuGemma4 {
                                 hu, 2 * ff_exp, mw.gate_up_exps.bytes_per_expert as u32,
                                 hu / 32, 0, cn)?;
                             self.launch_moe_geglu(pf_gu.raw_ptr(), pf_act.raw_ptr(), cn)?;
+                            self.launch_quantize_q8(pf_act.raw_ptr(), pf_xq8_e.raw_ptr(),
+                                                    ff_exp, (cn * nu) as u32)?;
+                            self.launch_moe_down(mw.down_exps.dtype, mw.down_exps.repacked,
+                                mw.down_exps.data.raw_ptr(), pf_xq8_e.raw_ptr(),
+                                pf_dn.raw_ptr(), ff_exp, hu,
+                                mw.down_exps.bytes_per_expert as u32,
+                                nu as u32 * (ff_exp / 32), ff_exp / 32, cn)?;
                         }
-                        self.launch_quantize_q8(pf_act.raw_ptr(), pf_xq8_e.raw_ptr(),
-                                                ff_exp, (cn * nu) as u32)?;
-                        self.launch_moe_down(mw.down_exps.dtype, mw.down_exps.repacked,
-                            mw.down_exps.data.raw_ptr(), pf_xq8_e.raw_ptr(), pf_dn.raw_ptr(),
-                            ff_exp, hu, mw.down_exps.bytes_per_expert as u32,
-                            nu as u32 * (ff_exp / 32), ff_exp / 32, cn)?;
                         self.launch_moe_combine(pf_dn.raw_ptr(), mw.down_exps_s.raw_ptr(),
                             pf_off(cur_moe.raw_ptr(), c0 * h), cn)?;
                         c0 += cn;
