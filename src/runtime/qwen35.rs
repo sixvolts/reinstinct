@@ -129,6 +129,12 @@ const MMQ_GEMM_Q8_0_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q8_0_rep
 const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 const MATVEC_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_repacked.cpp");
+const MATVEC_Q4K_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_q4k_repacked_batched.cpp");
+const MATVEC_Q5K_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_q5k_repacked_batched.cpp");
+const MATVEC_Q6K_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_q6k_repacked_batched.cpp");
 /// Output rows per wavefront in the dp4a matvec kernels (`#define ROWS`).
 const DP4A_ROWBLOCK: u32 = 2;
 
@@ -1012,6 +1018,10 @@ pub struct GpuQwen35 {
     matvec_q4k_repacked_module: Module,
     matvec_q5k_repacked_module: Module,
     matvec_q6k_repacked_module: Module,
+    /// K=2..4 batched K-quant matvec — the spec-decode verify path.
+    matvec_q4k_batched_module: Module,
+    matvec_q5k_batched_module: Module,
+    matvec_q6k_batched_module: Module,
     matvec_q8_0_repacked_module: Module,
     /// Scratch for the quantized activation (BlockQ8, 40 bytes per 32).
     xq8: DeviceBuf<u8>,
@@ -1213,6 +1223,12 @@ impl GpuQwen35 {
             cache.compile("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SOURCE)?;
         let matvec_q8_0_repacked_hsaco =
             cache.compile("matvec_q8_0_repacked", MATVEC_Q8_0_REPACKED_SOURCE)?;
+        let matvec_q4k_batched_hsaco =
+            cache.compile("matvec_q4k_repacked_batched", MATVEC_Q4K_REPACKED_BATCHED_SOURCE)?;
+        let matvec_q5k_batched_hsaco =
+            cache.compile("matvec_q5k_repacked_batched", MATVEC_Q5K_REPACKED_BATCHED_SOURCE)?;
+        let matvec_q6k_batched_hsaco =
+            cache.compile("matvec_q6k_repacked_batched", MATVEC_Q6K_REPACKED_BATCHED_SOURCE)?;
 
         // Load every per-layer block's weights from GGUF.
         let mut blocks = Vec::with_capacity(model.block_kinds.len());
@@ -1307,6 +1323,9 @@ impl GpuQwen35 {
             matvec_q4k_repacked_module: Module::load(&matvec_q4k_repacked_hsaco)?,
             matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
             matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
+            matvec_q4k_batched_module: Module::load(&matvec_q4k_batched_hsaco)?,
+            matvec_q5k_batched_module: Module::load(&matvec_q5k_batched_hsaco)?,
+            matvec_q6k_batched_module: Module::load(&matvec_q6k_batched_hsaco)?,
             matvec_q8_0_repacked_module: Module::load(&matvec_q8_0_repacked_hsaco)?,
             xq8: DeviceBuf::new(((xq8_max_in + 31) / 32) * 40)?,
             dp4a_enabled: std::env::var_os("REINSTINCT_QWEN_NO_DP4A").is_none(),
@@ -3273,6 +3292,16 @@ impl GpuQwen35 {
         let in_d = w.in_dim as usize;
         let out_d = w.out_dim as usize;
 
+        // Small-N batched K-quant matvec — the spec-decode verify path.
+        // The MMQ GEMM's 64-wide token tile makes a 3-row verify pay the
+        // full 64-row compute on the compute-bound MI50; this kernel
+        // reads each weight sub-block once and dots it against n_rows ≤ 4
+        // activation rows, staying HBM-bound like a 1-row decode matvec.
+        if w.repacked && n_rows <= 4
+            && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            return self.bmm_batched_kquant(w, x_f32, n_rows, y_f32);
+        }
+
         // Repacked K-quants AND repacked Q8_0: the 2D-tiled int8 MMQ
         // GEMM consumes the quantised weight directly — no dequant to
         // fp16, no HGEMM. Q8_0 covers the GDN ssm_out weights (and
@@ -3318,6 +3347,39 @@ impl GpuQwen35 {
         // (hit on the 27B; the 0.8B raced through by luck).
         self.stream.synchronize()?;
         let _ = dq;
+        Ok(())
+    }
+
+    /// Small-N (`n_rows` ≤ 4) batched K-quant matvec: quantise X →
+    /// BlockQ8, then one launch reads each weight sub-block once and
+    /// dots it against all `n_rows` activation rows. HBM-bound, unlike
+    /// the 64-wide MMQ tile — the spec-decode verify path. `y_f32` is
+    /// written `[n_rows, out_dim]`, identical layout to `bmm_mmq`.
+    fn bmm_batched_kquant(&self, w: &GpuMatvecTensor, x_f32: *mut c_void,
+                          n_rows: usize, y_f32: *mut c_void) -> Result<(), String>
+    {
+        let in_d  = w.in_dim as usize;
+        let out_d = w.out_dim as usize;
+        let (module, kname) = match w.dtype {
+            GgmlType::Q5_K => (&self.matvec_q5k_batched_module, "matvec_q5k_repacked_batched_f32"),
+            GgmlType::Q6_K => (&self.matvec_q6k_batched_module, "matvec_q6k_repacked_batched_f32"),
+            _              => (&self.matvec_q4k_batched_module, "matvec_q4k_repacked_batched_f32"),
+        };
+        // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
+        let xq8 = self.pool_u8.take(n_rows * (in_d / 32) * 40)?;
+        self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
+        // grid.x = ceil(out_dim / 8) — the kernel emits 8 output rows/WG.
+        let f = module.function(kname)?;
+        let mut wp = w.data.raw_ptr(); let mut xp = xq8.raw_ptr(); let mut yp = y_f32;
+        let mut ia = in_d as u32; let mut oa = out_d as u32; let mut nr = n_rows as u32;
+        let mut args: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
+        unsafe {
+            f.launch(((out_d as u32 + 7) / 8, 1, 1), (256, 1, 1),
+                     0, Some(&self.stream), &mut args)?;
+        }
         Ok(())
     }
 
@@ -3544,7 +3606,10 @@ impl GpuQwen35 {
         // MTP spec-decode loop reads a row as the next `prev_hidden`.
         self.verify_hidden.copy_from_device_at(&ba, 0)?;
 
-        // Output norm (all rows) + projection (per row → logits_all).
+        // Output norm (all rows) + projection. The projection stays a
+        // per-row decode matvec: the (tied) output weight is not in the
+        // repacked layout, so routing it through `bmm` would hit the
+        // dequant-to-fp16 fallback — far worse than n fast matvecs.
         self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
         let logits_all = self.pool_f32.take(n * self.vocab)?;
