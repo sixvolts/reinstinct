@@ -108,6 +108,10 @@ const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.
 const MOE_EXPERT_SORT_SOURCE: &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MOE_MMQ_Q4K_GROUPED_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4k_grouped.cpp");
+const MOE_MMQ_Q5K_GROUPED_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q5k_grouped.cpp");
+const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q6k_grouped.cpp");
 
 /// Token-tile width of the grouped-expert GEMM — `tile_off` counts
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Must match the BN
@@ -391,8 +395,10 @@ struct MoeRuntime {
     m_shexp_gate: Module,
     /// Expert-routing counting sort (grouped-expert GEMM prefill path).
     m_expert_sort: Module,
-    /// Grouped-expert MMQ GEMM — repacked Q4_K (gate/up prefill).
+    /// Grouped-expert MMQ GEMM — repacked Q4_K/Q5_K/Q6_K (MoE prefill).
     m_grouped_q4k: Module,
+    m_grouped_q5k: Module,
+    m_grouped_q6k: Module,
     // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
     logits:  DeviceBuf<f32>,   // [n_tok, n_expert] router logits
     ids:     DeviceBuf<i32>,   // [n_tok, n_used] selected expert ids
@@ -404,6 +410,7 @@ struct MoeRuntime {
     sort_toff:   DeviceBuf<i32>,  // [n_expert+1] expert GEMM-tile offsets
     sort_perm:   DeviceBuf<i32>,  // [n_tok, n_used] entry indices grouped by expert
     g_in:    DeviceBuf<u8>,    // [n_tok, n_used, hidden/32] gathered (sorted) gate/up input
+    g_out:   DeviceBuf<f32>,  // [n_tok, n_used, hidden] sorted down-GEMM output
     ones:    DeviceBuf<f32>,   // [n_expert] = 1.0 (combine has no per-expert scale)
     xq8_in:  DeviceBuf<u8>,    // [n_tok, hidden/32] quantised block input
     xq8_exp: DeviceBuf<u8>,    // [n_tok, n_used, expert_ff/32] quantised down acts
@@ -446,6 +453,10 @@ impl MoeRuntime {
                               "moe_expert_sort", MOE_EXPERT_SORT_SOURCE)?)?,
             m_grouped_q4k: Module::load(&cache.compile(
                               "mmq_gemm_q4k_grouped", MOE_MMQ_Q4K_GROUPED_SOURCE)?)?,
+            m_grouped_q5k: Module::load(&cache.compile(
+                              "mmq_gemm_q5k_grouped", MOE_MMQ_Q5K_GROUPED_SOURCE)?)?,
+            m_grouped_q6k: Module::load(&cache.compile(
+                              "mmq_gemm_q6k_grouped", MOE_MMQ_Q6K_GROUPED_SOURCE)?)?,
             logits:  DeviceBuf::new(c * n_expert)?,
             ids:     DeviceBuf::new(c * n_used)?,
             weights: DeviceBuf::new(c * n_used)?,
@@ -455,6 +466,7 @@ impl MoeRuntime {
             sort_toff:   DeviceBuf::new(n_expert + 1)?,
             sort_perm:   DeviceBuf::new(c * n_used)?,
             g_in:    DeviceBuf::new(c * n_used * (hidden / 32).max(1) * 40)?,
+            g_out:   DeviceBuf::new(c * n_used * hidden)?,
             ones,
             xq8_in:  DeviceBuf::new(c * (hidden / 32).max(1) * 40)?,
             xq8_exp: DeviceBuf::new(c * n_used * (expert_ff / 32).max(1) * 40)?,
@@ -2101,13 +2113,16 @@ impl GpuQwen35 {
         // token activation across the 8 experts (slot stride 0); down has
         // a distinct activation per (token, expert).
         self.launch_quantize_q8_into(input_ptr, moe.xq8_in.raw_ptr(), h, nt)?;
-        // Grouped-expert GEMM for gate/up (Q4_K): sort tokens by expert,
-        // gather, one tiled GEMM per expert (weight read once per expert
-        // instead of once per routed token). Down stays on the matvec
-        // path. Gated by REINSTINCT_MOE_GROUPED while it proves out.
+        // Grouped-expert GEMM: sort tokens by expert, gather, one tiled
+        // GEMM per expert (weight read once per expert, not once per
+        // routed token). The whole FFN — gate, up, down — runs in
+        // expert-sorted order; only a single scatter at the end returns
+        // to [token, slot] order. Gated by REINSTINCT_MOE_GROUPED.
         let grouped = std::env::var_os("REINSTINCT_MOE_GROUPED").is_some()
             && w.gate_exps.dtype == GgmlType::Q4_K && w.gate_exps.repacked
-            && w.up_exps.dtype == GgmlType::Q4_K && w.up_exps.repacked;
+            && w.up_exps.dtype == GgmlType::Q4_K && w.up_exps.repacked
+            && matches!(w.down_exps.dtype, GgmlType::Q5_K | GgmlType::Q6_K)
+            && w.down_exps.repacked;
         if grouped {
             self.launch_moe_sort(moe, nt)?;
             self.launch_moe_gather_xq(moe, h / 32, nt)?;
@@ -2115,14 +2130,16 @@ impl GpuQwen35 {
                                          moe.e_gate.raw_ptr(), h, ff, nt)?;
             self.launch_moe_grouped_gemm(moe, &w.up_exps, moe.g_in.raw_ptr(),
                                          moe.e_up.raw_ptr(), h, ff, nt)?;
-            // gate/up are in expert-sorted order; swiglu is elementwise,
-            // then scatter back to [token, slot] order for the down matvec.
+            // gate/up/swiglu/quantize all stay in expert-sorted order.
             self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
                                moe.e_gate.raw_ptr(), nt * n_used * ff)?;
-            self.launch_moe_scatter_rows(moe, moe.e_gate.raw_ptr(),
-                                         moe.e_up.raw_ptr(), ff, nt)?;
-            self.launch_quantize_q8_into(moe.e_up.raw_ptr(), moe.xq8_exp.raw_ptr(),
+            self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
                                          ff, nt * n_used)?;
+            self.launch_moe_grouped_gemm(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                                         moe.g_out.raw_ptr(), ff, h, nt)?;
+            // single scatter back to [token, slot] order for the combine.
+            self.launch_moe_scatter_rows(moe, moe.g_out.raw_ptr(),
+                                         moe.e_out.raw_ptr(), h, nt)?;
         } else {
             self.launch_moe_expert_matvec(moe, &w.gate_exps, moe.xq8_in.raw_ptr(),
                                           moe.e_gate.raw_ptr(), h, ff, nt, h / 32, 0)?;
@@ -2132,10 +2149,10 @@ impl GpuQwen35 {
                                moe.e_gate.raw_ptr(), nt * n_used * ff)?;
             self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
                                          ff, nt * n_used)?;
+            self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                                          moe.e_out.raw_ptr(), ff, h, nt,
+                                          n_used * (ff / 32), ff / 32)?;
         }
-        self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
-                                      moe.e_out.raw_ptr(), ff, h, nt,
-                                      n_used * (ff / 32), ff / 32)?;
 
         // --- Shared expert --- dense, shared weights → batched GEMMs ---
         self.bmm(&w.gate_shexp, input_ptr, n, moe.sh_gate.raw_ptr())?;
@@ -2312,8 +2329,8 @@ impl GpuQwen35 {
                           Some(&self.stream), &mut args) }
     }
 
-    /// Grouped-expert MMQ GEMM — repacked Q4_K. `xq` / `y` are in
-    /// expert-sorted order; one launch covers all experts (each
+    /// Grouped-expert MMQ GEMM — repacked Q4_K/Q5_K/Q6_K. `xq` / `y`
+    /// are in expert-sorted order; one launch covers all experts (each
     /// workgroup maps to its expert via `sort_toff`).
     #[allow(clippy::too_many_arguments)]
     fn launch_moe_grouped_gemm(&self, moe: &MoeRuntime, et: &GpuExpertTensor,
@@ -2321,7 +2338,12 @@ impl GpuQwen35 {
                                in_dim: u32, out_dim: u32, n_tok: u32)
         -> Result<(), String>
     {
-        let f = moe.m_grouped_q4k.function("mmq_gemm_q4k_grouped_f32")?;
+        let (module, kname) = match et.dtype {
+            GgmlType::Q5_K => (&moe.m_grouped_q5k, "mmq_gemm_q5k_grouped_f32"),
+            GgmlType::Q6_K => (&moe.m_grouped_q6k, "mmq_gemm_q6k_grouped_f32"),
+            _              => (&moe.m_grouped_q4k, "mmq_gemm_q4k_grouped_f32"),
+        };
+        let f = module.function(kname)?;
         let n_entries = n_tok * moe.n_used as u32;
         let tile_ub = (n_entries + MOE_GEMM_BN - 1) / MOE_GEMM_BN + moe.n_expert as u32;
         let mut a0 = et.data.raw_ptr(); let mut a1 = et.bytes_per_expert as u32;
