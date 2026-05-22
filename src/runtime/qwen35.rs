@@ -1483,8 +1483,16 @@ impl GpuQwen35 {
                                    (out_d + 7) / 8, 256),
                 GgmlType::Q6_K => (&self.matvec_q6k_repacked_module, "matvec_q6k_repacked_f32",
                                    (out_d + 7) / 8, 256),
-                GgmlType::Q8_0 => (&self.matvec_q8_0_repacked_module, "matvec_q8_0_repacked_f32",
-                                   (out_d + 1) / 2, 64),
+                // Q8_0: ROWS=1 (grid=out_d) for large out_dim — doubles
+                // the wavefront count, which sustains HBM bandwidth that
+                // ROWS=2 starves at out_dim≥4096. ROWS=2 stays best for
+                // mid-size out_dim (~2048).
+                GgmlType::Q8_0 if out_d >= 4096 =>
+                    (&self.matvec_q8_0_repacked_module, "matvec_q8_0_repacked_r1_f32",
+                     out_d, 64),
+                GgmlType::Q8_0 =>
+                    (&self.matvec_q8_0_repacked_module, "matvec_q8_0_repacked_f32",
+                     (out_d + 1) / 2, 64),
                 _              => (&self.matvec_q4k_repacked_module, "matvec_q4k_repacked_f32",
                                    (out_d + 7) / 8, 256),
             };

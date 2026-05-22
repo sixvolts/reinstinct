@@ -12,13 +12,18 @@
 //   slab + out_dim × nsp × 32     : out_dim × nsp × 2   fp16 d
 //   nsp = (n_blocks is power of two) ? n_blocks + 1 : n_blocks  // anti-alias
 //
-// grid = ceil(out_dim / ROWS); block = 64.
+// Two entry points, one per row tiling:
+//   * `_f32`    — ROWS=2, grid = ceil(out_dim/2). Best for mid-size
+//     out_dim (≈2048): one workgroup streams two adjacent weight rows.
+//   * `_r1_f32` — ROWS=1, grid = out_dim. Doubles the wavefront count;
+//     wins on large out_dim (≥4096) where ROWS=2 leaves too few
+//     wavefront generations in flight to sustain HBM bandwidth
+//     (measured: ROWS=2 out_dim=4096 stalls ~184 GB/s; ROWS=1 ~2× it).
+// The caller picks per matvec — see qwen35 / gemma4 launch_matvec.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
-
-#define ROWS 2
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -27,12 +32,13 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
-extern "C" __global__
-void matvec_q8_0_repacked_f32(const unsigned char* __restrict__ slab,
-                              const BlockQ8*   __restrict__ xq,
-                              float*           __restrict__ y,
-                              unsigned int in_dim,
-                              unsigned int out_dim)
+template<int ROWS>
+__device__ __forceinline__
+void mv_q8_0_repacked(const unsigned char* __restrict__ slab,
+                      const BlockQ8*   __restrict__ xq,
+                      float*           __restrict__ y,
+                      unsigned int in_dim,
+                      unsigned int out_dim)
 {
     const unsigned int n_blocks = in_dim >> 5;
     const unsigned int nsp = ((n_blocks & (n_blocks - 1u)) == 0u)
@@ -83,4 +89,24 @@ void matvec_q8_0_repacked_f32(const unsigned char* __restrict__ slab,
         a += __shfl_xor(a,  1);
         if (lane == 0 && (row0 + r) < (int)out_dim) y[row0 + r] = a;
     }
+}
+
+extern "C" __global__
+void matvec_q8_0_repacked_f32(const unsigned char* __restrict__ slab,
+                              const BlockQ8*   __restrict__ xq,
+                              float*           __restrict__ y,
+                              unsigned int in_dim,
+                              unsigned int out_dim)
+{
+    mv_q8_0_repacked<2>(slab, xq, y, in_dim, out_dim);
+}
+
+extern "C" __global__
+void matvec_q8_0_repacked_r1_f32(const unsigned char* __restrict__ slab,
+                                 const BlockQ8*   __restrict__ xq,
+                                 float*           __restrict__ y,
+                                 unsigned int in_dim,
+                                 unsigned int out_dim)
+{
+    mv_q8_0_repacked<1>(slab, xq, y, in_dim, out_dim);
 }
