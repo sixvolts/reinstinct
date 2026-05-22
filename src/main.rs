@@ -208,6 +208,18 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         max_seq: usize,
     },
+    /// QMTP-1 diagnostic: load a Qwen 3.6 MTP model, prefill a prompt,
+    /// then decode N tokens with the main model while running the
+    /// in-GGUF "nextn" MTP head alongside. Reports the K=1 spec-decode
+    /// accept rate — the fraction of MTP drafts that match the main
+    /// model's own next token. No acceptance loop / speedup yet.
+    QwenMtpProbe {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -234,6 +246,8 @@ fn main() -> anyhow::Result<()> {
             mtp_draft_cli(&target, &drafter, prompt, system, k),
         Command::MtpGen { target, drafter, prompt, system, k, steps, temperature, seed } =>
             mtp_gen_cli(&target, &drafter, prompt, system, k, steps, temperature, seed),
+        Command::QwenMtpProbe { path, prompt, steps } =>
+            qwen_mtp_probe_cli(&path, prompt, steps),
     }
 }
 
@@ -1127,6 +1141,71 @@ fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>
     let mean = (sum / n) as f32;
     let std = ((sum_sq / n) - (mean as f64).powi(2)).sqrt() as f32;
     println!("\nlogit stats   = min {min:.4}  max {max:.4}  mean {mean:.4}  std {std:.4}");
+    Ok(())
+}
+
+/// QMTP-1 diagnostic — prefill a prompt on a Qwen MTP model, then probe
+/// the in-GGUF "nextn" head's K=1 spec-decode accept rate.
+fn qwen_mtp_probe_cli(path: &std::path::Path, prompt: Option<String>,
+                      steps: usize) -> anyhow::Result<()> {
+    use reinstinct_engine::hip;
+    use reinstinct_engine::tokenizer::Tokenizer;
+    use reinstinct_engine::sampling::argmax;
+    use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-mtp-probe is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + steps + 4;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    if gpu.n_mtp_heads() == 0 {
+        anyhow::bail!("model has no MTP (nextn) head — not an MTP build");
+    }
+    let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+
+    println!("model   = {}", path.display());
+    println!("arch    = {arch}");
+    println!("prompt  = {} tokens", prompt_ids.len());
+    println!("steps   = {steps}");
+
+    let logits = if prompt_ids.len() > 1 {
+        gpu.forward_tokens_batched(&prompt_ids, &mut state).map_err(anyhow::Error::msg)?
+    } else {
+        gpu.forward_tokens(&prompt_ids, &mut state).map_err(anyhow::Error::msg)?
+    };
+    let first = argmax(&logits);
+
+    let t0 = std::time::Instant::now();
+    let (rate, matches, total) = gpu.mtp_accept_probe(first, steps, &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let el = t0.elapsed().as_secs_f64();
+
+    println!("\n--- MTP K=1 accept probe ---");
+    println!("  matches      = {matches} / {total}");
+    println!("  accept rate  = {:.1}%", rate * 100.0);
+    println!("  elapsed      = {:.2} s  ({:.1} tok/s main decode)",
+             el, total as f64 / el);
+    println!("\nNOTE: the MTP block's KV cache is built cold (it does not");
+    println!("mirror the prefill), so early steps under-report — QMTP-2");
+    println!("warms it. A healthy drafter should still clear ~50%+ here.");
     Ok(())
 }
 

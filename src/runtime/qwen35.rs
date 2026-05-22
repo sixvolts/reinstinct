@@ -540,11 +540,11 @@ impl GpuFullAttnWeights {
 ///       → shared_head_norm                            ─ [hidden]
 ///       → tied lm_head                                ─ [vocab]
 ///
-/// Currently loaded but inert — no forward path written; the K=1
-/// MTP spec-decode round arithmetic on MI50 caps the best-case win at
-/// ~5% over baseline, which doesn't justify the ~800 LOC of qwen
-/// batched verify_forward work needed to make it real. See the
-/// gemma4-mtp memory file for the analysis and wire-up sketch.
+/// Draft forward is `GpuQwen35::mtp_draft_forward`; the K=1 accept rate
+/// can be measured with `mtp_accept_probe` (the `qwen-mtp-probe` CLI) —
+/// ~79-83% on the 4B / 27B MTP builds. The earlier "~5%" estimate was
+/// wrong: it assumed a sequential GDN verify, but reinstinct has batched
+/// GDN inner-loop kernels, so a K-token verify is a single batched pass.
 pub struct GpuMtpHead {
     pub block:            GpuFullAttnBlock,
     pub eh_proj:          GpuMatvecTensor,   // [2·hidden, hidden]
@@ -773,6 +773,8 @@ pub struct GpuQwen35 {
     // Per-call activation scratch (persistent across calls; overwritten each call).
     hidden_a:    DeviceBuf<f32>,   // [hidden]
     hidden_b:    DeviceBuf<f32>,   // [hidden]
+    /// MTP-head scratch: [0..2h] = concat(enorm·emb | hnorm·prev), [2h..3h] = block hidden.
+    mtp_scratch: DeviceBuf<f32>,   // [3 * hidden]
     ffn_a:       DeviceBuf<f32>,   // [ffn]
     ffn_b:       DeviceBuf<f32>,   // [ffn]
     q_raw:       DeviceBuf<f32>,   // [2 * q_dim]
@@ -970,6 +972,7 @@ impl GpuQwen35 {
 
         let hidden_a    = DeviceBuf::new(hidden)?;
         let hidden_b    = DeviceBuf::new(hidden)?;
+        let mtp_scratch = DeviceBuf::new(3 * hidden)?;
         let ffn_a       = DeviceBuf::new(ffn)?;
         let ffn_b       = DeviceBuf::new(ffn)?;
         let q_raw       = DeviceBuf::new(2 * q_dim)?;
@@ -1082,7 +1085,7 @@ impl GpuQwen35 {
 
         Ok(Self {
             token_embd, output_norm, output_proj,
-            hidden_a, hidden_b, ffn_a, ffn_b,
+            hidden_a, hidden_b, mtp_scratch, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
             moe_prof_on, prof_mark, prof_buckets,
@@ -2534,6 +2537,96 @@ impl GpuQwen35 {
         self.step_ffn(scratch, scratch, &weights.ffn)?;
         self.launch_add_inplace(hidden_io, scratch, h)?;
         Ok(())
+    }
+
+    /// MTP-head draft forward — predicts the token *after* `embed_next`
+    /// using the in-GGUF "nextn" head (DeepSeek-V3 style). Inputs:
+    ///   `prev_hidden` — the main model's final block output (pre
+    ///                   output-norm), i.e. `hidden_a` after a decode;
+    ///   `embed_next`  — the token that follows `prev_hidden`'s position
+    ///                   in the sequence (the main model's prediction).
+    ///
+    ///   emb          = embed_lookup(embed_next)
+    ///   concat[0..h] = rmsnorm(emb,         enorm)
+    ///   concat[h..2h]= rmsnorm(prev_hidden, hnorm)
+    ///   hid          = eh_proj · concat                  ([2h] → [h])
+    ///   hid          = full_attn_block(hid)              attn(mtp_kv)+ffn
+    ///   normed       = rmsnorm(hid, shared_head_norm)
+    ///   logits       = lm_head · normed                  (tied output)
+    ///
+    /// The MTP block's attention reads/writes its own KV cache `mtp_kv`
+    /// at the device-resident `d_pos` — the caller must `set_pos` first.
+    /// Logits land in `self.logits`; the caller syncs and reads them.
+    /// Does not advance any sequence position.
+    fn mtp_draft_forward(&self,
+        mtp: &GpuMtpHead, prev_hidden: *mut c_void, embed_next: u32,
+        mtp_kv: &mut GpuKvCache,
+    ) -> Result<(), String>
+    {
+        let h  = self.hidden as u32;
+        let sp = self.mtp_scratch.raw_ptr() as *mut f32;
+        let concat  = sp;                                       // [0  .. 2h]
+        let mtp_hid = unsafe { sp.add(2 * self.hidden) };       // [2h .. 3h]
+        let scr     = self.hidden_b.raw_ptr() as *mut f32;      // emb / scratch / normed
+
+        self.launch_embed_lookup_dispatch(
+            &self.token_embd, scr as *mut c_void, embed_next)?;
+        self.launch_rmsnorm(scr as *mut c_void, mtp.enorm.raw_ptr(),
+                            concat as *mut c_void, h, self.rms_eps)?;
+        self.launch_rmsnorm(prev_hidden, mtp.hnorm.raw_ptr(),
+                            unsafe { concat.add(self.hidden) } as *mut c_void,
+                            h, self.rms_eps)?;
+        self.launch_matvec_dispatch(&mtp.eh_proj, concat as *mut c_void,
+                                    mtp_hid as *mut c_void)?;
+        self.step_full_attention_block_dev(mtp_hid as *mut c_void,
+                                           scr as *mut c_void, &mtp.block, mtp_kv)?;
+        self.launch_rmsnorm(mtp_hid as *mut c_void, mtp.shared_head_norm.raw_ptr(),
+                            scr as *mut c_void, h, self.rms_eps)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    scr as *mut c_void, self.logits.raw_ptr())?;
+        Ok(())
+    }
+
+    /// QMTP-1 diagnostic — decode `n_tokens` greedily from the current
+    /// `state` with the main model, and at each step run the MTP head
+    /// alongside. Returns `(accept_rate, matches, total)` where a "match"
+    /// is the MTP head's argmax equalling the token the main model
+    /// actually decodes for that position (the K=1 spec-decode accept
+    /// rate). NOTE: the MTP block's KV cache is built cold here (it does
+    /// not mirror the prefill), so early steps under-report — QMTP-2
+    /// warms the cache properly.
+    pub fn mtp_accept_probe(&self, first_token: u32, n_tokens: usize,
+                            state: &mut Qwen35GpuState)
+        -> Result<(f32, usize, usize), String>
+    {
+        if self.mtp.is_empty() {
+            return Err("model has no MTP (nextn) head".into());
+        }
+        let mut mtp_kv = GpuKvCache::new(
+            self.max_seq, self.n_kv_heads, self.head_dim)?;
+        let mut logits_host = vec![0.0f32; self.vocab];
+        let mut tok = first_token;
+        let mut pending: Option<u32> = None;
+        let (mut matches, mut total) = (0usize, 0usize);
+
+        for i in 0..n_tokens {
+            let main_logits = self.forward_token(tok, state)?;
+            let next = crate::sampling::argmax(&main_logits);
+            if let Some(d) = pending.take() {
+                total += 1;
+                if d == next { matches += 1; }
+            }
+            // MTP block runs as its own fresh sequence: position = step i.
+            self.set_pos(i)?;
+            self.mtp_draft_forward(&self.mtp[0], self.hidden_a.raw_ptr(),
+                                   next, &mut mtp_kv)?;
+            self.stream.synchronize()?;
+            self.logits.copy_to_host(&mut logits_host)?;
+            pending = Some(crate::sampling::argmax(&logits_host));
+            tok = next;
+        }
+        let rate = if total == 0 { 0.0 } else { matches as f32 / total as f32 };
+        Ok((rate, matches, total))
     }
 
     /// End-to-end forward pass for one decode token. Mirrors
