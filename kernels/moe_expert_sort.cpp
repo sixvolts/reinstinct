@@ -73,3 +73,38 @@ void moe_sort_scatter(const int* __restrict__ ids,
     int rank = atomicAdd(&cursor[e], 1);
     perm[expert_off[e] + rank] = (int)i;
 }
+
+// Gather quantised activation rows into expert-contiguous order:
+// xq_dst[p] = xq_src[ perm[p] / n_used ].  One BlockQ8 (40 B = 10 u32)
+// per thread. grid (ceil(nsub/256), n_entries). Used for the grouped
+// GEMM's gate/up input — every slot of a token shares one activation.
+extern "C" __global__
+void moe_gather_xq(const unsigned char* __restrict__ xq_src,
+                   const int* __restrict__ perm,
+                   unsigned char* __restrict__ xq_dst,
+                   unsigned int nsub, unsigned int n_used,
+                   unsigned int n_entries) {
+    unsigned int p  = blockIdx.y;
+    unsigned int sb = blockIdx.x * 256u + threadIdx.x;
+    if (p >= n_entries || sb >= nsub) return;
+    unsigned int tok = (unsigned int)perm[p] / n_used;
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(
+        xq_src + ((size_t)tok * nsub + sb) * 40);
+    uint32_t* d = reinterpret_cast<uint32_t*>(
+        xq_dst + ((size_t)p * nsub + sb) * 40);
+    #pragma unroll
+    for (int i = 0; i < 10; i++) d[i] = s[i];
+}
+
+// Scatter sorted-order rows back to entry order: dst[perm[p]] = src[p].
+// grid (ceil(dim/256), n_entries). `dim` floats per row.
+extern "C" __global__
+void moe_scatter_rows(const float* __restrict__ src,
+                      const int* __restrict__ perm,
+                      float* __restrict__ dst,
+                      unsigned int dim, unsigned int n_entries) {
+    unsigned int p = blockIdx.y;
+    unsigned int c = blockIdx.x * 256u + threadIdx.x;
+    if (p >= n_entries || c >= dim) return;
+    dst[(size_t)perm[p] * dim + c] = src[(size_t)p * dim + c];
+}

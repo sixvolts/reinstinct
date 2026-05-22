@@ -106,6 +106,8 @@ const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_
 const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
 const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.cpp");
 const MOE_EXPERT_SORT_SOURCE: &str = include_str!("../../kernels/moe_expert_sort.cpp");
+const MOE_MMQ_Q4K_GROUPED_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q4k_grouped.cpp");
 
 /// Token-tile width of the grouped-expert GEMM — `tile_off` counts
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Matches the MMQ
@@ -389,6 +391,8 @@ struct MoeRuntime {
     m_shexp_gate: Module,
     /// Expert-routing counting sort (grouped-expert GEMM prefill path).
     m_expert_sort: Module,
+    /// Grouped-expert MMQ GEMM — repacked Q4_K (gate/up prefill).
+    m_grouped_q4k: Module,
     // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
     logits:  DeviceBuf<f32>,   // [n_tok, n_expert] router logits
     ids:     DeviceBuf<i32>,   // [n_tok, n_used] selected expert ids
@@ -399,6 +403,7 @@ struct MoeRuntime {
     sort_eoff:   DeviceBuf<i32>,  // [n_expert+1] expert entry offsets
     sort_toff:   DeviceBuf<i32>,  // [n_expert+1] expert GEMM-tile offsets
     sort_perm:   DeviceBuf<i32>,  // [n_tok, n_used] entry indices grouped by expert
+    g_in:    DeviceBuf<u8>,    // [n_tok, n_used, hidden/32] gathered (sorted) gate/up input
     ones:    DeviceBuf<f32>,   // [n_expert] = 1.0 (combine has no per-expert scale)
     xq8_in:  DeviceBuf<u8>,    // [n_tok, hidden/32] quantised block input
     xq8_exp: DeviceBuf<u8>,    // [n_tok, n_used, expert_ff/32] quantised down acts
@@ -439,6 +444,8 @@ impl MoeRuntime {
             m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
             m_expert_sort: Module::load(&cache.compile(
                               "moe_expert_sort", MOE_EXPERT_SORT_SOURCE)?)?,
+            m_grouped_q4k: Module::load(&cache.compile(
+                              "mmq_gemm_q4k_grouped", MOE_MMQ_Q4K_GROUPED_SOURCE)?)?,
             logits:  DeviceBuf::new(c * n_expert)?,
             ids:     DeviceBuf::new(c * n_used)?,
             weights: DeviceBuf::new(c * n_used)?,
@@ -447,6 +454,7 @@ impl MoeRuntime {
             sort_eoff:   DeviceBuf::new(n_expert + 1)?,
             sort_toff:   DeviceBuf::new(n_expert + 1)?,
             sort_perm:   DeviceBuf::new(c * n_used)?,
+            g_in:    DeviceBuf::new(c * n_used * (hidden / 32).max(1) * 40)?,
             ones,
             xq8_in:  DeviceBuf::new(c * (hidden / 32).max(1) * 40)?,
             xq8_exp: DeviceBuf::new(c * n_used * (expert_ff / 32).max(1) * 40)?,
@@ -2093,14 +2101,38 @@ impl GpuQwen35 {
         // token activation across the 8 experts (slot stride 0); down has
         // a distinct activation per (token, expert).
         self.launch_quantize_q8_into(input_ptr, moe.xq8_in.raw_ptr(), h, nt)?;
-        self.launch_moe_expert_matvec(moe, &w.gate_exps, moe.xq8_in.raw_ptr(),
-                                      moe.e_gate.raw_ptr(), h, ff, nt, h / 32, 0)?;
-        self.launch_moe_expert_matvec(moe, &w.up_exps, moe.xq8_in.raw_ptr(),
-                                      moe.e_up.raw_ptr(), h, ff, nt, h / 32, 0)?;
-        self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
-                           moe.e_gate.raw_ptr(), nt * n_used * ff)?;
-        self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
-                                     ff, nt * n_used)?;
+        // Grouped-expert GEMM for gate/up (Q4_K): sort tokens by expert,
+        // gather, one tiled GEMM per expert (weight read once per expert
+        // instead of once per routed token). Down stays on the matvec
+        // path. Gated by REINSTINCT_MOE_GROUPED while it proves out.
+        let grouped = std::env::var_os("REINSTINCT_MOE_GROUPED").is_some()
+            && w.gate_exps.dtype == GgmlType::Q4_K && w.gate_exps.repacked
+            && w.up_exps.dtype == GgmlType::Q4_K && w.up_exps.repacked;
+        if grouped {
+            self.launch_moe_sort(moe, nt)?;
+            self.launch_moe_gather_xq(moe, h / 32, nt)?;
+            self.launch_moe_grouped_gemm(moe, &w.gate_exps, moe.g_in.raw_ptr(),
+                                         moe.e_gate.raw_ptr(), h, ff, nt)?;
+            self.launch_moe_grouped_gemm(moe, &w.up_exps, moe.g_in.raw_ptr(),
+                                         moe.e_up.raw_ptr(), h, ff, nt)?;
+            // gate/up are in expert-sorted order; swiglu is elementwise,
+            // then scatter back to [token, slot] order for the down matvec.
+            self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                               moe.e_gate.raw_ptr(), nt * n_used * ff)?;
+            self.launch_moe_scatter_rows(moe, moe.e_gate.raw_ptr(),
+                                         moe.e_up.raw_ptr(), ff, nt)?;
+            self.launch_quantize_q8_into(moe.e_up.raw_ptr(), moe.xq8_exp.raw_ptr(),
+                                         ff, nt * n_used)?;
+        } else {
+            self.launch_moe_expert_matvec(moe, &w.gate_exps, moe.xq8_in.raw_ptr(),
+                                          moe.e_gate.raw_ptr(), h, ff, nt, h / 32, 0)?;
+            self.launch_moe_expert_matvec(moe, &w.up_exps, moe.xq8_in.raw_ptr(),
+                                          moe.e_up.raw_ptr(), h, ff, nt, h / 32, 0)?;
+            self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                               moe.e_gate.raw_ptr(), nt * n_used * ff)?;
+            self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
+                                         ff, nt * n_used)?;
+        }
         self.launch_moe_expert_matvec(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
                                       moe.e_out.raw_ptr(), ff, h, nt,
                                       n_used * (ff / 32), ff / 32)?;
@@ -2243,6 +2275,67 @@ impl GpuQwen35 {
             eprintln!("[moe-sort-check] FAIL: {fail}");
         }
         Ok(())
+    }
+
+    /// Gather gate/up activations into expert-sorted order:
+    /// `g_in[p] = xq8_in[perm[p] / n_used]`. `nsub = hidden/32`.
+    fn launch_moe_gather_xq(&self, moe: &MoeRuntime, nsub: u32, n_tok: u32)
+        -> Result<(), String>
+    {
+        let f = moe.m_expert_sort.function("moe_gather_xq")?;
+        let n_entries = n_tok * moe.n_used as u32;
+        let mut a0 = moe.xq8_in.raw_ptr(); let mut a1 = moe.sort_perm.raw_ptr();
+        let mut a2 = moe.g_in.raw_ptr(); let mut a3 = nsub;
+        let mut a4 = moe.n_used as u32; let mut a5 = n_entries;
+        let mut args: [*mut c_void; 6] = [
+            &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+            &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+            &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void];
+        unsafe { f.launch(((nsub + 255) / 256, n_entries, 1), (256, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    /// Scatter sorted-order rows back to entry order: `dst[perm[p]] = src[p]`.
+    fn launch_moe_scatter_rows(&self, moe: &MoeRuntime, src: *mut c_void,
+                               dst: *mut c_void, dim: u32, n_tok: u32)
+        -> Result<(), String>
+    {
+        let f = moe.m_expert_sort.function("moe_scatter_rows")?;
+        let n_entries = n_tok * moe.n_used as u32;
+        let mut a0 = src; let mut a1 = moe.sort_perm.raw_ptr(); let mut a2 = dst;
+        let mut a3 = dim; let mut a4 = n_entries;
+        let mut args: [*mut c_void; 5] = [
+            &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+            &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+            &mut a4 as *mut _ as *mut c_void];
+        unsafe { f.launch(((dim + 255) / 256, n_entries, 1), (256, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
+    /// Grouped-expert MMQ GEMM — repacked Q4_K. `xq` / `y` are in
+    /// expert-sorted order; one launch covers all experts (each
+    /// workgroup maps to its expert via `sort_toff`).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_grouped_gemm(&self, moe: &MoeRuntime, et: &GpuExpertTensor,
+                               xq: *mut c_void, y: *mut c_void,
+                               in_dim: u32, out_dim: u32, n_tok: u32)
+        -> Result<(), String>
+    {
+        let f = moe.m_grouped_q4k.function("mmq_gemm_q4k_grouped_f32")?;
+        let n_entries = n_tok * moe.n_used as u32;
+        let tile_ub = (n_entries + MOE_GEMM_BN - 1) / MOE_GEMM_BN + moe.n_expert as u32;
+        let mut a0 = et.data.raw_ptr(); let mut a1 = et.bytes_per_expert as u32;
+        let mut a2 = moe.sort_eoff.raw_ptr(); let mut a3 = moe.sort_toff.raw_ptr();
+        let mut a4 = moe.n_expert as u32; let mut a5 = xq; let mut a6 = y;
+        let mut a7 = in_dim; let mut a8 = out_dim;
+        let mut args: [*mut c_void; 9] = [
+            &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+            &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+            &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void,
+            &mut a6 as *mut _ as *mut c_void, &mut a7 as *mut _ as *mut c_void,
+            &mut a8 as *mut _ as *mut c_void];
+        unsafe { f.launch(((out_dim + 63) / 64, tile_ub, 1), (256, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
     }
 
     /// Routed-expert matvec — grid (out_dim/8, n_used, n_tok). For decode
