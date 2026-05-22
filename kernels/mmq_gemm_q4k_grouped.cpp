@@ -11,8 +11,12 @@
 // grid = (ceil(out_dim/BM), tile_upper_bound); workgroups whose tile
 // index is past the real total (tile_off[n_expert]) early-exit.
 //
-// Body is mmq_gemm_q4k_repacked with tok0 = the expert's tile base and
-// the p_rows guard replaced by the expert's row-end.
+// BN=32: MoE routing spreads tokens thin (256-expert models see ~16
+// tokens/expert at P=512), so a 64-wide token tile would be ~75% empty
+// — and the MMQ tile cost is dp4a-bound and occupancy-independent, so
+// empty columns are wasted work. BN=32 halves the waste. The
+// cooperative loads use a `for e=t; e<N; e+=256` form so they stay
+// correct for BN<64 (BN*BK can be < 256).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -20,11 +24,9 @@
 
 #define BK 4
 #define TM 4
-#define TN 4
-#define BM (16 * TM)
-#define BN (16 * TN)
-#define LDW (BM * BK / 256)
-#define LDX (BN * BK / 256)
+#define TN 2
+#define BM (16 * TM)   // 64 weight rows / workgroup
+#define BN (16 * TN)   // 32 tokens / workgroup
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -84,9 +86,7 @@ void mmq_gemm_q4k_grouped_f32(const unsigned char* __restrict__ slab,
         for (int n = 0; n < TN; n++) acc[r][n] = 0.0f;
 
     for (unsigned int sb0 = 0; sb0 < n_sub; sb0 += BK) {
-        #pragma unroll
-        for (int i = 0; i < LDW; i++) {
-            const int e2 = t + i * 256;
+        for (int e2 = t; e2 < BM * BK; e2 += 256) {
             const int lr = e2 / BK, lk = e2 % BK;
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim) {
@@ -105,9 +105,7 @@ void mmq_gemm_q4k_grouped_f32(const unsigned char* __restrict__ slab,
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }
         }
-        #pragma unroll
-        for (int i = 0; i < LDX; i++) {
-            const int e2 = t + i * 256;
+        for (int e2 = t; e2 < BN * BK; e2 += 256) {
             const int lr = e2 / BK, lk = e2 % BK;
             const unsigned int xtok = tok0 + lr;
             if (xtok < tok_end) {
