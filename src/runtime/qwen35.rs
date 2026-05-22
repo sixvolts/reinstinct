@@ -105,6 +105,12 @@ const MOE_MV_Q6K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_
 const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_repacked.cpp");
 const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
 const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.cpp");
+const MOE_EXPERT_SORT_SOURCE: &str = include_str!("../../kernels/moe_expert_sort.cpp");
+
+/// Token-tile width of the grouped-expert GEMM — `tile_off` counts
+/// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Matches the MMQ
+/// GEMM's BN.
+const MOE_GEMM_BN: u32 = 64;
 const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
@@ -381,10 +387,18 @@ struct MoeRuntime {
     m_down_q6k:   Module,
     m_combine:    Module,
     m_shexp_gate: Module,
+    /// Expert-routing counting sort (grouped-expert GEMM prefill path).
+    m_expert_sort: Module,
     // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
     logits:  DeviceBuf<f32>,   // [n_tok, n_expert] router logits
     ids:     DeviceBuf<i32>,   // [n_tok, n_used] selected expert ids
     weights: DeviceBuf<f32>,   // [n_tok, n_used] renormalised routing weights
+    // Expert-routing sort scratch — see kernels/moe_expert_sort.cpp.
+    sort_count:  DeviceBuf<i32>,  // [n_expert]   histogram
+    sort_cursor: DeviceBuf<i32>,  // [n_expert]   scatter cursor
+    sort_eoff:   DeviceBuf<i32>,  // [n_expert+1] expert entry offsets
+    sort_toff:   DeviceBuf<i32>,  // [n_expert+1] expert GEMM-tile offsets
+    sort_perm:   DeviceBuf<i32>,  // [n_tok, n_used] entry indices grouped by expert
     ones:    DeviceBuf<f32>,   // [n_expert] = 1.0 (combine has no per-expert scale)
     xq8_in:  DeviceBuf<u8>,    // [n_tok, hidden/32] quantised block input
     xq8_exp: DeviceBuf<u8>,    // [n_tok, n_used, expert_ff/32] quantised down acts
@@ -423,9 +437,16 @@ impl MoeRuntime {
                               "moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SOURCE)?)?,
             m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
             m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
+            m_expert_sort: Module::load(&cache.compile(
+                              "moe_expert_sort", MOE_EXPERT_SORT_SOURCE)?)?,
             logits:  DeviceBuf::new(c * n_expert)?,
             ids:     DeviceBuf::new(c * n_used)?,
             weights: DeviceBuf::new(c * n_used)?,
+            sort_count:  DeviceBuf::new(n_expert)?,
+            sort_cursor: DeviceBuf::new(n_expert)?,
+            sort_eoff:   DeviceBuf::new(n_expert + 1)?,
+            sort_toff:   DeviceBuf::new(n_expert + 1)?,
+            sort_perm:   DeviceBuf::new(c * n_used)?,
             ones,
             xq8_in:  DeviceBuf::new(c * (hidden / 32).max(1) * 40)?,
             xq8_exp: DeviceBuf::new(c * n_used * (expert_ff / 32).max(1) * 40)?,
@@ -2060,6 +2081,13 @@ impl GpuQwen35 {
         self.bmm(&w.gate_inp, input_ptr, n, moe.logits.raw_ptr())?;
         self.launch_moe_topk(moe, nt)?;
 
+        // Grouped-expert GEMM groundwork (M1): expert-routing sort. Not
+        // yet consumed — the matvec path below still runs. Gated for now.
+        if std::env::var_os("REINSTINCT_MOE_SORT_CHECK").is_some() {
+            self.launch_moe_sort(moe, nt)?;
+            self.verify_moe_sort(moe, nt)?;
+        }
+
         // --- Routed experts --- one int8 activation per token, then the
         // expert matvecs batch over tokens (grid.z). gate/up share the
         // token activation across the 8 experts (slot stride 0); down has
@@ -2106,6 +2134,115 @@ impl GpuQwen35 {
             &mut wa as *mut _ as *mut c_void];
         let smem = moe.n_expert as u32 * 4;
         unsafe { f.launch((n_tok,1,1),(128,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
+    /// Counting-sort the `n_tok * n_used` routing entries by expert id
+    /// into `moe.sort_perm`, with `sort_eoff` (entry offsets) and
+    /// `sort_toff` (GEMM-tile offsets). Foundation of the grouped-expert
+    /// GEMM prefill path — see kernels/moe_expert_sort.cpp.
+    fn launch_moe_sort(&self, moe: &MoeRuntime, n_tok: u32) -> Result<(), String> {
+        let ne = moe.n_expert as u32;
+        let n_entries = n_tok * moe.n_used as u32;
+        let zero = |buf: *mut c_void, n: u32| -> Result<(), String> {
+            let f = moe.m_expert_sort.function("moe_sort_zero")?;
+            let mut a0 = buf; let mut a1 = n;
+            let mut args: [*mut c_void; 2] = [
+                &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void];
+            unsafe { f.launch(((n + 255) / 256, 1, 1), (256, 1, 1), 0,
+                              Some(&self.stream), &mut args) }
+        };
+        zero(moe.sort_count.raw_ptr(), ne)?;
+        {
+            let f = moe.m_expert_sort.function("moe_sort_histogram")?;
+            let mut a0 = moe.ids.raw_ptr(); let mut a1 = moe.sort_count.raw_ptr();
+            let mut a2 = n_entries; let mut a3 = ne;
+            let mut args: [*mut c_void; 4] = [
+                &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+                &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_entries + 255) / 256, 1, 1), (256, 1, 1), 0,
+                              Some(&self.stream), &mut args)?; }
+        }
+        {
+            let f = moe.m_expert_sort.function("moe_sort_scan")?;
+            let mut a0 = moe.sort_count.raw_ptr(); let mut a1 = moe.sort_eoff.raw_ptr();
+            let mut a2 = moe.sort_toff.raw_ptr(); let mut a3 = ne; let mut a4 = MOE_GEMM_BN;
+            let mut args: [*mut c_void; 5] = [
+                &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+                &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+                &mut a4 as *mut _ as *mut c_void];
+            unsafe { f.launch((1, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args)?; }
+        }
+        zero(moe.sort_cursor.raw_ptr(), ne)?;
+        {
+            let f = moe.m_expert_sort.function("moe_sort_scatter")?;
+            let mut a0 = moe.ids.raw_ptr(); let mut a1 = moe.sort_eoff.raw_ptr();
+            let mut a2 = moe.sort_cursor.raw_ptr(); let mut a3 = moe.sort_perm.raw_ptr();
+            let mut a4 = n_entries; let mut a5 = ne;
+            let mut args: [*mut c_void; 6] = [
+                &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+                &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+                &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void];
+            unsafe { f.launch(((n_entries + 255) / 256, 1, 1), (256, 1, 1), 0,
+                              Some(&self.stream), &mut args)?; }
+        }
+        Ok(())
+    }
+
+    /// Host-side check of `launch_moe_sort` — syncs, downloads the sort
+    /// buffers, asserts the permutation is a valid expert grouping.
+    /// Gated by `REINSTINCT_MOE_SORT_CHECK`.
+    fn verify_moe_sort(&self, moe: &MoeRuntime, n_tok: u32) -> Result<(), String> {
+        self.stream.synchronize()?;
+        let ne = moe.n_expert;
+        let n_entries = n_tok as usize * moe.n_used;
+        let mut ids  = vec![0i32; n_entries];
+        let mut perm = vec![0i32; n_entries];
+        let mut eoff = vec![0i32; ne + 1];
+        let mut toff = vec![0i32; ne + 1];
+        moe.ids.copy_range_to_host(&mut ids, 0)?;
+        moe.sort_perm.copy_range_to_host(&mut perm, 0)?;
+        moe.sort_eoff.copy_to_host(&mut eoff)?;
+        moe.sort_toff.copy_to_host(&mut toff)?;
+
+        let mut count = vec![0i32; ne];
+        for &e in &ids { if e >= 0 && (e as usize) < ne { count[e as usize] += 1; } }
+        let mut fail = String::new();
+        let mut eacc = 0i32; let mut tacc = 0i32;
+        for e in 0..ne {
+            if eoff[e] != eacc { fail = format!("eoff[{e}]={} != {eacc}", eoff[e]); break; }
+            if toff[e] != tacc { fail = format!("toff[{e}]={} != {tacc}", toff[e]); break; }
+            eacc += count[e];
+            tacc += (count[e] + MOE_GEMM_BN as i32 - 1) / MOE_GEMM_BN as i32;
+        }
+        if fail.is_empty() && eoff[ne] != eacc {
+            fail = format!("eoff[ne]={} != n_entries-ish {eacc}", eoff[ne]);
+        }
+        let mut seen = vec![false; n_entries];
+        if fail.is_empty() {
+            for e in 0..ne {
+                for p in eoff[e]..eoff[e + 1] {
+                    let entry = perm[p as usize];
+                    if entry < 0 || (entry as usize) >= n_entries {
+                        fail = format!("perm[{p}]={entry} out of range"); break;
+                    }
+                    if seen[entry as usize] { fail = format!("perm dup {entry}"); break; }
+                    seen[entry as usize] = true;
+                    if ids[entry as usize] != e as i32 {
+                        fail = format!("perm[{p}]→entry {entry} expert {} != {e}",
+                                       ids[entry as usize]);
+                        break;
+                    }
+                }
+                if !fail.is_empty() { break; }
+            }
+        }
+        if fail.is_empty() {
+            eprintln!("[moe-sort-check] OK  n_tok={n_tok} entries={n_entries} \
+                       tiles={}", toff[ne]);
+        } else {
+            eprintln!("[moe-sort-check] FAIL: {fail}");
+        }
+        Ok(())
     }
 
     /// Routed-expert matvec — grid (out_dim/8, n_used, n_tok). For decode
