@@ -25,6 +25,8 @@ const MMQ_GEMM_Q5K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
+const MMQ_GEMM_Q8_0_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q8_0_repacked.cpp");
 const MV_Q4K_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q4k_repacked_batched.cpp");
 const MV_Q5K_REPACKED_BATCHED_SOURCE: &str =
@@ -167,6 +169,7 @@ pub struct PrefillGemm {
     mmq_q4k:     Module,
     mmq_q5k:     Module,
     mmq_q6k:     Module,
+    mmq_q8_0:    Module,
     mv_q4k_batched: Module,    // K=2..8 batched K-quant matvec for verify
     mv_q5k_batched: Module,
     mv_q6k_batched: Module,
@@ -209,6 +212,8 @@ impl PrefillGemm {
                                                      MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k:     Module::load(&cache.compile("mmq_gemm_q6k_repacked",
                                                      MMQ_GEMM_Q6K_SOURCE)?)?,
+            mmq_q8_0:    Module::load(&cache.compile("mmq_gemm_q8_0_repacked",
+                                                     MMQ_GEMM_Q8_0_SOURCE)?)?,
             mv_q4k_batched: Module::load(&cache.compile("matvec_q4k_repacked_batched",
                                                      MV_Q4K_REPACKED_BATCHED_SOURCE)?)?,
             mv_q5k_batched: Module::load(&cache.compile("matvec_q5k_repacked_batched",
@@ -246,11 +251,11 @@ impl PrefillGemm {
                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<DeviceBuf<f32>, String>
     {
-        // Repacked K-quants: the 2D-tiled int8 MMQ GEMM consumes the
-        // quantised weight directly — no dequant to fp16, no HGEMM.
-        // Repacked Q8_0 falls through to the dequant→HGEMM path below;
-        // an int8-MMQ Q8_0 GEMM would be a follow-up.
-        if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+        // Repacked K-quants and Q8_0: the 2D-tiled int8 MMQ GEMM
+        // consumes the quantised weight directly — no dequant to fp16,
+        // no HGEMM.
+        if repacked && matches!(dtype,
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0) {
             return self.matmul_mmq(stream, w_dev, dtype, in_dim, out_dim, x, n_rows);
         }
 
@@ -355,6 +360,11 @@ impl PrefillGemm {
         let n_y = n_rows * out_dim;
         if dst.len() < n_y {
             return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
+        }
+        // Repacked Q8_0: no batched-matvec variant exists, so MMQ for
+        // every K — still far beats the dequant→HGEMM fallback.
+        if repacked && dtype == GgmlType::Q8_0 {
+            return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
         }
         if repacked && matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
             if n_rows >= 1 && n_rows <= 4 {
@@ -482,9 +492,10 @@ impl PrefillGemm {
         -> Result<DeviceBuf<f32>, String>
     {
         let (module, kname) = match dtype {
-            GgmlType::Q5_K => (&self.mmq_q5k, "mmq_gemm_q5k_repacked_f32"),
-            GgmlType::Q6_K => (&self.mmq_q6k, "mmq_gemm_q6k_repacked_f32"),
-            _              => (&self.mmq_q4k, "mmq_gemm_q4k_repacked_f32"),
+            GgmlType::Q5_K => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_f32"),
+            GgmlType::Q6_K => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_f32"),
+            GgmlType::Q8_0 => (&self.mmq_q8_0, "mmq_gemm_q8_0_repacked_f32"),
+            _              => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_f32"),
         };
         let n_xq8 = (n_rows * in_dim / 32) * 40;          // BlockQ8 bytes
         if self.xq8.borrow().len() < n_xq8 {
@@ -583,9 +594,10 @@ impl PrefillGemm {
         -> Result<(), String>
     {
         let (module, kname) = match dtype {
-            GgmlType::Q5_K => (&self.mmq_q5k, "mmq_gemm_q5k_repacked_f32"),
-            GgmlType::Q6_K => (&self.mmq_q6k, "mmq_gemm_q6k_repacked_f32"),
-            _              => (&self.mmq_q4k, "mmq_gemm_q4k_repacked_f32"),
+            GgmlType::Q5_K => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_f32"),
+            GgmlType::Q6_K => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_f32"),
+            GgmlType::Q8_0 => (&self.mmq_q8_0, "mmq_gemm_q8_0_repacked_f32"),
+            _              => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_f32"),
         };
         let n_xq8 = (n_rows * in_dim / 32) * 40;
         if self.xq8.borrow().len() < n_xq8 {
