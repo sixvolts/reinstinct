@@ -145,6 +145,7 @@ const MATVEC_Q5_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q5_
 const MATVEC_Q6_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k_wave64.cpp");
 const MATVEC_Q8_0_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0_wave64.cpp");
 const MATVEC_IQ4_XS_WAVE64_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs_wave64.cpp");
+const MATVEC_IQ4_XS_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs_dp4a.cpp");
 const MATVEC_F16_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f16_wave64.cpp");
 
 /// A weight tensor used as the W matrix in a `y = W·x` matvec, resident on
@@ -1021,6 +1022,7 @@ pub struct GpuQwen35 {
     matvec_q6_k_wave64_module:   Module,
     matvec_q8_0_wave64_module:   Module,
     matvec_iq4_xs_wave64_module: Module,
+    matvec_iq4_xs_dp4a_module: Module,
     matvec_f16_wave64_module:    Module,
 
     // int8 dp4a matvec: quantize the activation once, then v_dot4_i32_i8.
@@ -1228,6 +1230,7 @@ impl GpuQwen35 {
         let matvec_q6_k_wave64_hsaco   = cache.compile("matvec_q6_k_wave64",   MATVEC_Q6_K_WAVE64_SOURCE)?;
         let matvec_q8_0_wave64_hsaco   = cache.compile("matvec_q8_0_wave64",   MATVEC_Q8_0_WAVE64_SOURCE)?;
         let matvec_iq4_xs_wave64_hsaco = cache.compile("matvec_iq4_xs_wave64", MATVEC_IQ4_XS_WAVE64_SOURCE)?;
+        let matvec_iq4_xs_dp4a_hsaco = cache.compile("matvec_iq4_xs_dp4a", MATVEC_IQ4_XS_DP4A_SOURCE)?;
         let matvec_f16_wave64_hsaco    = cache.compile("matvec_f16_wave64",    MATVEC_F16_WAVE64_SOURCE)?;
         let quantize_q8_hsaco      = cache.compile("quantize_q8",      QUANTIZE_Q8_SOURCE)?;
         let matvec_q4_k_dp4a_hsaco = cache.compile("matvec_q4_k_dp4a", MATVEC_Q4_K_DP4A_SOURCE)?;
@@ -1335,6 +1338,7 @@ impl GpuQwen35 {
             matvec_q6_k_wave64_module:   Module::load(&matvec_q6_k_wave64_hsaco)?,
             matvec_q8_0_wave64_module:   Module::load(&matvec_q8_0_wave64_hsaco)?,
             matvec_iq4_xs_wave64_module: Module::load(&matvec_iq4_xs_wave64_hsaco)?,
+            matvec_iq4_xs_dp4a_module: Module::load(&matvec_iq4_xs_dp4a_hsaco)?,
             matvec_f16_wave64_module:    Module::load(&matvec_f16_wave64_hsaco)?,
             quantize_q8_module:      Module::load(&quantize_q8_hsaco)?,
             matvec_q4_k_dp4a_module: Module::load(&matvec_q4_k_dp4a_hsaco)?,
@@ -1767,16 +1771,19 @@ impl GpuQwen35 {
 
         let dp4a = self.dp4a_enabled
             && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
-                               | GgmlType::Q6_K | GgmlType::Q8_0);
+                               | GgmlType::Q6_K | GgmlType::Q8_0
+                               | GgmlType::IQ4_XS);
         if dp4a {
             self.launch_quantize_q8(x, in_d)?;
             // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
-            // others: 64-thread, 2 rows per wavefront.
+            // others: 64-thread, 2 rows per wavefront. IQ4_XS shares the
+            // 64-thread/1-row layout of matvec_iq4_xs_wave64_f32.
             let (module, kname, rows, block) = match w.dtype {
-                GgmlType::Q4_K => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
-                GgmlType::Q5_K => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
-                GgmlType::Q6_K => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
-                _              => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
+                GgmlType::Q4_K   => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
+                GgmlType::Q5_K   => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                GgmlType::Q6_K   => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                GgmlType::IQ4_XS => (&self.matvec_iq4_xs_dp4a_module, "matvec_iq4_xs_dp4a_f32", 1u32, 64),
+                _                => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
             };
             let f = module.function(kname)?;
             let grid = (out_d + rows - 1) / rows;
