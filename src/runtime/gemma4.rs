@@ -18,6 +18,7 @@ use crate::runtime::qwen35::{DeviceBufPool, GpuMatvecTensor, PooledBuf};
 // Reused kernel sources.
 const RMSNORM_SRC:           &str = include_str!("../../kernels/rmsnorm.cpp");
 const RMSNORM_ADD_SRC:       &str = include_str!("../../kernels/rmsnorm_add.cpp");
+const RMSNORM_Q8_SRC:        &str = include_str!("../../kernels/rmsnorm_q8.cpp");
 const RMSNORM_MULTIHEAD_SRC: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
 const ROPE_SRC:              &str = include_str!("../../kernels/rope_dpos.cpp");
 const ADD_INPLACE_SRC:       &str = include_str!("../../kernels/add_inplace.cpp");
@@ -78,6 +79,7 @@ const MOE_MV_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/moe_matvec_q6k
 const MOE_MATVEC_Q8_0_SRC:   &str = include_str!("../../kernels/moe_matvec_q8_0_dp4a.cpp");
 const MOE_MATVEC_Q8_0_DOWN_SRC: &str = include_str!("../../kernels/moe_matvec_q8_0_down.cpp");
 const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
+const MOE_GEGLU_Q8_SRC:      &str = include_str!("../../kernels/moe_geglu_q8.cpp");
 const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp");
 const MOE_EXPERT_SORT_SRC:   &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MMQ_Q6K_GROUPED_SRC:   &str = include_str!("../../kernels/mmq_gemm_q6k_grouped.cpp");
@@ -101,6 +103,24 @@ fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
         .ok_or_else(|| format!("{name}: no data"))?;
     let floats: &[f32] = bytemuck::cast_slice(bytes);
     DeviceBuf::from_slice(floats)
+}
+
+/// Load an F32 tensor and multiply every element by `scale` host-side
+/// before uploading. Lets us fold downstream `launch_scale` calls into
+/// the weight — eg the gate_inp_s RMSNorm weight gets pre-scaled by
+/// 1/sqrt(hidden) so the per-layer router skips one launch.
+fn load_fp32_scaled(gguf: &GgufFile, name: &str, scale: f32)
+    -> Result<DeviceBuf<f32>, String>
+{
+    let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
+    if info.ggml_type != GgmlType::F32 {
+        return Err(format!("tensor {name}: expected F32, got {:?}", info.ggml_type));
+    }
+    let bytes = gguf.tensor_data(name).map_err(|e| format!("{name}: {e}"))?
+        .ok_or_else(|| format!("{name}: no data"))?;
+    let mut floats: Vec<f32> = bytemuck::cast_slice::<u8, f32>(bytes).to_vec();
+    for v in &mut floats { *v *= scale; }
+    DeviceBuf::from_slice(&floats)
 }
 
 /// Load a 2D BF16 weight, converting it to f32 on the host and wrapping
@@ -317,15 +337,20 @@ pub struct GpuGemma4Block {
 impl GpuGemma4Block {
     fn from_gguf(gguf: &GgufFile, layer: u32, kind: AttnKind,
                  head_dim: usize, n_kv: usize, moe: bool,
-                 kv_donor: Option<usize>, ple: bool) -> Result<Self, String> {
+                 kv_donor: Option<usize>, ple: bool,
+                 hidden: usize) -> Result<Self, String> {
         let p = format!("blk.{layer}.");
         let moe_block = if moe {
+            // Pre-scale gate_inp_s by 1/sqrt(hidden) so the router's
+            // `launch_scale` after the rmsnorm becomes unnecessary —
+            // rmsnorm(x) * (w * 1/sqrt(h)) = rmsnorm(x) * w * 1/sqrt(h).
+            let inv_sqrt_h = 1.0 / (hidden as f32).sqrt();
             Some(MoeBlock {
                 post_ffw_norm_1: load_fp32(gguf, &format!("{p}post_ffw_norm_1.weight"))?,
                 pre_ffw_norm_2:  load_fp32(gguf, &format!("{p}pre_ffw_norm_2.weight"))?,
                 post_ffw_norm_2: load_fp32(gguf, &format!("{p}post_ffw_norm_2.weight"))?,
                 gate_inp:    GpuMatvecTensor::from_gguf_matvec(gguf, &format!("{p}ffn_gate_inp.weight"))?,
-                gate_inp_s:  load_fp32(gguf, &format!("{p}ffn_gate_inp.scale"))?,
+                gate_inp_s:  load_fp32_scaled(gguf, &format!("{p}ffn_gate_inp.scale"), inv_sqrt_h)?,
                 gate_up_exps: ExpertTensor::from_gguf(gguf, &format!("{p}ffn_gate_up_exps.weight"))?,
                 down_exps:    ExpertTensor::from_gguf(gguf, &format!("{p}ffn_down_exps.weight"))?,
                 down_grouped: ExpertTensor::from_gguf_repacked(
@@ -614,6 +639,7 @@ pub struct GpuGemma4 {
     // Kernel modules.
     m_rmsnorm:   Module,
     m_rmsnorm_add: Module,
+    m_rmsnorm_q8: Module,
     m_rmsnorm_mh: Module,
     m_rope:      Module,
     m_add:       Module,
@@ -662,6 +688,7 @@ pub struct GpuGemma4 {
     m_moe_mv_q8_0: Module,
     m_moe_mv_q8_0_down: Module,
     m_moe_geglu:   Module,
+    m_moe_geglu_q8: Module,
     m_moe_combine: Module,
     /// Grouped-expert GEMM modules (MoE prefill, `REINSTINCT_MOE_GROUPED`).
     m_expert_sort: Module,
@@ -773,7 +800,8 @@ impl GpuGemma4 {
             blocks.push(GpuGemma4Block::from_gguf(
                 gguf, layer, kind,
                 cfg.head_dim(l) as usize,
-                cfg.kv_heads[l] as usize, moe, kv_donor, cfg.has_ple())?);
+                cfg.kv_heads[l] as usize, moe, kv_donor, cfg.has_ple(),
+                hidden)?);
         }
 
         // Per-Layer-Embedding global weights (E4B only).
@@ -873,6 +901,7 @@ impl GpuGemma4 {
             n_layer_kv_from_start: cfg.n_layer_kv_from_start as usize,
             m_rmsnorm:     ld("rmsnorm", RMSNORM_SRC)?,
             m_rmsnorm_add: ld("rmsnorm_add", RMSNORM_ADD_SRC)?,
+            m_rmsnorm_q8:  ld("rmsnorm_q8", RMSNORM_Q8_SRC)?,
             m_rmsnorm_mh: ld("rmsnorm_multihead", RMSNORM_MULTIHEAD_SRC)?,
             m_rope:       ld("rope", ROPE_SRC)?,
             m_add:        ld("add_inplace", ADD_INPLACE_SRC)?,
@@ -914,6 +943,7 @@ impl GpuGemma4 {
             m_moe_mv_q8_0:  ld("moe_matvec_q8_0_dp4a", MOE_MATVEC_Q8_0_SRC)?,
             m_moe_mv_q8_0_down: ld("moe_matvec_q8_0_down", MOE_MATVEC_Q8_0_DOWN_SRC)?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
+            m_moe_geglu_q8: ld("moe_geglu_q8", MOE_GEGLU_Q8_SRC)?,
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
             m_expert_sort:  ld("moe_expert_sort", MOE_EXPERT_SORT_SRC)?,
             m_grouped_q6k:  ld("mmq_gemm_q6k_grouped", MMQ_Q6K_GROUPED_SRC)?,
@@ -1019,11 +1049,34 @@ impl GpuGemma4 {
         unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
+    /// Fused rmsnorm + Q8 quantize: writes int8 blocks directly from the
+    /// normalized output. Replaces
+    /// `launch_rmsnorm(x, w, normed) + launch_quantize_q8(normed, xq8)`.
+    /// Used on the MoE decode path's expert-prep step.
+    pub(crate) fn launch_rmsnorm_q8(&self, x: *mut c_void, w: *mut c_void, out: *mut c_void,
+                                    n: u32) -> Result<(), String>
+    {
+        let f = self.m_rmsnorm_q8.function("rmsnorm_q8_f32")?;
+        let block: u32 = 512;
+        let mut xa=x; let mut wa=w; let mut oa=out; let mut na=n; let mut ea=self.rms_eps;
+        let mut args: [*mut c_void; 5] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void];
+        let smem = block * 4;
+        unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
     pub(crate) fn launch_rmsnorm_mh(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void,
                          n_heads: u32, head_dim: u32) -> Result<(), String>
     {
         let f = self.m_rmsnorm_mh.function("rmsnorm_multihead_f32")?;
-        let block: u32 = 256;
+        // Block up to min(512, head_dim) — same dispatch-overhead-hiding
+        // logic as launch_rmsnorm, capped at head_dim since extra threads
+        // would idle (kernel strides over head_dim per block).
+        let block: u32 = if head_dim >= 512 { 512 }
+                         else if head_dim >= 256 { 256 }
+                         else { 128 };
         let mut xa=x; let mut wa=w; let mut ya=y;
         let mut nh=n_heads; let mut hd=head_dim; let mut ea=self.rms_eps;
         let mut args: [*mut c_void; 6] = [
@@ -1208,42 +1261,53 @@ impl GpuGemma4 {
     pub(crate) fn launch_matvec(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
         -> Result<(), String>
     {
-        // Repacked weights all share the quantize-then-dispatch pattern,
-        // but K-quants run at 256-thread/8-row workgroups and Q8_0 runs
-        // at 64-thread/2-row (the existing dp4a Q8_0 footprint, just on
-        // the cleaner two-plane layout).
+        // Quantize fp32 activation → self.xq8, then dispatch the int8
+        // matvec. Use launch_matvec_xq8 when the caller has already
+        // quantized once for a SHARED activation (Q/K/V/O on a single
+        // post-norm vector; ffn_gate+ffn_up on a single post-norm vector).
         if w.repacked {
             self.launch_quantize_q8(x, self.xq8.raw_ptr(), w.in_dim, 1)?;
-            let (module, kname, grid, kblock): (&Module, &str, u32, u32) = match w.dtype {
-                GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32",
-                                   (w.out_dim + 7) / 8, 256),
-                GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32",
-                                   (w.out_dim + 7) / 8, 256),
-                // Q8_0: ROWS=1 for large out_dim doubles the wavefront
-                // count and sustains HBM bandwidth that ROWS=2 starves;
-                // ROWS=2 stays best mid-size (see matvec_q8_0_repacked).
-                GgmlType::Q8_0 if w.out_dim >= 4096 =>
-                    (&self.m_mv_q8_0_repacked, "matvec_q8_0_repacked_r1_f32",
-                     w.out_dim, 64),
-                GgmlType::Q8_0 => (&self.m_mv_q8_0_repacked, "matvec_q8_0_repacked_f32",
-                                   (w.out_dim + 1) / 2, 64),
-                _              => (&self.m_mv_q4k_repacked, "matvec_q4k_repacked_f32",
-                                   (w.out_dim + 7) / 8, 256),
-            };
-            let f = module.function(kname)?;
-            let mut wa = w.data.raw_ptr();
-            let mut xa = self.xq8.raw_ptr();
-            let mut ya = y;
-            let mut ia = w.in_dim; let mut oa = w.out_dim;
-            let mut args: [*mut c_void; 5] = [
-                &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
-                &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
-                &mut oa as *mut _ as *mut c_void];
-            return unsafe {
-                f.launch((grid, 1, 1), (kblock, 1, 1), 0, Some(&self.stream), &mut args)
-            };
+            return self.launch_matvec_xq8(w, self.xq8.raw_ptr(), y);
         }
         self.launch_matvec_raw(w.data.raw_ptr(), w.dtype, w.in_dim, w.out_dim, x, y)
+    }
+
+    /// Repacked matvec from a pre-quantized int8 activation in `xq8`.
+    /// Skips the quantize step — caller is responsible for quantizing the
+    /// activation ONCE before calling this for each matvec that shares the
+    /// same input (Q/K/V/O on one normed vector; ffn gate+up; etc).
+    pub(crate) fn launch_matvec_xq8(&self, w: &GpuMatvecTensor, xq8: *mut c_void, y: *mut c_void)
+        -> Result<(), String>
+    {
+        assert!(w.repacked, "launch_matvec_xq8 requires a repacked weight");
+        let (module, kname, grid, kblock): (&Module, &str, u32, u32) = match w.dtype {
+            GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32",
+                               (w.out_dim + 7) / 8, 256),
+            GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32",
+                               (w.out_dim + 7) / 8, 256),
+            // Q8_0: ROWS=1 for large out_dim doubles the wavefront
+            // count and sustains HBM bandwidth that ROWS=2 starves;
+            // ROWS=2 stays best mid-size (see matvec_q8_0_repacked).
+            GgmlType::Q8_0 if w.out_dim >= 4096 =>
+                (&self.m_mv_q8_0_repacked, "matvec_q8_0_repacked_r1_f32",
+                 w.out_dim, 64),
+            GgmlType::Q8_0 => (&self.m_mv_q8_0_repacked, "matvec_q8_0_repacked_f32",
+                               (w.out_dim + 1) / 2, 64),
+            _              => (&self.m_mv_q4k_repacked, "matvec_q4k_repacked_f32",
+                               (w.out_dim + 7) / 8, 256),
+        };
+        let f = module.function(kname)?;
+        let mut wa = w.data.raw_ptr();
+        let mut xa = xq8;
+        let mut ya = y;
+        let mut ia = w.in_dim; let mut oa = w.out_dim;
+        let mut args: [*mut c_void; 5] = [
+            &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void];
+        unsafe {
+            f.launch((grid, 1, 1), (kblock, 1, 1), 0, Some(&self.stream), &mut args)
+        }
     }
 
     /// Matvec from an explicit weight pointer — lets the MoE path point
@@ -1438,6 +1502,25 @@ impl GpuGemma4 {
             &mut ga as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
             &mut ff as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
         unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Fused MoE GeGLU + Q8 quantize. Replaces
+    /// `launch_moe_geglu(gu, act) + launch_quantize_q8(act, xq8, ff, n_slot)`.
+    /// Saves one launch per layer + the HBM round-trip of `act` through fp32.
+    fn launch_moe_geglu_q8(&self, gu: *mut c_void, out: *mut c_void, n_slot: usize)
+        -> Result<(), String>
+    {
+        let f = self.m_moe_geglu_q8.function("moe_geglu_q8_f32")?;
+        let block: u32 = 256;
+        let ff = self.expert_ff as u32;
+        let n_sub = ff >> 5;
+        let grid_x = (n_sub + 7) / 8;       // 8 sub-blocks per WG
+        let mut ga=gu; let mut oa=out; let mut ffa=ff;
+        let mut args: [*mut c_void; 3] = [
+            &mut ga as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut ffa as *mut _ as *mut c_void];
+        unsafe { f.launch((grid_x, n_slot as u32, 1), (block, 1, 1),
+                          0, Some(&self.stream), &mut args) }
     }
 
     /// Weighted sum of per-expert down outputs into `out`. For decode
@@ -2224,7 +2307,6 @@ impl GpuGemma4 {
                     // processes the prefill in MOE_PREFILL_CHUNK chunks
                     // so the expert-intermediate scratch stays bounded.
                     let ff_exp = self.expert_ff as u32;
-                    let inv_sqrt_h = 1.0 / (self.hidden as f32).sqrt();
                     let ne = self.n_expert;
                     let nu = self.n_expert_used;
                     // Grouped-expert GEMM for the fused gate_up + down —
@@ -2243,10 +2325,11 @@ impl GpuGemma4 {
                                                 moe_in_all.raw_ptr(), hu, p as u32)?;
                     self.launch_quantize_q8(moe_in_all.raw_ptr(), xq8_moe.raw_ptr(),
                                             hu, p as u32)?;
-                    // Router: scale·rmsnorm(x) → F32 projection → [P, n_expert].
+                    // Router: rmsnorm(x) with pre-scaled gate_inp_s
+                    // (weights folded ×1/sqrt(hidden) at load) → F32
+                    // projection → [P, n_expert].
                     self.launch_rmsnorm_batched(x.raw_ptr(), mw.gate_inp_s.raw_ptr(),
                                                 normed.raw_ptr(), hu, p as u32)?;
-                    self.launch_scale_batched(normed.raw_ptr(), hu, inv_sqrt_h, p as u32)?;
                     self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, &pf_logits,
                         &mw.gate_inp.data, mw.gate_inp.dtype, mw.gate_inp.repacked,
                         mw.gate_inp.in_dim as usize, mw.gate_inp.out_dim as usize,
@@ -2935,19 +3018,39 @@ impl GpuGemma4 {
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.attn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.prof_lap("a_norm");
-        // Q: project, per-head norm, RoPE.
-        self.launch_matvec(&b.attn_q, self.normed.raw_ptr(), self.q_buf.raw_ptr())?;
+        // Quantize the shared post-norm activation ONCE — Q, K, V all
+        // read the same `normed`. (launch_matvec would re-quantize per
+        // call; that's 2-3 redundant quantize launches per layer.)
+        let need_kv = b.kv_donor.is_none();
+        let qkv_repacked = b.attn_q.repacked
+            && (!need_kv || (b.attn_k.repacked
+                && b.attn_v.as_ref().map(|v| v.repacked).unwrap_or(true)));
+        if qkv_repacked {
+            self.launch_quantize_q8(self.normed.raw_ptr(), self.xq8.raw_ptr(),
+                                    b.attn_q.in_dim, 1)?;
+            self.launch_matvec_xq8(&b.attn_q, self.xq8.raw_ptr(), self.q_buf.raw_ptr())?;
+        } else {
+            self.launch_matvec(&b.attn_q, self.normed.raw_ptr(), self.q_buf.raw_ptr())?;
+        }
         self.launch_rmsnorm_mh(self.q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
                                self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32)?;
         self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32,
                          b.kind)?;
         self.prof_lap("a_q_proj");
         // K/V: computed and written to the cache only on KV-owning layers.
-        if b.kv_donor.is_none() {
-            self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
+        if need_kv {
+            if qkv_repacked {
+                self.launch_matvec_xq8(&b.attn_k, self.xq8.raw_ptr(), self.k_proj.raw_ptr())?;
+            } else {
+                self.launch_matvec(&b.attn_k, self.normed.raw_ptr(), self.k_proj.raw_ptr())?;
+            }
             let v_src = match &b.attn_v {
                 Some(wv) => {
-                    self.launch_matvec(wv, self.normed.raw_ptr(), self.v_norm.raw_ptr())?;
+                    if qkv_repacked {
+                        self.launch_matvec_xq8(wv, self.xq8.raw_ptr(), self.v_norm.raw_ptr())?;
+                    } else {
+                        self.launch_matvec(wv, self.normed.raw_ptr(), self.v_norm.raw_ptr())?;
+                    }
                     self.v_norm.raw_ptr()  // temp holding the raw V projection
                 }
                 None => self.k_proj.raw_ptr(),  // full layers: V is the K projection
@@ -2989,8 +3092,16 @@ impl GpuGemma4 {
             None => {
                 self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),
                                     self.normed.raw_ptr(), h)?;
-                self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
-                self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
+                // Quantize the shared post-norm ONCE for ffn_gate + ffn_up.
+                if b.ffn_gate.repacked && b.ffn_up.repacked {
+                    self.launch_quantize_q8(self.normed.raw_ptr(), self.xq8.raw_ptr(),
+                                            b.ffn_gate.in_dim, 1)?;
+                    self.launch_matvec_xq8(&b.ffn_gate, self.xq8.raw_ptr(), self.ffn_a.raw_ptr())?;
+                    self.launch_matvec_xq8(&b.ffn_up,   self.xq8.raw_ptr(), self.ffn_b.raw_ptr())?;
+                } else {
+                    self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
+                    self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
+                }
                 self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                                   self.ffn_a.raw_ptr(), self.ffn as u32)?;
                 self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
@@ -3034,8 +3145,16 @@ impl GpuGemma4 {
         // --- Shared MLP --- → cur_mlp (kept live across the MoE branch).
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.ffn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
-        self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
-        self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
+        // Quantize the shared post-norm ONCE for ffn_gate + ffn_up.
+        if b.ffn_gate.repacked && b.ffn_up.repacked {
+            self.launch_quantize_q8(self.normed.raw_ptr(), self.xq8.raw_ptr(),
+                                    b.ffn_gate.in_dim, 1)?;
+            self.launch_matvec_xq8(&b.ffn_gate, self.xq8.raw_ptr(), self.ffn_a.raw_ptr())?;
+            self.launch_matvec_xq8(&b.ffn_up,   self.xq8.raw_ptr(), self.ffn_b.raw_ptr())?;
+        } else {
+            self.launch_matvec(&b.ffn_gate, self.normed.raw_ptr(), self.ffn_a.raw_ptr())?;
+            self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
+        }
         self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                           self.ffn_a.raw_ptr(), self.ffn as u32)?;
         self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
@@ -3045,9 +3164,11 @@ impl GpuGemma4 {
 
         // --- Router --- on attn_out: plain RMSNorm scaled by gate_inp_s,
         // then by 1/√hidden, then the F32 projection to expert logits.
+        // gate_inp_s is pre-scaled by 1/sqrt(hidden) at load — the
+        // rmsnorm folds the router input scaling, so no separate
+        // launch_scale call is needed.
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), mw.gate_inp_s.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
-        self.launch_scale(self.normed.raw_ptr(), h, 1.0 / (self.hidden as f32).sqrt())?;
         self.launch_matvec(&mw.gate_inp, self.normed.raw_ptr(), self.moe_logits.raw_ptr())?;
         self.prof_lap("router_matvec");
         self.launch_moe_topk(1)?;
@@ -3057,10 +3178,11 @@ impl GpuGemma4 {
         // from moe_topk stay on device, and one launch per stage covers
         // all n_expert_used experts (grid.y = expert slot). No host
         // round-trip → the whole forward is a pure kernel chain.
-        self.launch_rmsnorm(self.hidden_a.raw_ptr(), mw.pre_ffw_norm_2.raw_ptr(),
-                            self.moe_in.raw_ptr(), h)?;
-        // gate_up: one shared activation, quantized once.
-        self.launch_quantize_q8(self.moe_in.raw_ptr(), self.xq8.raw_ptr(), h, 1)?;
+        // Fused: xq8 = quantize(rmsnorm(hidden_a) * pre_ffw_norm_2).
+        // Saves one launch + the round-trip of normalized values through
+        // HBM (was rmsnorm → moe_in → quantize → xq8).
+        self.launch_rmsnorm_q8(self.hidden_a.raw_ptr(), mw.pre_ffw_norm_2.raw_ptr(),
+                               self.xq8.raw_ptr(), h)?;
         self.launch_moe_matvec(mw.gate_up_exps.dtype, mw.gate_up_exps.repacked,
                                mw.gate_up_exps.data.raw_ptr(),
                                self.xq8.raw_ptr(), self.expert_gu.raw_ptr(), h, 2 * ff_exp,
@@ -3068,11 +3190,11 @@ impl GpuGemma4 {
                                /*xq_tok_stride*/ 0,
                                /*xq_slot_stride*/ 0,
                                /*n_tok*/ 1)?;
-        self.launch_moe_geglu(self.expert_gu.raw_ptr(), self.expert_act.raw_ptr(), 1)?;
+        // Fused: xq8_experts = quantize(geglu(expert_gu)).
+        // Saves one launch + the HBM round-trip of expert_act through fp32.
+        self.launch_moe_geglu_q8(self.expert_gu.raw_ptr(), self.xq8_experts.raw_ptr(),
+                                 self.n_expert_used)?;
         self.prof_lap("expert_gate_up");
-        // down: each expert has its own activation — quantize the batch.
-        self.launch_quantize_q8(self.expert_act.raw_ptr(), self.xq8_experts.raw_ptr(),
-                                ff_exp, self.n_expert_used as u32)?;
         self.launch_moe_down(mw.down_exps.dtype, mw.down_exps.repacked,
                              mw.down_exps.data.raw_ptr(),
                              self.xq8_experts.raw_ptr(), self.expert_outs.raw_ptr(), ff_exp, h,
