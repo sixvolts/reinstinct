@@ -14,17 +14,30 @@
 // Per-row state ops become LDS-fast (~10 cycles) instead of HBM-slow
 // (~200 ns).
 //
-// LDS layout chosen as state_lds[VV][KK]: the per-thread inner loop
-// (fixed vv, varying kk) reads contiguous addresses, and across the
-// wave's 16 vv-threads each iteration broadcasts a single bank (vv*128
-// mod 128 = 0; only kk distinguishes the bank, so 4 grps with 4
-// different kks hit 4 banks per cycle — no thrash).
+// LDS layout chosen as state_lds[VV][KK+PAD]: the per-thread inner loop
+// (fixed vv, varying kk) reads contiguous addresses.
+//
+// Bank conflict avoidance: with stride exactly HEAD_DIM=128, every wave
+// LDS access was a *64-way* bank conflict — addr/4 mod 32 reduced to
+// (kk mod 32), and the old grp→kk mapping (kk = grp*32 + local) made
+// all 4 grps share the same bank at every iteration. Two changes fix
+// it:
+//
+//   1. Stride is HEAD_DIM + 1 = 129. lvv*129 mod 32 = lvv mod 32, so
+//      the 16 lvvs in a grp span 16 distinct banks (no within-grp
+//      conflict).
+//   2. Per-grp kk traversal is `kk = local*4 + grp`. The 4 grps walk
+//      4 different kk %4 classes in lockstep, so at each iteration the
+//      cross-grp banks differ by 1. Combined with (1), the 64-lane
+//      access pattern reduces to a 2-way conflict — a 32× cut in LDS
+//      latency vs the 64-way layout.
 
 #include <hip/hip_runtime.h>
 
 #define HEAD_DIM 128
-#define QUARTER  (HEAD_DIM / 4)   // 32
+#define QUARTER  (HEAD_DIM / 4)    // 32
 #define COLS     16
+#define STATE_STRIDE (HEAD_DIM + 1)  // 129 (+1 pad to break bank conflicts)
 
 __device__ __forceinline__ float softplus_stable_r(float x) {
     return (x > 0.0f) ? x + __logf(1.0f + __expf(-x))
@@ -52,11 +65,18 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
     unsigned int out_row_stride)
 {
     (void)head_dim;
-    // LDS:  state_slice[COLS][HEAD_DIM] | q_lds[HEAD_DIM] | k_lds[HEAD_DIM]
+    // LDS layout:
+    //   state_slice [COLS][STATE_STRIDE]   COLS*STATE_STRIDE floats
+    //   q_lds       [HEAD_DIM]
+    //   k_lds       [HEAD_DIM]
+    //   a_lds       [n_rows]
+    //   b_lds       [n_rows]
     extern __shared__ float lds[];
     float* state_lds = lds;
-    float* q_lds     = lds + COLS * HEAD_DIM;
-    float* k_lds     = lds + COLS * HEAD_DIM + HEAD_DIM;
+    float* q_lds     = lds + COLS * STATE_STRIDE;
+    float* k_lds     = lds + COLS * STATE_STRIDE + HEAD_DIM;
+    float* a_lds     = lds + COLS * STATE_STRIDE + 2 * HEAD_DIM;
+    float* b_lds     = a_lds + n_rows;
 
     const int h = blockIdx.x;
     if (h >= (int)n_heads) return;
@@ -67,8 +87,6 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
     const unsigned int tile_base = blockIdx.y * COLS;
     const unsigned int vv        = tile_base + lvv;
 
-    const int kk0 = grp * QUARTER;
-    const int kk1 = kk0 + QUARTER;
     const size_t hd = HEAD_DIM;
     const size_t head_base = (size_t)h * HEAD_DIM * HEAD_DIM;
 
@@ -79,8 +97,14 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
     for (int i = tid; i < COLS * HEAD_DIM; i += 64) {
         const int kk     = i >> 4;      // 0..127  (16 vvs per kk)
         const int load_lvv = i & 15;
-        state_lds[load_lvv * HEAD_DIM + kk] =
+        state_lds[load_lvv * STATE_STRIDE + kk] =
             state[head_base + (size_t)kk * hd + tile_base + load_lvv];
+    }
+    // Preload per-row a, b scalars for this head into LDS so the inner
+    // row loop reads them at LDS speed (no per-row HBM scalar latency).
+    for (unsigned int r = tid; r < n_rows; r += 64) {
+        a_lds[r] = a_in_batch[(size_t)r * ab_row_stride + h];
+        b_lds[r] = b_in_batch[(size_t)r * ab_row_stride + h];
     }
     __syncthreads();
 
@@ -101,24 +125,26 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
         __syncthreads();
 
         const float dec = __expf(ssm_a_h *
-            softplus_stable_r(a_in_batch[(size_t)r * ab_row_stride + h] + dt_bias_h));
-        const float bet = 1.0f / (1.0f + __expf(
-            -b_in_batch[(size_t)r * ab_row_stride + h]));
+            softplus_stable_r(a_lds[r] + dt_bias_h));
+        const float bet = 1.0f / (1.0f + __expf(-b_lds[r]));
         const float vval = v_in_batch[(size_t)r * v_row_stride
                                     + (size_t)h * HEAD_DIM + vv];
 
         // Per-thread base pointer into this thread's vv-row in the LDS
-        // state slice. Sequential kk within this row → contiguous LDS.
-        float* lds_vv = state_lds + (size_t)lvv * HEAD_DIM;
+        // state slice. Stride includes the +1 pad to break bank conflicts.
+        float* lds_vv = state_lds + (size_t)lvv * STATE_STRIDE;
 
-        // Phase 1 — decay each kk + accumulate stateᵀ·k. Keep the
-        // decayed value in a register; only one LDS write per kk in
-        // phase 2 (halves the LDS write traffic vs writing twice).
+        // Per-grp kk traversal: kk = local*4 + grp. Grp g owns the
+        // kk %4 == g subset. The cross-grp reduction below sums all
+        // four classes — total partial dot product is unchanged
+        // (floats: addition is commutative within rounding, and the
+        // 4-way reduce is structurally identical), but the LDS bank
+        // pattern reduces from 64-way to 2-way conflict (see header).
         float s_arr[QUARTER];
         float pkv = 0.0f;
         #pragma unroll
         for (int local = 0; local < QUARTER; local++) {
-            const int kk = kk0 + local;
+            const int kk = local * 4 + grp;
             const float s = lds_vv[kk] * dec;
             s_arr[local] = s;
             pkv += s * k_lds[kk];
@@ -132,7 +158,7 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
         float pout = 0.0f;
         #pragma unroll
         for (int local = 0; local < QUARTER; local++) {
-            const int kk = kk0 + local;
+            const int kk = local * 4 + grp;
             const float s = s_arr[local] + k_lds[kk] * delta;
             lds_vv[kk] = s;
             pout += s * q_lds[kk];
@@ -150,6 +176,6 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
         const int kk        = i >> 4;
         const int store_lvv = i & 15;
         state[head_base + (size_t)kk * hd + tile_base + store_lvv] =
-            state_lds[store_lvv * HEAD_DIM + kk];
+            state_lds[store_lvv * STATE_STRIDE + kk];
     }
 }

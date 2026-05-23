@@ -1610,10 +1610,13 @@ impl GpuQwen35 {
             self.gdn_recurrent_step_fused_batched_module
                 .function("gdn_recurrent_step_fused_batched_f32")?
         };
-        // lds128 needs COLS·HEAD_DIM + 2·HEAD_DIM floats; general needs
-        // 2·HEAD_DIM (just q_lds + k_lds).
+        // lds128 needs COLS·STATE_STRIDE + 2·HEAD_DIM + 2·n_rows floats
+        // (state slice with +1 pad per row to break bank conflicts +
+        // q_lds + k_lds + a_lds + b_lds); general needs 2·HEAD_DIM
+        // (just q_lds + k_lds).
+        let state_stride = head_dim + 1;
         let smem = if use_lds128 {
-            (COLS * head_dim + 2 * head_dim) * 4
+            (COLS * state_stride + 2 * head_dim + 2 * n_rows) * 4
         } else {
             2 * head_dim * 4
         };
