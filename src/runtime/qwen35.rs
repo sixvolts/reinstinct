@@ -118,7 +118,7 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
 /// Token-tile width of the grouped-expert GEMM — `tile_off` counts
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Must match the BN
 /// the grouped-GEMM kernel is compiled with (mmq_gemm_q4k_grouped.cpp).
-const MOE_GEMM_BN: u32 = 32;
+const MOE_GEMM_BN: u32 = 16;
 const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");

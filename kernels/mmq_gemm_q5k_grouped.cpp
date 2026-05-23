@@ -10,7 +10,7 @@
 
 #define BK 4
 #define TM 4
-#define TN 2
+#define TN 1
 #define BM (16 * TM)   // 64
 #define BN (16 * TN)   // 32
 
