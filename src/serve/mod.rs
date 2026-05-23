@@ -380,6 +380,9 @@ impl ServerModel {
                         crate::chat::format_gemma4(tok, msgs, true)?
                     }
                 };
+                if prompt.is_empty() {
+                    return Err("prompt encoded to zero tokens".into());
+                }
                 if prompt.len() + req.max_tokens + 8 > *max_seq {
                     return Err(format!(
                         "prompt ({}) + max_tokens ({}) exceeds context window ({})",
@@ -451,14 +454,32 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
     let setup = (|| -> Result<(KernelCache, ServerModel, ServerModel), String> {
         crate::hip::Device::set(0)?;
         let cache = KernelCache::new()?;
-        eprintln!("[serve] loading big model   {} ...", big.display());
-        let t = std::time::Instant::now();
-        let big_m = ServerModel::load(&big, big_drafter.as_ref(), &cache, max_seq)?;
-        eprintln!("[serve]   loaded {} in {:.1}s", big_m.name(), t.elapsed().as_secs_f32());
-        eprintln!("[serve] loading small model {} ...", small.display());
-        let t = std::time::Instant::now();
-        let small_m = ServerModel::load(&small, None, &cache, max_seq)?;
-        eprintln!("[serve]   loaded {} in {:.1}s", small_m.name(), t.elapsed().as_secs_f32());
+        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>|
+            -> Result<ServerModel, String>
+        {
+            eprintln!("[serve] loading {label:5} model {} ...", path.display());
+            let t = std::time::Instant::now();
+            let m = ServerModel::load(path, drafter, &cache, max_seq)
+                .map_err(|e| {
+                    // VRAM-exhaustion → add a hint about model size vs VRAM.
+                    if e.to_lowercase().contains("memory") {
+                        let sz = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+                        format!("{label} model: {e}\n\
+                                 [hint] model file is {:.1} GB on disk; \
+                                 with KV cache for max_seq={max_seq} the GPU needs roughly \
+                                 1.2-1.5× that. Check `rocm-smi --showmeminfo vram` \
+                                 against your model's expected resident size, or lower \
+                                 max_seq with --max-seq.",
+                                 sz as f64 / (1024.0 * 1024.0 * 1024.0))
+                    } else {
+                        format!("{label} model: {e}")
+                    }
+                })?;
+            eprintln!("[serve]   loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
+            Ok(m)
+        };
+        let big_m   = load("big",   &big,   big_drafter.as_ref())?;
+        let small_m = load("small", &small, None)?;
         Ok((cache, big_m, small_m))
     })();
 
@@ -494,8 +515,18 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
                     let t = std::time::Instant::now();
                     let is_chat = req.is_chat();
-                    match model.generate(&req) {
-                        Ok((text, n_p, n_c, eos)) => {
+                    // `catch_unwind` around generate(): a panic in a kernel
+                    // launch, a slipped unwrap, or a numerical blowup
+                    // shouldn't kill the worker thread (which would 503
+                    // every subsequent request). On panic we 500 the
+                    // current request, log, and continue. The model's
+                    // state may be partially mutated; the next request's
+                    // `state.reset()` (called at the start of generate())
+                    // should bring it back to a clean slate.
+                    let result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| model.generate(&req)));
+                    match result {
+                        Ok(Ok((text, n_p, n_c, eos))) => {
                             eprintln!("[serve] {} {}: {} prompt + {} gen tok in {:.2}s",
                                 job.target.label(),
                                 if is_chat { "chat" } else { "completion" },
@@ -507,10 +538,27 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             };
                             HttpReply { status: 200, status_text: "OK", body }
                         }
-                        Err(e) => HttpReply {
+                        Ok(Err(e)) => HttpReply {
                             status: 400, status_text: "Bad Request",
                             body: error_body(&e, "invalid_request_error"),
                         },
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic in generate()".to_string()
+                            };
+                            eprintln!("[serve] PANIC during {} generate (continuing): {}",
+                                      job.target.label(), msg);
+                            HttpReply {
+                                status: 500, status_text: "Internal Server Error",
+                                body: error_body(
+                                    &format!("internal panic: {msg}"),
+                                    "server_error"),
+                            }
+                        }
                     }
                 }
             },
@@ -598,6 +646,37 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
            big_port: u16, small_port: u16, embed_port: u16, max_seq: usize)
     -> Result<(), String>
 {
+    // Surface any REINSTINCT_* env vars at startup. Several of them are
+    // perf-killers if set unintentionally on a serve box (graph capture
+    // off, dp4a path off, etc) — better to log them than have an
+    // operator chasing a silent regression weeks later.
+    let env_warnings: Vec<(&str, bool)> = vec![
+        ("REINSTINCT_NO_GRAPH",        true),
+        ("REINSTINCT_MOE_PROFILE",     true),
+        ("REINSTINCT_NO_DP4A_Q4",      true),
+        ("REINSTINCT_NO_DP4A_Q5",      true),
+        ("REINSTINCT_NO_DP4A_Q6",      true),
+        ("REINSTINCT_NO_DP4A_Q8",      true),
+        ("REINSTINCT_GEMMA_NO_DP4A",   true),
+        ("REINSTINCT_GDN_NO_LDS128",   true),
+        ("REINSTINCT_OLD_ATTN",        true),
+        ("REINSTINCT_PREFILL_NO_GRAPH", true),
+        ("REINSTINCT_PREFILL_DEBUG",   false),
+        ("REINSTINCT_DECODE_DEBUG",    false),
+        ("REINSTINCT_PREFILL_TRACE",   false),
+    ];
+    for (var, is_perf_killer) in &env_warnings {
+        if std::env::var_os(var).is_some() {
+            let tag = if *is_perf_killer { "WARN" } else { "info" };
+            eprintln!("[serve] {tag}: {var} is set — \
+                       {}", if *is_perf_killer {
+                "perf will regress significantly; unset for production"
+            } else {
+                "tracing on; expect verbose logs"
+            });
+        }
+    }
+
     if let Some(e) = &embed {
         eprintln!("[serve] note: --embed {} accepted but deferred — \
                    the :{embed_port} port will answer 503 until the \

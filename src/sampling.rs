@@ -36,11 +36,15 @@ impl Rng {
 }
 
 /// Greedy: index of the maximum logit. Ties broken by lowest index.
+/// NaN entries are ignored (so a degenerate model output that produced
+/// NaNs in a subset of vocab positions still returns the best of the
+/// finite entries instead of poisoning the comparison).
 pub fn argmax(logits: &[f32]) -> u32 {
+    assert!(!logits.is_empty(), "argmax called with empty logits");
     let mut best = 0usize;
-    let mut best_v = logits[0];
-    for (i, &v) in logits.iter().enumerate().skip(1) {
-        if v > best_v { best_v = v; best = i; }
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_finite() && v > best_v { best_v = v; best = i; }
     }
     best as u32
 }
@@ -55,6 +59,7 @@ pub fn argmax(logits: &[f32]) -> u32 {
 /// `k = 0` means "no filter" — softmax + sample over the full vocab.
 /// `temperature = 0.0` reduces to greedy regardless of k.
 pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rng) -> u32 {
+    assert!(!logits.is_empty(), "sample_temp_topk called with empty logits");
     if temperature <= 0.0 {
         return argmax(logits);
     }
@@ -62,22 +67,23 @@ pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rn
     let n = logits.len();
     let k_eff = if k == 0 || k > n { n } else { k };
 
-    // Partial selection of top-k: simple O(n*k) scan; for the typical
-    // k ≤ 200 this beats sorting the whole vocab and is allocation-free
-    // beyond a tiny scratch.
+    // Partial selection of top-k. Non-finite (NaN/±Inf) logits are
+    // skipped — they'd otherwise corrupt the softmax sum into NaN and
+    // produce a garbage token. If the model ever emits all-NaN logits
+    // (a real failure mode on numerical blowup), `top` ends up empty
+    // and we fall back to argmax (which has its own NaN guard).
     let mut top: Vec<(usize, f32)> = Vec::with_capacity(k_eff);
     for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() { continue; }
         if top.len() < k_eff {
             top.push((i, v));
-            // Keep `top` sorted ascending by logit; the smallest is at the end... no,
-            // simpler: keep min as first via a single pass.
-            // Actually for k_eff up to a few hundred a tiny sort each insert is fine.
             top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         } else if v > top[0].1 {
             top[0] = (i, v);
             top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         }
     }
+    if top.is_empty() { return argmax(logits); }
 
     // Softmax with temperature over the surviving k.
     let inv_t = 1.0 / temperature.max(1e-3);
@@ -87,6 +93,11 @@ pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rn
         *v = ((*v - max_logit) * inv_t).exp();
         sum += *v;
     }
+    // sum can collapse to 0 if every weight underflowed (extreme temperature
+    // or pathological logits) — fall back to the most-probable.
+    if !(sum > 0.0) {
+        return top.last().expect("top non-empty above").0 as u32;
+    }
     let r = rng.next_f32() * sum;
     let mut cum = 0.0_f32;
     for (idx, w) in &top {
@@ -94,7 +105,7 @@ pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rn
         if r <= cum { return *idx as u32; }
     }
     // Fall through (numerical edge): return the most-probable.
-    top.last().unwrap().0 as u32
+    top.last().expect("top non-empty above").0 as u32
 }
 
 /// Standard temperature-softmax over the full vocab. Subtract max for

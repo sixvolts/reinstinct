@@ -230,7 +230,8 @@ impl Gemma4AssistantModel {
 
         // Cross-check shape: pre_projection is [n_embd_backbone*2, hidden],
         // post_projection is [hidden, n_embd_backbone].
-        let pre = gguf.tensor("mtp.pre_projection.weight").unwrap();
+        let pre = gguf.tensor("mtp.pre_projection.weight").ok_or_else(||
+            Gemma4AssistantError::MissingTensor("mtp.pre_projection.weight".into()))?;
         let expect_pre_in = (self.config.n_embd_backbone * 2) as u64;
         if pre.shape() != [expect_pre_in, self.config.hidden_size as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
@@ -239,7 +240,8 @@ impl Gemma4AssistantModel {
                 expected: 2,
             });
         }
-        let post = gguf.tensor("mtp.post_projection.weight").unwrap();
+        let post = gguf.tensor("mtp.post_projection.weight").ok_or_else(||
+            Gemma4AssistantError::MissingTensor("mtp.post_projection.weight".into()))?;
         if post.shape() != [self.config.hidden_size as u64,
                             self.config.n_embd_backbone as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
