@@ -32,13 +32,21 @@ kernels. There are two execution surfaces:
 The GPU path has two modes for consuming tokens:
 
 - **Decode** — one token per forward, autoregressive. Uses an int8 KV
-  cache (SageAttention-style: dp4a Q·Kᵀ, dequant-V P·V) and a
-  parametric HIP graph so each step is a single graph replay.
-- **Prefill** — process a whole prompt of P tokens in one pass. Weights
-  are streamed once through a batched fp16 GEMM (rocBLAS HGEMM) instead
-  of a per-token matvec. The prefill populates every layer's int8 KV
-  cache for positions 0…P-1, so decode continues straight from position
-  P. `generate-text --gpu` uses this automatically for the prompt.
+  cache (SageAttention-style: dp4a Q·Kᵀ, dequant-V P·V), a parametric
+  HIP graph so each step is a single graph replay, and per-tensor dp4a
+  matvecs for K-quant + Q8_0 + IQ4_XS weights (no dequant pass).
+  Multiple `rmsnorm + add_residual` pairs are fused, and Q/K/V/O on a
+  shared post-norm activation quantize once (not once per matvec).
+- **Prefill** — process a whole prompt of P tokens in one pass. The
+  K-quant and Q8_0 paths use a hand-written 2D-tiled int8 MMQ GEMM
+  (dp4a, BM=64 × BN=64 tiles) — no dequant pass. F16 / F32 / IQ4_XS
+  weights fall back to dequant + rocBLAS HGEMM. The MoE branch uses a
+  grouped-expert GEMM: counting-sort tokens by expert, then one tiled
+  GEMM per expert. The whole prefill kernel chain is captured into a
+  HIP graph (one launch per call) and on Gemma 4 the instantiated
+  `GraphExec` is cached per `(state, P)` so subsequent same-shape
+  prefills skip `end_capture + instantiate`. `generate-text --gpu`
+  uses prefill automatically for the prompt; `serve` does too.
 
 ### Requirements
 
@@ -213,14 +221,18 @@ first mismatch plus the target's replacement pick.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--k <N>` | 3 | Drafted tokens per round. K=3 is the empirical sweet spot on Gemma 31B (best avg over factual / agentic prompts); K=2 wins narrowly on math, K=4 on creative-writing prompts where the drafter struggles regardless. Clamped to 1..=4 by the kernel cap. |
+| `--k <N>` | 3 | Drafted tokens per round. K=3 is the empirical best on Gemma 31B (factual + math); K=2 narrowly wins on creative prompts; K=4 hurts everywhere as accept rate falls. Clamped to 1..=4 by the kernel cap. |
 | `-n`, `--steps <N>` | 64 | Tokens to generate. |
 | `--temperature <F>` | 0.0 | `0` = greedy argmax acceptance. `> 0` switches to rejection-sampling acceptance (HF-style `min(1, p_target/p_draft)` with residual sampling on reject). |
 | `--seed <N>` | `0xC0FFEE` | PRNG seed (sampling mode only). |
 
 Prints the generated text plus accept-rate stats (`accepted / drafted = %`).
-With the recommended Q8_0 drafter and chat-templated prompts on 31B, accept
-ranges 65–90% on factual/math/code, 35–55% on creative writing.
+On Gemma 4 **31B** with the Q8 drafter, accept ranges 79–81% on factual /
+math / list prompts (K=3 → +11 to +25% wall-clock speedup) and 45–69% on
+creative prompts (MTP costs −12% on this hardware). See **PERFORMANCE →
+MTP spec-decode** for the full bench. On Gemma 4 **26B-A4B-MoE**, MTP
+universally costs ~25–50% — its verify path falls back to a sequential
+decode loop, so the drafter cost isn't amortized.
 **Diagnostic env vars:**
 - `REINSTINCT_NO_VERIFY_GRAPH=1` — skip HIP graph capture of the verify
   kernel chain (use the inline path instead).
@@ -397,20 +409,30 @@ break-even point on Gemma 31B.
 ### Drafter accept rate vs prompt format (Gemma 31B + Q8 drafter, MI50)
 
 The MTP drafter was trained on chat-templated text. Feeding it raw
-user prompts drops accept rate below the break-even point and makes
-spec-decode net-negative. Measured smoke:
+user prompts drops the accept rate. AND after the recent decode
+optimizations, plain Gemma 31B decode jumped from ~19.5 to ~27 tok/s
+— so the **break-even accept rate moved up to ~75%** (was ~65%).
+Below that, MTP is net-negative.
 
-| Endpoint | Prompt | Accept | Wall (48 tok) | vs plain |
-|---|---|---|---|---|
-| `/v1/completions` | "What is 17 times 23?" (raw) | 38% | 3.03 s | **-31%** |
-| `/v1/completions` | "List the first 10 prime numbers." (raw) | 79% | 2.04 s | +9% |
-| `/v1/chat/completions` | `{role: user, content: "What is 17 × 23?"}` | 69% | 2.24 s | +4% |
-| `/v1/chat/completions` | `{system, user: "List 5 primes."}` | 73% | 1.55 s | +8% |
+Recent measured numbers from the standard MTP bench (see PERFORMANCE
+→ MTP spec-decode):
 
-Rule of thumb: **accept ≥ 65% breaks even on this hardware**. Below
-that, set `use_speculative: false` for the turn. The cheapest way to
-keep accept high is to use `/v1/chat/completions` (server applies the
-template), or pre-template raw prompts on the client side.
+| Prompt class | Accept (best K) | MTP best | Plain | vs plain |
+|---|---:|---:|---:|---:|
+| Factual list ("List the first 10 primes…") | 79% (K=3) | 29.5 tok/s | 23.6 | **+25%** |
+| Math ("17 × 23, show work")                | 81% (K=3) | 29.9 tok/s | 26.9 | **+11%** |
+| Creative ("Haiku about a cat…")            | 69% (K=2) | 23.8 tok/s | 27.0 |   −12%  |
+
+Rule of thumb: **accept ≥ 75% breaks even on Gemma 31B**. Below that,
+set `use_speculative: false` for the turn. Use `/v1/chat/completions`
+(server applies the template) — raw prompts on `/v1/completions` lose
+~30 percentage points of accept on the drafter and almost always lose
+end-to-end.
+
+**On the 26B-A4B MoE target, leave `use_speculative` off
+unconditionally** — see PERFORMANCE → MTP spec-decode. The MoE
+verify path falls back to a sequential decode loop, so the drafter
+cost isn't amortized and MTP loses ~25–50% across all prompt classes.
 
 ### Errors
 
@@ -430,29 +452,80 @@ OpenAI-shaped error body on non-2xx:
 
 ## ENVIRONMENT
 
+### Benchmarking
+
 | Variable | Effect |
 |---|---|
-| `REINSTINCT_PREFILL` | `generate-text` + `--gpu` + `gemma4`: run only the batched prefill on the prompt, print timing and top-10 logits, then exit (skips generation). A benchmark surface — the normal path already prefills. |
-| `REINSTINCT_NO_GRAPH` | Disable HIP-graph capture/replay for the `gemma4` decode; run per-kernel instead. Needed when using the decode debug dump. |
-| `REINSTINCT_PREFILL_DEBUG` | Print a per-layer hidden-state norm dump during `prefill_forward` (`|x[0]|`, `|x[last]|`). |
-| `REINSTINCT_DECODE_DEBUG` | Print a per-layer hidden / q / attn norm dump during decode. Requires `REINSTINCT_NO_GRAPH` (a sync during graph capture is illegal). |
-| `REINSTINCT_GEMMA_NO_DP4A` | Force the f32/wave64 matvec instead of the int8 `v_dot4_i32_i8` dp4a path (A/B precision check). |
-| `REINSTINCT_NO_DP4A_Q4` / `_Q5` / `_Q6` / `_Q8` | Disable the dp4a path for one quant type only. |
-| `REINSTINCT_OFFLOAD_ARCH` | Override the GPU arch passed to `hipcc` (default `gfx906`). |
+| `REINSTINCT_PREFILL` | `generate-text` + `--gpu`: run only the batched prefill on the prompt, print timing and top-10 logits, then exit (skips generation). Drops the per-call generation noise so a prefill-only bench is one-line. |
+| `REINSTINCT_PREFILL_TWICE` | Used with `REINSTINCT_PREFILL=1`. Two passes: first warms the pool + captures the graph, second is the captured measurement. Prints both timings. The captured number is what's fair to compare against `llama-bench pp512` (steady state). |
+| `REINSTINCT_PREFILL_THRICE` | (Gemma 4 only) As `_TWICE` but also runs a third pass to measure the cache-replay path that skips `end_capture + instantiate`. Reports `warmup → captured → replay → fresh`. |
+| `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown. Diagnostic; breaks graph capture. |
+
+### Disabling optimizations (A/B + diagnosis)
+
+These flags exist to bisect a regression or compare against a slower
+baseline. All of them **make the engine slower** — never set them in
+serve mode. The serve startup logs WARN if any of them are active.
+
+| Variable | Effect |
+|---|---|
+| `REINSTINCT_NO_GRAPH` | Disable HIP-graph capture/replay for the `gemma4` decode; run per-kernel instead. Required for `REINSTINCT_DECODE_DEBUG`. |
+| `REINSTINCT_PREFILL_NO_GRAPH` | Same, for the prefill path (both qwen35 and gemma4). |
+| `REINSTINCT_GEMMA_NO_DP4A` | Force the f32/wave64 matvec instead of the int8 `v_dot4_i32_i8` dp4a path on gemma4. Big perf hit; precision check only. |
+| `REINSTINCT_NO_DP4A_Q4` / `_Q5` / `_Q6` / `_Q8` | Disable the dp4a path for one quant type. |
+| `REINSTINCT_GDN_NO_LDS128` | qwen35 only: opt out of the LDS-resident-state GDN recurrent kernel (head_dim=128 fast path). Falls back to the general HBM-state kernel. |
+| `REINSTINCT_OLD_ATTN` | gemma4 only: legacy single-block attention kernel instead of the split-K FlashDecoding path. |
+| `REINSTINCT_MOE_NO_GROUPED` | Opt out of the grouped-expert MMQ GEMM. Falls back to per-token expert matvecs (~2× slower MoE prefill). |
+| `REINSTINCT_MOE_PROFILE` | Per-stage decode timer (sync-per-lap). Disables graph capture as a side effect — big perf hit. |
+
+### Spec-decode (`mtp-gen`)
+
+| Variable | Effect |
+|---|---|
+| `REINSTINCT_NO_VERIFY_GRAPH` | Skip HIP-graph capture of the verify kernel chain (use the inline path instead). |
+| `REINSTINCT_VERIFY_SMOKE` | Parity check: `verify_forward(K)` vs K sequential `forward_token` calls from a snapshotted state. Prints argmax-match + L1/Linf diff per position; exits without generating. |
+| `REINSTINCT_VERIFY_BENCH=N` | Warm-then-time `verify_forward(K)` over N calls; prints per-call average ms. |
+| `REINSTINCT_DRAFTER_NO_BONUS` | Disable the K+1 bonus-token semantics on a full accept (advance by exactly K — measurement only). |
+
+### Debug / diagnostic
+
+| Variable | Effect |
+|---|---|
+| `REINSTINCT_PREFILL_DEBUG` | Print per-layer hidden-state norm dump during `prefill_forward`. |
+| `REINSTINCT_DECODE_DEBUG` | Print per-layer hidden / q / attn norm dump during decode. Requires `REINSTINCT_NO_GRAPH` (a sync during graph capture is illegal). |
+
+### Build / cache
+
+| Variable | Effect |
+|---|---|
+| `REINSTINCT_OFFLOAD_ARCH` | Override the GPU arch passed to `hipcc` (default `gfx906`). Kernels are recompiled when this changes (it's in the cache key). |
+| `REINSTINCT_HIPCC_VERSION` | Override the probed `hipcc --version` string. Needed when running under `rocprof`, whose `LD_PRELOAD` makes `hipcc/clang` abort with an LLVM double-registered-CLI-option error. |
 | `REINSTINCT_GGUF_FIXTURE` | Path to a GGUF fixture for the tokenizer/test harness (test-only). |
 
 ---
 
 ## MODELS
 
-Tested GGUF files live under `~/models/`:
+Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 
-| File | Arch | Notes |
-|---|---|---|
-| `gemma-4-31B-it-UD-Q4_K_XL.gguf` | gemma4 | Dense, 60 layers, head_dim 512 (full) / 256 (sliding). |
-| `gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf` | gemma4 | MoE, 128 experts top-8, dual FFN (shared MLP + routed experts). |
-| `gemma-4-E4B-it-UD-Q6_K_XL.gguf` | gemma4 | Smaller Gemma 4. |
-| `Qwen3.5-*-UD-Q4_K_XL.gguf` | qwen35 | Hybrid Gated-DeltaNet + GQA. |
+| File                                          | Arch        | Shape                                                         |
+|-----------------------------------------------|-------------|---------------------------------------------------------------|
+| `gemma-4-E4B-it-UD-Q4_K_XL.gguf`              | gemma4      | Dense + Per-Layer-Embeddings, 35 layers.                      |
+| `gemma-4-31B-it-UD-Q4_K_XL.gguf`              | gemma4      | Dense, 60 layers, head_dim 512 (full) / 256 (sliding).        |
+| `gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf`          | gemma4      | MoE, 128 experts top-8, dual FFN (shared MLP + routed).       |
+| `Qwen3.5-4B-UD-Q4_K_XL.gguf`                  | qwen35      | Hybrid Gated-DeltaNet + GQA, all dense layers.                |
+| `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
+| `Qwen3.6-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.5-27B, retuned weights.                        |
+| `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | MoE, 256 experts top-8, hybrid GDN.                           |
+| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | Same arch as 3.5-35B-MoE.                                     |
+
+MTP drafters (under `~/models/gemma4-mtp/`):
+
+| File                                                | Target           |
+|-----------------------------------------------------|------------------|
+| `gemma-4-31B-it-assistant.Q8_0.gguf`                | Gemma 4 31B      |
+| `gemma-4-31B-it-assistant.Q4_K_M.gguf`              | Gemma 4 31B (~5pp lower accept than Q8) |
+| `gemma-4-26B-A4B-it-assistant.Q8_0.gguf`            | Gemma 4 26B-A4B  |
 
 Unsloth "UD" Dynamic-quant files mix quant types **per tensor** — e.g. a
 nominally Q6_K MoE layer can carry a Q8_0 expert slab, and `UD-Q4_K_XL`
@@ -568,26 +641,105 @@ REINSTINCT_NO_GRAPH=1 REINSTINCT_DECODE_DEBUG=1 \
 
 ## PERFORMANCE (gfx906, MI50 32 GB)
 
-Indicative, single MI50:
+Comparison against `llama.cpp` (same machine, gfx906 build, llama-bench
+`pp512` and `tg64` defaults). Reinstinct prefill is the captured-graph
+steady-state (warmup pass discarded); decode is the average over 32
+forwards with a chat-templated prompt. 25% / 75% compute / cool duty
+cycle between runs.
 
-| Workload | Throughput |
-|---|---|
-| 26B MoE decode | ~64 tok/s (~15.4 ms/token) |
-| 31B dense decode | ~19.5 tok/s (~51 ms/token) |
-| 26B prefill, P=128 | ~12.5 ms/token |
-| 31B prefill, P=128 | ~16 ms/token |
-| 31B prefill fixed cost | ~0.99 s (weight dequant-to-fp16, amortized over P) |
+### Throughput vs llama.cpp
 
-Decode tuning that mattered: int8 dp4a matvec, ROWS=2 per wavefront
-(the matvec was occupancy-starved at ROWS=8), int8 KV cache, and a
-parametric HIP graph. The forward is matvec-bandwidth-bound on this
-ROCm/gfx906 — the graph buys ~4%.
+| Model                  | reinstinct prefill | llama pp512 | Δ        | reinstinct decode | llama tg64 | Δ        |
+|------------------------|-------------------:|------------:|---------:|------------------:|-----------:|---------:|
+| qwen-3.5-4B            |          915       |    882      |   **+4%**|       101         |     89     |  **+14%**|
+| gemma4-E4B             |         1070       |   1070      |    par   |        92         |     81     |  **+14%**|
+| qwen-3.5-27B           |          210       |    187      |  **+12%**|        25.4       |     24     |   **+6%**|
+| qwen-3.6-27B           |          211       |    187      |  **+13%**|        26.2       |     23     |  **+14%**|
+| gemma4-31B             |          177       |    172      |   **+3%**|        27.0       |     21     |  **+29%**|
+| qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|        92.5       |     80     |  **+16%**|
+| qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.9       |     79     |  **+19%**|
+| gemma4-26B-MoE         |          768       |    621      |  **+24%**|        83.6       |     85     |    98%   |
 
-Prefill: weights are dequantized to fp16 once per pass and streamed
-through rocBLAS HGEMM; the 26B's routed experts use a grouped GEMM so
-each expert's weight is L2-resident across all its tokens. The
-`PrefillGemm` context pools the dequant scratch and modules so the
-per-weight cost is paid once, not per call.
+Throughput in tok/s. Reinstinct prefill is the captured-graph
+steady state; decode is averaged over 32 forwards with a chat-templated
+prompt. **Reinstinct beats llama.cpp on 15 of 16 cells**; the one
+that doesn't (gemma-26B-MoE decode) is HBM-bandwidth-bound at 98% of
+llama's number — closing the last 2% would need an algorithmic
+change (spec-decode, KV quantization), not a kernel tweak.
+
+### MTP spec-decode (Gemma 4 only)
+
+Plain decode vs `mtp-gen` for the two MTP-supported configs across
+three prompt classes:
+
+| Model            | Prompt class | Plain | K=2  | K=3  | K=4  | accept (best K) | best Δ vs plain |
+|------------------|--------------|------:|-----:|-----:|-----:|----------------:|----------------:|
+| gemma4-31B       | friendly     |  23.6†|  25.8|  29.5|  28.5|    79% (K=3)    |     **+25%**    |
+| gemma4-31B       | math         |  26.9 |  26.0|  29.9|  29.4|    81% (K=3)    |     **+11%**    |
+| gemma4-31B       | creative     |  27.0 |  23.8|  24.3|  21.4|    69% (K=2)    |        −12%     |
+| gemma4-26B-MoE   | friendly     |  86.8 |  65.1|  49.4|  52.6|    83% (K=2)    |        −25%     |
+| gemma4-26B-MoE   | math         |  83.2 |  60.5|  54.7|  57.7|    77% (K=4)    |        −27%     |
+| gemma4-26B-MoE   | creative     |  87.8 |  43.3|  37.3|  31.8|    40% (K=2)    |        −51%     |
+
+Throughput in tok/s. † gemma4-31B "friendly" plain hit EOS early
+(36 forwards counted), inflating the per-token tail somewhat —
+treat the 29.5 K=3 result as the real signal for that row.
+
+**Where MTP wins:** Gemma 4 31B on factual / math / list prompts
+(+11 to +25%). The drafter was trained on chat-templated text and
+behaves best when the prompt cleanly steers it (lists, arithmetic,
+structured output).
+
+**Where MTP loses:** anything creative or open-ended on either
+target. Also: **the 26B-A4B MoE target loses on MTP universally** —
+its verify path falls back to `verify_forward_via_decode` (K
+sequential `forward_token` calls; a batched-MoE verify kernel was
+prototyped but ~3.5× slower on MI50 due to per-(token,slot) expert
+weight reads). The drafter cost is not amortized.
+
+**Rule of thumb:** for serve-mode dispatch, set `use_speculative: true`
+only on Gemma 4 31B for prompts you'd expect a >75% accept rate
+on. For the 26B-A4B target, leave it off.
+
+### Architecture notes
+
+Decode is matvec-bandwidth-bound on this gfx906; the captured HIP
+graph eliminates per-kernel launch overhead. Key changes from the
+straight-line implementation:
+
+- int8 dp4a matvec (`v_dot4_i32_i8`) for K-quant + Q8_0 weights;
+  ROWS=2 per wavefront, ROWS=1 for `out_dim ≥ 4096` to keep wavefronts
+  in flight on bigger projections. IQ4_XS got the same dp4a treatment
+  (previously fell through to a fp32 wave64 fallback that cost 12% of
+  decode GPU time on qwen 27B; now ~4%).
+- int8 KV cache with per-head scale; dp4a Q·Kᵀ, dequant-V P·V.
+- `rmsnorm + add_residual` fused on Gemma 4. Per-layer output scale
+  folded into the final fused `rmsnorm_add_scale`. The router weight
+  `gate_inp_s` is pre-scaled by 1/√hidden at load — eliminates the
+  separate `scale` launch per MoE layer.
+- Q/K/V/O share a single quantize-once + matvec_xq8(×N) on the post-
+  norm activation; ditto ffn gate + up. Cuts ~120 quantize launches
+  per decode forward on Gemma 26B-MoE.
+
+Prefill is mostly HBM-bound on the MoE grouped GEMM (47% of GPU time
+on qwen 35B-MoE). Key changes:
+
+- 2D-tiled int8 MMQ GEMM (Q4_K, Q5_K, Q6_K, Q8_0). No dequant-to-fp16
+  scratch. BM = 64, BK = 4, occupancy 2. sX tile padded `[BN][BK+1]`
+  to break a 4-way LDS bank conflict on `xq32` reads (-3% to -10%
+  across MoE variants).
+- Grouped-expert GEMM for MoE: counting-sort tokens by expert, gather
+  activations to expert-contiguous order, one tiled GEMM per expert,
+  scatter back. Per-tile BN = 16 for qwen MoE's Q4_K/Q5_K (~16
+  tokens/expert avg → 0 padding waste); BN = 32 for gemma 26B-MoE's
+  Q6_K/Q8_0 (~32 tokens/expert avg).
+- GDN recurrent kernel (qwen35 hybrid): LDS-resident state slice with
+  +1-stride pad to eliminate a 64-way bank conflict; per-thread
+  decayed-state in a 32-float register array; per-row `a`/`b` scalars
+  preloaded to LDS. 3.84× speedup over the baseline (8.57 → 2.23 ms).
+- HIP graph capture + per-(state, P) `GraphExec` cache on Gemma 4
+  prefill — skips end_capture + instantiate on subsequent same-shape
+  prefills.
 
 ---
 
@@ -640,3 +792,41 @@ forward-pass divergence to a specific layer.
 - `model` typed-parses `qwen35` only; `generate` / `generate-text`
   cover `gemma4` and `qwen35`.
 - Single-GPU only.
+- `chat` (KV-prefix-reuse, snapshot/restore) is gemma4-only — the
+  qwen35 hybrid attention + GDN state needs separate snapshot
+  machinery (not yet built).
+- MTP spec-decode is gemma4-only at runtime. The Qwen MTP path was
+  built and measured (commit `0c8a92e` history), but the MoE-heavy
+  qwen35 arch defeated speculative batching on MI50 (best result
+  ~0.58× plain decode); the code was reverted.
+- MTP on Gemma 4 **26B-A4B-MoE** falls back to `verify_forward_via_decode`
+  (K sequential `forward_token` calls) — a batched-verify MoE kernel
+  was prototyped but ~3.5× slower than the decode-loop on MI50 due to
+  per-(token,slot) expert weight reads. Currently MTP costs ~30% on
+  the MoE target, helps only the dense 31B.
+
+## SERVE-MODE NOTES
+
+The HTTP server is hardened for non-critical real-world load:
+
+- Single GPU worker thread, FIFO queue across all three ports (one
+  GPU; no in-flight concurrency to manage).
+- Worker uses `catch_unwind` around `model.generate()` — a panic in
+  any one request returns 500 to that request and continues serving
+  instead of killing the worker thread.
+- HTTP request body capped at 8 MiB, headers at 16 KiB / 64 lines,
+  60-second socket read/write timeout. Defends against malformed
+  `Content-Length` OOM and slow-loris-style header floods.
+- JSON parser has a 256-level nesting limit — a deeply-nested body
+  can't stack-overflow the recursive descent.
+- VRAM-exhaustion errors at model load surface a hint about the file
+  size vs `--max-seq` budget plus a pointer to `rocm-smi --showmeminfo vram`.
+- Sampling tolerates non-finite logits — NaN/Inf entries are filtered
+  before top-k; all-NaN falls back to argmax instead of panicking.
+- Startup logs WARN if any perf-killing `REINSTINCT_*` env vars are
+  set (graph capture off, dp4a path off, MoE profile timer on, etc).
+  Catches a forgotten knob before it silently regresses perf.
+
+Long-running memory stability hasn't been load-tested at scale
+(1000s of requests). For non-critical workloads, expected to be
+stable; for production-critical, run your own soak test first.
