@@ -59,7 +59,7 @@ void mmq_gemm_q8_0_repacked_f32(const unsigned char* __restrict__ wbase,
     __shared__ uint4   sW_lo[BM][BK];
     __shared__ uint4   sW_hi[BM][BK];
     __shared__ float   sWd[BM][BK];      // per-sub-block fp16 scale, dequant'd
-    __shared__ BlockQ8 sX[BN][BK];       // int8 acts
+    __shared__ BlockQ8 sX[BN][BK + 1];       // int8 acts
 
     float acc[TM][TN];
     #pragma unroll

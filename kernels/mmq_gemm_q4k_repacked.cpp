@@ -65,7 +65,7 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
 
     __shared__ uint4   sW[BM][BK];       // packed nibbles
     __shared__ float2  sWs[BM][BK];      // (dsc, deff) — formed from the v2 scales
-    __shared__ BlockQ8 sX[BN][BK];       // int8 acts
+    __shared__ BlockQ8 sX[BN][BK + 1];       // int8 acts
 
     float acc[TM][TN];
     #pragma unroll

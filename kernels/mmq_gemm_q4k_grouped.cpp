@@ -77,7 +77,7 @@ void mmq_gemm_q4k_grouped_f32(const unsigned char* __restrict__ slab,
 
     __shared__ uint4   sW[BM][BK];
     __shared__ float2  sWs[BM][BK];
-    __shared__ BlockQ8 sX[BN][BK];
+    __shared__ BlockQ8 sX[BN][BK + 1];
 
     float acc[TM][TN];
     #pragma unroll
