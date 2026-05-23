@@ -1049,6 +1049,26 @@ impl GpuGemma4 {
         unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 
+    /// Fused rmsnorm + residual add + per-layer output scale:
+    /// `y[i] = (y[i] + rmsnorm(x)[i] * w[i]) * scale`. Used at the FINAL
+    /// rmsnorm_add of each decode block to fold `layer_output_scale` into
+    /// the kernel, saving one launch per layer.
+    pub(crate) fn launch_rmsnorm_add_scale(&self, x: *mut c_void, w: *mut c_void,
+                                            y: *mut c_void, n: u32, scale: f32)
+        -> Result<(), String>
+    {
+        let f = self.m_rmsnorm_add.function("rmsnorm_add_scale_f32")?;
+        let block: u32 = 512;
+        let mut xa=x; let mut wa=w; let mut ya=y; let mut na=n;
+        let mut ea=self.rms_eps; let mut sa=scale;
+        let mut args: [*mut c_void; 6] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void];
+        let smem = block * 4;
+        unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
     /// Fused rmsnorm + Q8 quantize: writes int8 blocks directly from the
     /// normalized output. Replaces
     /// `launch_rmsnorm(x, w, normed) + launch_quantize_q8(normed, xq8)`.
@@ -3105,8 +3125,17 @@ impl GpuGemma4 {
                 self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                                   self.ffn_a.raw_ptr(), self.ffn as u32)?;
                 self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
-                self.launch_rmsnorm_add(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
-                                        self.hidden_a.raw_ptr(), h)?;
+                // If there's no PLE residual after this, fold the per-layer
+                // output scale into the final rmsnorm_add (saves one launch).
+                let fold_scale = self.ple.is_none() || b.ple.is_none();
+                if fold_scale {
+                    self.launch_rmsnorm_add_scale(self.hidden_b.raw_ptr(),
+                        b.post_ffw_norm.raw_ptr(), self.hidden_a.raw_ptr(),
+                        h, b.layer_output_scale)?;
+                } else {
+                    self.launch_rmsnorm_add(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                                            self.hidden_a.raw_ptr(), h)?;
+                }
             }
             Some(mw) => self.moe_ffn(b, mw)?,
         }
@@ -3124,14 +3153,15 @@ impl GpuGemma4 {
             };
             self.launch_geglu(self.ple_gate.raw_ptr(), slice,
                               self.ple_gate.raw_ptr(), np)?;
-            // project back up, fused post-norm + residual add.
+            // project back up, fused post-norm + residual add + the
+            // per-layer output scale (this PLE residual is the final
+            // hidden_a writer in this layer).
             self.launch_matvec(&pb.proj, self.ple_gate.raw_ptr(), self.ple_tmp.raw_ptr())?;
-            self.launch_rmsnorm_add(self.ple_tmp.raw_ptr(), pb.post_norm.raw_ptr(),
-                                    self.hidden_a.raw_ptr(), h)?;
+            self.launch_rmsnorm_add_scale(self.ple_tmp.raw_ptr(), pb.post_norm.raw_ptr(),
+                                          self.hidden_a.raw_ptr(), h, b.layer_output_scale)?;
         }
-
-        // Per-layer output scale.
-        self.launch_scale(self.hidden_a.raw_ptr(), h, b.layer_output_scale)?;
+        // (For paths without PLE, the per-layer output scale was folded
+        // into the dense or MoE branch's final rmsnorm_add above.)
         Ok(())
     }
 
@@ -3208,9 +3238,17 @@ impl GpuGemma4 {
         // Fused: cur_mlp += rmsnorm(moe_acc) * post_ffw_norm_2
         self.launch_rmsnorm_add(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
                                 self.cur_mlp.raw_ptr(), h)?;
-        // Fused: hidden_a += rmsnorm(cur_mlp) * post_ffw_norm
-        self.launch_rmsnorm_add(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
-                                self.hidden_a.raw_ptr(), h)?;
+        // Final rmsnorm_add: if no PLE residual follows, fold the
+        // per-layer output scale into this kernel (saves one launch).
+        let fold_scale = self.ple.is_none() || b.ple.is_none();
+        if fold_scale {
+            self.launch_rmsnorm_add_scale(self.cur_mlp.raw_ptr(),
+                b.post_ffw_norm.raw_ptr(), self.hidden_a.raw_ptr(),
+                h, b.layer_output_scale)?;
+        } else {
+            self.launch_rmsnorm_add(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                                    self.hidden_a.raw_ptr(), h)?;
+        }
         self.prof_lap("moe_combine");
         Ok(())
     }

@@ -60,3 +60,44 @@ void rmsnorm_add_f32(const float* __restrict__ x,    // [n]
         y[i] += x[i] * rrms * w[i];
     }
 }
+
+// As above, but also multiplies the entire result by `scale` —
+// `y[i] = (y[i] + rmsnorm(x)[i] * w[i]) * scale`. Used to fuse the
+// per-layer output scale (`b.layer_output_scale`) into the FINAL
+// rmsnorm_add of each decode block, saving one launch per layer.
+extern "C" __global__
+void rmsnorm_add_scale_f32(const float* __restrict__ x,
+                           const float* __restrict__ w,
+                           float*       __restrict__ y,
+                           unsigned int n,
+                           float        eps,
+                           float        scale)
+{
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int bs  = blockDim.x;
+
+    x += (size_t)blockIdx.y * n;
+    y += (size_t)blockIdx.y * n;
+
+    float sum = 0.0f;
+    for (int i = tid; i < (int)n; i += bs) {
+        float v = x[i];
+        sum += v * v;
+    }
+    smem[tid] = sum;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        smem[0] = rsqrtf(smem[0] / (float)n + eps);
+    }
+    __syncthreads();
+    const float rrms = smem[0];
+
+    for (int i = tid; i < (int)n; i += bs) {
+        y[i] = (y[i] + x[i] * rrms * w[i]) * scale;
+    }
+}
