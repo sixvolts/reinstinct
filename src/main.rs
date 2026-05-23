@@ -543,9 +543,10 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         if std::env::var_os("REINSTINCT_PREFILL").is_some() {
             let do_twice = std::env::var_os("REINSTINCT_PREFILL_TWICE").is_some()
                 && prompt.len() > 1;
-            if do_twice {
-                // Warmup pass (cold pools → uncaptured), then a fresh-state
-                // second pass that uses the captured graph.
+            let do_thrice = std::env::var_os("REINSTINCT_PREFILL_THRICE").is_some()
+                && prompt.len() > 1;
+            if do_twice || do_thrice {
+                // Pass 1: cold pools → uncaptured (also warms pools).
                 let mut s_warm = Gemma4GpuState::new(&model, max_seq)
                     .map_err(anyhow::Error::msg)?;
                 let t1 = std::time::Instant::now();
@@ -554,12 +555,34 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
                 let el1 = t1.elapsed().as_secs_f64();
                 println!("warmup prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
                          el1 * 1e3, prompt.len(), el1 * 1e3 / prompt.len() as f64);
+                if do_thrice {
+                    // Pass 2: pools warm, state.cache miss → capture +
+                    // instantiate + store.
+                    let mut s_cap = Gemma4GpuState::new(&model, max_seq)
+                        .map_err(anyhow::Error::msg)?;
+                    let t2 = std::time::Instant::now();
+                    let _ = gm.prefill_forward(&prompt, &mut s_cap)
+                        .map_err(anyhow::Error::msg)?;
+                    let el2 = t2.elapsed().as_secs_f64();
+                    println!("captured prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                             el2 * 1e3, prompt.len(), el2 * 1e3 / prompt.len() as f64);
+                    // Pass 3: SAME state.cache hit → just launch cached
+                    // GraphExec, no capture/instantiate cost.
+                    let t3 = std::time::Instant::now();
+                    let _ = gm.prefill_forward(&prompt, &mut s_cap)
+                        .map_err(anyhow::Error::msg)?;
+                    let el3 = t3.elapsed().as_secs_f64();
+                    println!("replay prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                             el3 * 1e3, prompt.len(), el3 * 1e3 / prompt.len() as f64);
+                }
             }
             let t = std::time::Instant::now();
             let lg = gm.prefill_forward(&prompt, &mut state)
                 .map_err(anyhow::Error::msg)?;
             let el = t.elapsed().as_secs_f64();
-            let label = if do_twice { "captured prefill" } else { "batched prefill " };
+            let label = if do_thrice { "fresh prefill   " }
+                        else if do_twice { "captured prefill" }
+                        else { "batched prefill " };
             println!("{label} = {:.1} ms  ({} tokens, {:.2} ms/token)",
                      el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
             let mut idx: Vec<usize> = (0..lg.len()).collect();

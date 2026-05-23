@@ -408,6 +408,15 @@ impl Gemma4KvCache {
 pub struct Gemma4GpuState {
     caches: Vec<Gemma4KvCache>,
     pub pos: usize,
+    /// Per-state cache of captured prefill graphs, keyed by token count
+    /// `P`. After the first capture at each P (which costs hundreds of
+    /// ms — graph compilation, kernel-arg resolution, dispatch list
+    /// build), subsequent prefills at the same P launch the stored
+    /// `GraphExec` directly, skipping `begin_capture` / kernel-enqueue
+    /// / `end_capture` / `instantiate` entirely. Per-state (not
+    /// per-runtime) because each captured graph hardcodes this state's
+    /// KV cache pointers.
+    prefill_graphs: std::collections::HashMap<usize, GraphExec>,
 }
 
 impl Gemma4GpuState {
@@ -420,7 +429,7 @@ impl Gemma4GpuState {
                 cfg.head_dim(layer) as usize,
                 max_seq)?);
         }
-        Ok(Self { caches, pos: 0 })
+        Ok(Self { caches, pos: 0, prefill_graphs: std::collections::HashMap::new() })
     }
     pub fn reset(&mut self) {
         for c in &mut self.caches { c.len = 0; }
@@ -1941,15 +1950,53 @@ impl GpuGemma4 {
         let normed   = self.pool_f32.take(p * h)?;
         let hu = h as u32;
 
-        // HIP graph capture: the first prefill at each `p` runs uncaptured
-        // so all the inner pool.take calls hit hipMalloc and warm the
-        // pool; subsequent prefills at the same `p` capture+launch. dbg
-        // and trace paths run uncaptured (their syncs would break it).
+        // Three-state prefill execution:
+        //  1) state.prefill_graphs has this P → just replay the cached
+        //     GraphExec. Pool buffers' pointers are stable across calls
+        //     (LIFO + deterministic take order), so the captured
+        //     pointers still hit the same physical buffers.
+        //  2) pools_warm && !no_graph && cache miss → first capture for
+        //     this (state, P): begin_capture, enqueue chain, end_capture,
+        //     instantiate, store in state.prefill_graphs, launch.
+        //  3) Otherwise → uncaptured warmup (also marks pools_warm for P).
         let trace = std::env::var_os("REINSTINCT_PREFILL_DEBUG").is_some();
         let pools_warm = self.prefill_warm_p.borrow().contains(&p);
-        let no_graph = trace
-            || !pools_warm
-            || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
+        let force_no_graph = trace || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
+
+        // Cache hit: skip the whole kernel chain — the captured graph
+        // already encodes it. Pool buffers stay reserved for the launch
+        // duration (drops at fn end return them to the pool, in the same
+        // LIFO order, so the next call's takes resolve to the same
+        // pointers the graph expects).
+        if !force_no_graph {
+            if let Some(exec) = state.prefill_graphs.get(&p) {
+                exec.launch(&self.stream)?;
+                if self.softcap > 0.0 {
+                    // The captured graph doesn't include softcap (it
+                    // operates on self.logits, written by the graph,
+                    // so we apply it post-launch — same as the
+                    // uncaptured path's tail).
+                }
+                self.stream.synchronize()?;
+                if self.softcap > 0.0 {
+                    self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
+                    self.stream.synchronize()?;
+                }
+                let mut out = vec![0.0f32; self.vocab];
+                self.logits.copy_to_host(&mut out)?;
+                for c in &mut state.caches { c.len = p; }
+                state.pos = p;
+                // Drop tokens_dev, x, normed and the other pooled bufs
+                // declared above via normal scope exit — they return to
+                // the pool with stable LIFO ordering.
+                drop((moe_in_all, cur_mlp, cur_moe, xq8_moe, pf_logits,
+                      pf_gu, pf_act, pf_dn, pf_xq8_e, gs, tokens_dev,
+                      x, normed));
+                return Ok(out);
+            }
+        }
+
+        let no_graph = force_no_graph || !pools_warm;
         if !no_graph {
             Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
         }
@@ -2276,16 +2323,16 @@ impl GpuGemma4 {
             self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
         }
 
-        // End capture (if active) and replay the whole prefill chain as a
-        // single graph launch. The graph is instantiated+launched once
-        // per prefill call: capture replaces ~Nlayer * Nkernel launches
-        // with one graph dispatch, cutting host-side overhead.
+        // End capture (if active), instantiate, STORE in the per-state
+        // graph cache (so future prefills at the same (state, P) skip
+        // the capture+instantiate cost entirely), then launch.
         if !no_graph {
             capture_guard.active = false;
             let g = Graph::end_capture(&self.stream)?;
             let exec = g.instantiate()?;
             drop(g);
             exec.launch(&self.stream)?;
+            state.prefill_graphs.insert(p, exec);
         } else {
             // This call warmed the pools for `p`; future calls can capture.
             self.prefill_warm_p.borrow_mut().insert(p);
