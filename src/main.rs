@@ -354,6 +354,20 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         // print timing + top-10, and exit (skips generation). Mirrors the
         // gemma4 path so the harness has one interface for both arches.
         if std::env::var_os("REINSTINCT_PREFILL").is_some() {
+            let do_twice = std::env::var_os("REINSTINCT_PREFILL_TWICE").is_some()
+                && prompt.len() > 1;
+            if do_twice {
+                // Warmup pass (cold pools → uncaptured), then a fresh-state
+                // second pass that uses the captured graph.
+                let mut s_warm = Qwen35GpuState::new(&model, max_seq)
+                    .map_err(anyhow::Error::msg)?;
+                let t1 = std::time::Instant::now();
+                let _ = gpu.forward_tokens_batched(&prompt, &mut s_warm)
+                    .map_err(anyhow::Error::msg)?;
+                let el1 = t1.elapsed().as_secs_f64();
+                println!("warmup prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                         el1 * 1e3, prompt.len(), el1 * 1e3 / prompt.len() as f64);
+            }
             let t = std::time::Instant::now();
             let lg = if prompt.len() > 1 {
                 gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
@@ -361,7 +375,8 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
                 gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
             };
             let el = t.elapsed().as_secs_f64();
-            println!("batched prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
+            let label = if do_twice { "captured prefill" } else { "batched prefill " };
+            println!("{label} = {:.1} ms  ({} tokens, {:.2} ms/token)",
                      el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
             let mut idx: Vec<usize> = (0..lg.len()).collect();
             idx.sort_unstable_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());

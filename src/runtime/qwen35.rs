@@ -929,6 +929,14 @@ pub struct GpuQwen35 {
     /// per-call `hipMalloc` so the per-round spec-decode verify is cheap.
     pool_f32: DeviceBufPool<f32>,
     pool_u8:  DeviceBufPool<u8>,
+    /// fp16 scratch — `bmm` non-MMQ path's x_f16/y_f16 + dequant output
+    /// (must be pooled so the prefill chain can be HIP-graph-captured —
+    /// hipMalloc is forbidden during capture).
+    pool_u16: DeviceBufPool<u16>,
+    /// Token-counts whose prefill pools have been fully warmed. The
+    /// first prefill at a new `n` runs uncaptured (allocating into the
+    /// pools); subsequent prefills at that `n` capture+launch.
+    prefill_warm_p: std::cell::RefCell<std::collections::HashSet<usize>>,
     ffn_a:       DeviceBuf<f32>,   // [ffn]
     ffn_b:       DeviceBuf<f32>,   // [ffn]
     q_raw:       DeviceBuf<f32>,   // [2 * q_dim]
@@ -1135,6 +1143,8 @@ impl GpuQwen35 {
         let verify_hidden = DeviceBuf::new(VERIFY_MAX_TOKENS * hidden)?;
         let pool_f32      = DeviceBufPool::new();
         let pool_u8       = DeviceBufPool::new();
+        let pool_u16      = DeviceBufPool::new();
+        let prefill_warm_p = std::cell::RefCell::new(std::collections::HashSet::new());
         let ffn_a       = DeviceBuf::new(ffn)?;
         let ffn_b       = DeviceBuf::new(ffn)?;
         let q_raw       = DeviceBuf::new(2 * q_dim)?;
@@ -1254,7 +1264,7 @@ impl GpuQwen35 {
         Ok(Self {
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
-            pool_f32, pool_u8, ffn_a, ffn_b,
+            pool_f32, pool_u8, pool_u16, prefill_warm_p, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
             moe_prof_on, prof_mark, prof_buckets,
@@ -3226,9 +3236,9 @@ impl GpuQwen35 {
     }
 
     /// Bulk-dequant a quantized weight tensor to a fresh fp16 buffer.
-    fn dequant_weight(&self, w: &GpuMatvecTensor) -> Result<DeviceBuf<u16>, String> {
+    fn dequant_weight(&self, w: &GpuMatvecTensor) -> Result<PooledBuf<'_, u16>, String> {
         let n = (w.in_dim as usize) * (w.out_dim as usize);
-        let out: DeviceBuf<u16> = DeviceBuf::new(n)?;
+        let out = self.pool_u16.take(n)?;
 
         // Repacked Q4_K: the two-plane layout dequantizes a sub-block at a
         // time straight into [out_dim, in_dim] fp16 order.
@@ -3313,7 +3323,7 @@ impl GpuQwen35 {
         }
 
         // W → fp16 (F16 weights are already fp16: use raw bytes directly).
-        let dq: Option<DeviceBuf<u16>>;
+        let dq: Option<PooledBuf<u16>>;
         let w_ptr: *mut c_void;
         if w.dtype == GgmlType::F16 {
             w_ptr = w.data.raw_ptr();
@@ -3323,12 +3333,12 @@ impl GpuQwen35 {
             w_ptr = b.raw_ptr();
             dq = Some(b);
         }
-        // X → fp16.
-        let x_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * in_d)?;
+        // X → fp16. Pooled (capture-safe; pooled buffers aren't freed).
+        let x_f16 = self.pool_u16.take(n_rows * in_d)?;
         self.launch_cvt("cvt_f32_to_f16", x_f32, x_f16.raw_ptr(), (n_rows * in_d) as u32)?;
         // GEMM. rocBLAS handle shares self.stream, so it serialises after
         // the dequant + cvt launches above — no explicit sync needed.
-        let y_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * out_d)?;
+        let y_f16 = self.pool_u16.take(n_rows * out_d)?;
         unsafe {
             self.rocblas.gemm_f16_f32acc(
                 RocblasOp::Transpose, RocblasOp::None,
@@ -3341,12 +3351,9 @@ impl GpuQwen35 {
             )?;
         }
         self.launch_cvt("cvt_f16_to_f32", y_f16.raw_ptr(), y_f32, (n_rows * out_d) as u32)?;
-        // dq / x_f16 / y_f16 are local — freed when this fn returns. The
-        // dequant / cvt / rocBLAS kernels above run async on the stream,
-        // so sync before the buffers drop: otherwise the freed memory is
-        // reused under the still-running kernels, a GPU memory fault
-        // (hit on the 27B; the 0.8B raced through by luck).
-        self.stream.synchronize()?;
+        // dq / x_f16 / y_f16 are pooled — returned to the pool on drop,
+        // not freed; next take() reuses them stream-ordered after these
+        // kernels, so no per-call sync is needed.
         let _ = dq;
         Ok(())
     }
@@ -3507,6 +3514,21 @@ impl GpuQwen35 {
         let bb    = self.pool_f32.take(n * h)?;        // scratch
         let bnorm = self.pool_f32.take(n * h)?;        // normed scratch
 
+        // HIP graph capture around the prefill kernel chain. The first
+        // prefill at each `n` runs uncaptured so the inner-block buffer
+        // pools fill with the right sizes (hipMalloc is forbidden during
+        // capture); subsequent prefills at the same `n` capture+launch.
+        // Skipped under the trace path (its syncs would break capture)
+        // and via `REINSTINCT_PREFILL_NO_GRAPH=1`.
+        let trace = std::env::var_os("REINSTINCT_PREFILL_TRACE").is_some();
+        let pools_warm = self.prefill_warm_p.borrow().contains(&n);
+        let no_graph = trace
+            || !pools_warm
+            || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
+        if !no_graph {
+            Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
+        }
+
         // 1) Embed all tokens into ba (one row each).
         for (r, &tok) in tokens.iter().enumerate() {
             let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
@@ -3516,7 +3538,6 @@ impl GpuQwen35 {
         // 2) Every block. Optional per-block timing trace
         //    (REINSTINCT_PREFILL_TRACE=1) — syncs after each block, so
         //    only use for diagnosis, not steady-state benchmarking.
-        let trace = std::env::var_os("REINSTINCT_PREFILL_TRACE").is_some();
         let mut block_ms: Vec<(char, f64)> = Vec::with_capacity(self.blocks.len());
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             let t0 = if trace { Some(std::time::Instant::now()) } else { None };
@@ -3557,6 +3578,17 @@ impl GpuQwen35 {
                             self.hidden_b.raw_ptr(), h as u32, self.rms_eps)?;
         self.launch_matvec_dispatch(self.output_proj_tensor(),
                                     self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+
+        if !no_graph {
+            let g = Graph::end_capture(&self.stream)?;
+            let exec = g.instantiate()?;
+            drop(g);
+            exec.launch(&self.stream)?;
+        } else {
+            // This call warmed the pool for `n`; future calls can capture.
+            self.prefill_warm_p.borrow_mut().insert(n);
+        }
+
         self.stream.synchronize()?;
         state.pos += n;
         let mut out = vec![0.0f32; self.vocab];
