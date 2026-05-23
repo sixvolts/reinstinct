@@ -68,6 +68,8 @@ const L2NORM_QK_BATCHED_SOURCE: &str =
     include_str!("../../kernels/l2norm_qk_batched.cpp");
 const GDN_RECURRENT_STEP_FUSED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/gdn_recurrent_step_fused_batched.cpp");
+const GDN_RECURRENT_STEP_FUSED_BATCHED_LDS128_SOURCE: &str =
+    include_str!("../../kernels/gdn_recurrent_step_fused_batched_lds128.cpp");
 const RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE: &str =
     include_str!("../../kernels/rmsnorm_gated_multihead_batched.cpp");
 
@@ -1000,6 +1002,10 @@ pub struct GpuQwen35 {
     conv1d_step_silu_batched_module: Module,
     l2norm_qk_batched_module: Module,
     gdn_recurrent_step_fused_batched_module: Module,
+    /// head_dim=128 LDS-resident-state variant of the recurrent kernel.
+    /// Stages the 8 KB per-WG state slice into LDS once per call so the
+    /// per-row state ops are LDS-fast instead of HBM-latency-bound.
+    gdn_recurrent_step_fused_batched_lds128_module: Module,
     rmsnorm_gated_multihead_batched_module: Module,
 
     matvec_f16_module:     Module,
@@ -1207,6 +1213,9 @@ impl GpuQwen35 {
             "l2norm_qk_batched", L2NORM_QK_BATCHED_SOURCE)?;
         let gdn_recurrent_step_fused_batched_hsaco = cache.compile(
             "gdn_recurrent_step_fused_batched", GDN_RECURRENT_STEP_FUSED_BATCHED_SOURCE)?;
+        let gdn_recurrent_step_fused_batched_lds128_hsaco = cache.compile(
+            "gdn_recurrent_step_fused_batched_lds128",
+            GDN_RECURRENT_STEP_FUSED_BATCHED_LDS128_SOURCE)?;
         let rmsnorm_gated_multihead_batched_hsaco = cache.compile(
             "rmsnorm_gated_multihead_batched", RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
@@ -1291,6 +1300,8 @@ impl GpuQwen35 {
                 Module::load(&l2norm_qk_batched_hsaco)?,
             gdn_recurrent_step_fused_batched_module:
                 Module::load(&gdn_recurrent_step_fused_batched_hsaco)?,
+            gdn_recurrent_step_fused_batched_lds128_module:
+                Module::load(&gdn_recurrent_step_fused_batched_lds128_hsaco)?,
             rmsnorm_gated_multihead_batched_module:
                 Module::load(&rmsnorm_gated_multihead_batched_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
@@ -1584,11 +1595,28 @@ impl GpuQwen35 {
         qk_row_stride: u32, v_row_stride: u32, ab_row_stride: u32,
         out_row_stride: u32) -> Result<(), String>
     {
-        let f = self.gdn_recurrent_step_fused_batched_module
-            .function("gdn_recurrent_step_fused_batched_f32")?;
+        // head_dim=128 hits the LDS-resident-state variant — stages the
+        // 8 KB per-WG state slice into LDS once per call so per-row
+        // state ops are LDS-fast instead of HBM-latency-bound.
+        // `REINSTINCT_GDN_NO_LDS128=1` forces the general kernel.
         const COLS: u32 = 16;
         let block: u32 = 64;
-        let smem = 2 * head_dim * 4;
+        let use_lds128 = head_dim == 128
+            && std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none();
+        let f = if use_lds128 {
+            self.gdn_recurrent_step_fused_batched_lds128_module
+                .function("gdn_recurrent_step_fused_batched_lds128_f32")?
+        } else {
+            self.gdn_recurrent_step_fused_batched_module
+                .function("gdn_recurrent_step_fused_batched_f32")?
+        };
+        // lds128 needs COLS·HEAD_DIM + 2·HEAD_DIM floats; general needs
+        // 2·HEAD_DIM (just q_lds + k_lds).
+        let smem = if use_lds128 {
+            (COLS * head_dim + 2 * head_dim) * 4
+        } else {
+            2 * head_dim * 4
+        };
         let mut qa=q_in; let mut ka=k_in; let mut va=v_in;
         let mut aa=a_in; let mut ba=b_in;
         let mut sa=ssm_a; let mut dta=dt_bias;
