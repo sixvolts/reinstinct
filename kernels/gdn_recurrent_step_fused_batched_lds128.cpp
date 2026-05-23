@@ -44,7 +44,7 @@ __device__ __forceinline__ float softplus_stable_r(float x) {
                       :     __logf(1.0f + __expf(x));
 }
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(64, 2)
 void gdn_recurrent_step_fused_batched_lds128_f32(
     const float* __restrict__ q_in_batch,
     const float* __restrict__ k_in_batch,
