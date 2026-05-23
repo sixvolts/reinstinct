@@ -398,19 +398,19 @@ const VERIFY_MAX_TOKENS: usize = 16;
 /// buffers are never freed mid-run, so kernels still reading them on the
 /// single engine stream stay safe without a per-call sync — which is
 /// what makes the per-round spec-decode verify cheap.
-struct DeviceBufPool<T> {
+pub(crate) struct DeviceBufPool<T> {
     free: std::cell::RefCell<std::collections::HashMap<usize, Vec<DeviceBuf<T>>>>,
 }
 
 impl<T: Copy> DeviceBufPool<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { free: std::cell::RefCell::new(std::collections::HashMap::new()) }
     }
 
     /// A buffer of exactly `len` elements — reused from the pool when
     /// available, freshly allocated otherwise. Contents are unspecified
     /// (same contract as `DeviceBuf::new`).
-    fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
+    pub(crate) fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
         let reused = self.free.borrow_mut().get_mut(&len).and_then(|v| v.pop());
         let buf = match reused {
             Some(b) => b,
@@ -422,7 +422,7 @@ impl<T: Copy> DeviceBufPool<T> {
 
 /// A `DeviceBuf` borrowed from a `DeviceBufPool`; returns to the pool
 /// when dropped. Derefs to `DeviceBuf<T>` so call sites are unchanged.
-struct PooledBuf<'a, T> {
+pub(crate) struct PooledBuf<'a, T> {
     buf:  Option<DeviceBuf<T>>,
     pool: &'a DeviceBufPool<T>,
     len:  usize,

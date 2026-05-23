@@ -13,7 +13,7 @@ use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::model::gemma4::{AttnKind, Gemma4Model};
 use crate::runtime::KernelCache;
-use crate::runtime::qwen35::GpuMatvecTensor;
+use crate::runtime::qwen35::{DeviceBufPool, GpuMatvecTensor, PooledBuf};
 
 // Reused kernel sources.
 const RMSNORM_SRC:           &str = include_str!("../../kernels/rmsnorm.cpp");
@@ -269,15 +269,18 @@ pub struct MoeBlock {
 
 /// Per-prefill-call scratch for the grouped-expert GEMM MoE path
 /// (`REINSTINCT_MOE_GROUPED`). Mirrors qwen35's `MoeRuntime` sort fields.
-struct MoeGroupedScratch {
-    count:  DeviceBuf<i32>,   // [n_expert]   routing histogram
-    cursor: DeviceBuf<i32>,   // [n_expert]   scatter cursor
-    eoff:   DeviceBuf<i32>,   // [n_expert+1] expert entry offsets
-    toff:   DeviceBuf<i32>,   // [n_expert+1] expert GEMM-tile offsets
-    perm:   DeviceBuf<i32>,   // [cw*n_used]  entries grouped by expert
-    g_in:   DeviceBuf<u8>,    // [cw*n_used, hidden/32] gathered gate_up input
-    e_act:  DeviceBuf<f32>,   // [cw*n_used, expert_ff] sorted GeGLU output
-    g_out:  DeviceBuf<f32>,   // [cw*n_used, hidden] sorted grouped-down output
+/// Pooled so the first prefill at each P warms the allocator and
+/// subsequent prefills capture the kernel chain into a HIP graph
+/// (hipMalloc is forbidden inside `Graph::begin_capture`).
+struct MoeGroupedScratch<'a> {
+    count:  PooledBuf<'a, i32>,   // [n_expert]   routing histogram
+    cursor: PooledBuf<'a, i32>,   // [n_expert]   scatter cursor
+    eoff:   PooledBuf<'a, i32>,   // [n_expert+1] expert entry offsets
+    toff:   PooledBuf<'a, i32>,   // [n_expert+1] expert GEMM-tile offsets
+    perm:   PooledBuf<'a, i32>,   // [cw*n_used]  entries grouped by expert
+    g_in:   PooledBuf<'a, u8>,    // [cw*n_used, hidden/32] gathered gate_up input
+    e_act:  PooledBuf<'a, f32>,   // [cw*n_used, expert_ff] sorted GeGLU output
+    g_out:  PooledBuf<'a, f32>,   // [cw*n_used, hidden] sorted grouped-down output
 }
 
 /// All weights for one Gemma 4 transformer block on device.
@@ -719,6 +722,15 @@ pub struct GpuGemma4 {
     n_expert:      usize,
     n_expert_used: usize,
     expert_ff:     usize,
+
+    /// Per-call activation/scratch pool for `prefill_forward`. First
+    /// call at each token count `P` runs uncaptured to fill the pool;
+    /// subsequent calls capture the kernel chain into a HIP graph.
+    pool_f32: DeviceBufPool<f32>,
+    pool_u8:  DeviceBufPool<u8>,
+    pool_u32: DeviceBufPool<u32>,
+    pool_i32: DeviceBufPool<i32>,
+    prefill_warm_p: std::cell::RefCell<std::collections::HashSet<usize>>,
 }
 
 impl GpuGemma4 {
@@ -942,6 +954,11 @@ impl GpuGemma4 {
             n_expert:      cfg.expert_count as usize,
             n_expert_used: cfg.expert_used_count as usize,
             expert_ff:     cfg.expert_ff_size as usize,
+            pool_f32: DeviceBufPool::new(),
+            pool_u8:  DeviceBufPool::new(),
+            pool_u32: DeviceBufPool::new(),
+            pool_i32: DeviceBufPool::new(),
+            prefill_warm_p: std::cell::RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1415,7 +1432,7 @@ impl GpuGemma4 {
     /// Counting-sort the `n_entries` routing entries (`ids` = topk expert
     /// ids, [n_tok, n_used]) by expert into `gs.perm`, with `gs.eoff`
     /// (entry offsets) and `gs.toff` (GEMM-tile offsets).
-    fn launch_moe_sort(&self, gs: &MoeGroupedScratch, ids: *mut c_void,
+    fn launch_moe_sort(&self, gs: &MoeGroupedScratch<'_>, ids: *mut c_void,
                        n_expert: u32, n_entries: u32) -> Result<(), String>
     {
         let zero = |buf: *mut c_void, n: u32| -> Result<(), String> {
@@ -1465,7 +1482,7 @@ impl GpuGemma4 {
 
     /// Gather per-token gate_up activations (`xq_src`, BlockQ8 [n_tok,
     /// nsub]) into expert-sorted order `gs.g_in`. `nsub = hidden/32`.
-    fn launch_moe_gather_xq(&self, gs: &MoeGroupedScratch, xq_src: *mut c_void,
+    fn launch_moe_gather_xq(&self, gs: &MoeGroupedScratch<'_>, xq_src: *mut c_void,
                             nsub: u32, n_used: u32, n_entries: u32) -> Result<(), String>
     {
         let f = self.m_expert_sort.function("moe_gather_xq")?;
@@ -1482,7 +1499,7 @@ impl GpuGemma4 {
 
     /// Scatter expert-sorted rows `src` back to entry [token,slot] order
     /// `dst` via `gs.perm`. `dim` = floats per row.
-    fn launch_moe_scatter_rows(&self, gs: &MoeGroupedScratch, src: *mut c_void,
+    fn launch_moe_scatter_rows(&self, gs: &MoeGroupedScratch<'_>, src: *mut c_void,
                                dst: *mut c_void, dim: u32, n_entries: u32)
         -> Result<(), String>
     {
@@ -1499,7 +1516,7 @@ impl GpuGemma4 {
 
     /// One grouped-expert MMQ GEMM: `y[n_entries, out_dim]` = the
     /// expert-sorted activations `xq` · each entry's expert weight.
-    fn launch_moe_grouped_gemm(&self, et: &ExpertTensor, gs: &MoeGroupedScratch,
+    fn launch_moe_grouped_gemm(&self, et: &ExpertTensor, gs: &MoeGroupedScratch<'_>,
                                xq: *mut c_void, y: *mut c_void,
                                in_dim: u32, out_dim: u32,
                                n_entries: u32, n_expert: u32) -> Result<(), String>
@@ -1887,58 +1904,94 @@ impl GpuGemma4 {
         // `cw` rows of expert-intermediate scratch — the MoE branch
         // processes the prefill in MOE_PREFILL_CHUNK-token chunks.
         let cw = p.min(MOE_PREFILL_CHUNK);
-        let moe_in_all  = DeviceBuf::<f32>::new(p * h)?;
-        let cur_mlp     = DeviceBuf::<f32>::new(p * h)?;
-        let cur_moe     = DeviceBuf::<f32>::new(p * h)?;
-        let xq8_moe     = DeviceBuf::<u8>::new(p * (h / 32) * 40)?;
+        // Pooled per-call scratch — first call at each `p` warms the pool
+        // (hipMalloc through `pool_f32.take`); subsequent calls reuse and
+        // can capture the kernel chain into a HIP graph (hipMalloc is
+        // forbidden inside `Graph::begin_capture`).
+        let moe_in_all  = self.pool_f32.take(p * h)?;
+        let cur_mlp     = self.pool_f32.take(p * h)?;
+        let cur_moe     = self.pool_f32.take(p * h)?;
+        let xq8_moe     = self.pool_u8.take(p * (h / 32) * 40)?;
         // Per-chunk routed-expert scratch: [cw, n_used, ·].
-        let pf_logits   = DeviceBuf::<f32>::new(p * ne_a)?;
-        let pf_gu       = DeviceBuf::<f32>::new(cw * nu_a * 2 * ff_a)?;
-        let pf_act      = DeviceBuf::<f32>::new(cw * nu_a * ff_a)?;
-        let pf_dn       = DeviceBuf::<f32>::new(cw * nu_a * h)?;
-        let pf_xq8_e    = DeviceBuf::<u8>::new(cw * nu_a * (ff_a / 32) * 40)?;
+        let pf_logits   = self.pool_f32.take(p * ne_a)?;
+        let pf_gu       = self.pool_f32.take(cw * nu_a * 2 * ff_a)?;
+        let pf_act      = self.pool_f32.take(cw * nu_a * ff_a)?;
+        let pf_dn       = self.pool_f32.take(cw * nu_a * h)?;
+        let pf_xq8_e    = self.pool_u8.take(cw * nu_a * (ff_a / 32) * 40)?;
         // Grouped-expert GEMM scratch (REINSTINCT_MOE_GROUPED path).
         let gs = MoeGroupedScratch {
-            count:  DeviceBuf::new(ne_a)?,
-            cursor: DeviceBuf::new(ne_a)?,
-            eoff:   DeviceBuf::new(ne_a + 1)?,
-            toff:   DeviceBuf::new(ne_a + 1)?,
-            perm:   DeviceBuf::new(cw * nu_a)?,
-            g_in:   DeviceBuf::new(cw * nu_a * (h / 32) * 40)?,
-            e_act:  DeviceBuf::new(cw * nu_a * ff_a)?,
-            g_out:  DeviceBuf::new(cw * nu_a * h)?,
+            count:  self.pool_i32.take(ne_a)?,
+            cursor: self.pool_i32.take(ne_a)?,
+            eoff:   self.pool_i32.take(ne_a + 1)?,
+            toff:   self.pool_i32.take(ne_a + 1)?,
+            perm:   self.pool_i32.take(cw * nu_a)?,
+            g_in:   self.pool_u8 .take(cw * nu_a * (h / 32) * 40)?,
+            e_act:  self.pool_f32.take(cw * nu_a * ff_a)?,
+            g_out:  self.pool_f32.take(cw * nu_a * h)?,
         };
 
         // --- embed P tokens → x [P, hidden] ---
-        // One batched lookup over the device-resident token ids — no
-        // per-token launch+sync loop.
-        let tokens_dev = DeviceBuf::<u32>::from_slice(tokens)?;
-        let x = DeviceBuf::<f32>::new(p * h)?;
+        // tokens_dev is filled BEFORE begin_capture so the host→device
+        // memcpy (sync, allowed only outside capture) lands the current
+        // call's token ids into a pooled device buffer. The captured
+        // graph then reads them via launch_embed_batched at replay.
+        let tokens_dev = self.pool_u32.take(p)?;
+        tokens_dev.copy_from_host(tokens)?;
+        let x        = self.pool_f32.take(p * h)?;
+        let normed   = self.pool_f32.take(p * h)?;
+        let hu = h as u32;
+
+        // HIP graph capture: the first prefill at each `p` runs uncaptured
+        // so all the inner pool.take calls hit hipMalloc and warm the
+        // pool; subsequent prefills at the same `p` capture+launch. dbg
+        // and trace paths run uncaptured (their syncs would break it).
+        let trace = std::env::var_os("REINSTINCT_PREFILL_DEBUG").is_some();
+        let pools_warm = self.prefill_warm_p.borrow().contains(&p);
+        let no_graph = trace
+            || !pools_warm
+            || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
+        if !no_graph {
+            Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
+        }
+        // RAII: if any of the kernel launches between here and the matching
+        // `end_capture` errors out, ensure we don't leave the stream in
+        // capture mode. Drop fires on error early-return.
+        struct CaptureGuard<'a> { stream: &'a Stream, active: bool }
+        impl Drop for CaptureGuard<'_> {
+            fn drop(&mut self) { if self.active { let _ = Graph::end_capture(self.stream); } }
+        }
+        let mut capture_guard = CaptureGuard { stream: &self.stream, active: !no_graph };
+
         let es = (h as f32).sqrt();
         self.launch_embed_batched(&self.token_embd, x.raw_ptr(),
                                   tokens_dev.raw_ptr(), p as u32)?;
         self.launch_scale(x.raw_ptr(), (p * h) as u32, es)?;
 
-        let normed = DeviceBuf::<f32>::new(p * h)?;
-        let hu = h as u32;
         // The pooled GEMM context (modules + fp16 scratch) is resident in
         // `self.prefill_gemm`; its scratch grows on demand if P exceeds
         // the size assumed at construction.
-        let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<DeviceBuf<f32>, String> {
-            self.prefill_gemm.matmul(&self.rocblas, &self.stream, &w.data, w.dtype, w.repacked,
-                      w.in_dim as usize, w.out_dim as usize, xin, p)
+        //
+        // gemm: allocates the output via the pool, writes via matmul_into.
+        // Returning a PooledBuf<'_, f32> keeps the per-call DeviceBuf::new
+        // out of the captured region.
+        let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<PooledBuf<'_, f32>, String> {
+            let out = self.pool_f32.take(p * w.out_dim as usize)?;
+            self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, &out,
+                      &w.data, w.dtype, w.repacked,
+                      w.in_dim as usize, w.out_dim as usize, xin, p)?;
+            Ok(out)
         };
 
         // --- Per-Layer-Embedding setup (E4B) ---
         // Build `ple_perm` [n_layer][P][np]: each layer's [P, np] slice
         // contiguous. Mirrors llama.cpp build_inp_per_layer +
         // project_per_layer_inputs.
-        let ple_perm: Option<DeviceBuf<f32>> = if let Some(pg_w) = &self.ple {
+        let ple_perm: Option<PooledBuf<'_, f32>> = if let Some(pg_w) = &self.ple {
             let np = self.n_embd_per_layer;
             let nl = self.blocks.len();
             let pd = (np * nl) as u32;          // per-token PLE width
             // batched lookup of the per-layer token embedding.
-            let ple_raw = DeviceBuf::<f32>::new(p * np * nl)?;
+            let ple_raw = self.pool_f32.take(p * np * nl)?;
             self.launch_embed_batched(&pg_w.tok_embd, ple_raw.raw_ptr(),
                                       tokens_dev.raw_ptr(), p as u32)?;
             self.launch_scale(ple_raw.raw_ptr(), p as u32 * pd, (np as f32).sqrt())?;
@@ -1951,10 +2004,9 @@ impl GpuGemma4 {
             self.launch_add_batched(ple_raw.raw_ptr(), ple_proj.raw_ptr(), pd, p as u32)?;
             self.launch_scale(ple_raw.raw_ptr(), p as u32 * pd, 1.0 / 2.0f32.sqrt())?;
             // permute to layer-major so each layer slice is contiguous.
-            let perm = DeviceBuf::<f32>::new(nl * p * np)?;
+            let perm = self.pool_f32.take(nl * p * np)?;
             self.launch_permute_ple(&self.m_permute_pf, ple_raw.raw_ptr(), perm.raw_ptr(),
                                     p as u32, nl as u32, np as u32)?;
-            self.stream.synchronize()?;
             Some(perm)
         } else { None };
 
@@ -1963,8 +2015,8 @@ impl GpuGemma4 {
         let sharing = self.n_layer_kv_from_start < self.blocks.len();
         let donor_swa_idx  = self.n_layer_kv_from_start.saturating_sub(2);
         let donor_full_idx = self.n_layer_kv_from_start.saturating_sub(1);
-        let mut donor_swa:  Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = None;
-        let mut donor_full: Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = None;
+        let mut donor_swa:  Option<(PooledBuf<'_, f32>, PooledBuf<'_, f32>)> = None;
+        let mut donor_full: Option<(PooledBuf<'_, f32>, PooledBuf<'_, f32>)> = None;
 
         let dbg = std::env::var("REINSTINCT_PREFILL_DEBUG").is_ok();
         // Per-category prefill timing (REINSTINCT_PREFILL_DEBUG). `lap`
@@ -2002,7 +2054,7 @@ impl GpuGemma4 {
 
             // K/V: computed on KV-owning layers; KV-sharing layers reuse
             // a donor layer's post-norm K/V (see kv_donor).
-            let kv_owned: Option<(DeviceBuf<f32>, DeviceBuf<f32>)> = if b.kv_donor.is_none() {
+            let kv_owned: Option<(PooledBuf<'_, f32>, PooledBuf<'_, f32>)> = if b.kv_donor.is_none() {
                 let k = gemm(&b.attn_k, &normed)?;
                 let v_gemm;
                 let v_ptr = match &b.attn_v {
@@ -2010,8 +2062,8 @@ impl GpuGemma4 {
                     None     => k.raw_ptr(),     // full layers: V is the K projection
                 };
                 lap(&t_gemm)?;
-                let k_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
-                let v_norm = DeviceBuf::<f32>::new(p * kv_dim)?;
+                let k_norm = self.pool_f32.take(p * kv_dim)?;
+                let v_norm = self.pool_f32.take(p * kv_dim)?;
                 self.launch_rmsnorm_mh_batched(k.raw_ptr(), b.attn_k_norm.raw_ptr(),
                     k_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
                 self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
@@ -2030,6 +2082,7 @@ impl GpuGemma4 {
                 None
             };
             // attention reads either this layer's K/V or the donor's.
+            // Deref coercion: PooledBuf<f32> → DeviceBuf<f32>.
             let (k_attn, v_attn): (&DeviceBuf<f32>, &DeviceBuf<f32>) = match &kv_owned {
                 Some((k, v)) => (k, v),
                 None => {
@@ -2045,7 +2098,7 @@ impl GpuGemma4 {
                 AttnKind::Full    => 0,
             };
             lap(&t_norm)?;
-            let attn = DeviceBuf::<f32>::new(p * q_dim)?;
+            let attn = self.pool_f32.take(p * q_dim)?;
             self.launch_attn_prefill(&self.m_attn_pf, q.raw_ptr(), k_attn.raw_ptr(), v_attn.raw_ptr(),
                                      attn.raw_ptr(), n_kv as u32, hd as u32, window, p)?;
             lap(&t_attn)?;
@@ -2222,6 +2275,22 @@ impl GpuGemma4 {
         if self.softcap > 0.0 {
             self.launch_softcap(self.logits.raw_ptr(), self.vocab as u32)?;
         }
+
+        // End capture (if active) and replay the whole prefill chain as a
+        // single graph launch. The graph is instantiated+launched once
+        // per prefill call: capture replaces ~Nlayer * Nkernel launches
+        // with one graph dispatch, cutting host-side overhead.
+        if !no_graph {
+            capture_guard.active = false;
+            let g = Graph::end_capture(&self.stream)?;
+            let exec = g.instantiate()?;
+            drop(g);
+            exec.launch(&self.stream)?;
+        } else {
+            // This call warmed the pools for `p`; future calls can capture.
+            self.prefill_warm_p.borrow_mut().insert(p);
+        }
+
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
