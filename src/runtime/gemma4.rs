@@ -17,6 +17,7 @@ use crate::runtime::qwen35::{DeviceBufPool, GpuMatvecTensor, PooledBuf};
 
 // Reused kernel sources.
 const RMSNORM_SRC:           &str = include_str!("../../kernels/rmsnorm.cpp");
+const RMSNORM_ADD_SRC:       &str = include_str!("../../kernels/rmsnorm_add.cpp");
 const RMSNORM_MULTIHEAD_SRC: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
 const ROPE_SRC:              &str = include_str!("../../kernels/rope_dpos.cpp");
 const ADD_INPLACE_SRC:       &str = include_str!("../../kernels/add_inplace.cpp");
@@ -612,6 +613,7 @@ pub struct GpuGemma4 {
 
     // Kernel modules.
     m_rmsnorm:   Module,
+    m_rmsnorm_add: Module,
     m_rmsnorm_mh: Module,
     m_rope:      Module,
     m_add:       Module,
@@ -869,7 +871,8 @@ impl GpuGemma4 {
             ple_tmp:  DeviceBuf::new(hidden)?,
             n_embd_per_layer: cfg.n_embd_per_layer as usize,
             n_layer_kv_from_start: cfg.n_layer_kv_from_start as usize,
-            m_rmsnorm:    ld("rmsnorm", RMSNORM_SRC)?,
+            m_rmsnorm:     ld("rmsnorm", RMSNORM_SRC)?,
+            m_rmsnorm_add: ld("rmsnorm_add", RMSNORM_ADD_SRC)?,
             m_rmsnorm_mh: ld("rmsnorm_multihead", RMSNORM_MULTIHEAD_SRC)?,
             m_rope:       ld("rope", ROPE_SRC)?,
             m_add:        ld("add_inplace", ADD_INPLACE_SRC)?,
@@ -985,7 +988,28 @@ impl GpuGemma4 {
         -> Result<(), String>
     {
         let f = self.m_rmsnorm.function("rmsnorm_f32")?;
-        let block: u32 = 256;
+        // block=512 picked from a 64/128/256/512 sweep — per-call GPU
+        // dispatch overhead (~5-9 μs) dwarfs the actual compute (~130
+        // ns), so a bigger WG hides the overhead better. Above 512 the
+        // tree-reduction depth costs more than the saving.
+        let block: u32 = 512;
+        let mut xa=x; let mut wa=w; let mut ya=y; let mut na=n; let mut ea=self.rms_eps;
+        let mut args: [*mut c_void; 5] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void];
+        let smem = block * 4;
+        unsafe { f.launch((1,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
+    }
+
+    /// Fused rmsnorm + residual add: `y[i] += rmsnorm(x)[i] * w[i]`.
+    /// Replaces `launch_rmsnorm(x, w, normed) + launch_add(y, normed)` —
+    /// halves the per-pair dispatch cost (one launch instead of two).
+    pub(crate) fn launch_rmsnorm_add(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void, n: u32)
+        -> Result<(), String>
+    {
+        let f = self.m_rmsnorm_add.function("rmsnorm_add_f32")?;
+        let block: u32 = 512;
         let mut xa=x; let mut wa=w; let mut ya=y; let mut na=n; let mut ea=self.rms_eps;
         let mut args: [*mut c_void; 5] = [
             &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
@@ -2953,12 +2977,11 @@ impl GpuGemma4 {
                             attn_kv.v.raw_ptr(), attn_kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
                             n_kv as u32, head_dim as u32, window)?;
         self.prof_lap("a_kernel");
-        // Output projection, post-norm, residual.
+        // Output projection, fused post-norm + residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
                            self.hidden_b.raw_ptr())?;
-        self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_attn_norm.raw_ptr(),
-                            self.normed.raw_ptr(), h)?;
-        self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+        self.launch_rmsnorm_add(self.hidden_b.raw_ptr(), b.post_attn_norm.raw_ptr(),
+                                self.hidden_a.raw_ptr(), h)?;
         self.prof_lap("a_out_proj");
 
         // --- FFN --- (dense GeGLU, or the dual shared-MLP + MoE branch)
@@ -2971,9 +2994,8 @@ impl GpuGemma4 {
                 self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                                   self.ffn_a.raw_ptr(), self.ffn as u32)?;
                 self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
-                self.launch_rmsnorm(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
-                                    self.normed.raw_ptr(), h)?;
-                self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+                self.launch_rmsnorm_add(self.hidden_b.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                                        self.hidden_a.raw_ptr(), h)?;
             }
             Some(mw) => self.moe_ffn(b, mw)?,
         }
@@ -2991,11 +3013,10 @@ impl GpuGemma4 {
             };
             self.launch_geglu(self.ple_gate.raw_ptr(), slice,
                               self.ple_gate.raw_ptr(), np)?;
-            // project back up, post-norm, residual add.
+            // project back up, fused post-norm + residual add.
             self.launch_matvec(&pb.proj, self.ple_gate.raw_ptr(), self.ple_tmp.raw_ptr())?;
-            self.launch_rmsnorm(self.ple_tmp.raw_ptr(), pb.post_norm.raw_ptr(),
-                                self.normed.raw_ptr(), h)?;
-            self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+            self.launch_rmsnorm_add(self.ple_tmp.raw_ptr(), pb.post_norm.raw_ptr(),
+                                    self.hidden_a.raw_ptr(), h)?;
         }
 
         // Per-layer output scale.
@@ -3062,13 +3083,12 @@ impl GpuGemma4 {
         self.prof_lap("expert_down");
         self.launch_moe_combine(self.expert_outs.raw_ptr(), mw.down_exps_s.raw_ptr(),
                                 self.moe_acc.raw_ptr(), 1)?;
-        // cur_moe = rmsnorm(moe_acc, post_ffw_norm_2); combined = cur_mlp + cur_moe.
-        self.launch_rmsnorm(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
-                            self.normed.raw_ptr(), h)?;
-        self.launch_add(self.cur_mlp.raw_ptr(), self.normed.raw_ptr(), h)?;
-        self.launch_rmsnorm(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
-                            self.normed.raw_ptr(), h)?;
-        self.launch_add(self.hidden_a.raw_ptr(), self.normed.raw_ptr(), h)?;
+        // Fused: cur_mlp += rmsnorm(moe_acc) * post_ffw_norm_2
+        self.launch_rmsnorm_add(self.moe_acc.raw_ptr(), mw.post_ffw_norm_2.raw_ptr(),
+                                self.cur_mlp.raw_ptr(), h)?;
+        // Fused: hidden_a += rmsnorm(cur_mlp) * post_ffw_norm
+        self.launch_rmsnorm_add(self.cur_mlp.raw_ptr(), b.post_ffw_norm.raw_ptr(),
+                                self.hidden_a.raw_ptr(), h)?;
         self.prof_lap("moe_combine");
         Ok(())
     }
