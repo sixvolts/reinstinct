@@ -419,8 +419,10 @@ impl ServerModel {
                 // are captured lazily per K and cached across requests.
                 let d = drafter.as_mut().unwrap();
                 let k = req.speculative_k.unwrap_or(3).clamp(1, 4);
-                let prefill_logits = gpu.prefill_forward(&prompt[..prompt.len() - 1], state)?;
-                let _ = prefill_logits;  // discarded — forward_token below recomputes
+                // Prefill all but the last token — its logits aren't
+                // useful; the verify path immediately re-forwards it
+                // through `forward_token` to seed the chain.
+                let _ = gpu.prefill_forward(&prompt[..prompt.len() - 1], state)?;
                 let verify_logits = gpu.forward_token(*prompt.last().unwrap(), state)?;
                 if d.verify_graphs[k].is_none() && !gpu.is_moe() {
                     d.verify_graphs[k] = Some(gpu.capture_verify_graph(state, k)?);

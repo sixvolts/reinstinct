@@ -28,6 +28,7 @@ impl Json {
     pub fn as_bool(&self) -> Option<bool> {
         match self { Json::Bool(b) => Some(*b), _ => None }
     }
+    #[allow(dead_code)]   // public API symmetry with as_f64/as_bool/as_str
     pub fn as_array(&self) -> Option<&[Json]> {
         match self { Json::Arr(a) => Some(a.as_slice()), _ => None }
     }

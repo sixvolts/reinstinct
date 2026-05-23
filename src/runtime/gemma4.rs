@@ -628,11 +628,9 @@ pub struct GpuGemma4 {
     moe_logits:  DeviceBuf<f32>,   // [MOE_PREFILL_CHUNK, n_expert]
     moe_ids:     DeviceBuf<i32>,   // [MOE_PREFILL_CHUNK, n_expert_used]
     moe_weights: DeviceBuf<f32>,   // [MOE_PREFILL_CHUNK, n_expert_used]
-    moe_in:      DeviceBuf<f32>,   // [hidden] — routed-expert input
     moe_acc:     DeviceBuf<f32>,   // [hidden] — expert mixture accumulator
     cur_mlp:     DeviceBuf<f32>,   // [hidden] — shared-MLP result, kept live
     expert_gu:   DeviceBuf<f32>,   // [n_used · 2·expert_ff] — fused gate_up
-    expert_act:  DeviceBuf<f32>,   // [n_used · expert_ff]    — geglu output
     expert_outs: DeviceBuf<f32>,   // [n_used · hidden]       — per-expert down
     xq8_experts: DeviceBuf<u8>,    // batched int8 activation for the 8 experts
 
@@ -957,11 +955,9 @@ impl GpuGemma4 {
             moe_logits:  DeviceBuf::new(MOE_PREFILL_CHUNK * (cfg.expert_count as usize).max(1))?,
             moe_ids:     DeviceBuf::new(MOE_PREFILL_CHUNK * (cfg.expert_used_count as usize).max(1))?,
             moe_weights: DeviceBuf::new(MOE_PREFILL_CHUNK * (cfg.expert_used_count as usize).max(1))?,
-            moe_in:      DeviceBuf::new(hidden)?,
             moe_acc:     DeviceBuf::new(hidden)?,
             cur_mlp:     DeviceBuf::new(hidden)?,
             expert_gu:   DeviceBuf::new(n_used_a * 2 * expert_ff_a)?,
-            expert_act:  DeviceBuf::new(n_used_a * expert_ff_a)?,
             expert_outs: DeviceBuf::new(n_used_a * hidden)?,
             xq8_experts: DeviceBuf::<u8>::new(n_used_a * (expert_ff_a / 32).max(1) * 40)?,
             xq8,
