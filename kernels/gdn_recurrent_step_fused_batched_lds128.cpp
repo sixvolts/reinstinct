@@ -111,23 +111,29 @@ void gdn_recurrent_step_fused_batched_lds128_f32(
         // state slice. Sequential kk within this row → contiguous LDS.
         float* lds_vv = state_lds + (size_t)lvv * HEAD_DIM;
 
-        // Phase 1 — decay each kk + accumulate stateᵀ·k. All in LDS.
+        // Phase 1 — decay each kk + accumulate stateᵀ·k. Keep the
+        // decayed value in a register; only one LDS write per kk in
+        // phase 2 (halves the LDS write traffic vs writing twice).
+        float s_arr[QUARTER];
         float pkv = 0.0f;
         #pragma unroll
-        for (int kk = kk0; kk < kk1; kk++) {
-            float s = lds_vv[kk] * dec;
-            lds_vv[kk] = s;
+        for (int local = 0; local < QUARTER; local++) {
+            const int kk = kk0 + local;
+            const float s = lds_vv[kk] * dec;
+            s_arr[local] = s;
             pkv += s * k_lds[kk];
         }
         pkv += __shfl_xor(pkv, 16);
         const float kv = pkv + __shfl_xor(pkv, 32);
         const float delta = (vval - kv) * bet;
 
-        // Phase 2 — rank-1 update + stateᵀ·q. All in LDS.
+        // Phase 2 — rank-1 update from the register-held decayed state,
+        // accumulate stateᵀ·q, write the updated state to LDS once.
         float pout = 0.0f;
         #pragma unroll
-        for (int kk = kk0; kk < kk1; kk++) {
-            float s = lds_vv[kk] + k_lds[kk] * delta;
+        for (int local = 0; local < QUARTER; local++) {
+            const int kk = kk0 + local;
+            const float s = s_arr[local] + k_lds[kk] * delta;
             lds_vv[kk] = s;
             pout += s * q_lds[kk];
         }
