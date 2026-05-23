@@ -102,7 +102,13 @@ pub fn sample_temp_topk(logits: &[f32], temperature: f32, k: usize, rng: &mut Rn
     let mut cum = 0.0_f32;
     for (idx, w) in &top {
         cum += *w;
-        if r <= cum { return *idx as u32; }
+        // Strict inequality so an underflowed (w == 0) entry can't
+        // pre-empt the real winner when r itself is at the boundary.
+        // This matters for collapsed-softmax cases where 9 of 10 top-k
+        // weights underflow to 0 and the one survivor at the END is
+        // the actual winner: with `r <= cum`, r=0 would return the
+        // first zero-weight entry instead of waiting for the survivor.
+        if r < cum { return *idx as u32; }
     }
     // Fall through (numerical edge): return the most-probable.
     top.last().expect("top non-empty above").0 as u32
@@ -200,6 +206,71 @@ mod tests {
         let mut b = Rng::new(7);
         for _ in 0..100 {
             assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn argmax_skips_nan() {
+        // NaN entries shouldn't poison the comparison — the max of the
+        // finite entries wins.
+        let logits = vec![1.0, f32::NAN, 3.0, f32::NAN, 2.0];
+        assert_eq!(argmax(&logits), 2);
+    }
+
+    #[test]
+    fn argmax_skips_inf() {
+        // Positive infinity dominates everything (still finite-checked
+        // via is_finite, which excludes +inf), so the finite max wins.
+        let logits = vec![1.0, f32::INFINITY, 3.0, 2.0];
+        assert_eq!(argmax(&logits), 2);
+    }
+
+    #[test]
+    fn argmax_all_nan_returns_first() {
+        // Degenerate input — every entry is NaN. argmax falls through
+        // to the initial `best = 0` so we return a deterministic
+        // sentinel instead of panicking.
+        let logits = vec![f32::NAN; 5];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    #[test]
+    fn sample_topk_handles_nan_logits() {
+        // A few NaNs in the vocab shouldn't crash sampling. The
+        // surviving finite entries should drive the distribution.
+        let mut logits = vec![f32::NAN; 100];
+        logits[42] = 10.0;
+        logits[77] = 2.0;
+        let mut rng = Rng::new(0xDEADBEEF);
+        for _ in 0..50 {
+            let t = sample_temp_topk(&logits, 1.0, 5, &mut rng);
+            assert!(t == 42 || t == 77,
+                "sampled garbage index {t}; should have been 42 or 77");
+        }
+    }
+
+    #[test]
+    fn sample_topk_all_nan_returns_deterministic() {
+        // All NaN → falls back to argmax → deterministic index. The
+        // request will produce garbage output but at least the worker
+        // stays alive (serve hardening rationale).
+        let logits = vec![f32::NAN; 10];
+        let mut rng = Rng::new(1);
+        let t = sample_temp_topk(&logits, 1.0, 5, &mut rng);
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn sample_topk_handles_collapsed_softmax() {
+        // Logit spread so wide that all but one weight underflows to 0
+        // at the chosen temperature. Should return the dominant token
+        // instead of the fallthrough panic that the pre-hardened code
+        // would hit via `top.last().unwrap()` on an empty cum-sum.
+        let mut logits = vec![-1000.0_f32; 50];
+        logits[7] = 100.0;
+        let mut rng = Rng::new(1);
+        for _ in 0..10 {
+            assert_eq!(sample_temp_topk(&logits, 0.01, 10, &mut rng), 7);
         }
     }
 }
