@@ -393,11 +393,29 @@ instead of the flat `text` field on text_completion. Same `usage` block.
 |---|---|---|---|
 | `prompt` / `messages` | string / array | — | One required, depending on endpoint. |
 | `max_tokens` | int | 256 | Decode-token budget. Clamped to `[1, 4096]`. |
-| `temperature` | float | 0.8 | `0` ⇒ greedy. |
-| `top_k` | int | 40 | `0` ⇒ no filter. |
+| `temperature` | float | 0.8 | `0` ⇒ greedy (skip the sampler chain). |
+| `top_k` | int | 40 | Keep the K largest logits. `0` ⇒ no filter. |
+| `top_p` | float | 1.0 | Nucleus filter: keep smallest prefix covering P of the softmax mass. `1.0` ⇒ no filter. |
+| `min_p` | float | 0.0 | Drop logits below `min_p × max_prob`. `0.0` ⇒ no filter. Modern community-favored alternative to top_p. |
+| `repetition_penalty` | float | 1.0 | Divide positive logits by penalty (multiply negative) for tokens in the recent `repetition_window`. `1.0` ⇒ no penalty. |
+| `repetition_window` | int | 64 | Tokens of decode history considered by repetition penalty. |
+| `frequency_penalty` | float | 0.0 | OpenAI-style: `logits[t] -= count(t) × frequency_penalty`. |
+| `presence_penalty` | float | 0.0 | OpenAI-style: `logits[t] -= (count(t) > 0) × presence_penalty`. |
+| `mirostat` | int | — | Set to `2` to enable Mirostat v2 adaptive sampling (replaces top_k/top_p/temperature). |
+| `mirostat_tau` | float | 5.0 | Mirostat target surprise (nat-log). Only used with `mirostat: 2`. |
+| `mirostat_eta` | float | 0.1 | Mirostat learning rate. Only used with `mirostat: 2`. |
 | `seed` | int | 0 | PRNG seed. |
+| `request_timeout_seconds` | float | 120 | Wall-clock cap on the whole generation. On hit, returns with `finish_reason: length`. Clamped to `[0.1, 600]`. |
 | `use_speculative` | bool | drafter-present | Opt in/out of MTP spec-decode per request. `true` errors with 400 if no drafter was loaded (see `--big-drafter`). |
 | `speculative_k` | int | 3 | K override for spec-decode. Clamped to `[1, 4]`. Ignored when spec-decode is off. |
+
+Sampler chain order (matches llama.cpp + OpenAI):
+
+```
+penalties → top-k → top-p → min-p → temperature → inverse-CDF draw
+```
+
+Mirostat v2 (when `mirostat: 2`) replaces the top-k/top-p/temperature stages with adaptive entropy control. Penalties still run.
 
 `use_speculative` is the per-turn knob for chat systems that classify
 incoming turns: leave it default-on for technical / agentic /
