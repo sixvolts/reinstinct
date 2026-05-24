@@ -17,7 +17,7 @@ mod json;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,67 @@ use json::Json;
 
 use crate::gguf::GgufFile;
 use crate::runtime::KernelCache;
+
+/// Server-wide counters, shared between worker + acceptors. Atomic
+/// so the `/metrics` endpoint can read them without locking.
+#[derive(Default)]
+struct Metrics {
+    requests_total:    AtomicU64,    // every HTTP request reaching a route
+    requests_ok:       AtomicU64,    // 2xx replies
+    requests_4xx:      AtomicU64,
+    requests_5xx:      AtomicU64,
+    prompt_tokens:     AtomicU64,    // total across all completed requests
+    completion_tokens: AtomicU64,
+    decode_us_total:   AtomicU64,    // sum of decode wall times (microseconds)
+    requests_eos:      AtomicU64,    // finish_reason == stop
+    requests_length:   AtomicU64,    // finish_reason == length
+    panics_recovered:  AtomicU64,    // catch_unwind hits in the worker
+    start_unix:        AtomicU64,    // server up-time anchor
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let m = Self::default();
+        m.start_unix.store(unix_now(), Ordering::Relaxed);
+        m
+    }
+
+    /// Prometheus-style text exposition. Cheap — read each counter once.
+    fn render_prometheus(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(2048);
+        let metric = |s: &mut String, name: &str, help: &str, value: u64| {
+            let _ = writeln!(s, "# HELP reinstinct_{name} {help}");
+            let _ = writeln!(s, "# TYPE reinstinct_{name} counter");
+            let _ = writeln!(s, "reinstinct_{name} {value}");
+        };
+        metric(&mut s, "requests_total", "total HTTP requests reaching a route",
+               self.requests_total.load(Ordering::Relaxed));
+        metric(&mut s, "requests_ok_total", "requests with a 2xx reply",
+               self.requests_ok.load(Ordering::Relaxed));
+        metric(&mut s, "requests_4xx_total", "requests with a 4xx reply",
+               self.requests_4xx.load(Ordering::Relaxed));
+        metric(&mut s, "requests_5xx_total", "requests with a 5xx reply",
+               self.requests_5xx.load(Ordering::Relaxed));
+        metric(&mut s, "prompt_tokens_total", "sum of prompt_tokens across completed requests",
+               self.prompt_tokens.load(Ordering::Relaxed));
+        metric(&mut s, "completion_tokens_total", "sum of completion_tokens",
+               self.completion_tokens.load(Ordering::Relaxed));
+        metric(&mut s, "decode_us_total", "sum of decode wall time (microseconds)",
+               self.decode_us_total.load(Ordering::Relaxed));
+        metric(&mut s, "requests_eos_total", "requests that ended at EOS",
+               self.requests_eos.load(Ordering::Relaxed));
+        metric(&mut s, "requests_length_total", "requests stopped by max_tokens or timeout",
+               self.requests_length.load(Ordering::Relaxed));
+        metric(&mut s, "panics_recovered_total", "panics caught by the worker's catch_unwind",
+               self.panics_recovered.load(Ordering::Relaxed));
+        let _ = writeln!(s, "# HELP reinstinct_start_unix_seconds server start time");
+        let _ = writeln!(s, "# TYPE reinstinct_start_unix_seconds gauge");
+        let _ = writeln!(s, "reinstinct_start_unix_seconds {}",
+                         self.start_unix.load(Ordering::Relaxed));
+        s
+    }
+}
 
 /// Which resident model a request targets.
 #[derive(Clone, Copy, PartialEq)]
@@ -71,6 +132,8 @@ impl GenReq {
 
 /// A unit of work handed from a connection thread to the GPU worker.
 struct Job {
+    /// Monotonic id for log + metric correlation.
+    request_id: u64,
     target: Target,
     /// `Err` carries an already-formed client error (bad request / wrong route).
     req: Result<GenReq, (u16, &'static str, String)>,
@@ -525,7 +588,7 @@ impl ServerModel {
 // --- the GPU worker ----------------------------------------------------
 
 fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: PathBuf, max_seq: usize)
+          small: PathBuf, max_seq: usize, metrics: Arc<Metrics>)
 {
     let setup = (|| -> Result<(KernelCache, ServerModel, ServerModel), String> {
         crate::hip::Device::set(0)?;
@@ -577,16 +640,26 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
 
     for job in rx {
         let reply = match job.req {
-            Err((status, status_text, msg)) => HttpReply {
-                status, status_text, body: error_body(&msg, "invalid_request_error"),
-            },
+            Err((status, status_text, msg)) => {
+                eprintln!("[serve] req={} target={} status={} reason={:?} msg={}",
+                          job.request_id, job.target.label(), status, status_text, msg);
+                metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
+                HttpReply {
+                    status, status_text, body: error_body(&msg, "invalid_request_error"),
+                }
+            }
             Ok(req) => match job.target {
-                Target::Embed => HttpReply {
-                    status: 503, status_text: "Service Unavailable",
-                    body: error_body(
-                        "embedder not yet available — nomic-bert encoder is a follow-up",
-                        "server_error"),
-                },
+                Target::Embed => {
+                    eprintln!("[serve] req={} target=embed status=503 reason=not-yet-available",
+                              job.request_id);
+                    metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+                    HttpReply {
+                        status: 503, status_text: "Service Unavailable",
+                        body: error_body(
+                            "embedder not yet available — nomic-bert encoder is a follow-up",
+                            "server_error"),
+                    }
+                }
                 Target::Big | Target::Small => {
                     let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
                     let t = std::time::Instant::now();
@@ -595,18 +668,27 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     // launch, a slipped unwrap, or a numerical blowup
                     // shouldn't kill the worker thread (which would 503
                     // every subsequent request). On panic we 500 the
-                    // current request, log, and continue. The model's
-                    // state may be partially mutated; the next request's
-                    // `state.reset()` (called at the start of generate())
-                    // should bring it back to a clean slate.
+                    // current request, log, and continue.
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req)));
                     match result {
                         Ok(Ok((text, n_p, n_c, eos))) => {
-                            eprintln!("[serve] {} {}: {} prompt + {} gen tok in {:.2}s",
-                                job.target.label(),
+                            let wall_us = t.elapsed().as_micros() as u64;
+                            metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
+                            metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
+                            metrics.completion_tokens.fetch_add(n_c as u64, Ordering::Relaxed);
+                            metrics.decode_us_total.fetch_add(wall_us, Ordering::Relaxed);
+                            if eos { metrics.requests_eos.fetch_add(1, Ordering::Relaxed); }
+                            else   { metrics.requests_length.fetch_add(1, Ordering::Relaxed); }
+                            let tok_per_s = if n_c > 0 && wall_us > 0 {
+                                n_c as f64 * 1_000_000.0 / wall_us as f64
+                            } else { 0.0 };
+                            eprintln!("[serve] req={} target={} type={} status=200 \
+                                       n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={}",
+                                job.request_id, job.target.label(),
                                 if is_chat { "chat" } else { "completion" },
-                                n_p, n_c, t.elapsed().as_secs_f32());
+                                n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
+                                if eos { "stop" } else { "length" });
                             let body = if is_chat {
                                 chat_completion_response(model.name(), &text, n_p, n_c, eos)
                             } else {
@@ -614,10 +696,15 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             };
                             HttpReply { status: 200, status_text: "OK", body }
                         }
-                        Ok(Err(e)) => HttpReply {
-                            status: 400, status_text: "Bad Request",
-                            body: error_body(&e, "invalid_request_error"),
-                        },
+                        Ok(Err(e)) => {
+                            eprintln!("[serve] req={} target={} status=400 reason={:?}",
+                                      job.request_id, job.target.label(), e);
+                            metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
+                            HttpReply {
+                                status: 400, status_text: "Bad Request",
+                                body: error_body(&e, "invalid_request_error"),
+                            }
+                        }
                         Err(payload) => {
                             let msg = if let Some(s) = payload.downcast_ref::<&str>() {
                                 (*s).to_string()
@@ -626,8 +713,10 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             } else {
                                 "unknown panic in generate()".to_string()
                             };
-                            eprintln!("[serve] PANIC during {} generate (continuing): {}",
-                                      job.target.label(), msg);
+                            eprintln!("[serve] req={} target={} status=500 PANIC={}",
+                                      job.request_id, job.target.label(), msg);
+                            metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+                            metrics.panics_recovered.fetch_add(1, Ordering::Relaxed);
                             HttpReply {
                                 status: 500, status_text: "Internal Server Error",
                                 body: error_body(
@@ -645,20 +734,50 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
 
 // --- connection handling ----------------------------------------------
 
-fn handle_conn(mut stream: std::net::TcpStream, target: Target, tx: mpsc::Sender<Job>) {
+fn handle_conn(mut stream: std::net::TcpStream, target: Target,
+               tx: mpsc::Sender<Job>, metrics: Arc<Metrics>)
+{
+    let request_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
     let request = match http::read_request(&stream) {
         Ok(r) => r,
         Err(e) => {
+            metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[serve] req={request_id} target={} status=400 reason=malformed-http err={e}",
+                      target.label());
             let _ = http::write_response(&mut stream, 400, "Bad Request",
                 &error_body(&format!("malformed HTTP request: {e}"), "invalid_request_error"));
             return;
         }
     };
 
+    // Plain GET /metrics on any port — serves Prometheus text. Cheap;
+    // no GPU work. Operator point-of-entry for serving observability.
+    let path = request.path.trim_end_matches('/');
+    let is_get = request.method.eq_ignore_ascii_case("GET");
+    if is_get && path.ends_with("/metrics") {
+        let body = metrics.render_prometheus();
+        // Direct write — bypass JSON error_body shape.
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body);
+        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        return;
+    }
+    // Plain GET /healthz — tiny liveness check.
+    if is_get && path.ends_with("/healthz") {
+        let body = "ok\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body);
+        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        return;
+    }
+
     // Route. LLM ports take /v1/completions (raw) or /v1/chat/completions
     // (messages, chat template applied server-side). Embed port takes
     // /v1/embeddings (answers 503 until the encoder lands).
-    let path = request.path.trim_end_matches('/');
     let is_post = request.method.eq_ignore_ascii_case("POST");
     let route = if target == Target::Embed {
         if is_post && path.ends_with("/v1/embeddings") { Some("embed") } else { None }
@@ -673,7 +792,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target, tx: mpsc::Sender
     let req = match route {
         None => Err((404u16, "Not Found",
             format!("no route for {} {} (expected POST /v1/completions or \
-                     /v1/chat/completions on this port)",
+                     /v1/chat/completions on this port, or GET /metrics / /healthz)",
                     request.method, request.path))),
         Some("embed") => {
             // Worker answers 503; keep the shape.
@@ -692,19 +811,23 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target, tx: mpsc::Sender
     };
 
     let (rtx, rrx) = mpsc::channel();
-    if tx.send(Job { target, req, reply: rtx }).is_err() {
+    if tx.send(Job { request_id, target, req, reply: rtx }).is_err() {
+        metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
         let _ = http::write_response(&mut stream, 503, "Service Unavailable",
             &error_body("server worker is gone", "server_error"));
         return;
     }
-    let reply = rrx.recv().unwrap_or(HttpReply {
-        status: 500, status_text: "Internal Server Error",
-        body: error_body("worker dropped the request", "server_error"),
+    let reply = rrx.recv().unwrap_or_else(|_| {
+        metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+        HttpReply {
+            status: 500, status_text: "Internal Server Error",
+            body: error_body("worker dropped the request", "server_error"),
+        }
     });
     let _ = http::write_response(&mut stream, reply.status, reply.status_text, &reply.body);
 }
 
-fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>) {
+fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>, metrics: Arc<Metrics>) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => { eprintln!("[serve] FATAL: cannot bind port {port}: {e}"); return; }
@@ -714,7 +837,8 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>) {
         match conn {
             Ok(stream) => {
                 let tx = tx.clone();
-                thread::spawn(move || handle_conn(stream, target, tx));
+                let metrics = Arc::clone(&metrics);
+                thread::spawn(move || handle_conn(stream, target, tx, metrics));
             }
             Err(e) => eprintln!("[serve] accept error on :{port}: {e}"),
         }
@@ -765,12 +889,14 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
     }
 
     let (tx, rx) = mpsc::channel::<Job>();
+    let metrics = Arc::new(Metrics::new());
 
     let worker_handle = {
         let (big, big_drafter, small) =
             (big.clone(), big_drafter.clone(), small.clone());
+        let metrics = Arc::clone(&metrics);
         thread::Builder::new().name("gpu-worker".into())
-            .spawn(move || worker(rx, big, big_drafter, small, max_seq))
+            .spawn(move || worker(rx, big, big_drafter, small, max_seq, metrics))
             .map_err(|e| e.to_string())?
     };
 
@@ -778,8 +904,9 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
                            (small_port, Target::Small),
                            (embed_port, Target::Embed)] {
         let tx = tx.clone();
+        let metrics = Arc::clone(&metrics);
         thread::Builder::new().name(format!("accept-{}", target.label()))
-            .spawn(move || acceptor(port, target, tx))
+            .spawn(move || acceptor(port, target, tx, metrics))
             .map_err(|e| e.to_string())?;
     }
     drop(tx);   // only the acceptors hold senders now
