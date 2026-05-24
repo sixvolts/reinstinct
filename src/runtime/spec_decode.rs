@@ -50,6 +50,14 @@ impl SpecStats {
 /// `last_tok` is the most recently committed token (== prompt's last
 /// on the first round, == previously-accepted on later rounds).
 #[allow(clippy::too_many_arguments)]
+/// `p_min`: drafter early-stop threshold. After each AR draft step the
+/// drafted token's probability under the drafter's softmax is computed;
+/// if it falls below `p_min`, the K-round terminates early and the
+/// verify batch only contains the high-confidence prefix. `0.0`
+/// disables (default — always draft K). Ported from llama.cpp
+/// common/speculative.cpp's `params.p_min`. Lets K=4 default safely:
+/// creative prompts terminate the draft early instead of paying for
+/// 4 verify positions at ~30% accept.
 pub fn spec_decode_generate(
     target: &GpuGemma4,
     drafter: &GpuGemma4Assistant,
@@ -63,6 +71,7 @@ pub fn spec_decode_generate(
     k: usize,
     temperature: f32,
     seed: u64,
+    p_min: f32,
 ) -> Result<(Vec<u32>, SpecStats), String> {
     let mut generated: Vec<u32> = Vec::new();
     let mut stats = SpecStats::default();
@@ -82,9 +91,48 @@ pub fn spec_decode_generate(
             let logits_d = drafter.forward_step(target, state, prev, pos_const)?;
             let d = if sampling { sample_from_logits(&logits_d, temperature, &mut rng) }
                     else        { argmax(&logits_d) };
+            // `p_min` early stop: if the drafter isn't confident at the
+            // chosen token, bail before the rest of the K-round — the
+            // verify cost of the trailing low-confidence positions
+            // usually exceeds the few they'd add via lucky acceptance.
+            if p_min > 0.0 {
+                let max_logit = logits_d.iter().copied()
+                    .filter(|v| v.is_finite())
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if max_logit.is_finite() {
+                    let denom: f32 = logits_d.iter()
+                        .map(|&v| if v.is_finite() { (v - max_logit).exp() } else { 0.0 })
+                        .sum();
+                    let pick_logit = logits_d.get(d as usize).copied().unwrap_or(f32::NEG_INFINITY);
+                    let pick_p = if denom > 0.0 && pick_logit.is_finite() {
+                        (pick_logit - max_logit).exp() / denom
+                    } else { 0.0 };
+                    if pick_p < p_min {
+                        // Don't push this draft — its low confidence
+                        // means the verify pass would almost certainly
+                        // reject it. Cap the round at what we have.
+                        drafter_logits_arr.push(logits_d);
+                        drafted.push(d);
+                        break;
+                    }
+                }
+            }
             drafted.push(d);
             drafter_logits_arr.push(logits_d);
             prev = d;
+        }
+        if drafted.is_empty() {
+            // p_min triggered on the FIRST draft step — fall back to a
+            // single forward to avoid an empty-verify round.
+            let next = target.forward_token(last_tok, state)?;
+            let pick = if sampling { sample_from_logits(&next, temperature, &mut rng) }
+                       else        { argmax(&next) };
+            generated.push(pick);
+            last_tok = pick;
+            verify_logits = target.forward_token(pick, state)?;
+            stats.hit_eos = pick == eos;
+            if stats.hit_eos { break; }
+            continue;
         }
 
         // --- BATCHED VERIFY: target processes K candidates in one

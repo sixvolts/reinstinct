@@ -1844,6 +1844,10 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     // "input_ids[:, -1:]"), and h_prev gets refreshed per round inside
     // the loop via `drafter.set_h_prev_from_target(target)`.
     let t_gen = std::time::Instant::now();
+    // p_min override via env (CLI testing knob); default 0 = disabled
+    // matches the historical behaviour.
+    let p_min_cli = std::env::var("REINSTINCT_DRAFTER_P_MIN").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
     let (generated, stats) = reinstinct_engine::runtime::spec_decode::spec_decode_generate(
         &gm, &drafter, &mut state,
         verify_graph.as_ref(), k,
@@ -1851,6 +1855,7 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         *prompt.last().unwrap(),
         cfg_eos,
         steps, k, temperature, seed,
+        p_min_cli,
     ).map_err(anyhow::Error::msg)?;
 
     let gen_secs = t_gen.elapsed().as_secs_f64();

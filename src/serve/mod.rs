@@ -121,6 +121,12 @@ struct GenReq {
     /// Per-request K override for spec-decode. `None` ⇒ server default
     /// (currently 3). Ignored when spec-decode is off.
     speculative_k: Option<usize>,
+    /// Drafter confidence early-stop threshold. After each AR draft step
+    /// the drafter's chosen-token probability gets checked; if below
+    /// `speculative_p_min`, the K-round terminates early. `0.0` (default)
+    /// disables. Lets K=4 default safely (creative prompts truncate the
+    /// draft instead of paying for 4 verify positions at 30% accept).
+    speculative_p_min: f32,
     /// Wall-clock cap on the generation. If decode runs past it, the
     /// request stops early with `finish_reason: "length"`. None disables.
     request_timeout: Option<std::time::Duration>,
@@ -174,7 +180,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Returns the parsed (GenReq fields). Accepts every OpenAI sampler
 /// knob plus a few extensions (min_p, repetition_penalty, mirostat).
 fn parse_common_fields(j: &Json)
-    -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>,
+    -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
         Option<std::time::Duration>, bool)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
@@ -212,11 +218,13 @@ fn parse_common_fields(j: &Json)
     let use_speculative = j.get("use_speculative").and_then(Json::as_bool);
     let speculative_k = j.get("speculative_k").and_then(Json::as_f64)
         .map(|n| (n as usize).clamp(1, 4));
+    let speculative_p_min = j.get("speculative_p_min").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(0.0).clamp(0.0, 1.0);
     let request_timeout = j.get("request_timeout_seconds").and_then(Json::as_f64)
         .map(|n| std::time::Duration::from_secs_f64(n.max(0.1).min(600.0)))
         .or(Some(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)));
     let stream = j.get("stream").and_then(Json::as_bool).unwrap_or(false);
-    (max_tokens, sp, use_speculative, speculative_k, request_timeout, stream)
+    (max_tokens, sp, use_speculative, speculative_k, speculative_p_min, request_timeout, stream)
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
@@ -271,10 +279,11 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let prompt = j.get("prompt").and_then(Json::as_str)
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
-    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout, stream)
-        = parse_common_fields(&j);
+    let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
+         request_timeout, stream) = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
-                use_speculative, speculative_k, request_timeout, stream })
+                use_speculative, speculative_k, speculative_p_min,
+                request_timeout, stream })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -308,10 +317,11 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         };
         messages.push(ChatMessage { role, content: content.to_string() });
     }
-    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout, stream)
-        = parse_common_fields(&j);
+    let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
+         request_timeout, stream) = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
-                use_speculative, speculative_k, request_timeout, stream })
+                use_speculative, speculative_k, speculative_p_min,
+                request_timeout, stream })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -669,6 +679,7 @@ impl ServerModel {
                     *prompt.last().unwrap(),
                     *eos,
                     req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
+                    req.speculative_p_min,
                 )?;
                 eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%)",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
@@ -945,6 +956,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 sampler: crate::sampling::SamplerParams::default(),
                 use_speculative: None,
                 speculative_k: None,
+                speculative_p_min: 0.0,
                 request_timeout: None,
                 stream: false,
             })
