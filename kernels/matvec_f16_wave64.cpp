@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 extern "C" __global__
 void matvec_f16_wave64_f32(const uint16_t* __restrict__ w_bits,
@@ -22,12 +23,7 @@ void matvec_f16_wave64_f32(const uint16_t* __restrict__ w_bits,
         acc += __half2float(h) * x[i];
     }
 
-    acc += __shfl_xor(acc, 32);
-    acc += __shfl_xor(acc, 16);
-    acc += __shfl_xor(acc,  8);
-    acc += __shfl_xor(acc,  4);
-    acc += __shfl_xor(acc,  2);
-    acc += __shfl_xor(acc,  1);
+    acc = wave64_reduce_add_f32(acc);
 
     if (lane == 0) y[row] = acc;
 }

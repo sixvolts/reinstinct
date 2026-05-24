@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 struct __attribute__((packed)) BlockIQ4_XS {
     uint16_t d;
@@ -60,12 +61,7 @@ void matvec_iq4_xs_wave64_f32(const BlockIQ4_XS* __restrict__ w_blocks,
         acc += dl * partial;
     }
 
-    acc += __shfl_xor(acc, 32);
-    acc += __shfl_xor(acc, 16);
-    acc += __shfl_xor(acc,  8);
-    acc += __shfl_xor(acc,  4);
-    acc += __shfl_xor(acc,  2);
-    acc += __shfl_xor(acc,  1);
+    acc = wave64_reduce_add_f32(acc);
 
     if (lane == 0) y[row] = acc;
 }

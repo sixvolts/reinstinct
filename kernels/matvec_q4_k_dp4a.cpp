@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 #define ROWS 2
 
@@ -103,12 +104,7 @@ void matvec_q4_k_dp4a_f32(const BlockQ4_K* __restrict__ w_blocks,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) {
         float a = acc[r];
-        a += __shfl_xor(a, 32);
-        a += __shfl_xor(a, 16);
-        a += __shfl_xor(a,  8);
-        a += __shfl_xor(a,  4);
-        a += __shfl_xor(a,  2);
-        a += __shfl_xor(a,  1);
+        a = wave64_reduce_add_f32(a);
         if (lane == 0 && (row0 + r) < (int)out_dim) y[row0 + r] = a;
     }
 }

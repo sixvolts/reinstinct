@@ -8,6 +8,7 @@
 // waves reduce through a 4-element LDS slot.
 
 #include <hip/hip_runtime.h>
+#include "gfx906_dpp.h"
 
 extern "C" __global__
 void matvec_f32_b256(const float* __restrict__ w,
@@ -29,12 +30,7 @@ void matvec_f32_b256(const float* __restrict__ w,
         acc += wrow[i] * x[i];
     }
 
-    acc += __shfl_xor(acc, 32);
-    acc += __shfl_xor(acc, 16);
-    acc += __shfl_xor(acc,  8);
-    acc += __shfl_xor(acc,  4);
-    acc += __shfl_xor(acc,  2);
-    acc += __shfl_xor(acc,  1);
+    acc = wave64_reduce_add_f32(acc);
 
     if (lane == 0) wred[wave] = acc;
     __syncthreads();

@@ -22,6 +22,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 #define ROWS         2     // output rows per wavefront
 #define N_ROWS_MAX   4     // K upper bound; the verify-cost-vs-K experiment
@@ -129,12 +130,7 @@ void matvec_q4k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
     for (int r = 0; r < ROWS; r++) {
         for (unsigned int b = 0; b < n_rows; b++) {
             float a = acc[r][b];
-            a += __shfl_xor(a, 32);
-            a += __shfl_xor(a, 16);
-            a += __shfl_xor(a,  8);
-            a += __shfl_xor(a,  4);
-            a += __shfl_xor(a,  2);
-            a += __shfl_xor(a,  1);
+            a = wave64_reduce_add_f32(a);
             if (lane == 0 && (row0 + r) < (int)out_dim) {
                 y[(size_t)b * out_dim + (row0 + r)] = a;
             }

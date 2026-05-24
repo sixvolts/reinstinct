@@ -26,6 +26,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 struct __attribute__((packed)) BlockIQ4_XS {
     uint16_t d;
@@ -46,6 +47,35 @@ __device__ static const int8_t KVALUES_IQ4NL[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
        1,   13,  25,  38,  53,  69,  89, 113,
 };
+
+// Same KVALUES_IQ4NL table, packed for v_perm_b32 (__builtin_amdgcn_perm).
+// v_perm picks 4 bytes from an 8-byte source pair using a per-byte
+// selector. The 16-entry table splits in half: indices 0..7 from
+// the "low" pair, 8..15 from the "high" pair. We dispatch on bit 3
+// of each nibble and mux the two perm results.
+//
+// Pre-packed little-endian: byte 0 of low_lo = -127 (=0x81), byte 1
+// = -104 (=0x98), ..., byte 0 of high_lo = 1 (=0x01), etc.
+__device__ static constexpr uint32_t IQ4NL_LO_LO = 0xBFAD9881u; // -127,-104,-83,-65
+__device__ static constexpr uint32_t IQ4NL_LO_HI = 0xF6EADDCFu; // -49,-35,-22,-10
+__device__ static constexpr uint32_t IQ4NL_HI_LO = 0x26190D01u; //   1, 13, 25, 38
+__device__ static constexpr uint32_t IQ4NL_HI_HI = 0x71594535u; //  53, 69, 89,113
+
+// Look up 4 IQ4NL values in parallel. `nibs` packs 4 nibbles in 4 bytes
+// (each byte holds a 4-bit table index, top nibble of byte must be 0).
+// Returns the 4 looked-up int8 codebook values packed as 4 bytes in a
+// uint32 (same byte order as the input). Two v_perm_b32 + a per-byte
+// mux: half the instructions vs the literal byte-by-byte LDS table
+// lookup the compiler emits for `KVALUES_IQ4NL[byte]`.
+__device__ __forceinline__ uint32_t iq4nl_lookup4(uint32_t nibs)
+{
+    const uint32_t sel  = nibs & 0x07070707u;           // low 3 bits → source-byte index
+    const uint32_t bit3 = (nibs >> 3) & 0x01010101u;
+    const uint32_t hi_mask = bit3 * 0xFFu;              // 0xFF in bytes that want the hi half
+    const uint32_t lo = __builtin_amdgcn_perm(IQ4NL_LO_HI, IQ4NL_LO_LO, sel);
+    const uint32_t hi = __builtin_amdgcn_perm(IQ4NL_HI_HI, IQ4NL_HI_LO, sel);
+    return (lo & ~hi_mask) | (hi & hi_mask);
+}
 
 extern "C" __global__
 void matvec_iq4_xs_dp4a_f32(const BlockIQ4_XS* __restrict__ w_blocks,
@@ -83,35 +113,27 @@ void matvec_iq4_xs_dp4a_f32(const BlockIQ4_XS* __restrict__ w_blocks,
         const uint8_t* qs_base = blk->qs + ib * 16;
 
         int idot = 0;
+        const uint32_t* qs32 = reinterpret_cast<const uint32_t*>(qs_base);
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            // Pack 4 lo nibbles + 4 hi nibbles into 2 int32s via the
-            // KVALUES lookup. Each int8 weight maps via the asymmetric
-            // KVALUES table.
-            uint32_t lo_packed = 0, hi_packed = 0;
-            #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                const int byte = qs_base[j * 4 + b];
-                const uint32_t lo = (uint32_t)(uint8_t)KVALUES_IQ4NL[byte & 0xF];
-                const uint32_t hi = (uint32_t)(uint8_t)KVALUES_IQ4NL[byte >> 4];
-                lo_packed |= lo << (b * 8);
-                hi_packed |= hi << (b * 8);
-            }
+            // Load 4 packed (lo+hi) nibble bytes in one dword, then look
+            // up all 8 nibbles in parallel via v_perm_b32. The dp4a
+            // consumes 4 weights at a time; one lookup feeds the lo
+            // dot, the other feeds the hi dot.
+            const uint32_t bytes    = qs32[j];
+            const uint32_t lo_nibs  = bytes & 0x0F0F0F0Fu;
+            const uint32_t hi_nibs  = (bytes >> 4) & 0x0F0F0F0Fu;
+            const uint32_t lo_packed = iq4nl_lookup4(lo_nibs);
+            const uint32_t hi_packed = iq4nl_lookup4(hi_nibs);
             // xq32[0..3] = quants for weight slot 0..15 in this sub-block;
-            // xq32[4..7] = quants for weight slot 16..31. lo_packed dots
-            // against the first half, hi_packed against the second.
+            // xq32[4..7] = quants for weight slot 16..31.
             idot = __builtin_amdgcn_sdot4((int)lo_packed, xq32[j],     idot, false);
             idot = __builtin_amdgcn_sdot4((int)hi_packed, xq32[j + 4], idot, false);
         }
         acc += dl * dx * (float)idot;
     }
 
-    acc += __shfl_xor(acc, 32);
-    acc += __shfl_xor(acc, 16);
-    acc += __shfl_xor(acc,  8);
-    acc += __shfl_xor(acc,  4);
-    acc += __shfl_xor(acc,  2);
-    acc += __shfl_xor(acc,  1);
+    acc = wave64_reduce_add_f32(acc);
 
     if (lane == 0) y[row] = acc;
 }

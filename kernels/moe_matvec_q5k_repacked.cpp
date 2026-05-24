@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 #define ROWS 2
 
@@ -103,12 +104,7 @@ void moe_matvec_q5k_repacked_f32(const unsigned char* __restrict__ slab,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) {
         float a = acc[r];
-        a += __shfl_xor(a, 32);
-        a += __shfl_xor(a, 16);
-        a += __shfl_xor(a,  8);
-        a += __shfl_xor(a,  4);
-        a += __shfl_xor(a,  2);
-        a += __shfl_xor(a,  1);
+        a = wave64_reduce_add_f32(a);
         if (lane == 0 && (row0 + r) < (int)out_dim) yo[row0 + r] = a;
     }
 }

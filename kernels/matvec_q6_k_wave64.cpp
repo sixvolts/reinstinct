@@ -14,6 +14,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 struct __attribute__((packed)) BlockQ6_K {
     uint8_t  ql[128];
@@ -74,12 +75,7 @@ void matvec_q6_k_wave64_f32(const BlockQ6_K* __restrict__ w_blocks,
     }
 
     // Wave64 reduction via __shfl_xor — every lane ends up with the sum.
-    acc += __shfl_xor(acc, 32);
-    acc += __shfl_xor(acc, 16);
-    acc += __shfl_xor(acc,  8);
-    acc += __shfl_xor(acc,  4);
-    acc += __shfl_xor(acc,  2);
-    acc += __shfl_xor(acc,  1);
+    acc = wave64_reduce_add_f32(acc);
 
     if (lane == 0) y[row] = acc;
 }
