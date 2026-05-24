@@ -408,6 +408,8 @@ instead of the flat `text` field on text_completion. Same `usage` block.
 | `request_timeout_seconds` | float | 120 | Wall-clock cap on the whole generation. On hit, returns with `finish_reason: length`. Clamped to `[0.1, 600]`. |
 | `use_speculative` | bool | drafter-present | Opt in/out of MTP spec-decode per request. `true` errors with 400 if no drafter was loaded (see `--big-drafter`). |
 | `speculative_k` | int | 3 | K override for spec-decode. Clamped to `[1, 4]`. Ignored when spec-decode is off. |
+| `logprobs` | bool / int | — | `true` ⇒ return top-5 logprobs per token. `int N` ⇒ top-N (cap 20). Both response shapes supported (text-completions parallel arrays + chat-completions per-token objects). Streaming embeds the per-token logprobs in each SSE chunk. **Not supported on the MTP spec-decode path** — pass `use_speculative: false` if you need logprobs on a drafter-equipped server. |
+| `top_logprobs` | int | 5 | Chat-completions count companion to `logprobs: true`. Capped at 20. |
 
 Sampler chain order (matches llama.cpp + OpenAI):
 
@@ -451,6 +453,13 @@ end-to-end.
 unconditionally** — see PERFORMANCE → MTP spec-decode. The MoE
 verify path falls back to a sequential decode loop, so the drafter
 cost isn't amortized and MTP loses ~25–50% across all prompt classes.
+
+**Qwen 3.5/3.6 NextN MTP heads (in-GGUF, both dense + MoE)** load and
+run, but lose on MI50 — best measured speedup is 0.59× plain decode
+(qwen-3.6-35B-A3B MoE MTP, math prompt, K=1). The GDN inner-loop
+verify cost amplifies through the recurrent state. The loader path is
+there for future use; for now leave `use_speculative` off on every
+qwen target.
 
 ### Errors
 
