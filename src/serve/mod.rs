@@ -136,6 +136,30 @@ struct GenReq {
     /// the socket, the next Chunk send fails (Receiver dropped) and the
     /// worker stops generating.
     stream: bool,
+    /// OpenAI `logprobs`. `0` ⇒ omit logprobs entirely (the common case;
+    /// no extra cost). `1..=N` ⇒ report the chosen token's logprob plus
+    /// the top-(N-1) alternatives with theirs. Capped at 20 server-side.
+    ///
+    /// Not supported on the MTP spec-decode path — the verify-step
+    /// softmax probabilities aren't currently routed back from
+    /// `spec_decode_generate`. Spec-decode responses always emit
+    /// `logprobs: null`. Disable spec-decode (`use_speculative: false`)
+    /// if you need logprobs.
+    top_logprobs_n: usize,
+}
+
+/// Per-token logprob diagnostic for the OpenAI `logprobs:true` field.
+/// `token` is the decoded UTF-8 byte sequence the token produced
+/// (rendered exactly as a chat client would display it). `top_alts`
+/// is the alternatives list — same shape: each alternative's text
+/// and its log-probability under the post-filter, post-temperature
+/// distribution. Includes the chosen token's own entry so a client
+/// can rank-find it without a separate field.
+#[derive(Clone, Debug)]
+struct TokenLogprob {
+    token: String,
+    logprob: f32,
+    top_alts: Vec<(String, f32)>,
 }
 
 /// Messages from the GPU worker to the connection-handler thread.
@@ -181,7 +205,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// knob plus a few extensions (min_p, repetition_penalty, mirostat).
 fn parse_common_fields(j: &Json)
     -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
-        Option<std::time::Duration>, bool)
+        Option<std::time::Duration>, bool, usize)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
@@ -224,18 +248,40 @@ fn parse_common_fields(j: &Json)
         .map(|n| std::time::Duration::from_secs_f64(n.max(0.1).min(600.0)))
         .or(Some(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)));
     let stream = j.get("stream").and_then(Json::as_bool).unwrap_or(false);
-    (max_tokens, sp, use_speculative, speculative_k, speculative_p_min, request_timeout, stream)
+    // OpenAI `logprobs`: bool turns it on with a default top-N of 5;
+    // an integer specifies the top-N directly. Capped at 20 so a
+    // request can't ask us to sort the full vocab for diagnostics.
+    let top_logprobs_n = match j.get("logprobs") {
+        Some(Json::Bool(true))  => 5,
+        Some(Json::Bool(false)) => 0,
+        Some(Json::Num(n))      => (*n as usize).min(20),
+        // OpenAI chat-completions uses `top_logprobs` for the count,
+        // gated by a separate `logprobs: true`. Accept both shapes.
+        _ => match (j.get("logprobs").and_then(Json::as_bool),
+                    j.get("top_logprobs").and_then(Json::as_f64)) {
+            (Some(true), Some(n)) => (n as usize).min(20),
+            (Some(true), None)    => 5,
+            _ => 0,
+        },
+    };
+    (max_tokens, sp, use_speculative, speculative_k, speculative_p_min,
+     request_timeout, stream, top_logprobs_n)
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
 
 /// One streamed text-completion chunk in OpenAI shape. Each event is a
 /// separate `data: ...` line; the client SDK concatenates `text` fields.
-fn completion_stream_chunk(id: &str, model: &str, text: &str, finish: Option<&str>) -> String {
+fn completion_stream_chunk(id: &str, model: &str, text: &str,
+                            finish: Option<&str>,
+                            logprob: Option<&TokenLogprob>) -> String {
     let mut choice = vec![
         ("text".into(),     Json::Str(text.to_string())),
         ("index".into(),    Json::Num(0.0)),
-        ("logprobs".into(), Json::Null),
+        ("logprobs".into(), match logprob {
+            Some(t) => render_text_logprobs(std::slice::from_ref(t)),
+            None    => Json::Null,
+        }),
     ];
     choice.push(("finish_reason".into(),
                  finish.map(|f| Json::Str(f.to_string())).unwrap_or(Json::Null)));
@@ -250,7 +296,9 @@ fn completion_stream_chunk(id: &str, model: &str, text: &str, finish: Option<&st
 
 /// One streamed chat-completion chunk. First chunk carries `role`;
 /// subsequent chunks carry just `content`; final chunk has `finish_reason`.
-fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta, finish: Option<&str>) -> String {
+fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta,
+                      finish: Option<&str>,
+                      logprob: Option<&TokenLogprob>) -> String {
     let mut d = Vec::with_capacity(2);
     if let Some(r) = delta.role    { d.push(("role".into(),    Json::Str(r.to_string()))); }
     if let Some(c) = delta.content { d.push(("content".into(), Json::Str(c.to_string()))); }
@@ -258,6 +306,10 @@ fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta, finish: Option<&st
         ("index".into(), Json::Num(0.0)),
         ("delta".into(), Json::Obj(d)),
     ];
+    choice.push(("logprobs".into(), match logprob {
+        Some(t) => render_chat_logprobs(std::slice::from_ref(t)),
+        None    => Json::Null,
+    }));
     choice.push(("finish_reason".into(),
                  finish.map(|f| Json::Str(f.to_string())).unwrap_or(Json::Null)));
     Json::Obj(vec![
@@ -271,6 +323,71 @@ fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta, finish: Option<&st
 
 struct ChatDelta<'a> { role: Option<&'a str>, content: Option<&'a str> }
 
+/// Convert a `SampleResult` into a `TokenLogprob` by decoding each token
+/// id through the caller-provided decoder. The "delta" text we surface
+/// for an alternative is the standalone decode of that token id — which
+/// can differ from the multi-token UTF-8 reassembly that the streamed
+/// `content` uses (a single byte-fragment token won't be a valid UTF-8
+/// boundary on its own). Callers display the alternative text raw
+/// since OpenAI clients treat it as opaque-but-displayable.
+///
+/// The decode closure is taken instead of a concrete tokenizer type
+/// because qwen + gemma use different tokenizers (`tokenizer::Tokenizer`
+/// vs `gemma4::GemmaTokenizer`) — both expose a `decode(&[u32]) -> String`
+/// method but neither implements a shared trait.
+fn decode_token_logprob(decode: impl Fn(&[u32]) -> String,
+                        chosen: u32,
+                        res: &crate::sampling::SampleResult) -> TokenLogprob
+{
+    let token = decode(&[chosen]);
+    let logprob = res.logprob.unwrap_or(f32::NEG_INFINITY);
+    let top_alts = res.top_logprobs.iter()
+        .map(|(id, lp)| (decode(&[*id]), *lp))
+        .collect();
+    TokenLogprob { token, logprob, top_alts }
+}
+
+/// Render a vector of TokenLogprob into the OpenAI logprobs object for
+/// chat completions (`logprobs.content`). When empty, returns `Json::Null`
+/// so the surrounding response stays valid for "logprobs not available
+/// here" (spec-decode path, or feature not requested).
+fn render_chat_logprobs(lp: &[TokenLogprob]) -> Json {
+    if lp.is_empty() { return Json::Null; }
+    let content = lp.iter().map(|t| {
+        let alts: Vec<Json> = t.top_alts.iter().map(|(tk, l)|
+            Json::Obj(vec![
+                ("token".into(),   Json::Str(tk.clone())),
+                ("logprob".into(), Json::Num(*l as f64)),
+            ])).collect();
+        Json::Obj(vec![
+            ("token".into(),        Json::Str(t.token.clone())),
+            ("logprob".into(),      Json::Num(t.logprob as f64)),
+            ("top_logprobs".into(), Json::Arr(alts)),
+        ])
+    }).collect();
+    Json::Obj(vec![("content".into(), Json::Arr(content))])
+}
+
+/// `text_completions`-shape logprobs object (the older /v1/completions
+/// shape, which exposes parallel arrays rather than per-token objects).
+fn render_text_logprobs(lp: &[TokenLogprob]) -> Json {
+    if lp.is_empty() { return Json::Null; }
+    let tokens: Vec<Json> = lp.iter().map(|t| Json::Str(t.token.clone())).collect();
+    let token_logprobs: Vec<Json> = lp.iter()
+        .map(|t| Json::Num(t.logprob as f64)).collect();
+    let top_lps: Vec<Json> = lp.iter().map(|t| {
+        let obj: Vec<(String, Json)> = t.top_alts.iter()
+            .map(|(tk, l)| (tk.clone(), Json::Num(*l as f64)))
+            .collect();
+        Json::Obj(obj)
+    }).collect();
+    Json::Obj(vec![
+        ("tokens".into(),         Json::Arr(tokens)),
+        ("token_logprobs".into(), Json::Arr(token_logprobs)),
+        ("top_logprobs".into(),   Json::Arr(top_lps)),
+    ])
+}
+
 /// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
 /// path; no chat template is applied server-side.
 fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
@@ -280,10 +397,10 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream) = parse_common_fields(&j);
+         request_timeout, stream, top_logprobs_n) = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream })
+                request_timeout, stream, top_logprobs_n })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -318,10 +435,10 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         messages.push(ChatMessage { role, content: content.to_string() });
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream) = parse_common_fields(&j);
+         request_timeout, stream, top_logprobs_n) = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream })
+                request_timeout, stream, top_logprobs_n })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -333,12 +450,13 @@ fn unix_now() -> u64 {
 }
 
 fn completion_response(model: &str, text: &str, n_prompt: usize,
-                       n_completion: usize, hit_eos: bool) -> String {
+                       n_completion: usize, hit_eos: bool,
+                       logprobs: &[TokenLogprob]) -> String {
     let id = format!("cmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let choice = Json::Obj(vec![
         ("text".into(),          Json::Str(text.to_string())),
         ("index".into(),         Json::Num(0.0)),
-        ("logprobs".into(),      Json::Null),
+        ("logprobs".into(),      render_text_logprobs(logprobs)),
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
@@ -360,7 +478,8 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
 fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
-                            n_completion: usize, hit_eos: bool) -> String {
+                            n_completion: usize, hit_eos: bool,
+                            logprobs: &[TokenLogprob]) -> String {
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let message = Json::Obj(vec![
         ("role".into(),    Json::Str("assistant".into())),
@@ -369,6 +488,7 @@ fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
     let choice = Json::Obj(vec![
         ("index".into(),         Json::Num(0.0)),
         ("message".into(),       message),
+        ("logprobs".into(),      render_chat_logprobs(logprobs)),
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
@@ -612,18 +732,25 @@ impl ServerModel {
         match self { ServerModel::Qwen { name, .. } | ServerModel::Gemma { name, .. } => name }
     }
 
-    /// Run one completion. Returns (text, prompt_tokens, completion_tokens, hit_eos).
-    /// `on_token`, if Some, receives the decoded text DELTA for each
-    /// emitted token. Returning `false` from it (e.g. because the
-    /// streaming channel closed — the client disconnected) aborts the
-    /// generation early; the partial text accumulated so far is still
-    /// returned.
+    /// Run one completion. Returns (text, prompt_tokens, completion_tokens,
+    /// hit_eos, per_token_logprobs). `on_token`, if Some, receives the
+    /// decoded text DELTA for each emitted token plus an optional
+    /// `TokenLogprob` when the request asked for logprobs. Returning
+    /// `false` from it (e.g. because the streaming channel closed —
+    /// the client disconnected) aborts generation early; the partial
+    /// text accumulated so far is still returned.
+    ///
+    /// `per_token_logprobs` is the accumulated history for non-streaming
+    /// responses to embed in the final `logprobs` field. Empty when the
+    /// request didn't ask for logprobs OR when the model is on the spec-
+    /// decode path (which doesn't surface per-token softmax probs today).
     fn generate(&mut self, req: &GenReq,
-                mut on_token: impl FnMut(&str) -> bool)
-        -> Result<(String, usize, usize, bool), String>
+                mut on_token: impl FnMut(&str, Option<&TokenLogprob>) -> bool)
+        -> Result<(String, usize, usize, bool, Vec<TokenLogprob>), String>
     {
-        use crate::sampling::{Rng, sample_chain};
+        use crate::sampling::{Rng, sample_chain_lp};
         let mut sp = req.sampler.clone();
+        let want_lp = req.top_logprobs_n;
         let mut rng = Rng::new(sp.seed);
         // `history` is the decoded-so-far token sequence (for repetition
         // penalty); `counts` is the same data laid out per-vocab for
@@ -664,11 +791,13 @@ impl ServerModel {
                 let mut hit_eos = false;
                 let mut prev_text_len: usize = 0;
                 let mut full_text = String::new();
+                let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 for _ in 0..req.max_tokens {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
                     }
-                    let t = sample_chain(&mut logits, &mut sp, &out, &counts, &mut rng);
+                    let res = sample_chain_lp(&mut logits, &mut sp, &out, &counts, &mut rng, want_lp);
+                    let t = res.token;
                     if t == *eos { hit_eos = true; break; }
                     out.push(t);
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
@@ -678,18 +807,25 @@ impl ServerModel {
                     // unicode glyphs render correctly because we only emit
                     // bytes once the trailing token completes them.
                     full_text = tok.decode(&out);
+                    let tlp = if want_lp > 0 {
+                        Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
+                    } else { None };
                     if full_text.len() > prev_text_len {
                         let delta = &full_text[prev_text_len..];
-                        if !on_token(delta) {
+                        let ok = on_token(delta, tlp.as_ref());
+                        if let Some(t) = tlp { all_lp.push(t); }
+                        if !ok {
                             // Channel closed (client disconnected). Stop
                             // generating; return what we have.
                             break;
                         }
                         prev_text_len = full_text.len();
+                    } else if let Some(t) = tlp {
+                        all_lp.push(t);
                     }
                     logits = gpu.forward_token(t, state)?;
                 }
-                Ok((full_text, prompt.len(), out.len(), hit_eos))
+                Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
@@ -770,25 +906,34 @@ impl ServerModel {
                     let mut hit_eos = false;
                     let mut prev_text_len: usize = 0;
                     let mut full_text = String::new();
+                    let mut all_lp: Vec<TokenLogprob> = Vec::new();
                     for _ in 0..req.max_tokens {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
                         }
-                        let t = sample_chain(&mut logits, &mut sp, &out, &counts, &mut rng);
+                        let res = sample_chain_lp(&mut logits, &mut sp, &out, &counts, &mut rng, want_lp);
+                        let t = res.token;
                         if t == *eos { hit_eos = true; break; }
                         out.push(t);
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
                         full_text = tok.decode(&out);
+                        let tlp = if want_lp > 0 {
+                            Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
+                        } else { None };
                         if full_text.len() > prev_text_len {
                             let delta = &full_text[prev_text_len..];
-                            if !on_token(delta) { break; }
+                            let ok = on_token(delta, tlp.as_ref());
+                            if let Some(t) = tlp { all_lp.push(t); }
+                            if !ok { break; }
                             prev_text_len = full_text.len();
+                        } else if let Some(t) = tlp {
+                            all_lp.push(t);
                         }
                         logits = gpu.forward_token(t, state)?;
                     }
-                    return Ok((full_text, prompt.len(), out.len(), hit_eos));
+                    return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
                 }
 
                 // Spec-decode path: prefill, then K=req.speculative_k
@@ -815,7 +960,14 @@ impl ServerModel {
                 )?;
                 eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%)",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
-                Ok((tok.decode(&gen_toks), prompt.len(), gen_toks.len(), stats.hit_eos))
+                if want_lp > 0 {
+                    eprintln!("[serve] note: logprobs requested but ignored on \
+                               spec-decode path; pass use_speculative=false to enable");
+                }
+                // No per-token logprobs from spec-decode today; the response
+                // shaper renders `logprobs: null` when the vec is empty.
+                Ok((tok.decode(&gen_toks), prompt.len(), gen_toks.len(),
+                    stats.hit_eos, Vec::new()))
             }
         }
     }
@@ -916,7 +1068,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     // expectations).
                     if is_stream && is_chat {
                         let frame = chat_stream_chunk(&stream_id, &model_name,
-                            ChatDelta { role: Some("assistant"), content: None }, None);
+                            ChatDelta { role: Some("assistant"), content: None }, None, None);
                         let _ = reply_tx.send(StreamMsg::Chunk(frame));
                     }
                     // `catch_unwind` around generate(): a panic in a kernel
@@ -927,21 +1079,21 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let stream_id_for_cb = stream_id.clone();
                     let model_name_for_cb = model_name.clone();
                     let reply_for_cb = reply_tx.clone();
-                    let on_token = move |delta: &str| -> bool {
+                    let on_token = move |delta: &str, lp: Option<&TokenLogprob>| -> bool {
                         if !is_stream { return true; }
                         let frame = if is_chat {
                             chat_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                ChatDelta { role: None, content: Some(delta) }, None)
+                                ChatDelta { role: None, content: Some(delta) }, None, lp)
                         } else {
                             completion_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                delta, None)
+                                delta, None, lp)
                         };
                         reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
                     };
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
                     match result {
-                        Ok(Ok((text, n_p, n_c, eos))) => {
+                        Ok(Ok((text, n_p, n_c, eos, lp))) => {
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
@@ -965,19 +1117,19 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 let fin = if eos { "stop" } else { "length" };
                                 let frame = if is_chat {
                                     chat_stream_chunk(&stream_id, &model_name,
-                                        ChatDelta { role: None, content: None }, Some(fin))
+                                        ChatDelta { role: None, content: None }, Some(fin), None)
                                 } else {
                                     completion_stream_chunk(&stream_id, &model_name,
-                                        "", Some(fin))
+                                        "", Some(fin), None)
                                 };
                                 let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response(&model_name, &text, n_p, n_c, eos)
+                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp)
                                 } else {
-                                    completion_response(&model_name, &text, n_p, n_c, eos)
+                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp)
                                 };
                                 HttpReply { status: 200, status_text: "OK", body }
                             }
@@ -1091,6 +1243,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 speculative_p_min: 0.0,
                 request_timeout: None,
                 stream: false,
+                top_logprobs_n: 0,
             })
         }
         Some("chat") => parse_chat_completions(&request.body),
@@ -1242,4 +1395,72 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
 
     worker_handle.join().map_err(|_| "gpu worker panicked".to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod logprobs_tests {
+    use super::*;
+
+    fn parse_lp(body: &str) -> usize {
+        parse_common_fields(&Json::parse(body).unwrap()).7
+    }
+
+    #[test]
+    fn logprobs_bool_true_defaults_to_5() {
+        assert_eq!(parse_lp(r#"{"logprobs": true}"#), 5);
+    }
+
+    #[test]
+    fn logprobs_int_chooses_count() {
+        assert_eq!(parse_lp(r#"{"logprobs": 10}"#), 10);
+    }
+
+    #[test]
+    fn logprobs_capped_at_20() {
+        assert_eq!(parse_lp(r#"{"logprobs": 999}"#), 20);
+    }
+
+    #[test]
+    fn logprobs_omitted_is_zero() {
+        assert_eq!(parse_lp(r#"{}"#), 0);
+    }
+
+    #[test]
+    fn logprobs_false_is_zero() {
+        assert_eq!(parse_lp(r#"{"logprobs": false}"#), 0);
+    }
+
+    #[test]
+    fn render_text_logprobs_has_parallel_arrays() {
+        let lp = vec![
+            TokenLogprob { token: "hi".into(), logprob: -0.5,
+                top_alts: vec![("hi".into(), -0.5), ("hello".into(), -1.2)] },
+            TokenLogprob { token: " world".into(), logprob: -0.7,
+                top_alts: vec![(" world".into(), -0.7)] },
+        ];
+        let s = render_text_logprobs(&lp).to_string();
+        assert!(s.contains("\"tokens\""));
+        assert!(s.contains("\"token_logprobs\""));
+        assert!(s.contains("\"top_logprobs\""));
+        assert!(s.contains("\"hi\""));
+        assert!(s.contains("\" world\""));
+    }
+
+    #[test]
+    fn render_chat_logprobs_has_content_array() {
+        let lp = vec![TokenLogprob {
+            token: "hi".into(), logprob: -0.5,
+            top_alts: vec![("hi".into(), -0.5), ("hello".into(), -1.2)] }];
+        let s = render_chat_logprobs(&lp).to_string();
+        assert!(s.contains("\"content\""));
+        assert!(s.contains("\"token\""));
+        assert!(s.contains("\"logprob\""));
+        assert!(s.contains("\"top_logprobs\""));
+    }
+
+    #[test]
+    fn empty_logprobs_render_as_null() {
+        assert_eq!(render_text_logprobs(&[]).to_string(), "null");
+        assert_eq!(render_chat_logprobs(&[]).to_string(), "null");
+    }
 }

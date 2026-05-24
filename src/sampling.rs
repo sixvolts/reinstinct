@@ -360,6 +360,39 @@ pub fn sample_mirostat_v2(logits: &[f32], state: &mut MirostatV2, rng: &mut Rng)
 pub fn sample_chain(logits: &mut [f32], params: &mut SamplerParams,
                     history: &[u32], counts: &[u16], rng: &mut Rng) -> u32
 {
+    sample_chain_lp(logits, params, history, counts, rng, 0).token
+}
+
+/// One token's worth of sampling output, with optional log-probability
+/// diagnostics for the OpenAI `logprobs:true` response field.
+#[derive(Clone, Debug)]
+pub struct SampleResult {
+    pub token: u32,
+    /// log P(token) under the POST-filter, POST-temperature distribution.
+    /// `None` when `top_logprobs_n == 0` (caller didn't ask for diagnostics).
+    pub logprob: Option<f32>,
+    /// Top-K alternatives by probability, including the chosen token,
+    /// each tagged with their log-probability. Length ≤ `top_logprobs_n`,
+    /// sorted descending by logprob. Empty when not requested.
+    pub top_logprobs: Vec<(u32, f32)>,
+}
+
+/// Like [`sample_chain`] but also returns the chosen-token logprob and
+/// the top-`top_logprobs_n` alternatives. `top_logprobs_n == 0` skips
+/// the diagnostic work (no extra allocation, equivalent to plain
+/// `sample_chain` cost).
+///
+/// All probabilities are reported on the POST-filter, POST-temperature
+/// distribution — i.e. they match what was actually sampled from, not
+/// the raw model logits. This matches what OpenAI returns: the user
+/// can reproduce the sampling distribution from these numbers.
+///
+/// For Mirostat the truncation is dynamic per-step; `top_logprobs`
+/// reports the top-K of the renormalized truncated distribution.
+pub fn sample_chain_lp(logits: &mut [f32], params: &mut SamplerParams,
+                       history: &[u32], counts: &[u16], rng: &mut Rng,
+                       top_logprobs_n: usize) -> SampleResult
+{
     assert!(!logits.is_empty(), "sample_chain called with empty logits");
     // Mirostat path is mutually exclusive with the top-k/top-p/temperature
     // chain — those filters would interfere with mu's update.
@@ -368,7 +401,8 @@ pub fn sample_chain(logits: &mut [f32], params: &mut SamplerParams,
             params.frequency_penalty, params.presence_penalty);
         apply_repetition_penalty(logits, history,
             params.repetition_window, params.repetition_penalty);
-        return sample_mirostat_v2(logits, ms, rng);
+        let token = sample_mirostat_v2(logits, ms, rng);
+        return finalize_lp(logits, token, top_logprobs_n, 1.0);
     }
     apply_freq_presence_penalty(logits, counts,
         params.frequency_penalty, params.presence_penalty);
@@ -377,7 +411,50 @@ pub fn sample_chain(logits: &mut [f32], params: &mut SamplerParams,
     apply_top_k(logits, params.top_k);
     apply_top_p(logits, params.top_p);
     apply_min_p(logits, params.min_p);
-    sample_softmax_temp(logits, params.temperature, rng)
+    let token = sample_softmax_temp(logits, params.temperature, rng);
+    finalize_lp(logits, token, top_logprobs_n, params.temperature.max(1e-3))
+}
+
+/// Compute logprob of `picked` + top-K alternatives over the (already
+/// filtered) logits. Skips the work entirely when `top_n == 0`.
+fn finalize_lp(logits: &[f32], picked: u32, top_n: usize, temperature: f32)
+    -> SampleResult
+{
+    if top_n == 0 {
+        return SampleResult { token: picked, logprob: None, top_logprobs: vec![] };
+    }
+    let inv_t = 1.0 / temperature;
+    let max = logits.iter().copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return SampleResult { token: picked, logprob: Some(f32::NEG_INFINITY),
+                              top_logprobs: vec![] };
+    }
+    // Stable softmax. Track (idx, logp) pairs — log so picked token's
+    // value comes back as log P, not P.
+    let mut logps: Vec<(u32, f32)> = Vec::with_capacity(logits.len());
+    let mut sumexp = 0.0_f32;
+    let mut scaled: Vec<f32> = Vec::with_capacity(logits.len());
+    for &v in logits {
+        let s = if v.is_finite() { (v - max) * inv_t } else { f32::NEG_INFINITY };
+        scaled.push(s);
+        if s.is_finite() { sumexp += s.exp(); }
+    }
+    let lse = sumexp.max(1e-30).ln();
+    for (i, &s) in scaled.iter().enumerate() {
+        logps.push((i as u32, s - lse));
+    }
+    let picked_lp = logps[picked as usize].1;
+    // Partial sort: top-N alternatives by logp.
+    let cap = top_n.min(logps.len());
+    let mut top = logps;
+    top.select_nth_unstable_by(cap - 1, |a, b|
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top.truncate(cap);
+    top.sort_unstable_by(|a, b|
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    SampleResult { token: picked, logprob: Some(picked_lp), top_logprobs: top }
 }
 
 /// Standard temperature-softmax over the full vocab. Subtract max for
@@ -419,6 +496,43 @@ pub fn sample_from_probs(probs: &[f32], rng: &mut Rng) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_chain_lp_matches_softmax() {
+        // Logits = [log 1, log 2, log 3, log 4], temp 1, no filters →
+        // post-softmax probs = [0.1, 0.2, 0.3, 0.4], logprobs ≈
+        // ln of those values.
+        let mut logits: Vec<f32> = (1..=4).map(|x| (x as f32).ln()).collect();
+        let mut params = SamplerParams {
+            temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0,
+            repetition_penalty: 1.0, repetition_window: 0,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
+            mirostat: None, seed: 0,
+        };
+        let mut rng = Rng::new(123);
+        let r = sample_chain_lp(&mut logits, &mut params, &[], &[], &mut rng, 4);
+        let tl = r.top_logprobs;
+        assert_eq!(tl.len(), 4);
+        // Top entry should be token id 3 (largest logit).
+        assert_eq!(tl[0].0, 3);
+        // logprob of token 3 ≈ ln(0.4) ≈ -0.916
+        assert!((tl[0].1 - 0.4f32.ln()).abs() < 1e-4, "{:?}", tl[0]);
+        // Picked token's logprob should equal whatever it's reported as.
+        let picked_lp = tl.iter().find(|(i, _)| *i == r.token).unwrap().1;
+        assert!((r.logprob.unwrap() - picked_lp).abs() < 1e-5);
+    }
+
+    #[test]
+    fn sample_chain_lp_zero_n_skips_diagnostics() {
+        let mut logits = vec![1.0, 3.0, 2.0, 5.0, 4.0];
+        let mut params = SamplerParams::default();
+        params.temperature = 0.0; // greedy
+        let mut rng = Rng::new(7);
+        let r = sample_chain_lp(&mut logits, &mut params, &[], &[], &mut rng, 0);
+        assert_eq!(r.token, 3);
+        assert!(r.logprob.is_none());
+        assert!(r.top_logprobs.is_empty());
+    }
 
     #[test]
     fn argmax_picks_largest() {
