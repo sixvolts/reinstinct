@@ -8,6 +8,91 @@
 
 use crate::tokenizer::{GemmaTokenizer, Tokenizer};
 
+/// Best-effort identification of a model's chat template by matching
+/// signature strings in the GGUF `tokenizer.chat_template` jinja blob.
+/// Returns a stable label or `Unknown(template_first_120_chars)`. Used
+/// at serve-load to log "you loaded a {family} model; serve will apply
+/// the {qwen3,gemma4} template" — if the family doesn't match, the
+/// operator sees the mismatch immediately instead of after the first
+/// garbled generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTemplateFamily {
+    /// Qwen 3.5/3.6 `<|im_start|>role\n…<|im_end|>\n`. Server applies.
+    Qwen3,
+    /// Gemma 4 `<|turn>role\n…<turn|>\n`. Server applies.
+    Gemma4,
+    /// Mistral `[INST] … [/INST]`. Not currently applied by serve.
+    Mistral,
+    /// Llama 3 `<|start_header_id|>role<|end_header_id|>\n\n…<|eot_id|>`.
+    /// Not currently applied by serve.
+    Llama3,
+    /// DeepSeek chat (v2.5+). Not currently applied by serve.
+    DeepSeek,
+    /// ChatML generic (`<|im_start|>…<|im_end|>`) but vocab not Qwen-3.
+    ChatML,
+    /// We don't have a signature match. Holds the template prefix for
+    /// operator inspection.
+    Unknown(String),
+}
+
+impl ChatTemplateFamily {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Qwen3      => "qwen3",
+            Self::Gemma4     => "gemma4",
+            Self::Mistral    => "mistral",
+            Self::Llama3     => "llama3",
+            Self::DeepSeek   => "deepseek",
+            Self::ChatML     => "chatml",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Whether the serve worker can apply this template natively (i.e.,
+    /// our `format_*` helpers cover it). Currently only Qwen3 + Gemma4.
+    pub fn supported_by_serve(&self) -> bool {
+        matches!(self, Self::Qwen3 | Self::Gemma4)
+    }
+}
+
+/// Detect the chat template family from a raw GGUF
+/// `tokenizer.chat_template` string. Heuristic match on stable
+/// signatures — works on real-world templates because each family's
+/// template is essentially a unique string.
+pub fn detect_chat_template(jinja: &str) -> ChatTemplateFamily {
+    // Order matters: more-specific matches come first.
+    // Gemma 4: `<|turn>` is the unique delimiter.
+    if jinja.contains("<|turn>") || jinja.contains("<turn|>") {
+        return ChatTemplateFamily::Gemma4;
+    }
+    // Llama 3: <|start_header_id|>role<|end_header_id|>.
+    if jinja.contains("start_header_id") || jinja.contains("eot_id") {
+        return ChatTemplateFamily::Llama3;
+    }
+    // Mistral / Mixtral: [INST] wrapping.
+    if jinja.contains("[INST]") || jinja.contains("[/INST]") {
+        return ChatTemplateFamily::Mistral;
+    }
+    // DeepSeek: `User:` / `Assistant:` literal + `<|begin_of_sentence|>`.
+    if jinja.contains("<|begin_of_sentence|>") && jinja.contains("Assistant:") {
+        return ChatTemplateFamily::DeepSeek;
+    }
+    // Qwen 3.5/3.6: <|im_start|>…<|im_end|> with role variable. The
+    // Qwen-3 jinja also contains `image_count` / `video_count` setup
+    // for multi-modal turns; older Qwen-2 ChatML doesn't.
+    if jinja.contains("<|im_start|>") {
+        if jinja.contains("image_count") || jinja.contains("248045")
+            || jinja.contains("Qwen3") || jinja.contains("qwen3") {
+            return ChatTemplateFamily::Qwen3;
+        }
+        return ChatTemplateFamily::ChatML;
+    }
+    // Fallback — first ~120 chars of the template so an operator can
+    // grep for it.
+    let prefix: String = jinja.chars().take(120).collect();
+    ChatTemplateFamily::Unknown(prefix)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     System,
@@ -101,6 +186,51 @@ pub fn format_gemma4_user_turn(tok: &GemmaTokenizer, content: &str)
 const QWEN_IM_START: u32 = 248045;   // <|im_start|>
 const QWEN_IM_END:   u32 = 248046;   // <|im_end|>
 const QWEN_NEWLINE:  u32 = 198;      // \n
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn detects_qwen3() {
+        let q = r#"{%- set image_count = namespace(value=0) %}\n<|im_start|>"#;
+        assert_eq!(detect_chat_template(q), ChatTemplateFamily::Qwen3);
+    }
+    #[test]
+    fn detects_gemma4() {
+        let g = "{% for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n{% endfor %}";
+        assert_eq!(detect_chat_template(g), ChatTemplateFamily::Gemma4);
+    }
+    #[test]
+    fn detects_mistral() {
+        let m = "{% for m in messages %}[INST] {{ m.content }} [/INST]{% endfor %}";
+        assert_eq!(detect_chat_template(m), ChatTemplateFamily::Mistral);
+    }
+    #[test]
+    fn detects_llama3() {
+        let l = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n";
+        assert_eq!(detect_chat_template(l), ChatTemplateFamily::Llama3);
+    }
+    #[test]
+    fn detects_chatml_when_no_qwen_signature() {
+        let c = "<|im_start|>system\n{{ system }}<|im_end|>";
+        assert_eq!(detect_chat_template(c), ChatTemplateFamily::ChatML);
+    }
+    #[test]
+    fn unknown_keeps_prefix() {
+        let other = "{% completely unfamiliar template {{ stuff }} %}";
+        match detect_chat_template(other) {
+            ChatTemplateFamily::Unknown(s) => assert!(!s.is_empty()),
+            o => panic!("expected Unknown, got {o:?}"),
+        }
+    }
+    #[test]
+    fn supported_by_serve_is_correct() {
+        assert!(ChatTemplateFamily::Qwen3.supported_by_serve());
+        assert!(ChatTemplateFamily::Gemma4.supported_by_serve());
+        assert!(!ChatTemplateFamily::Llama3.supported_by_serve());
+        assert!(!ChatTemplateFamily::Mistral.supported_by_serve());
+    }
+}
 
 /// Render `messages` into a Qwen 3.5/3.6 chat-template token sequence,
 /// matching `Qwen3.5-*/chat_template.jinja` for the basic chat case

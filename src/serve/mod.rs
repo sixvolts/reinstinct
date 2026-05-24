@@ -312,6 +312,23 @@ impl ServerModel {
             .and_then(|v| v.as_str()).unwrap_or("<unknown>").to_string();
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string();
 
+        // Detect the chat template family from the GGUF's jinja blob;
+        // log the family + warn if serve can't apply it natively.
+        if let Some(t) = g.metadata_get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+        {
+            let fam = crate::chat::detect_chat_template(t);
+            if fam.supported_by_serve() {
+                eprintln!("[serve]   chat template: {} (supported natively)",
+                          fam.label());
+            } else {
+                eprintln!("[serve]   chat template: {} — NOT applied by serve. \
+                           /v1/chat/completions will fail at format time. \
+                           Use /v1/completions and pre-template client-side.",
+                          fam.label());
+            }
+        }
+
         if arch == "gemma4" {
             use crate::model::gemma4::Gemma4Model;
             use crate::model::gemma4_assistant::Gemma4AssistantModel;

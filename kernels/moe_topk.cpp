@@ -32,11 +32,20 @@ void moe_topk_f32(const float* __restrict__ logits,
     out_ids     += (size_t)blockIdx.x * n_used;
     out_weights += (size_t)blockIdx.x * n_used;
 
-    // load + block-max
+    // load + block-max. NaN-safe: a single NaN logit (from a numerical
+    // blowup upstream) would otherwise poison fmaxf's reductions
+    // depending on argument order, then the softmax sum, then all the
+    // post-softmax probs, then make argmax pick expert 0 silently.
+    // Replace NaN with -INFINITY at load so it can never be a max
+    // (isfinite is true for normal values + ±inf; the !isnan check is
+    // the surgical version that allows ±inf to pass — softmax handles
+    // those correctly via the (v-m) shift).
     float local_max = -INFINITY;
     for (int i = t; i < n_expert; i += nt) {
-        probs[i] = logits[i];
-        local_max = fmaxf(local_max, logits[i]);
+        float v = logits[i];
+        if (isnan(v)) v = -INFINITY;
+        probs[i] = v;
+        local_max = fmaxf(local_max, v);
     }
     red[t] = local_max;
     __syncthreads();
