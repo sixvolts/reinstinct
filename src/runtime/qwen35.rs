@@ -170,6 +170,12 @@ pub struct GpuMatvecTensor {
 impl GpuMatvecTensor {
     /// Load the named tensor from `gguf` straight to device memory in its
     /// on-disk form. Verifies the tensor is 2D and computes (in_dim, out_dim).
+    ///
+    /// BF16 weights are dequantized to F32 at load. The matvec kernels
+    /// have no BF16 path on gfx906 (no native BF16 ALU), and the tensors
+    /// that ship as BF16 in MTP-bearing MoE GGUFs are tiny config-like
+    /// matrices (MoE routers ≈ 2 MB) where the bytes-on-VRAM cost is
+    /// dwarfed by the simplification.
     pub fn from_gguf(gguf: &GgufFile, name: &str) -> Result<Self, String> {
         let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
         let bytes = gguf.tensor_data(name)
@@ -181,9 +187,18 @@ impl GpuMatvecTensor {
         }
         let in_dim  = shape[0] as u32;
         let out_dim = shape[1] as u32;
+        let (data, dtype) = if info.ggml_type == GgmlType::BF16 {
+            let u16s: &[u16] = bytemuck::cast_slice(bytes);
+            let f32s: Vec<f32> = u16s.iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+            let raw: &[u8] = bytemuck::cast_slice(&f32s);
+            (DeviceBuf::from_slice(raw)?, GgmlType::F32)
+        } else {
+            (DeviceBuf::from_slice(bytes)?, info.ggml_type)
+        };
         Ok(Self {
-            data: DeviceBuf::from_slice(bytes)?,
-            dtype: info.ggml_type,
+            data, dtype,
             in_dim, out_dim,
             repacked: false,
         })
@@ -236,14 +251,27 @@ impl GpuMatvecTensor {
 /// Load an fp32 tensor straight from GGUF to device.
 fn load_fp32_tensor(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
     let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
-    if info.ggml_type != GgmlType::F32 {
-        return Err(format!("tensor {name}: expected F32, got {:?}", info.ggml_type));
-    }
     let bytes = gguf.tensor_data(name)
         .map_err(|e| format!("read {name}: {e}"))?
         .ok_or_else(|| format!("tensor {name} has no data"))?;
-    let floats: &[f32] = bytemuck::cast_slice(bytes);
-    DeviceBuf::from_slice(floats)
+    match info.ggml_type {
+        GgmlType::F32 => {
+            let floats: &[f32] = bytemuck::cast_slice(bytes);
+            DeviceBuf::from_slice(floats)
+        }
+        // Some MTP-bearing MoE GGUFs store small per-channel vectors
+        // (e.g. ffn_gate_inp_shexp) as BF16 to save space. Convert at
+        // load time — these tensors are too small for the dtype to
+        // matter at runtime, and downstream code is fp32-only.
+        GgmlType::BF16 => {
+            let u16s: &[u16] = bytemuck::cast_slice(bytes);
+            let floats: Vec<f32> = u16s.iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+            DeviceBuf::from_slice(&floats)
+        }
+        other => Err(format!("tensor {name}: expected F32 or BF16, got {:?}", other)),
+    }
 }
 
 /// FFN weights for a single transformer block, resident on device. Matvec
