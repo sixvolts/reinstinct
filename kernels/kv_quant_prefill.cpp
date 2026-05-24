@@ -14,6 +14,7 @@
 
 #include <hip/hip_runtime.h>
 #include <math.h>
+#include "gfx906_dpp.h"
 
 extern "C" __global__
 void kv_quant_prefill_f32(const float* __restrict__ src,
@@ -39,7 +40,7 @@ void kv_quant_prefill_f32(const float* __restrict__ src,
     }
     const float amax  = red[0];
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
-    const float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+    const float inv   = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
 
     signed char* dq = dst_q + ((size_t)p * n_kv + h) * head_dim;
     for (int i = tid; i < (int)head_dim; i += bs) {
@@ -80,7 +81,7 @@ void kv_quant_prefill_offset_f32(const float* __restrict__ src,
     }
     const float amax  = red[0];
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
-    const float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+    const float inv   = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
 
     const unsigned int base_pos = *base_pos_ptr;
     const size_t row_idx = (size_t)(base_pos + p);

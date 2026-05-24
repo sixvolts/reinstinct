@@ -96,3 +96,13 @@ __device__ __forceinline__ float wave64_reduce_max_f32(float x) {
     x = fmaxf(x, __shfl_xor(x, 32));
     return x;
 }
+
+// Hardware reciprocal via v_rcp_f32 — skips the IEEE division pipeline.
+// ~24-bit precision (the v_rcp_f32 ULP is one); fine for int8 quantize
+// scaling where the downstream output only carries 7-8 bits anyway.
+// Source: llamacpp-gfx906-furnace (gfx906-common.cuh:63-71).
+__device__ __forceinline__ float fast_rcp_f32(float x) {
+    float r;
+    asm volatile("v_rcp_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}

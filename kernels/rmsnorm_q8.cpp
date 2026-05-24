@@ -26,6 +26,7 @@
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -89,7 +90,7 @@ void rmsnorm_q8_f32(const float* __restrict__ x,    // [n]
             vsum += __shfl_xor(vsum, o);
         }
 
-        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        const float inv = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
         int q = (int)rintf(v * inv);
         q = max(-127, min(127, q));
 
