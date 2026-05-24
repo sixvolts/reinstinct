@@ -1381,7 +1381,10 @@ impl GpuGemma4 {
                                  (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
             GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32", out_dim),
             GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32",  out_dim),
-            other => return Err(format!("gemma4 matvec: no kernel for {other:?}")),
+            other => return Err(format!(
+                "gemma4 matvec: no kernel for {other:?} (weight shape [{in_dim}×{out_dim}]). \
+                 Check the GGUF for this dtype on a matmul tensor — most likely a UD-mix \
+                 type that needs its own dp4a path.", in_dim=in_dim, out_dim=out_dim)),
         };
         let f = module.function(kname)?;
         // The F32 kernel uses a 256-thread block (4 waves/row); the
@@ -1441,7 +1444,10 @@ impl GpuGemma4 {
             match dtype {
                 GgmlType::Q6_K => (&self.m_moe_mv_q6k,  "moe_matvec_q6k_dp4a_f32",  64, Q4K_ROWBLOCK),
                 GgmlType::Q8_0 => (&self.m_moe_mv_q8_0, "moe_matvec_q8_0_dp4a_f32", 64, Q4K_ROWBLOCK),
-                other => return Err(format!("moe matvec: no kernel for expert type {other:?}")),
+                other => return Err(format!(
+                    "moe matvec: no kernel for expert type {other:?} \
+                     (weight shape [{in_dim}×{out_dim}], bytes/expert {bpe})",
+                    in_dim=in_dim, out_dim=out_dim, bpe=bytes_per_expert)),
             }
         };
         let f = module.function(kname)?;
@@ -1681,7 +1687,8 @@ impl GpuGemma4 {
         let (module, kname, threads, grid): (&Module, &str, u32, u32) = match table.dtype {
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_f32", 256, hidden/256),
             GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_f32", 256, (hidden + 255)/256),
-            other => return Err(format!("gemma4 embed: no kernel for {other:?}")),
+            other => return Err(format!("gemma4 embed: no kernel for {other:?} \
+                 (token_embd weight; needs an embed-lookup kernel for this dtype)")),
         };
         let f = module.function(kname)?;
         let mut t=table.data.raw_ptr(); let mut o=out;
@@ -1703,7 +1710,9 @@ impl GpuGemma4 {
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_batched_f32", hidden/256),
             GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_batched_f32",
                                (hidden + 255)/256),
-            other => return Err(format!("gemma4 batched embed: no kernel for {other:?}")),
+            other => return Err(format!("gemma4 batched embed: no kernel for {other:?} \
+                 (batched embed kernel covers Q4_K/Q5_K/Q6_K/Q8_0/F16/F32 — \
+                 add the missing dtype variant if it appears in a token_embd tensor)")),
         };
         let f = module.function(kname)?;
         let mut t=table.data.raw_ptr(); let mut o=out;

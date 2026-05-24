@@ -1471,7 +1471,8 @@ impl GpuQwen35 {
             GgmlType::Q6_K => self.launch_embed_lookup_q6_k(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q4_K => self.launch_embed_lookup_q4_k(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q8_0 => self.launch_embed_lookup_q8_0(table.data.raw_ptr(), out, token, hidden),
-            other => Err(format!("embed_lookup: no kernel for {:?}", other)),
+            other => Err(format!("qwen35 embed_lookup: no kernel for {other:?} \
+                 (token_embd weight; needs an embed-lookup kernel for this dtype)")),
         }
     }
 
@@ -1825,7 +1826,10 @@ impl GpuQwen35 {
                                     "matvec_f16_f32", wp, x, y, in_d, out_d),
             GgmlType::F16    => self.launch_matvec_wave64(&self.matvec_f16_wave64_module,
                                     "matvec_f16_wave64_f32", wp, x, y, in_d, out_d),
-            other => Err(format!("matvec dispatch: no kernel for {:?}", other)),
+            other => Err(format!(
+                "qwen35 matvec: no kernel for {other:?} (weight shape [{in_d}×{out_d}]). \
+                 Likely a UD-mix dtype on a matmul tensor. \
+                 Supported: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS (dp4a).")),
         }
     }
 
