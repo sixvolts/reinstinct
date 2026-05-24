@@ -1561,6 +1561,12 @@ impl GpuQwen35 {
     {
         let f = module.function(kname)?;
         let block: u32 = 64;
+        // Q6_K wave64 packs ROWS=2 rows per block (the dp4a sibling has
+        // done this since the start; the wave64 variant didn't until the
+        // gfx906 micro-opt pass). All other wave64 kernels stay at 1
+        // row per block.
+        let rows_per_block: u32 = if kname == "matvec_q6_k_wave64_f32" { 2 } else { 1 };
+        let grid_x = (out_dim + rows_per_block - 1) / rows_per_block;
         let mut wa = w; let mut xa = x; let mut ya = y;
         let mut ia = in_dim; let mut oa = out_dim;
         let mut args: [*mut c_void; 5] = [
@@ -1570,7 +1576,7 @@ impl GpuQwen35 {
             &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((out_dim, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+        unsafe { f.launch((grid_x, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
     // ===== batched (n_rows-collapsed) GDN launchers, used by prefill =====

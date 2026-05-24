@@ -1,10 +1,14 @@
 // Wave-cooperative Q6_K matvec for gfx906 (Wave64).
 //
 // Same dequant math as matvec_q6_k.cpp, but:
-//   - One *wave* (64 threads) per output row, not a 256-thread block.
-//     Lower latency per row = more waves resident per CU = better occupancy
-//     on the launch-bound output_proj shape (in=1024 → out=248320).
-//   - Reduction uses __shfl_xor across the 64 lanes of the wavefront —
+//   - One *wave* (64 threads) per 2 output rows (ROWS=2). Each lane
+//     reads one sub-block of x once and accumulates a dot for BOTH
+//     rows — the activation read is shared across rows, the weight
+//     read varies. Halves the launch count vs the 1-row layout,
+//     amortising launch overhead on the launch-bound output_proj /
+//     lm_head shape (in=1024, out=248320 → 124160 blocks instead
+//     of 248320).
+//   - Reduction uses DPP across the 64 lanes of the wavefront —
 //     no shared memory, no __syncthreads.
 //   - Each thread owns ONE sub-block (16 weights) per iteration. For
 //     in_dim=1024 there are exactly 64 sub-blocks per row, so the work
@@ -15,6 +19,8 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include "gfx906_dpp.h"
+
+#define ROWS 2
 
 struct __attribute__((packed)) BlockQ6_K {
     uint8_t  ql[128];
@@ -31,15 +37,17 @@ void matvec_q6_k_wave64_f32(const BlockQ6_K* __restrict__ w_blocks,
                             unsigned int in_dim,
                             unsigned int out_dim)
 {
-    const int row = blockIdx.x;
-    if (row >= (int)out_dim) return;
+    const int row0 = blockIdx.x * ROWS;
+    if (row0 >= (int)out_dim) return;
     const int lane = threadIdx.x;       // 0..63
 
     const unsigned int n_blocks    = in_dim >> 8;   // /256
     const unsigned int n_subblocks = in_dim >> 4;   // /16
-    const BlockQ6_K* row_blocks = w_blocks + (size_t)row * n_blocks;
 
-    float acc = 0.0f;
+    float acc[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
+
     for (int sb = lane; sb < (int)n_subblocks; sb += 64) {
         const int blk_idx     = sb >> 4;        // /16 sub-blocks per Q6_K block
         const int sb_in_blk   = sb & 15;
@@ -54,28 +62,39 @@ void matvec_q6_k_wave64_f32(const BlockQ6_K* __restrict__ w_blocks,
         const int ql_high     = group >> 1;
         const int qh_off_blk  = chunk * 32;
 
-        const BlockQ6_K* blk = row_blocks + blk_idx;
-        const __half d_h = *reinterpret_cast<const __half*>(&blk->d);
-        const float  d   = __half2float(d_h);
-        const float  ds  = d * (float)blk->scales[sc_idx];
-
+        // Activation is shared across both rows — load once.
         const float* x_base = x + (size_t)sb * 16;
-        float partial = 0.0f;
+        float xs[16];
         #pragma unroll
-        for (int li = 0; li < 16; li++) {
-            const int l = l_start + li;
-            const uint8_t ql_byte = blk->ql[ql_off_blk + l];
-            const uint8_t ql_nib  = ql_high ? (ql_byte >> 4) : (ql_byte & 0x0F);
-            const uint8_t qh_byte = blk->qh[qh_off_blk + l];
-            const uint8_t qh_pair = (qh_byte >> qh_shift) & 0x3;
-            const int q = (int)(ql_nib | (qh_pair << 4)) - 32;
-            partial += (float)q * x_base[li];
+        for (int li = 0; li < 16; li++) xs[li] = x_base[li];
+
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int)out_dim) continue;
+            const BlockQ6_K* blk = w_blocks + (size_t)row * n_blocks + blk_idx;
+            const __half d_h = *reinterpret_cast<const __half*>(&blk->d);
+            const float  d   = __half2float(d_h);
+            const float  ds  = d * (float)blk->scales[sc_idx];
+
+            float partial = 0.0f;
+            #pragma unroll
+            for (int li = 0; li < 16; li++) {
+                const int l = l_start + li;
+                const uint8_t ql_byte = blk->ql[ql_off_blk + l];
+                const uint8_t ql_nib  = ql_high ? (ql_byte >> 4) : (ql_byte & 0x0F);
+                const uint8_t qh_byte = blk->qh[qh_off_blk + l];
+                const uint8_t qh_pair = (qh_byte >> qh_shift) & 0x3;
+                const int q = (int)(ql_nib | (qh_pair << 4)) - 32;
+                partial += (float)q * xs[li];
+            }
+            acc[r] += ds * partial;
         }
-        acc += ds * partial;
     }
 
-    // Wave64 reduction via __shfl_xor — every lane ends up with the sum.
-    acc = wave64_reduce_add_f32(acc);
-
-    if (lane == 0) y[row] = acc;
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        float a = wave64_reduce_add_f32(acc[r]);
+        if (lane == 0 && (row0 + r) < (int)out_dim) y[row0 + r] = a;
+    }
 }
