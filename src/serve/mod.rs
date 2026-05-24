@@ -51,9 +51,7 @@ enum PromptInput {
 struct GenReq {
     prompt: PromptInput,
     max_tokens: usize,
-    temperature: f32,
-    top_k: usize,
-    seed: u64,
+    sampler: crate::sampling::SamplerParams,
     /// MTP spec-decode opt-in/opt-out. `None` ⇒ use the server default
     /// (true if the target has a drafter loaded, false otherwise).
     /// `Some(false)` lets a per-turn classifier disable the drafter on
@@ -62,6 +60,9 @@ struct GenReq {
     /// Per-request K override for spec-decode. `None` ⇒ server default
     /// (currently 3). Ignored when spec-decode is off.
     speculative_k: Option<usize>,
+    /// Wall-clock cap on the generation. If decode runs past it, the
+    /// request stops early with `finish_reason: "length"`. None disables.
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl GenReq {
@@ -84,21 +85,57 @@ struct HttpReply {
 
 // --- request parsing ---------------------------------------------------
 
+/// Server-wide cap on a single request's wall-clock generation. Bigger
+/// than this and the worker can't service incoming requests; clients
+/// can ask for less via `request_timeout_seconds`.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
 /// Common decode + sampling fields shared by both endpoint parsers.
-/// Returns (max_tokens, temperature, top_k, seed, use_speculative, speculative_k).
-fn parse_common_fields(j: &Json) -> (usize, f32, usize, u64, Option<bool>, Option<usize>) {
+/// Returns the parsed (GenReq fields). Accepts every OpenAI sampler
+/// knob plus a few extensions (min_p, repetition_penalty, mirostat).
+fn parse_common_fields(j: &Json)
+    -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>,
+        Option<std::time::Duration>)
+{
+    use crate::sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
         .map(|n| n as usize).unwrap_or(256).clamp(1, 4096);
-    let temperature = j.get("temperature").and_then(Json::as_f64)
+
+    let mut sp = SamplerParams::default();
+    sp.temperature = j.get("temperature").and_then(Json::as_f64)
         .map(|n| n as f32).unwrap_or(0.8).max(0.0);
-    let top_k = j.get("top_k").and_then(Json::as_f64)
+    sp.top_k = j.get("top_k").and_then(Json::as_f64)
         .map(|n| n as usize).unwrap_or(40);
-    let seed = j.get("seed").and_then(Json::as_f64)
-        .map(|n| n as u64).unwrap_or(0);
+    sp.top_p = j.get("top_p").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(1.0).clamp(0.0, 1.0);
+    sp.min_p = j.get("min_p").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(0.0).clamp(0.0, 1.0);
+    sp.repetition_penalty = j.get("repetition_penalty").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(1.0).max(0.0);
+    sp.repetition_window = j.get("repetition_window").and_then(Json::as_f64)
+        .map(|n| n as usize).unwrap_or(64);
+    sp.frequency_penalty = j.get("frequency_penalty").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(0.0);
+    sp.presence_penalty = j.get("presence_penalty").and_then(Json::as_f64)
+        .map(|n| n as f32).unwrap_or(0.0);
+    sp.seed = j.get("seed").and_then(Json::as_f64).map(|n| n as u64).unwrap_or(0);
+
+    // Mirostat v2: opt-in via `mirostat: 2`. tau + eta override defaults.
+    if j.get("mirostat").and_then(Json::as_f64).map(|n| n as i64) == Some(2) {
+        let tau = j.get("mirostat_tau").and_then(Json::as_f64)
+            .map(|n| n as f32).unwrap_or(5.0);
+        let eta = j.get("mirostat_eta").and_then(Json::as_f64)
+            .map(|n| n as f32).unwrap_or(0.1);
+        sp.mirostat = Some(MirostatV2::new(tau, eta));
+    }
+
     let use_speculative = j.get("use_speculative").and_then(Json::as_bool);
     let speculative_k = j.get("speculative_k").and_then(Json::as_f64)
         .map(|n| (n as usize).clamp(1, 4));
-    (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+    let request_timeout = j.get("request_timeout_seconds").and_then(Json::as_f64)
+        .map(|n| std::time::Duration::from_secs_f64(n.max(0.1).min(600.0)))
+        .or(Some(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)));
+    (max_tokens, sp, use_speculative, speculative_k, request_timeout)
 }
 
 /// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
@@ -109,10 +146,10 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let prompt = j.get("prompt").and_then(Json::as_str)
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
-    let (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout)
         = parse_common_fields(&j);
-    Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, temperature, top_k,
-                seed, use_speculative, speculative_k })
+    Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
+                use_speculative, speculative_k, request_timeout })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -146,10 +183,10 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         };
         messages.push(ChatMessage { role, content: content.to_string() });
     }
-    let (max_tokens, temperature, top_k, seed, use_speculative, speculative_k)
+    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout)
         = parse_common_fields(&j);
-    Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, temperature, top_k,
-                seed, use_speculative, speculative_k })
+    Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
+                use_speculative, speculative_k, request_timeout })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -326,7 +363,15 @@ impl ServerModel {
     fn generate(&mut self, req: &GenReq)
         -> Result<(String, usize, usize, bool), String>
     {
-        use crate::sampling::{Rng, sample_temp_topk};
+        use crate::sampling::{Rng, sample_chain};
+        let mut sp = req.sampler.clone();
+        let mut rng = Rng::new(sp.seed);
+        // `history` is the decoded-so-far token sequence (for repetition
+        // penalty); `counts` is the same data laid out per-vocab for
+        // OpenAI-style frequency/presence penalties. Both are empty when
+        // the per-request knobs leave their defaults.
+        let deadline = req.request_timeout
+            .map(|d| std::time::Instant::now() + d);
 
         match self {
             ServerModel::Qwen { gpu, state, tok, eos, max_seq, .. } => {
@@ -353,13 +398,19 @@ impl ServerModel {
                 } else {
                     gpu.forward_tokens(&prompt, state)?
                 };
-                let mut rng = Rng::new(req.seed);
-                let mut out = Vec::new();
+                let vocab = logits.len();
+                let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
+                    || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
+                let mut out: Vec<u32> = Vec::new();
                 let mut hit_eos = false;
                 for _ in 0..req.max_tokens {
-                    let t = sample_temp_topk(&logits, req.temperature, req.top_k, &mut rng);
+                    if let Some(d) = deadline {
+                        if std::time::Instant::now() >= d { break; }
+                    }
+                    let t = sample_chain(&mut logits, &mut sp, &out, &counts, &mut rng);
                     if t == *eos { hit_eos = true; break; }
                     out.push(t);
+                    if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
                     logits = gpu.forward_token(t, state)?;
                 }
                 Ok((tok.decode(&out), prompt.len(), out.len(), hit_eos))
@@ -405,13 +456,21 @@ impl ServerModel {
                 if !do_spec {
                     // Plain prefill + decode.
                     let mut logits = gpu.prefill_forward(&prompt, state)?;
-                    let mut rng = Rng::new(req.seed);
-                    let mut out = Vec::new();
+                    let vocab = logits.len();
+                    let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
+                        || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
+                    let mut out: Vec<u32> = Vec::new();
                     let mut hit_eos = false;
                     for _ in 0..req.max_tokens {
-                        let t = sample_temp_topk(&logits, req.temperature, req.top_k, &mut rng);
+                        if let Some(d) = deadline {
+                            if std::time::Instant::now() >= d { break; }
+                        }
+                        let t = sample_chain(&mut logits, &mut sp, &out, &counts, &mut rng);
                         if t == *eos { hit_eos = true; break; }
                         out.push(t);
+                        if !counts.is_empty() {
+                            counts[t as usize] = counts[t as usize].saturating_add(1);
+                        }
                         logits = gpu.forward_token(t, state)?;
                     }
                     return Ok((tok.decode(&out), prompt.len(), out.len(), hit_eos));
@@ -436,7 +495,7 @@ impl ServerModel {
                     verify_logits,
                     *prompt.last().unwrap(),
                     *eos,
-                    req.max_tokens, k, req.temperature, req.seed,
+                    req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
                 )?;
                 eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%)",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
@@ -601,9 +660,14 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target, tx: mpsc::Sender
                     request.method, request.path))),
         Some("embed") => {
             // Worker answers 503; keep the shape.
-            Ok(GenReq { prompt: PromptInput::Raw(String::new()), max_tokens: 0,
-                        temperature: 0.0, top_k: 0, seed: 0,
-                        use_speculative: None, speculative_k: None })
+            Ok(GenReq {
+                prompt: PromptInput::Raw(String::new()),
+                max_tokens: 0,
+                sampler: crate::sampling::SamplerParams::default(),
+                use_speculative: None,
+                speculative_k: None,
+                request_timeout: None,
+            })
         }
         Some("chat") => parse_chat_completions(&request.body),
         Some("completions") => parse_completions(&request.body),
