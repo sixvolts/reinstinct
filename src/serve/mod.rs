@@ -124,6 +124,23 @@ struct GenReq {
     /// Wall-clock cap on the generation. If decode runs past it, the
     /// request stops early with `finish_reason: "length"`. None disables.
     request_timeout: Option<std::time::Duration>,
+    /// OpenAI `stream: true` — Server-Sent Events response. The worker
+    /// emits one `Chunk` per decoded token; the connection writes them
+    /// as `data: {json}\n\n`. Implicit cancellation: if the client closes
+    /// the socket, the next Chunk send fails (Receiver dropped) and the
+    /// worker stops generating.
+    stream: bool,
+}
+
+/// Messages from the GPU worker to the connection-handler thread.
+/// Non-streaming requests send exactly one `Done(reply)`. Streaming
+/// requests send a sequence of `Chunk` (one per decoded token) then a
+/// final `Done` carrying the trailing usage stats.
+enum StreamMsg {
+    /// SSE-style chunk — the connection writes `data: {payload}\n\n`.
+    Chunk(String),
+    /// Final reply for non-streaming, or stream-terminator for streaming.
+    Done(HttpReply),
 }
 
 impl GenReq {
@@ -137,7 +154,7 @@ struct Job {
     target: Target,
     /// `Err` carries an already-formed client error (bad request / wrong route).
     req: Result<GenReq, (u16, &'static str, String)>,
-    reply: mpsc::Sender<HttpReply>,
+    reply: mpsc::Sender<StreamMsg>,
 }
 
 struct HttpReply {
@@ -158,7 +175,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// knob plus a few extensions (min_p, repetition_penalty, mirostat).
 fn parse_common_fields(j: &Json)
     -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>,
-        Option<std::time::Duration>)
+        Option<std::time::Duration>, bool)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
@@ -198,8 +215,53 @@ fn parse_common_fields(j: &Json)
     let request_timeout = j.get("request_timeout_seconds").and_then(Json::as_f64)
         .map(|n| std::time::Duration::from_secs_f64(n.max(0.1).min(600.0)))
         .or(Some(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)));
-    (max_tokens, sp, use_speculative, speculative_k, request_timeout)
+    let stream = j.get("stream").and_then(Json::as_bool).unwrap_or(false);
+    (max_tokens, sp, use_speculative, speculative_k, request_timeout, stream)
 }
+
+// --- streaming helpers (SSE) --------------------------------------------
+
+/// One streamed text-completion chunk in OpenAI shape. Each event is a
+/// separate `data: ...` line; the client SDK concatenates `text` fields.
+fn completion_stream_chunk(id: &str, model: &str, text: &str, finish: Option<&str>) -> String {
+    let mut choice = vec![
+        ("text".into(),     Json::Str(text.to_string())),
+        ("index".into(),    Json::Num(0.0)),
+        ("logprobs".into(), Json::Null),
+    ];
+    choice.push(("finish_reason".into(),
+                 finish.map(|f| Json::Str(f.to_string())).unwrap_or(Json::Null)));
+    Json::Obj(vec![
+        ("id".into(),      Json::Str(id.to_string())),
+        ("object".into(),  Json::Str("text_completion".into())),
+        ("created".into(), Json::Num(unix_now() as f64)),
+        ("model".into(),   Json::Str(model.to_string())),
+        ("choices".into(), Json::Arr(vec![Json::Obj(choice)])),
+    ]).to_string()
+}
+
+/// One streamed chat-completion chunk. First chunk carries `role`;
+/// subsequent chunks carry just `content`; final chunk has `finish_reason`.
+fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta, finish: Option<&str>) -> String {
+    let mut d = Vec::with_capacity(2);
+    if let Some(r) = delta.role    { d.push(("role".into(),    Json::Str(r.to_string()))); }
+    if let Some(c) = delta.content { d.push(("content".into(), Json::Str(c.to_string()))); }
+    let mut choice = vec![
+        ("index".into(), Json::Num(0.0)),
+        ("delta".into(), Json::Obj(d)),
+    ];
+    choice.push(("finish_reason".into(),
+                 finish.map(|f| Json::Str(f.to_string())).unwrap_or(Json::Null)));
+    Json::Obj(vec![
+        ("id".into(),      Json::Str(id.to_string())),
+        ("object".into(),  Json::Str("chat.completion.chunk".into())),
+        ("created".into(), Json::Num(unix_now() as f64)),
+        ("model".into(),   Json::Str(model.to_string())),
+        ("choices".into(), Json::Arr(vec![Json::Obj(choice)])),
+    ]).to_string()
+}
+
+struct ChatDelta<'a> { role: Option<&'a str>, content: Option<&'a str> }
 
 /// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
 /// path; no chat template is applied server-side.
@@ -209,10 +271,10 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let prompt = j.get("prompt").and_then(Json::as_str)
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
-    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout)
+    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout, stream)
         = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
-                use_speculative, speculative_k, request_timeout })
+                use_speculative, speculative_k, request_timeout, stream })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -246,10 +308,10 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         };
         messages.push(ChatMessage { role, content: content.to_string() });
     }
-    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout)
+    let (max_tokens, sampler, use_speculative, speculative_k, request_timeout, stream)
         = parse_common_fields(&j);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
-                use_speculative, speculative_k, request_timeout })
+                use_speculative, speculative_k, request_timeout, stream })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -440,7 +502,13 @@ impl ServerModel {
     }
 
     /// Run one completion. Returns (text, prompt_tokens, completion_tokens, hit_eos).
-    fn generate(&mut self, req: &GenReq)
+    /// `on_token`, if Some, receives the decoded text DELTA for each
+    /// emitted token. Returning `false` from it (e.g. because the
+    /// streaming channel closed — the client disconnected) aborts the
+    /// generation early; the partial text accumulated so far is still
+    /// returned.
+    fn generate(&mut self, req: &GenReq,
+                mut on_token: impl FnMut(&str) -> bool)
         -> Result<(String, usize, usize, bool), String>
     {
         use crate::sampling::{Rng, sample_chain};
@@ -483,6 +551,8 @@ impl ServerModel {
                     || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
                 let mut out: Vec<u32> = Vec::new();
                 let mut hit_eos = false;
+                let mut prev_text_len: usize = 0;
+                let mut full_text = String::new();
                 for _ in 0..req.max_tokens {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
@@ -491,9 +561,24 @@ impl ServerModel {
                     if t == *eos { hit_eos = true; break; }
                     out.push(t);
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
+                    // Re-decode the whole output: append-only token streams
+                    // mean the previous prefix bytes are stable, so the
+                    // delta is the suffix past prev_text_len. Multi-token
+                    // unicode glyphs render correctly because we only emit
+                    // bytes once the trailing token completes them.
+                    full_text = tok.decode(&out);
+                    if full_text.len() > prev_text_len {
+                        let delta = &full_text[prev_text_len..];
+                        if !on_token(delta) {
+                            // Channel closed (client disconnected). Stop
+                            // generating; return what we have.
+                            break;
+                        }
+                        prev_text_len = full_text.len();
+                    }
                     logits = gpu.forward_token(t, state)?;
                 }
-                Ok((tok.decode(&out), prompt.len(), out.len(), hit_eos))
+                Ok((full_text, prompt.len(), out.len(), hit_eos))
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, .. } => {
                 let prompt = match &req.prompt {
@@ -541,6 +626,8 @@ impl ServerModel {
                         || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
                     let mut out: Vec<u32> = Vec::new();
                     let mut hit_eos = false;
+                    let mut prev_text_len: usize = 0;
+                    let mut full_text = String::new();
                     for _ in 0..req.max_tokens {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
@@ -551,9 +638,15 @@ impl ServerModel {
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
+                        full_text = tok.decode(&out);
+                        if full_text.len() > prev_text_len {
+                            let delta = &full_text[prev_text_len..];
+                            if !on_token(delta) { break; }
+                            prev_text_len = full_text.len();
+                        }
                         logits = gpu.forward_token(t, state)?;
                     }
-                    return Ok((tok.decode(&out), prompt.len(), out.len(), hit_eos));
+                    return Ok((full_text, prompt.len(), out.len(), hit_eos));
                 }
 
                 // Spec-decode path: prefill, then K=req.speculative_k
@@ -628,10 +721,10 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             eprintln!("[serve] FATAL: model load failed: {e}");
             // Drain the queue with 503s so clients don't hang forever.
             for job in rx {
-                let _ = job.reply.send(HttpReply {
+                let _ = job.reply.send(StreamMsg::Done(HttpReply {
                     status: 503, status_text: "Service Unavailable",
                     body: error_body(&format!("model load failed: {e}"), "server_error"),
-                });
+                }));
             }
             return;
         }
@@ -664,13 +757,46 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
                     let t = std::time::Instant::now();
                     let is_chat = req.is_chat();
+                    let is_stream = req.stream;
+                    // For streaming requests, build a one-shot SSE id +
+                    // first-chunk role frame (chat) up front so the
+                    // per-token callback can emit just text deltas.
+                    let stream_id = if is_chat {
+                        format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed))
+                    } else {
+                        format!("cmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed))
+                    };
+                    let model_name = model.name().to_string();
+                    let reply_tx = job.reply.clone();
+                    // For chat streams, emit a role-only opener frame
+                    // before any text content (matches OpenAI SDK
+                    // expectations).
+                    if is_stream && is_chat {
+                        let frame = chat_stream_chunk(&stream_id, &model_name,
+                            ChatDelta { role: Some("assistant"), content: None }, None);
+                        let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                    }
                     // `catch_unwind` around generate(): a panic in a kernel
                     // launch, a slipped unwrap, or a numerical blowup
                     // shouldn't kill the worker thread (which would 503
                     // every subsequent request). On panic we 500 the
                     // current request, log, and continue.
+                    let stream_id_for_cb = stream_id.clone();
+                    let model_name_for_cb = model_name.clone();
+                    let reply_for_cb = reply_tx.clone();
+                    let on_token = move |delta: &str| -> bool {
+                        if !is_stream { return true; }
+                        let frame = if is_chat {
+                            chat_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
+                                ChatDelta { role: None, content: Some(delta) }, None)
+                        } else {
+                            completion_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
+                                delta, None)
+                        };
+                        reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
+                    };
                     let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| model.generate(&req)));
+                        std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
                     match result {
                         Ok(Ok((text, n_p, n_c, eos))) => {
                             let wall_us = t.elapsed().as_micros() as u64;
@@ -684,17 +810,34 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 n_c as f64 * 1_000_000.0 / wall_us as f64
                             } else { 0.0 };
                             eprintln!("[serve] req={} target={} type={} status=200 \
-                                       n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={}",
+                                       n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={} stream={}",
                                 job.request_id, job.target.label(),
                                 if is_chat { "chat" } else { "completion" },
                                 n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
-                                if eos { "stop" } else { "length" });
-                            let body = if is_chat {
-                                chat_completion_response(model.name(), &text, n_p, n_c, eos)
+                                if eos { "stop" } else { "length" }, is_stream);
+                            if is_stream {
+                                // Final SSE frame: empty delta + finish_reason.
+                                // Then Done signals the connection handler
+                                // to write "data: [DONE]\n\n" and close.
+                                let fin = if eos { "stop" } else { "length" };
+                                let frame = if is_chat {
+                                    chat_stream_chunk(&stream_id, &model_name,
+                                        ChatDelta { role: None, content: None }, Some(fin))
+                                } else {
+                                    completion_stream_chunk(&stream_id, &model_name,
+                                        "", Some(fin))
+                                };
+                                let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                                HttpReply { status: 200, status_text: "OK",
+                                            body: String::new() }
                             } else {
-                                completion_response(model.name(), &text, n_p, n_c, eos)
-                            };
-                            HttpReply { status: 200, status_text: "OK", body }
+                                let body = if is_chat {
+                                    chat_completion_response(&model_name, &text, n_p, n_c, eos)
+                                } else {
+                                    completion_response(&model_name, &text, n_p, n_c, eos)
+                                };
+                                HttpReply { status: 200, status_text: "OK", body }
+                            }
                         }
                         Ok(Err(e)) => {
                             eprintln!("[serve] req={} target={} status=400 reason={:?}",
@@ -728,7 +871,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                 }
             },
         };
-        let _ = job.reply.send(reply);
+        let _ = job.reply.send(StreamMsg::Done(reply));
     }
 }
 
@@ -803,6 +946,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 use_speculative: None,
                 speculative_k: None,
                 request_timeout: None,
+                stream: false,
             })
         }
         Some("chat") => parse_chat_completions(&request.body),
@@ -817,14 +961,55 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             &error_body("server worker is gone", "server_error"));
         return;
     }
-    let reply = rrx.recv().unwrap_or_else(|_| {
-        metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
-        HttpReply {
-            status: 500, status_text: "Internal Server Error",
-            body: error_body("worker dropped the request", "server_error"),
+    // Receive the first message: if it's Done, plain response. If it's
+    // Chunk, switch to SSE streaming mode (writing each chunk as it arrives
+    // until a Done arrives or the channel closes).
+    use std::io::Write;
+    let first = rrx.recv();
+    match first {
+        Ok(StreamMsg::Done(reply)) => {
+            let _ = http::write_response(&mut stream, reply.status, reply.status_text, &reply.body);
         }
-    });
-    let _ = http::write_response(&mut stream, reply.status, reply.status_text, &reply.body);
+        Ok(StreamMsg::Chunk(payload)) => {
+            // SSE: open with the appropriate headers, then write each
+            // chunk as `data: {payload}\n\n`. Final `data: [DONE]\n\n`
+            // matches OpenAI's terminator. If a socket write fails
+            // mid-stream, drop the connection — the worker will see the
+            // channel close on its next send and stop generating.
+            let header = "HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/event-stream\r\n\
+                          Cache-Control: no-cache\r\n\
+                          Connection: close\r\n\r\n";
+            if stream.write_all(header.as_bytes()).is_err() { return; }
+            if stream.write_all(format!("data: {payload}\n\n").as_bytes()).is_err() { return; }
+            let _ = stream.flush();
+            loop {
+                match rrx.recv() {
+                    Ok(StreamMsg::Chunk(p)) => {
+                        if stream.write_all(format!("data: {p}\n\n").as_bytes()).is_err() { return; }
+                        let _ = stream.flush();
+                    }
+                    Ok(StreamMsg::Done(_reply)) => {
+                        // Standard OpenAI SSE terminator. The summary
+                        // reply body isn't sent in streaming mode —
+                        // clients accumulate the chunks.
+                        let _ = stream.write_all(b"data: [DONE]\n\n");
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(_) => {
+                        // Worker dropped the channel. Close stream.
+                        return;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+            let _ = http::write_response(&mut stream, 500, "Internal Server Error",
+                &error_body("worker dropped the request", "server_error"));
+        }
+    }
 }
 
 fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>, metrics: Arc<Metrics>) {
