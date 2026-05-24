@@ -419,23 +419,92 @@ enum ServerModel {
         /// MTP drafter for spec-decode. `None` ⇒ server was started
         /// without `--big-drafter`; every request runs plain decode.
         drafter: Option<GemmaDrafter>,
-        /// Single-slot KV prefix cache. Holds the most-recent request's
-        /// post-prefill state snapshot + its full prompt tokens. On the
-        /// next request, if the new prompt shares a non-trivial prefix
-        /// with the cached one, restore the snapshot and prefill only
-        /// the suffix — slashes TTFT for chat sessions where successive
-        /// turns reuse a long system + history prefix.
-        ///
-        /// Only one slot per model (last-request only) — keeps the VRAM
-        /// budget bounded. Multi-slot LRU is a follow-up if chat
-        /// workloads warrant it.
-        prefix_cache: Option<PrefixCache>,
+        /// KV prefix cache (LRU). On each request, scan all slots for
+        /// the longest common prefix with the new prompt; restore the
+        /// best match's snapshot and prefill only the suffix. Slashes
+        /// TTFT for chat sessions where successive turns reuse a long
+        /// system + history prefix. Multi-slot lets independent chat
+        /// sessions (different users / conversations) each get cache
+        /// hits even when interleaved on the same model.
+        prefix_cache: PrefixCache,
     },
 }
 
-struct PrefixCache {
+struct PrefixCacheEntry {
     tokens: Vec<u32>,
     snapshot: crate::runtime::gemma4::Gemma4StateSnapshot,
+}
+
+/// Small LRU cache of `PrefixCacheEntry` per `ServerModel::Gemma`. On
+/// each request we scan all slots for the longest common prefix with
+/// the new prompt; on insert we evict the oldest. Multi-slot is the
+/// difference between "two back-to-back turns share state" (1-slot)
+/// and "multiple concurrent chat sessions on the same model can each
+/// reuse state" (N-slot). Cap chosen by VRAM budget — each snapshot
+/// is ~max_seq × per-layer-KV bytes (e.g. ~50 MB for a 500-token
+/// gemma-26B-MoE prompt), so 4 slots ≈ ~200 MB.
+struct PrefixCache {
+    slots: std::collections::VecDeque<PrefixCacheEntry>,
+    cap: usize,
+}
+
+impl PrefixCache {
+    fn new(cap: usize) -> Self {
+        Self { slots: std::collections::VecDeque::with_capacity(cap), cap }
+    }
+
+    /// Find the slot with the longest common prefix vs `prompt`. Returns
+    /// `(slot_index, overlap_len)` when a slot has ≥ MIN_OVERLAP common
+    /// tokens AND less than `prompt.len()` (need a non-empty suffix to
+    /// prefill — full match means no work to do but also no need to
+    /// snapshot again). None otherwise.
+    fn best_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, e) in self.slots.iter().enumerate() {
+            let c = common_prefix_len(&e.tokens, prompt);
+            if c >= PREFIX_CACHE_MIN_OVERLAP && c < prompt.len() {
+                if best.map(|(_, bc)| c > bc).unwrap_or(true) {
+                    best = Some((i, c));
+                }
+            }
+        }
+        best
+    }
+
+    /// Mark slot `idx` as most-recently-used and return a reference
+    /// to its snapshot for restore. Moves entry to the back of the
+    /// deque (most-recent end).
+    fn touch(&mut self, idx: usize)
+        -> &crate::runtime::gemma4::Gemma4StateSnapshot
+    {
+        if idx + 1 < self.slots.len() {
+            let entry = self.slots.remove(idx).expect("idx valid");
+            self.slots.push_back(entry);
+            &self.slots.back().expect("just pushed").snapshot
+        } else {
+            &self.slots[idx].snapshot
+        }
+    }
+
+    /// Add a fresh (tokens, snapshot) pair. Evicts the oldest if at
+    /// cap. If a slot already holds an exact prefix duplicate, just
+    /// updates it (no point keeping two identical entries).
+    fn insert(&mut self, tokens: Vec<u32>,
+              snapshot: crate::runtime::gemma4::Gemma4StateSnapshot)
+    {
+        // Dedup: if some slot's tokens are identical to ours, swap its
+        // snapshot in place and move it to the back.
+        if let Some(pos) = self.slots.iter().position(|e| e.tokens == tokens) {
+            let mut e = self.slots.remove(pos).expect("pos valid");
+            e.snapshot = snapshot;
+            self.slots.push_back(e);
+            return;
+        }
+        if self.slots.len() >= self.cap {
+            self.slots.pop_front();
+        }
+        self.slots.push_back(PrefixCacheEntry { tokens, snapshot });
+    }
 }
 
 /// Minimum prefix overlap to make snapshot restore worthwhile.
@@ -443,6 +512,11 @@ struct PrefixCache {
 /// at our gemma 26B-MoE prefill speeds (~770 tok/s) that means at least
 /// ~32 tokens of overlap before the snapshot D2D copy starts paying off.
 const PREFIX_CACHE_MIN_OVERLAP: usize = 32;
+
+/// Default LRU slots per Gemma model. 4 = comfortable for a few
+/// concurrent chat sessions without VRAM bloat. Override-able via
+/// env in serve startup if a deployment wants more.
+const PREFIX_CACHE_SLOTS: usize = 4;
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
@@ -515,7 +589,7 @@ impl ServerModel {
                 Some(GemmaDrafter { runtime: dr, verify_graphs })
             } else { None };
             Ok(ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, name, drafter,
-                                    prefix_cache: None })
+                                    prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS) })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
             use crate::model::qwen3_5::Qwen35Model;
@@ -653,21 +727,17 @@ impl ServerModel {
                                 (start with --big-drafter PATH)".into());
                 }
 
-                // KV prefix cache: if the cached prompt is a non-trivial
-                // prefix of this request, restore the snapshot and
-                // prefill only the suffix. Falls back to a full prefill
-                // on miss / short overlap.
+                // KV prefix cache: scan LRU for the slot with the longest
+                // common prefix with this request. On hit, restore that
+                // slot's snapshot + truncate to the common prefix, then
+                // prefill only the suffix.
                 let mut overlap = 0usize;
-                let restored = if let Some(pc) = prefix_cache.as_ref() {
-                    let c = common_prefix_len(&pc.tokens, &prompt);
-                    if c >= PREFIX_CACHE_MIN_OVERLAP && c < prompt.len() {
-                        // Restore the snapshot (state now at len = pc.tokens.len()),
-                        // then truncate down to the common prefix.
-                        state.restore(&pc.snapshot)?;
-                        state.truncate(c);
-                        overlap = c;
-                        true
-                    } else { false }
+                let restored = if let Some((idx, c)) = prefix_cache.best_match(&prompt) {
+                    let snap = prefix_cache.touch(idx);
+                    state.restore(snap)?;
+                    state.truncate(c);
+                    overlap = c;
+                    true
                 } else { false };
                 if !restored {
                     state.reset();
@@ -686,14 +756,11 @@ impl ServerModel {
                         gpu.prefill_forward(&prompt, state)?
                     };
                     // Snapshot the post-prompt state for future requests
-                    // that share a prefix with this one. Best-effort —
-                    // a snapshot allocation failure shouldn't abort the
-                    // request, just skip caching this turn.
+                    // that share a prefix. Best-effort — a snapshot
+                    // allocation failure shouldn't abort the request,
+                    // just skip caching this turn.
                     match state.snapshot() {
-                        Ok(snap) => {
-                            *prefix_cache = Some(PrefixCache {
-                                tokens: prompt.clone(), snapshot: snap });
-                        }
+                        Ok(snap) => prefix_cache.insert(prompt.clone(), snap),
                         Err(e) => eprintln!("[serve] prefix-cache snapshot failed: {e}"),
                     }
                     let vocab = logits.len();
