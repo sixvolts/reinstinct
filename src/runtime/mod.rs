@@ -36,6 +36,11 @@ pub struct KernelCache {
     /// Output of `hipcc --version`, used in the cache key so a HIP upgrade
     /// invalidates compiled blobs automatically.
     hipcc_version: String,
+    /// Hash of all shared headers' content. Folded into every cache key
+    /// so an edit to e.g. `gfx906_dpp.h` invalidates cached `.hsaco`s
+    /// for every kernel that `#include`s it — without forcing each
+    /// kernel source to literally embed the header text.
+    headers_digest: u64,
 }
 
 impl KernelCache {
@@ -45,17 +50,64 @@ impl KernelCache {
     /// running under rocprof, whose LD_PRELOAD makes hipcc/clang abort
     /// (LLVM CLI option double-registration). With the cache warm this
     /// is the only hipcc call, so bypassing it is enough.
+    ///
+    /// Also drops the small shared headers (`gfx906_dpp.h`, …) into the
+    /// cache dir so `#include`s in kernel sources resolve against
+    /// `cache_dir` (which is what hipcc gets as `-I`).
     pub fn new() -> Result<Self, String> {
         let arch = std::env::var("REINSTINCT_OFFLOAD_ARCH")
             .unwrap_or_else(|_| DEFAULT_ARCH.to_string());
         let cache_dir = Self::default_cache_dir()?;
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("create cache dir {}: {e}", cache_dir.display()))?;
+        Self::sync_shared_headers(&cache_dir)?;
         let hipcc_version = match std::env::var("REINSTINCT_HIPCC_VERSION") {
             Ok(v) => v,
             Err(_) => Self::hipcc_version()?,
         };
-        Ok(Self { cache_dir, arch, hipcc_version })
+        let headers_digest = Self::compute_headers_digest();
+        Ok(Self { cache_dir, arch, hipcc_version, headers_digest })
+    }
+
+    /// Write the small shared `#include`-able headers to the cache dir
+    /// every startup. Their content is baked into the binary via
+    /// `include_str!`, so this is a write-only sync — `hipcc -I <cache>`
+    /// then resolves the `#include "gfx906_dpp.h"`-style references in
+    /// kernel sources. The header text is part of the cache key for every
+    /// dependent kernel (via the `include_str!` text included in the
+    /// kernel source string), so editing a header invalidates the
+    /// compiled `.hsaco`s that use it.
+    fn shared_headers() -> &'static [(&'static str, &'static str)] {
+        const HEADERS: &[(&str, &str)] = &[
+            ("gfx906_dpp.h", include_str!("../../kernels/gfx906_dpp.h")),
+        ];
+        HEADERS
+    }
+
+    fn sync_shared_headers(cache_dir: &Path) -> Result<(), String> {
+        for (name, body) in Self::shared_headers() {
+            let p = cache_dir.join(name);
+            // Skip rewrites when content matches — avoids touching the
+            // mtime on every process start (harmless but noisy).
+            match std::fs::read(&p) {
+                Ok(existing) if existing == body.as_bytes() => continue,
+                _ => {}
+            }
+            std::fs::write(&p, body)
+                .map_err(|e| format!("write shared header {}: {e}", p.display()))?;
+        }
+        Ok(())
+    }
+
+    fn compute_headers_digest() -> u64 {
+        let mut h = Xxh3::new();
+        for (name, body) in Self::shared_headers() {
+            h.update(name.as_bytes());
+            h.update(b"\0");
+            h.update(body.as_bytes());
+            h.update(b"\0");
+        }
+        h.digest()
     }
 
     fn default_cache_dir() -> Result<PathBuf, String> {
@@ -94,6 +146,8 @@ impl KernelCache {
         }
         h.update(b"\0hipcc=");
         h.update(self.hipcc_version.as_bytes());
+        h.update(b"\0headers=");
+        h.update(&self.headers_digest.to_le_bytes());
         format!("{:016x}", h.digest())
     }
 
@@ -120,6 +174,7 @@ impl KernelCache {
         cmd.arg("--genco")
            .arg(format!("--offload-arch={}", self.arch))
            .args(COMPILE_FLAGS)
+           .arg(format!("-I{}", self.cache_dir.display()))
            .arg("-o").arg(&tmp_out)
            .arg(&src_path);
         let started = std::time::Instant::now();
@@ -154,20 +209,28 @@ impl KernelCache {
 mod tests {
     use super::*;
 
+    fn k_with(arch: &str, hd: u64) -> KernelCache {
+        KernelCache { cache_dir: PathBuf::from("/tmp"),
+                      arch: arch.into(),
+                      hipcc_version: "v".into(),
+                      headers_digest: hd }
+    }
+
     #[test]
     fn cache_key_differs_with_arch() {
-        let mut k1 = KernelCache { cache_dir: PathBuf::from("/tmp"), arch: "gfx906".into(),
-                                   hipcc_version: "v".into() };
-        let h_a = k1.cache_key("kernel x");
-        k1.arch = "gfx1030".into();
-        let h_b = k1.cache_key("kernel x");
-        assert_ne!(h_a, h_b);
+        assert_ne!(k_with("gfx906", 0).cache_key("kernel x"),
+                   k_with("gfx1030", 0).cache_key("kernel x"));
     }
 
     #[test]
     fn cache_key_differs_with_source() {
-        let k = KernelCache { cache_dir: PathBuf::from("/tmp"), arch: "gfx906".into(),
-                              hipcc_version: "v".into() };
+        let k = k_with("gfx906", 0);
         assert_ne!(k.cache_key("a"), k.cache_key("b"));
+    }
+
+    #[test]
+    fn cache_key_differs_with_headers() {
+        assert_ne!(k_with("gfx906", 0).cache_key("k"),
+                   k_with("gfx906", 1).cache_key("k"));
     }
 }
