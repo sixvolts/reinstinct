@@ -419,7 +419,33 @@ enum ServerModel {
         /// MTP drafter for spec-decode. `None` ⇒ server was started
         /// without `--big-drafter`; every request runs plain decode.
         drafter: Option<GemmaDrafter>,
+        /// Single-slot KV prefix cache. Holds the most-recent request's
+        /// post-prefill state snapshot + its full prompt tokens. On the
+        /// next request, if the new prompt shares a non-trivial prefix
+        /// with the cached one, restore the snapshot and prefill only
+        /// the suffix — slashes TTFT for chat sessions where successive
+        /// turns reuse a long system + history prefix.
+        ///
+        /// Only one slot per model (last-request only) — keeps the VRAM
+        /// budget bounded. Multi-slot LRU is a follow-up if chat
+        /// workloads warrant it.
+        prefix_cache: Option<PrefixCache>,
     },
+}
+
+struct PrefixCache {
+    tokens: Vec<u32>,
+    snapshot: crate::runtime::gemma4::Gemma4StateSnapshot,
+}
+
+/// Minimum prefix overlap to make snapshot restore worthwhile.
+/// Restore + suffix-prefill needs to beat a plain prefill of N tokens —
+/// at our gemma 26B-MoE prefill speeds (~770 tok/s) that means at least
+/// ~32 tokens of overlap before the snapshot D2D copy starts paying off.
+const PREFIX_CACHE_MIN_OVERLAP: usize = 32;
+
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 /// MTP drafter resources tied to a Gemma target. Captured graphs
@@ -488,7 +514,8 @@ impl ServerModel {
                 for _ in 0..5 { verify_graphs.push(None); }
                 Some(GemmaDrafter { runtime: dr, verify_graphs })
             } else { None };
-            Ok(ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, name, drafter })
+            Ok(ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, name, drafter,
+                                    prefix_cache: None })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
             use crate::model::qwen3_5::Qwen35Model;
@@ -590,7 +617,7 @@ impl ServerModel {
                 }
                 Ok((full_text, prompt.len(), out.len(), hit_eos))
             }
-            ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, .. } => {
+            ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => {
                         let mut p = vec![*bos];
@@ -626,11 +653,49 @@ impl ServerModel {
                                 (start with --big-drafter PATH)".into());
                 }
 
-                state.reset();
+                // KV prefix cache: if the cached prompt is a non-trivial
+                // prefix of this request, restore the snapshot and
+                // prefill only the suffix. Falls back to a full prefill
+                // on miss / short overlap.
+                let mut overlap = 0usize;
+                let restored = if let Some(pc) = prefix_cache.as_ref() {
+                    let c = common_prefix_len(&pc.tokens, &prompt);
+                    if c >= PREFIX_CACHE_MIN_OVERLAP && c < prompt.len() {
+                        // Restore the snapshot (state now at len = pc.tokens.len()),
+                        // then truncate down to the common prefix.
+                        state.restore(&pc.snapshot)?;
+                        state.truncate(c);
+                        overlap = c;
+                        true
+                    } else { false }
+                } else { false };
+                if !restored {
+                    state.reset();
+                }
 
                 if !do_spec {
-                    // Plain prefill + decode.
-                    let mut logits = gpu.prefill_forward(&prompt, state)?;
+                    // Plain prefill + decode. If we hit the prefix cache,
+                    // prefill only the suffix; otherwise full prompt.
+                    let mut logits = if restored {
+                        let suffix = &prompt[overlap..];
+                        eprintln!("[serve] req kv-cache hit: \
+                                   reused {overlap}/{} tokens; prefilling {} suffix",
+                                  prompt.len(), suffix.len());
+                        gpu.prefill_forward(suffix, state)?
+                    } else {
+                        gpu.prefill_forward(&prompt, state)?
+                    };
+                    // Snapshot the post-prompt state for future requests
+                    // that share a prefix with this one. Best-effort —
+                    // a snapshot allocation failure shouldn't abort the
+                    // request, just skip caching this turn.
+                    match state.snapshot() {
+                        Ok(snap) => {
+                            *prefix_cache = Some(PrefixCache {
+                                tokens: prompt.clone(), snapshot: snap });
+                        }
+                        Err(e) => eprintln!("[serve] prefix-cache snapshot failed: {e}"),
+                    }
                     let vocab = logits.len();
                     let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                         || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
