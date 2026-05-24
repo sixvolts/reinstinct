@@ -43,6 +43,7 @@ pub struct GpuForwardTrace {
 use super::KernelCache;
 
 const EMBED_LOOKUP_SOURCE:      &str = include_str!("../../kernels/embed_lookup.cpp");
+const ARGMAX_F32_SOURCE:        &str = include_str!("../../kernels/argmax_f32.cpp");
 const RMSNORM_SOURCE:           &str = include_str!("../../kernels/rmsnorm.cpp");
 const SWIGLU_SOURCE:            &str = include_str!("../../kernels/swiglu.cpp");
 const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
@@ -983,6 +984,10 @@ pub struct GpuQwen35 {
     // Compiled kernel modules — keep alive for the lifetime of self.
     embed_module:            Module,
     rmsnorm_module:          Module,
+    argmax_f32_module:       Module,
+    /// Two-int output for argmax_f32 (idx + val packed back-to-back).
+    /// Persistent so the per-draft launch_argmax avoids a hipMalloc.
+    argmax_out:              DeviceBuf<i32>,
     swiglu_module:           Module,
     rmsnorm_multihead_module: Module,
     split_q_gate_module:     Module,
@@ -1195,6 +1200,7 @@ impl GpuQwen35 {
         let rope_sin = DeviceBuf::from_slice(&sin)?;
 
         let embed_hsaco             = cache.compile("embed_lookup",      EMBED_LOOKUP_SOURCE)?;
+        let argmax_f32_hsaco        = cache.compile("argmax_f32",        ARGMAX_F32_SOURCE)?;
         let rmsnorm_hsaco           = cache.compile("rmsnorm",           RMSNORM_SOURCE)?;
         let swiglu_hsaco            = cache.compile("swiglu",            SWIGLU_SOURCE)?;
         let rmsnorm_multihead_hsaco = cache.compile("rmsnorm_multihead", RMSNORM_MULTIHEAD_SOURCE)?;
@@ -1283,6 +1289,8 @@ impl GpuQwen35 {
             moe_prof_on, prof_mark, prof_buckets,
             rope_cos, rope_sin,
             embed_module:             Module::load(&embed_hsaco)?,
+            argmax_f32_module:        Module::load(&argmax_f32_hsaco)?,
+            argmax_out:               DeviceBuf::new(2)?,
             rmsnorm_module:           Module::load(&rmsnorm_hsaco)?,
             swiglu_module:            Module::load(&swiglu_hsaco)?,
             rmsnorm_multihead_module: Module::load(&rmsnorm_multihead_hsaco)?,
@@ -2867,14 +2875,22 @@ impl GpuQwen35 {
     /// feeds the previous link's block-hidden and drafted token. The MTP
     /// block's KV cache advances by `k` (drafts occupy MTP positions
     /// `mtp_pos .. mtp_pos+k`). Returns the `k` drafted token ids.
+    ///
+    /// Sampling runs on the GPU via `argmax_f32` → an 8-byte D2H of
+    /// `(idx, val)`, instead of D2H'ing the full vocab × K times.
+    /// Saves ~vocab*4 bytes × K of PCIe per draft round; on qwen 27B
+    /// with vocab≈152K that's ~600 KB per draft step × K=3 = ~1.8 MB
+    /// per round. Small per-call but stackable across rounds.
+    /// (Port of llama.cpp's `ad2775726` move-to-backend-sampling.)
     fn mtp_draft_chain(&self, mtp: &GpuMtpHead, prev_hidden: *mut c_void,
                        first_embed: u32, mtp_kv: &mut GpuKvCache,
                        k: usize, mtp_pos: usize) -> Result<Vec<u32>, String>
     {
         let h = self.hidden;
         let mut drafts = Vec::with_capacity(k);
-        let mut logits_host = vec![0.0f32; self.vocab];
         let mut embed = first_embed;
+        // Small staging buffer for the 2-int (idx, val-as-int) D2H.
+        let mut argmax_host = vec![0i32; 2];
         for i in 0..k {
             let prev = if i == 0 { prev_hidden } else { self.mtp_chain_hid.raw_ptr() };
             self.set_pos(mtp_pos + i)?;
@@ -2885,12 +2901,44 @@ impl GpuQwen35 {
                 self.mtp_chain_hid.copy_range_from_device_async(
                     &self.mtp_scratch, 2 * h, 0, h, &self.stream)?;
             }
+            // GPU-side argmax over self.logits → write (idx, val_bits)
+            // to self.argmax_out (2 ints). Then 8-byte D2H of just that.
+            self.launch_argmax_idx(self.logits.raw_ptr(), self.vocab as u32,
+                                   self.argmax_out.raw_ptr())?;
             self.stream.synchronize()?;
-            self.logits.copy_to_host(&mut logits_host)?;
-            embed = crate::sampling::argmax(&logits_host);
+            self.argmax_out.copy_to_host(&mut argmax_host)?;
+            embed = argmax_host[0] as u32;
             drafts.push(embed);
         }
         Ok(drafts)
+    }
+
+    /// One-block argmax over `n` fp32 logits. Output is two ints at
+    /// `out`: out[0] = argmax index, out[1] = argmax value reinterpreted
+    /// as int (so the same buffer holds both). 1024-thread block; LDS
+    /// of `block * (4+4)` bytes for the value+index tree-reduce.
+    fn launch_argmax_idx(&self, logits: *mut c_void, n: u32, out: *mut c_void)
+        -> Result<(), String>
+    {
+        let f = self.argmax_f32_module.function("argmax_f32")?;
+        let block: u32 = 1024;
+        let mut la = logits;
+        let mut na = n;
+        let mut oi = out;
+        // out[0..4] = idx, out[4..8] = val (reinterpreted via the kernel's
+        // out_val pointer arithmetic — pass the same base with +4 offset).
+        let mut ov = unsafe { (out as *mut i32).add(1) as *mut c_void };
+        let mut args: [*mut c_void; 4] = [
+            &mut la as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+            &mut oi as *mut _ as *mut c_void,
+            &mut ov as *mut _ as *mut c_void,
+        ];
+        // smem = block * 4 (vals) + block * 4 (idxs).
+        let smem = block * 8;
+        unsafe {
+            f.launch((1, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args)
+        }
     }
 
     /// QMTP-3 — MTP speculative-decode generation loop.
