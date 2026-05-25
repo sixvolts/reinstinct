@@ -44,11 +44,9 @@ noise there gets weighted out.
 The original 3-tier design (fp16 Hot / int8 Warm / turbo3 Cold) was
 simplified per user feedback (2026-05-25): int8 at 48 dB is plenty
 for any attention tier; the fp16 Hot tier added complexity (separate
-write kernel + dequant path) for invisible quality gain.
-
-The original 3-tier kernels (`kv_write_fp16.cpp`,
-`kv_promote_fp16_to_q8.cpp`) remain in the tree as primitives in
-case the Hot tier is reinstated later.
+write kernel + dequant path) for invisible quality gain. The Hot-tier
+kernels were removed; if reinstated later they can be revived from
+git history (see commits up to and including the 2-tier refactor).
 
 ## CLI: `superquant-bench`
 

@@ -289,7 +289,6 @@ pub fn launch_attn_partial_superquant(
     let mut cc    = kv.cold_count.get() as u32;
     let mut wc    = kv.warm_count.get() as u32;
     let mut sc    = scaling;
-    let mut ns    = n_splits;
 
     let mut args: [*mut c_void; 20] = [
         &mut q_p   as *mut _ as *mut c_void,

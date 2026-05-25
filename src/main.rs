@@ -250,9 +250,9 @@ enum Command {
     /// fills it via `write_step`, then runs the 2-tier attention kernel.
     /// Reports per-stage timing + attention rel-L2 vs pure fp32.
     ///
-    /// The env var REINSTINCT_KV_SUPERQUANT=1 is reserved for future
-    /// production integration into generate-text / serve forward passes;
-    /// this command always exercises SuperQuant.
+    /// For real-model SuperQuant runs use `generate-text` with
+    /// REINSTINCT_KV_SUPERQUANT=1; this command always exercises
+    /// SuperQuant on synthetic tensors (no model needed).
     SuperquantBench {
         /// int8 Warm tier capacity (token positions).
         #[arg(long, default_value_t = 2048)]

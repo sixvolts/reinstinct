@@ -1124,7 +1124,6 @@ pub struct GpuQwen35 {
     gdn_head_dim:    usize,
     gdn_conv_kernel: usize,
     rms_eps:    f32,
-    #[allow(dead_code)]
     max_seq:    usize,
 
     /// `Some` for a `qwen35moe` model — MoE FFN kernels + scratch.
