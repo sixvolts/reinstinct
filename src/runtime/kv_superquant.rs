@@ -33,6 +33,7 @@ use crate::hip::{DeviceBuf, Module};
 use crate::quant::turbo3::{CacheKind, ROT_GROUP};
 use super::KernelCache;
 use super::kv_turbo3::{slot_bytes, launch_promote_q8_to_turbo3};
+use std::cell::Cell;
 use std::ffi::c_void;
 
 pub const KV_WRITE_Q8_STEP_SOURCE: &str =
@@ -81,20 +82,30 @@ pub struct SuperQuantKvCache {
     pub head_dim: usize,
     pub config: SuperQuantConfig,
 
-    // Tier counts — populated positions in each tier.
-    pub warm_count: usize,
-    pub cold_count: usize,
+    // Tier counts — populated positions in each tier. Cell for
+    // interior mutability so write_step / cascade can run from a
+    // `&state` borrow (which is what the forward chain holds during
+    // its kernel-enqueue phase).
+    pub warm_count: Cell<usize>,
+    pub cold_count: Cell<usize>,
 
-    write_q8_module: Option<Module>,
+    write_q8_module: Module,
 }
 
 impl SuperQuantKvCache {
-    pub fn new(n_kv: usize, head_dim: usize, config: SuperQuantConfig)
+    /// Construct a SuperQuant cache. The kernel cache is borrowed only
+    /// at construction time — we eagerly compile + load the write
+    /// module so `write_step` can run from a `&self` borrow without
+    /// touching `cache`.
+    pub fn new(kernel_cache: &KernelCache,
+               n_kv: usize, head_dim: usize, config: SuperQuantConfig)
         -> Result<Self, String>
     {
         assert_eq!(head_dim % ROT_GROUP, 0,
             "SuperQuant head_dim {head_dim} must be a multiple of {ROT_GROUP}");
         let sb = slot_bytes(head_dim);
+        let hsaco = kernel_cache.compile("kv_write_q8_step", KV_WRITE_Q8_STEP_SOURCE)?;
+        let write_q8_module = Module::load(&hsaco)?;
         Ok(Self {
             warm_k: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
             warm_v: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
@@ -109,44 +120,36 @@ impl SuperQuantKvCache {
             scratch_warm_q: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
             scratch_warm_s: DeviceBuf::new(config.warm_cap * n_kv)?,
             n_kv, head_dim, config,
-            warm_count: 0, cold_count: 0,
-            write_q8_module: None,
+            warm_count: Cell::new(0), cold_count: Cell::new(0),
+            write_q8_module,
         })
     }
 
-    pub fn reset(&mut self) {
-        self.warm_count = 0;
-        self.cold_count = 0;
+    pub fn reset(&self) {
+        self.warm_count.set(0);
+        self.cold_count.set(0);
     }
 
-    pub fn len(&self) -> usize { self.cold_count + self.warm_count }
+    pub fn len(&self) -> usize { self.cold_count.get() + self.warm_count.get() }
     pub fn max_seq(&self) -> usize { self.config.total() }
-
-    fn ensure_write_q8(&mut self, cache: &KernelCache) -> Result<(), String> {
-        if self.write_q8_module.is_none() {
-            let hsaco = cache.compile("kv_write_q8_step", KV_WRITE_Q8_STEP_SOURCE)?;
-            self.write_q8_module = Some(Module::load(&hsaco)?);
-        }
-        Ok(())
-    }
+    pub fn warm_count(&self) -> usize { self.warm_count.get() }
+    pub fn cold_count(&self) -> usize { self.cold_count.get() }
 
     /// Write one decode-step's K + V projections (fp32 device buffers,
     /// [n_kv * head_dim] each) into the Warm tier. Cascades the oldest
     /// Warm entries to Cold if Warm is full.
-    pub fn write_step(&mut self, cache: &KernelCache,
+    pub fn write_step(&self, cache: &KernelCache,
                       src_k: *mut c_void, src_v: *mut c_void)
         -> Result<(), String>
     {
-        if self.warm_count >= self.config.warm_cap {
+        if self.warm_count.get() >= self.config.warm_cap {
             self.demote_warm_to_cold(cache, 1)?;
         }
-        self.ensure_write_q8(cache)?;
         let nkv = self.n_kv as u32;
         let hd  = self.head_dim as u32;
-        let pos = self.warm_count as u32;
+        let pos = self.warm_count.get() as u32;
         let ms  = self.config.warm_cap as u32;
-        let module = self.write_q8_module.as_ref().unwrap();
-        let f = module.function("kv_write_q8_step_f32")?;
+        let f = self.write_q8_module.function("kv_write_q8_step_f32")?;
 
         for (src, dst_q, dst_s) in [
             (src_k, self.warm_k.raw_ptr(), self.warm_ks.raw_ptr()),
@@ -170,18 +173,20 @@ impl SuperQuantKvCache {
             ];
             unsafe { f.launch((nkv, 1, 1), (256, 1, 1), 0, None, &mut args)?; }
         }
-        self.warm_count += 1;
+        self.warm_count.set(self.warm_count.get() + 1);
         Ok(())
     }
 
     /// Move `n` oldest Warm entries to the Cold tier.
-    pub fn demote_warm_to_cold(&mut self, cache: &KernelCache, n: usize)
+    pub fn demote_warm_to_cold(&self, cache: &KernelCache, n: usize)
         -> Result<(), String>
     {
-        assert!(n <= self.warm_count, "demote_warm_to_cold: n={n} > warm_count={}", self.warm_count);
-        assert!(self.cold_count + n <= self.config.cold_cap,
-            "cold tier overflow: cold_count={} + n={n} > cold_cap={}",
-            self.cold_count, self.config.cold_cap);
+        let wc = self.warm_count.get();
+        let cc = self.cold_count.get();
+        assert!(n <= wc, "demote_warm_to_cold: n={n} > warm_count={wc}");
+        assert!(cc + n <= self.config.cold_cap,
+            "cold tier overflow: cold_count={cc} + n={n} > cold_cap={}",
+            self.config.cold_cap);
 
         let sb = slot_bytes(self.head_dim);
         let row_elems = self.n_kv * self.head_dim;
@@ -190,7 +195,7 @@ impl SuperQuantKvCache {
         let src_v_ptr  = self.warm_v.raw_ptr();
         let src_ks_ptr = self.warm_ks.raw_ptr();
         let src_vs_ptr = self.warm_vs.raw_ptr();
-        let dst_off_bytes = self.cold_count * self.n_kv * sb;
+        let dst_off_bytes = cc * self.n_kv * sb;
         let dst_k_ptr = unsafe { self.cold_k.raw_ptr().add(dst_off_bytes) };
         let dst_v_ptr = unsafe { self.cold_v.raw_ptr().add(dst_off_bytes) };
 
@@ -202,31 +207,26 @@ impl SuperQuantKvCache {
             dst_v_ptr, n as u32, self.n_kv as u32, self.head_dim as u32)?;
         crate::hip::Device(0).synchronize()?;
 
-        // Slide warm forward by n (data + scales). Two D2D memcpys via
-        // per-cache scratch to avoid overlapping-source UB.
-        if self.warm_count - n > 0 {
-            let remaining = (self.warm_count - n) * row_elems;
-            let remaining_scales = (self.warm_count - n) * self.n_kv;
-            // K + ks
+        if wc - n > 0 {
+            let remaining = (wc - n) * row_elems;
+            let remaining_scales = (wc - n) * self.n_kv;
             self.scratch_warm_q.copy_range_from_device(&self.warm_k, n * row_elems, 0, remaining)?;
             self.warm_k.copy_range_from_device(&self.scratch_warm_q, 0, 0, remaining)?;
             self.scratch_warm_s.copy_range_from_device(&self.warm_ks, n * self.n_kv, 0, remaining_scales)?;
             self.warm_ks.copy_range_from_device(&self.scratch_warm_s, 0, 0, remaining_scales)?;
-            // V + vs
             self.scratch_warm_q.copy_range_from_device(&self.warm_v, n * row_elems, 0, remaining)?;
             self.warm_v.copy_range_from_device(&self.scratch_warm_q, 0, 0, remaining)?;
             self.scratch_warm_s.copy_range_from_device(&self.warm_vs, n * self.n_kv, 0, remaining_scales)?;
             self.warm_vs.copy_range_from_device(&self.scratch_warm_s, 0, 0, remaining_scales)?;
         }
-        self.warm_count -= n;
-        self.cold_count += n;
+        self.warm_count.set(wc - n);
+        self.cold_count.set(cc + n);
         Ok(())
     }
 
     /// No-op in current implementation. Reserved for future per-turn
-    /// demotion policy. Kept as part of the API so chat-template code
-    /// can call it unconditionally.
-    pub fn mark_turn_boundary(&mut self, _cache: &KernelCache) -> Result<(), String> {
+    /// demotion policy.
+    pub fn mark_turn_boundary(&self, _cache: &KernelCache) -> Result<(), String> {
         Ok(())
     }
 }
@@ -257,7 +257,7 @@ pub fn launch_attn_partial_superquant(
     let f = module.function("attn_partial_superquant_f32")?;
 
     let block: u32 = 256;
-    let total_len = (kv.cold_count + kv.warm_count) as u32;
+    let total_len = (kv.cold_count.get() + kv.warm_count.get()) as u32;
     let chunk = (total_len + n_splits - 1) / n_splits.max(1);
 
     // LDS: qf32 + scores + tmp(bs) + dqbuf(head_dim) + acc_v(head_dim)
@@ -286,8 +286,8 @@ pub fn launch_attn_partial_superquant(
     let mut nh    = n_heads;
     let mut nkv   = n_kv_heads;
     let mut hd    = head_dim;
-    let mut cc    = kv.cold_count as u32;
-    let mut wc    = kv.warm_count as u32;
+    let mut cc    = kv.cold_count.get() as u32;
+    let mut wc    = kv.warm_count.get() as u32;
     let mut sc    = scaling;
     let mut ns    = n_splits;
 
@@ -352,9 +352,9 @@ mod tests {
     fn allocates_and_resets() {
         let Some(_cache) = skip_if_no_gpu() else { return };
         let cfg = SuperQuantConfig { warm_cap: 64, cold_cap: 128 };
-        let mut kv = SuperQuantKvCache::new(2, 256, cfg).expect("alloc");
+        let kv = SuperQuantKvCache::new(&_cache, 2, 256, cfg).expect("alloc");
         assert_eq!(kv.len(), 0);
-        kv.warm_count = 10; kv.cold_count = 50;
+        kv.warm_count.set(10); kv.cold_count.set(50);
         assert_eq!(kv.len(), 60);
         kv.reset();
         assert_eq!(kv.len(), 0);
@@ -366,7 +366,7 @@ mod tests {
         let cfg = SuperQuantConfig { warm_cap: 4, cold_cap: 8 };
         let n_kv = 2;
         let head_dim = 128;
-        let mut kv = SuperQuantKvCache::new(n_kv, head_dim, cfg).expect("alloc");
+        let kv = SuperQuantKvCache::new(&cache, n_kv, head_dim, cfg).expect("alloc");
 
         let row_elems = n_kv * head_dim;
         let mut r = rng(0x9876);
@@ -378,8 +378,8 @@ mod tests {
             kv.write_step(&cache, dk.raw_ptr(), dv.raw_ptr()).expect("write_step");
         }
         // After 6 writes with warm_cap=4: warm=4, cold=2.
-        assert_eq!(kv.warm_count, 4);
-        assert_eq!(kv.cold_count, 2);
+        assert_eq!(kv.warm_count(), 4);
+        assert_eq!(kv.cold_count(), 2);
         assert_eq!(kv.len(), 6);
     }
 
@@ -393,7 +393,7 @@ mod tests {
         let n_kv = 1;
         let n_heads = 1;
         let head_dim = 128;
-        let mut kv = SuperQuantKvCache::new(n_kv, head_dim, cfg).expect("alloc");
+        let kv = SuperQuantKvCache::new(&cache, n_kv, head_dim, cfg).expect("alloc");
 
         let row_elems = n_kv * head_dim;
         let mut r = rng(0xABBA);
@@ -407,8 +407,8 @@ mod tests {
             kv.write_step(&cache, dk.raw_ptr(), dv.raw_ptr()).expect("write_step");
             ref_k.push(k); ref_v.push(v);
         }
-        assert_eq!(kv.cold_count, 4);
-        assert_eq!(kv.warm_count, 4);
+        assert_eq!(kv.cold_count(), 4);
+        assert_eq!(kv.warm_count(), 4);
 
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| r()).collect();
         let dq = DeviceBuf::<f32>::from_slice(&q).unwrap();

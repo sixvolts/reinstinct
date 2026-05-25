@@ -1648,7 +1648,7 @@ fn superquant_bench_cli(warm_cap: usize, cold_cap: usize,
 
     let _ = hip::Device::set(0).map_err(|e| anyhow::anyhow!("set gpu: {e}"))?;
     let cache = KernelCache::new().map_err(|e| anyhow::anyhow!(e))?;
-    let mut kv = SuperQuantKvCache::new(n_kv_u, head_dim, cfg)
+    let kv = SuperQuantKvCache::new(&cache, n_kv_u, head_dim, cfg)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Synthesize K/V — keep on host so we can compute the fp32 reference
@@ -1683,7 +1683,7 @@ fn superquant_bench_cli(warm_cap: usize, cold_cap: usize,
     let ms_per_write = dt_write.as_secs_f64() * 1000.0 / n_writes_actual as f64;
     println!("  total = {:.2} s  ({:.3} ms/token, {:.0} tok/s)",
         dt_write.as_secs_f64(), ms_per_write, n_writes_actual as f64 / dt_write.as_secs_f64());
-    println!("  tier counts: cold={} warm={}", kv.cold_count, kv.warm_count);
+    println!("  tier counts: cold={} warm={}", kv.cold_count(), kv.warm_count());
 
     // Time the attention phase.
     println!("\nphase 2: 3-tier attention");
