@@ -518,7 +518,8 @@ workloads. Trades attention rel-L2 error for capacity:
 At Gemma 31B's layer shape (n_kv=2, head_dim=256) with 8K positions
 in Cold + 2K in Warm: **1.68× capacity vs the standard int8 KV** at
 ~0.16 attention rel-L2 vs pure-fp32 reference. Write throughput
-~2200 tok/s, attention ~7 ms/call over 8K positions.
+~2200 tok/s, attention 9 ms/call over 10K positions. See
+`docs/SUPERQUANT.md` for per-cold-size measured table.
 
 ```bash
 # End-to-end correctness + perf bench on synthetic K/V tensors.

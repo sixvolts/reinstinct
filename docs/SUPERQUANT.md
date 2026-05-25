@@ -82,14 +82,30 @@ phase 4: memory accounting
 
 ## Measured numbers (Gemma 31B layer shape)
 
-n_kv=2, n_heads=16, head_dim=256, n_splits=8:
+n_kv=2, n_heads=16, head_dim=256, warm_cap=2048, n_splits=8. Each
+row is a separate `superquant-bench` invocation; n_writes scaled
+to fill `warm + cold` positions exactly.
 
 | Cold positions | Attention rel_l2 | Attention ms/call | Capacity vs int8 |
 |---:|---:|---:|---:|
-| 0     (all Warm)   | ~0 (lossless)   | 1.5  | 1.0× (same as int8) |
-| 2048  | 0.08 | 3.5  | 1.2× |
-| 4096  | 0.12 | 5.2  | 1.4× |
-| 6144  | 0.16 | 7.2  | 1.7× |
+| 0 (all Warm)    | **0.0039** | 0.54 | 1.06× |
+| 1024            | 0.116 | 2.54 | 1.24× |
+| 2048            | 0.136 | 3.40 | 1.37× |
+| 4096            | 0.150 | 5.26 | 1.53× |
+| 6144            | 0.160 | 7.16 | 1.62× |
+| 8192            | 0.163 | 9.06 | 1.69× |
+
+Observations:
+- rel_l2 plateaus around 0.16 — the cold tier's per-value SNR
+  floor dominates and adding more cold positions barely moves it.
+- Attention latency scales linearly with cold-tier size because
+  the per-position cooperative iRHT (FWHT in LDS) is the cost
+  centre. The Warm-only call is ~13× faster than the
+  8K-cold call — that's the optimization headroom for the
+  rotated-space attention follow-up.
+- Capacity gain caps at ~2.0× vs int8 (turbo3 is 0.4375× the
+  bytes-per-value of int8, but `warm_cap` worth of capacity is
+  paid at int8 rates).
 
 Attention latency scales with cold position count because the
 per-position iRHT (cooperative FWHT in LDS) is the dominant cost.
