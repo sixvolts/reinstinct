@@ -19,7 +19,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
-#include "gfx906_dpp.h"
 
 // Tile shape. An empirical sweep (BK ∈ {4,8}, TM/TN ∈ {4,8}, occupancy
 // 1/2) found this 4×4 / occupancy-2 point flat-optimal: TM=8 at
@@ -83,12 +82,9 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim) {
                 const unsigned int sb = sb0 + lk;
-                // Weight + scale streams: read once per K-tile, never reused.
-                // Bypass L1/L2 so the activation tile + LDS scales stay
-                // cache-resident on MI50's small (4 MB) L2.
-                sW[lr][lk] = loadnt_uint4(nib + (size_t)wrow * nsp + sb);
-                const uint16_t sm = loadnt(smp + (size_t)wrow * nsp + sb);
-                const uint32_t dd = loadnt(ddp + (size_t)wrow * n_super + (sb >> 3));
+                sW[lr][lk] = nib[(size_t)wrow * nsp + sb];
+                const uint16_t sm = smp[(size_t)wrow * nsp + sb];
+                const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
                 const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
                 const uint16_t dmin_bits = (uint16_t)(dd >> 16);
                 sWs[lr][lk] = make_float2(

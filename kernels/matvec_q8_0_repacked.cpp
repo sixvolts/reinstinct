@@ -65,17 +65,15 @@ void mv_q8_0_repacked(const unsigned char* __restrict__ slab,
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
             if (row >= (int)out_dim) continue;
-            // qs[row][sb] — 32 bytes = 8 int32, naturally aligned.
-            // Weight stream: nontemporal — bypass cache, this row's bytes
-            // are read exactly once per token decode.
+            // qs[row][sb] — 32 bytes = 8 int32, naturally aligned
             const int*     w_int = qs_int + ((size_t)row * nsp + sb) * 8;
-            const uint16_t db    = loadnt(d_plane + (size_t)row * nsp + sb);
+            const uint16_t db    = d_plane[(size_t)row * nsp + sb];
             const float    dw    = __half2float(*reinterpret_cast<const __half*>(&db));
 
             int idot = 0;
             #pragma unroll
             for (int g = 0; g < 8; g++) {
-                idot = __builtin_amdgcn_sdot4(loadnt(w_int + g), xq32[g], idot, false);
+                idot = __builtin_amdgcn_sdot4(w_int[g], xq32[g], idot, false);
             }
             acc[r] += dw * dx * (float)idot;
         }

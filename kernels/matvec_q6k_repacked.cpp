@@ -79,11 +79,11 @@ void matvec_q6k_repacked_f32(const uint8_t* __restrict__ wbase,
             if (row >= (int)out_dim) continue;
 
             const size_t idx = (size_t)row * nsp + sb;
-            const uint4    q    = loadnt_uint4(nib + idx);
-            const uint32_t h2lo = loadnt(h2p + idx * 2);       // groups 0..3
-            const uint32_t h2hi = loadnt(h2p + idx * 2 + 1);   // groups 4..7
-            const uint16_t sm     = loadnt(smp + idx);
-            const uint16_t d_bits = loadnt(ddp + (size_t)row * n_super + (sb >> 3));
+            const uint4    q    = nib[idx];
+            const uint32_t h2lo = h2p[idx * 2];       // groups 0..3
+            const uint32_t h2hi = h2p[idx * 2 + 1];   // groups 4..7
+            const uint16_t sm     = smp[idx];
+            const uint16_t d_bits = ddp[(size_t)row * n_super + (sb >> 3)];
             const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
             const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
             const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);

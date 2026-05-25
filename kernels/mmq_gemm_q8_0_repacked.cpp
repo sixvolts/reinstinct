@@ -15,7 +15,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
-#include "gfx906_dpp.h"
 
 #define BK 4         // sub-blocks per contraction chunk
 #define TM 4         // rows  per thread micro-tile
@@ -78,10 +77,9 @@ void mmq_gemm_q8_0_repacked_f32(const unsigned char* __restrict__ wbase,
             if (wrow < out_dim) {
                 const unsigned int sb = sb0 + lk;
                 // Two uint4 per sub-block at offsets (row*nsp + sb)*2 and *2+1.
-                // Weight stream: nontemporal — keeps activation in L2.
-                sW_lo[lr][lk] = loadnt_uint4(qsp + (size_t)(wrow * nsp + sb) * 2);
-                sW_hi[lr][lk] = loadnt_uint4(qsp + (size_t)(wrow * nsp + sb) * 2 + 1);
-                const uint16_t d_bits = loadnt(dp + (size_t)wrow * nsp + sb);
+                sW_lo[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2];
+                sW_hi[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2 + 1];
+                const uint16_t d_bits = dp[(size_t)wrow * nsp + sb];
                 sWd[lr][lk] = __half2float(*reinterpret_cast<const __half*>(&d_bits));
             } else {
                 sWd[lr][lk] = 0.0f;
