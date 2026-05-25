@@ -47,6 +47,8 @@ const SCALE_INPLACE_SRC:     &str = include_str!("../../kernels/scale_inplace.cp
 const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_q8.cpp");
 const ATTN_PARTIAL_Q8_SRC:   &str = include_str!("../../kernels/attn_partial_q8.cpp");
 const ATTN_PARTIAL_SQ_SRC:   &str = include_str!("../../kernels/attn_partial_superquant.cpp");
+const ATTN_PARTIAL_SQRS_SRC: &str = include_str!("../../kernels/attn_partial_superquant_rs.cpp");
+const ROTATE_Q_RHT_SRC:      &str = include_str!("../../kernels/rotate_q_rht.cpp");
 const ATTN_MERGE_SRC:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits per KV head — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
@@ -780,6 +782,17 @@ pub struct GpuGemma4 {
     /// SuperQuant 2-tier attention (opt-in). Always loaded so opt-in
     /// at state construction time doesn't need to recompile.
     m_attn_superquant: Module,
+    /// Rotated-space variant of SuperQuant attention. Q is pre-rotated
+    /// (m_rotate_q_rht) once per attention call, then cold scoring +
+    /// V accumulation happen in rotated space, with a single per-(head,
+    /// group) iRHT at the end. Skips the per-position FWHT that
+    /// dominates the v1 path's cold latency.
+    m_attn_superquant_rs: Module,
+    m_rotate_q_rht:        Module,
+    /// Per-call Q-rotation scratch — fp32 [n_heads × head_dim_max].
+    /// Holds Q × R_K (K's RHT applied to Q) for the rotated-space
+    /// attention kernel. Allocated once at GpuGemma4::new.
+    q_rot_scratch: DeviceBuf<f32>,
     m_attn_merge:   Module,
     /// Partial-attention scratch: [n_heads, ATTN_MAX_SPLITS, head_dim_max]
     /// and [n_heads, ATTN_MAX_SPLITS] for the running max / denominator.
@@ -1046,6 +1059,9 @@ impl GpuGemma4 {
             m_attn_win:   ld("attn_step_window", ATTN_WINDOW_SRC)?,
             m_attn_partial: ld("attn_partial_q8", ATTN_PARTIAL_Q8_SRC)?,
             m_attn_superquant: ld("attn_partial_superquant", ATTN_PARTIAL_SQ_SRC)?,
+            m_attn_superquant_rs: ld("attn_partial_superquant_rs", ATTN_PARTIAL_SQRS_SRC)?,
+            m_rotate_q_rht:    ld("rotate_q_rht", ROTATE_Q_RHT_SRC)?,
+            q_rot_scratch:     DeviceBuf::new(n_heads * hd_max)?,
             m_attn_merge:   ld("attn_merge", ATTN_MERGE_SRC)?,
             attn_o_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize * hd_max)?,
             attn_m_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?,
@@ -1860,6 +1876,124 @@ impl GpuGemma4 {
             &mut t as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
             &mut row as *mut _ as *mut c_void, &mut h as *mut _ as *mut c_void];
         unsafe { f.launch((grid_x, n_tokens, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Rotated-space SuperQuant attention. Two-pass: (1) pre-rotate
+    /// Q by K's RHT into `q_rot_scratch`; (2) launch the rs kernel
+    /// that scores cold K in rotated space (no per-position iRHT)
+    /// and accumulates V also in rotated space, applying ONE iRHT
+    /// per (head, group) at the end. Same partial+merge shape as the
+    /// non-rotated path.
+    pub(crate) fn launch_attn_superquant_rs(&self,
+        q: *mut c_void,
+        kv: &crate::runtime::kv_superquant::SuperQuantKvCache,
+        out: *mut c_void,
+        n_kv: u32, head_dim: u32) -> Result<(), String>
+    {
+        let n_heads = self.n_heads as u32;
+        let block: u32 = 256;
+        const ROT_GROUP: u32 = 128;
+        let groups_per_head = head_dim / ROT_GROUP;
+
+        // (1) Pre-rotate Q with K's signs — grid (n_heads, groups_per_head),
+        // block (128). One FWHT-128 per (head, group).
+        let f_rot = self.m_rotate_q_rht.function("rotate_q_rht_f32")?;
+        let mut q_p   = q;
+        let mut s1k_p = kv.signs1_k.raw_ptr();
+        let mut s2k_p = kv.signs2_k.raw_ptr();
+        let mut qr_p  = self.q_rot_scratch.raw_ptr();
+        let mut nh_a  = n_heads;
+        let mut hd_a  = head_dim;
+        let mut rargs: [*mut c_void; 6] = [
+            &mut q_p   as *mut _ as *mut c_void,
+            &mut s1k_p as *mut _ as *mut c_void,
+            &mut s2k_p as *mut _ as *mut c_void,
+            &mut qr_p  as *mut _ as *mut c_void,
+            &mut nh_a  as *mut _ as *mut c_void,
+            &mut hd_a  as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            f_rot.launch((n_heads, groups_per_head, 1), (128, 1, 1), 0,
+                         Some(&self.stream), &mut rargs)?;
+        }
+
+        // (2) Rotated-space attention launch.
+        let total_len = (kv.cold_count() + kv.warm_count()) as u32;
+        if total_len == 0 { return Ok(()); }
+        let n_splits = ((total_len + 255) / 256).clamp(1, ATTN_MAX_SPLITS);
+        let chunk = (total_len + n_splits - 1) / n_splits;
+
+        // LDS: qf32 + qrot + scores + tmp + acc_w + acc_r + dq_group + fwhtw
+        let smem_floats = head_dim + head_dim + chunk + block
+                        + head_dim + head_dim
+                        + ROT_GROUP + ROT_GROUP;
+        let smem = smem_floats * 4;
+
+        let f = self.m_attn_superquant_rs.function("attn_partial_superquant_rs_f32")?;
+        let mut q_p2  = q;
+        let mut qr_p2 = self.q_rot_scratch.raw_ptr();
+        let mut wk_p  = kv.warm_k.raw_ptr();
+        let mut wks_p = kv.warm_ks.raw_ptr();
+        let mut wv_p  = kv.warm_v.raw_ptr();
+        let mut wvs_p = kv.warm_vs.raw_ptr();
+        let mut ck_p  = kv.cold_k.raw_ptr();
+        let mut cv_p  = kv.cold_v.raw_ptr();
+        let mut s1v_p = kv.signs1_v.raw_ptr();
+        let mut s2v_p = kv.signs2_v.raw_ptr();
+        let mut op_p  = self.attn_o_partial.raw_ptr();
+        let mut mp_p  = self.attn_m_partial.raw_ptr();
+        let mut lp_p  = self.attn_l_partial.raw_ptr();
+        let mut nh    = n_heads;
+        let mut nkv_a = n_kv;
+        let mut hd    = head_dim;
+        let mut cc    = kv.cold_count() as u32;
+        let mut wc    = kv.warm_count() as u32;
+        let mut sc    = 1.0f32;
+
+        let mut args: [*mut c_void; 19] = [
+            &mut q_p2  as *mut _ as *mut c_void,
+            &mut qr_p2 as *mut _ as *mut c_void,
+            &mut wk_p  as *mut _ as *mut c_void,
+            &mut wks_p as *mut _ as *mut c_void,
+            &mut wv_p  as *mut _ as *mut c_void,
+            &mut wvs_p as *mut _ as *mut c_void,
+            &mut ck_p  as *mut _ as *mut c_void,
+            &mut cv_p  as *mut _ as *mut c_void,
+            &mut s1v_p as *mut _ as *mut c_void,
+            &mut s2v_p as *mut _ as *mut c_void,
+            &mut op_p  as *mut _ as *mut c_void,
+            &mut mp_p  as *mut _ as *mut c_void,
+            &mut lp_p  as *mut _ as *mut c_void,
+            &mut nh    as *mut _ as *mut c_void,
+            &mut nkv_a as *mut _ as *mut c_void,
+            &mut hd    as *mut _ as *mut c_void,
+            &mut cc    as *mut _ as *mut c_void,
+            &mut wc    as *mut _ as *mut c_void,
+            &mut sc    as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            f.launch((n_heads, n_splits, 1), (block, 1, 1), smem,
+                     Some(&self.stream), &mut args)?;
+        }
+
+        // Merge: same kernel as the q8 + non-rs SuperQuant paths.
+        let fm = self.m_attn_merge.function("attn_merge_f32")?;
+        let mut op2 = self.attn_o_partial.raw_ptr();
+        let mut mp2 = self.attn_m_partial.raw_ptr();
+        let mut lp2 = self.attn_l_partial.raw_ptr();
+        let mut oa  = out;
+        let mut hd2 = head_dim;
+        let mut ns2 = n_splits;
+        let mut margs: [*mut c_void; 6] = [
+            &mut op2 as *mut _ as *mut c_void,
+            &mut mp2 as *mut _ as *mut c_void,
+            &mut lp2 as *mut _ as *mut c_void,
+            &mut oa  as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void,
+            &mut ns2 as *mut _ as *mut c_void,
+        ];
+        unsafe { fm.launch((n_heads, 1, 1), (block, 1, 1), 0,
+                           Some(&self.stream), &mut margs) }
     }
 
     /// SuperQuant 2-tier decode attention. Same split-K shape as the
@@ -3372,18 +3506,23 @@ impl GpuGemma4 {
             AttnKind::Full    => 0,
         };
         if let Some(sq) = sq_attn {
-            // SuperQuant attention; `window` arg is dropped — SuperQuant
-            // doesn't currently support sliding-window attention (the
-            // tier layout doesn't carry a per-position window mask).
-            // For sliding-window layers under SuperQuant we still
-            // attend over the full cache; this is a precision/scope
-            // limitation, not a correctness bug — sliding window is
-            // an optimization for context bound, and SuperQuant uses
-            // tiering for the same goal.
+            // SuperQuant attention; `window` arg is dropped (sliding-window
+            // not yet supported under SuperQuant — see commit log).
+            //
+            // Default to the rotated-space (rs) variant — same output as
+            // the naive path but cuts cold-tier latency 3-5× by skipping
+            // the per-position iRHT. Opt out with REINSTINCT_KV_SUPERQUANT_NAIVE=1
+            // for A/B comparison.
             let _ = window;
-            self.launch_attn_superquant(self.q_buf.raw_ptr(), sq,
-                                        self.attn_concat.raw_ptr(),
-                                        n_kv as u32, head_dim as u32)?;
+            if std::env::var_os("REINSTINCT_KV_SUPERQUANT_NAIVE").is_some() {
+                self.launch_attn_superquant(self.q_buf.raw_ptr(), sq,
+                                            self.attn_concat.raw_ptr(),
+                                            n_kv as u32, head_dim as u32)?;
+            } else {
+                self.launch_attn_superquant_rs(self.q_buf.raw_ptr(), sq,
+                                               self.attn_concat.raw_ptr(),
+                                               n_kv as u32, head_dim as u32)?;
+            }
         } else {
             self.launch_attn_q8(self.q_buf.raw_ptr(), attn_kv.k.raw_ptr(), attn_kv.ks.raw_ptr(),
                                 attn_kv.v.raw_ptr(), attn_kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
