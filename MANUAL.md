@@ -505,6 +505,34 @@ serve mode. The serve startup logs WARN if any of them are active.
 | `REINSTINCT_MOE_NO_GROUPED` | Opt out of the grouped-expert MMQ GEMM. Falls back to per-token expert matvecs (~2× slower MoE prefill). |
 | `REINSTINCT_MOE_PROFILE` | Per-stage decode timer (sync-per-lap). Disables graph capture as a side effect — big perf hit. |
 
+### SuperQuant tiered KV cache (opt-in, not yet wired into forward pass)
+
+A 2-tier KV cache (`int8` Warm + `turbo3` Cold) for long-context
+workloads. Trades attention rel-L2 error for capacity:
+
+| Tier | Format | bpv | SNR | Holds |
+|---|---|---:|---:|---|
+| Warm | int8 + per-(slot,head) f32 scale | 8 | ~48 dB | writes + recent context |
+| Cold | turbo3 (RHT + Lloyd-Max 3-bit) | 3.5 | ~14.6 dB | older context |
+
+At Gemma 31B's layer shape (n_kv=2, head_dim=256) with 8K positions
+in Cold + 2K in Warm: **1.68× capacity vs the standard int8 KV** at
+~0.16 attention rel-L2 vs pure-fp32 reference. Write throughput
+~2200 tok/s, attention ~7 ms/call over 8K positions.
+
+```bash
+# End-to-end correctness + perf bench on synthetic K/V tensors.
+reinstinct-engine superquant-bench \
+  --warm-cap 2048 --cold-cap 8192 \
+  --n-kv 2 --n-heads 16 --head-dim 256 \
+  --n-writes 8192 --n-splits 8
+```
+
+See `docs/SUPERQUANT.md` for the full design + measured numbers per
+shape. The CLI is shipping; live integration into `generate-text` /
+`serve` is follow-up work (env var `REINSTINCT_KV_SUPERQUANT=1` is
+reserved).
+
 ### Spec-decode (`mtp-gen`)
 
 | Variable | Effect |
