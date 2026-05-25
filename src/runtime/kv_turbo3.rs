@@ -34,6 +34,89 @@ use std::ffi::c_void;
 
 pub const KV_WRITE_TURBO3_SOURCE: &str =
     include_str!("../../kernels/kv_write_turbo3.cpp");
+pub const KV_PROMOTE_FP16_TO_Q8_SOURCE: &str =
+    include_str!("../../kernels/kv_promote_fp16_to_q8.cpp");
+pub const KV_PROMOTE_Q8_TO_TURBO3_SOURCE: &str =
+    include_str!("../../kernels/kv_promote_q8_to_turbo3.cpp");
+
+/// Demote a contiguous range of fp16 K (or V) slots to int8 + per-(slot,
+/// head) scale. Caller supplies the source fp16 device buffer (the Hot
+/// tier's K or V slot range) and destination int8 + scale buffers (the
+/// Warm tier's K or V append region).
+///
+/// `n_demote` is the number of (slot) positions to promote, `n_kv` is
+/// the head count, `head_dim` the per-head dimension.
+pub fn launch_promote_fp16_to_q8(cache: &KernelCache,
+                                  src_fp16: *mut c_void,
+                                  dst_q: *mut c_void,
+                                  dst_s: *mut c_void,
+                                  n_demote: u32,
+                                  n_kv: u32,
+                                  head_dim: u32)
+    -> Result<(), String>
+{
+    let hsaco = cache.compile("kv_promote_fp16_to_q8", KV_PROMOTE_FP16_TO_Q8_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("kv_promote_fp16_to_q8_f32")?;
+
+    let mut s_p  = src_fp16;
+    let mut dq_p = dst_q;
+    let mut ds_p = dst_s;
+    let mut nkv  = n_kv;
+    let mut hd   = head_dim;
+    let mut args: [*mut c_void; 5] = [
+        &mut s_p  as *mut _ as *mut c_void,
+        &mut dq_p as *mut _ as *mut c_void,
+        &mut ds_p as *mut _ as *mut c_void,
+        &mut nkv  as *mut _ as *mut c_void,
+        &mut hd   as *mut _ as *mut c_void,
+    ];
+    let grid = (n_demote, n_kv, 1);
+    unsafe { f.launch(grid, (256, 1, 1), 0, None, &mut args)?; }
+    Ok(())
+}
+
+/// Demote int8 + scale slots into turbo3 cold-tier blocks. `kind`
+/// selects K vs V RHT sign masks (the cache owns both sets).
+pub fn launch_promote_q8_to_turbo3(cache: &KernelCache,
+                                    src_q: *mut c_void,
+                                    src_s: *mut c_void,
+                                    signs1: *mut c_void,
+                                    signs2: *mut c_void,
+                                    dst: *mut c_void,
+                                    n_demote: u32,
+                                    n_kv: u32,
+                                    head_dim: u32)
+    -> Result<(), String>
+{
+    assert_eq!(head_dim % ROT_GROUP as u32, 0);
+    let hsaco = cache.compile("kv_promote_q8_to_turbo3", KV_PROMOTE_Q8_TO_TURBO3_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("kv_promote_q8_to_turbo3_f32")?;
+
+    let mut sq_p = src_q;
+    let mut ss_p = src_s;
+    let mut s1_p = signs1;
+    let mut s2_p = signs2;
+    let mut d_p  = dst;
+    let mut nd   = n_demote;
+    let mut nkv  = n_kv;
+    let mut hd   = head_dim;
+    let mut args: [*mut c_void; 8] = [
+        &mut sq_p as *mut _ as *mut c_void,
+        &mut ss_p as *mut _ as *mut c_void,
+        &mut s1_p as *mut _ as *mut c_void,
+        &mut s2_p as *mut _ as *mut c_void,
+        &mut d_p  as *mut _ as *mut c_void,
+        &mut nd   as *mut _ as *mut c_void,
+        &mut nkv  as *mut _ as *mut c_void,
+        &mut hd   as *mut _ as *mut c_void,
+    ];
+    let groups_per_head = head_dim / ROT_GROUP as u32;
+    let grid = (n_demote * n_kv, groups_per_head, 1);
+    unsafe { f.launch(grid, (128, 1, 1), 0, None, &mut args)?; }
+    Ok(())
+}
 
 /// Bytes per (token, head) slot for `head_dim`. Asserts head_dim is a
 /// multiple of the 128-element rotation group.
@@ -211,6 +294,138 @@ mod tests {
         assert!(slot4.iter().all(|&b| b == 0), "wrote past slot boundary");
         let slot2 = &full_k[2 * slot_len..2 * slot_len + slot_len];
         assert!(slot2.iter().all(|&b| b == 0), "wrote before slot boundary");
+    }
+
+    /// fp16 → int8 → fp32 round trip: scale should preserve magnitudes
+    /// within ~0.4% (one ULP of int8 quantization).
+    #[test]
+    fn promote_fp16_to_q8_round_trip() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+
+        let n_demote = 4;
+        let n_kv     = 2;
+        let head_dim = 256;
+
+        // Synth K data, fp16 storage.
+        let mut s: u64 = 0xF00D;
+        let mut rng = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = ((s >> 33) as u32 & 0x007F_FFFF) | 0x3f80_0000;
+            (f32::from_bits(bits) - 1.5) * 0.4
+        };
+        let src_f32: Vec<f32> = (0..n_demote * n_kv * head_dim).map(|_| rng()).collect();
+        let src_f16: Vec<u16> = src_f32.iter()
+            .map(|&v| crate::quant::half::f32_to_f16(v))
+            .collect();
+        let dsrc: DeviceBuf<u16> = DeviceBuf::from_slice(&src_f16).unwrap();
+        let dq:   DeviceBuf<i8>  = DeviceBuf::new(n_demote * n_kv * head_dim).unwrap();
+        let ds:   DeviceBuf<f32> = DeviceBuf::new(n_demote * n_kv).unwrap();
+
+        launch_promote_fp16_to_q8(&cache,
+            dsrc.raw_ptr(), dq.raw_ptr(), ds.raw_ptr(),
+            n_demote as u32, n_kv as u32, head_dim as u32).expect("promote");
+        hip::Device(0).synchronize().unwrap();
+
+        let mut hq = vec![0i8;  n_demote * n_kv * head_dim];
+        let mut hs = vec![0.0f32; n_demote * n_kv];
+        dq.copy_to_host(&mut hq).unwrap();
+        ds.copy_to_host(&mut hs).unwrap();
+
+        // SNR per (token,head) row — int8 quant should give > 30 dB on
+        // any row where the values have reasonable dynamic range.
+        // Per-element rel-err is the wrong metric (small values near 0
+        // dominate noise; rel err -> inf as orig -> 0).
+        let mut min_snr = f32::INFINITY;
+        for p in 0..n_demote {
+            for h in 0..n_kv {
+                let scale = hs[p * n_kv + h];
+                let mut s_sig = 0.0f64;
+                let mut s_err = 0.0f64;
+                for i in 0..head_dim {
+                    let idx = (p * n_kv + h) * head_dim + i;
+                    let recon = hq[idx] as f32 * scale;
+                    let orig  = src_f32[idx];
+                    s_sig += (orig as f64).powi(2);
+                    s_err += ((orig - recon) as f64).powi(2);
+                }
+                let snr_db = 10.0 * (s_sig / s_err.max(1e-30)).log10() as f32;
+                if snr_db < min_snr { min_snr = snr_db; }
+            }
+        }
+        eprintln!("fp16→q8 worst-row SNR: {min_snr:.1} dB");
+        // int8 symmetric quant with amax-based scale gives ≈ 48 dB on
+        // unit-variance Gaussian-ish data. Even with the fp16→fp32→q8
+        // round trip we should clear 35 dB.
+        assert!(min_snr > 35.0, "fp16→q8 SNR {min_snr:.1} dB < 35");
+    }
+
+    /// int8 → turbo3 → fp32 round trip: SNR should land in the
+    /// expected 12-22 dB band (matching the standalone encode path).
+    #[test]
+    fn promote_q8_to_turbo3_round_trip() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::turbo3::{decode_rows, CacheKind};
+
+        let n_demote = 4;
+        let n_kv     = 2;
+        let head_dim = 256;
+
+        // Synth K as int8 + scale (simulate a populated Warm tier).
+        let mut s: u64 = 0xBEEF_F00D;
+        let mut rng_byte = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (((s >> 50) as i32 % 254) - 127) as i8
+        };
+        let src_q: Vec<i8> = (0..n_demote * n_kv * head_dim).map(|_| rng_byte()).collect();
+        let src_s: Vec<f32> = (0..n_demote * n_kv).map(|_| 0.012f32).collect();
+
+        let dq:   DeviceBuf<i8>  = DeviceBuf::from_slice(&src_q).unwrap();
+        let dscale: DeviceBuf<f32> = DeviceBuf::from_slice(&src_s).unwrap();
+        let signs1 = DeviceBuf::<i8>::from_slice(CacheKind::K.signs1()).unwrap();
+        let signs2 = DeviceBuf::<i8>::from_slice(CacheKind::K.signs2()).unwrap();
+        let sb = slot_bytes(head_dim);
+        let dout: DeviceBuf<u8>  = DeviceBuf::new(n_demote * n_kv * sb).unwrap();
+
+        launch_promote_q8_to_turbo3(&cache,
+            dq.raw_ptr(), dscale.raw_ptr(),
+            signs1.raw_ptr(), signs2.raw_ptr(),
+            dout.raw_ptr(),
+            n_demote as u32, n_kv as u32, head_dim as u32).expect("promote");
+        hip::Device(0).synchronize().unwrap();
+
+        // Reconstruct int8 row as fp32 ground truth, decode turbo3 to fp32, compare SNR.
+        let mut packed = vec![0u8; n_demote * n_kv * sb];
+        dout.copy_to_host(&mut packed).unwrap();
+
+        let n_rows = n_demote * n_kv;
+        let bytes_per_row = (head_dim / 128) * 4 * 16;
+        assert_eq!(packed.len(), n_rows * bytes_per_row);
+
+        let mut decoded = vec![0.0f32; n_rows * head_dim];
+        decode_rows(&packed, head_dim, CacheKind::K, &mut decoded);
+
+        // Ground truth: same int8 × scale we wrote.
+        let mut gt = vec![0.0f32; n_rows * head_dim];
+        for p in 0..n_demote {
+            for h in 0..n_kv {
+                let scale = src_s[p * n_kv + h];
+                for i in 0..head_dim {
+                    gt[(p * n_kv + h) * head_dim + i]
+                        = src_q[(p * n_kv + h) * head_dim + i] as f32 * scale;
+                }
+            }
+        }
+
+        let mut s_sig = 0.0f64;
+        let mut s_err = 0.0f64;
+        for (xv, dv) in gt.iter().zip(decoded.iter()) {
+            s_sig += (*xv as f64).powi(2);
+            s_err += ((*xv - *dv) as f64).powi(2);
+        }
+        let snr_db = 10.0 * (s_sig / s_err.max(1e-30)).log10();
+        eprintln!("q8→turbo3 SNR ({n_demote}×{n_kv}×hd={head_dim}): {snr_db:.1} dB");
+        assert!(snr_db > 10.0 && snr_db < 25.0,
+                "q8→turbo3 SNR {snr_db:.1} outside expected 10-25 band");
     }
 
     #[test]
