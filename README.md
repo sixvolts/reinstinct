@@ -27,8 +27,9 @@ Single MI50 32 GB, 300W TDP, ROCm 7.1+. All models are Unsloth Dynamic GGUF at Q
 | Gemma 4 31B Dense | 30.7B | **27.5** | 21.0 | **+31%** |
 | Qwen 3.5 27B (GDN hybrid) | 26.9B | **28.1** | 23.4 | **+20%** |
 | Qwen 3.6 27B-MTP | 26.9B | **28.4** | 23.2 | **+22%** |
+| Qwen 3.6 27B | 26.9B | **28.5** | 23.2 | **+23%** |
 
-reinstinct wins **9 of 10** tested configurations.
+reinstinct wins **10 of 10** tested configurations.
 
 ### How does this compare to other hardware?
 
