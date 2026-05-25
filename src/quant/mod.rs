@@ -9,6 +9,7 @@ pub mod q4_k;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod turbo3;
 
 use crate::gguf::error::{GgufError, Result};
 use crate::gguf::tensor_info::TensorInfo;

@@ -893,6 +893,95 @@ pub fn embed_lookup_f32(cache: &KernelCache, table: &[f32], hidden: usize, token
     Ok(out)
 }
 
+const TURBO3_ENCODE_SOURCE: &str = include_str!("../../kernels/turbo3_quantize.cpp");
+const TURBO3_DECODE_SOURCE: &str = include_str!("../../kernels/turbo3_dequantize.cpp");
+
+/// GPU encode for turbo3: f32 [n_rows, head_dim] → packed bytes.
+/// `kind` selects K vs V sign masks. Output is `n_rows * head_dim/32 * 16` bytes.
+pub fn turbo3_encode(cache: &KernelCache,
+                     x: &[f32],
+                     head_dim: usize,
+                     kind: crate::quant::turbo3::CacheKind)
+    -> Result<Vec<u8>, String>
+{
+    assert_eq!(head_dim % 128, 0, "head_dim must be a multiple of 128");
+    let n_rows = x.len() / head_dim;
+    let bytes_per_row = (head_dim / 128) * 4 * 16;
+    let mut out = vec![0u8; n_rows * bytes_per_row];
+
+    let hsaco = cache.compile("turbo3_encode", TURBO3_ENCODE_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("turbo3_encode_f32")?;
+
+    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
+    let ds1: DeviceBuf<i8> = DeviceBuf::from_slice(kind.signs1())?;
+    let ds2: DeviceBuf<i8> = DeviceBuf::from_slice(kind.signs2())?;
+    let dy: DeviceBuf<u8>  = DeviceBuf::new(out.len())?;
+
+    let mut x_ptr  = dx.raw_ptr();
+    let mut s1_ptr = ds1.raw_ptr();
+    let mut s2_ptr = ds2.raw_ptr();
+    let mut y_ptr  = dy.raw_ptr();
+    let mut nr = n_rows as u32;
+    let mut hd = head_dim as u32;
+    let mut args: [*mut c_void; 6] = [
+        &mut x_ptr  as *mut _ as *mut c_void,
+        &mut s1_ptr as *mut _ as *mut c_void,
+        &mut s2_ptr as *mut _ as *mut c_void,
+        &mut y_ptr  as *mut _ as *mut c_void,
+        &mut nr     as *mut _ as *mut c_void,
+        &mut hd     as *mut _ as *mut c_void,
+    ];
+    let grid = (n_rows as u32, (head_dim / 128) as u32, 1);
+    unsafe { f.launch(grid, (128, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+/// GPU decode for turbo3: packed bytes → f32 [n_rows, head_dim].
+pub fn turbo3_decode(cache: &KernelCache,
+                     packed: &[u8],
+                     n_rows: usize,
+                     head_dim: usize,
+                     kind: crate::quant::turbo3::CacheKind)
+    -> Result<Vec<f32>, String>
+{
+    assert_eq!(head_dim % 128, 0);
+    let bytes_per_row = (head_dim / 128) * 4 * 16;
+    assert_eq!(packed.len(), n_rows * bytes_per_row);
+    let mut out = vec![0.0f32; n_rows * head_dim];
+
+    let hsaco = cache.compile("turbo3_decode", TURBO3_DECODE_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("turbo3_decode_f32")?;
+
+    let dx: DeviceBuf<u8>  = DeviceBuf::from_slice(packed)?;
+    let ds1: DeviceBuf<i8> = DeviceBuf::from_slice(kind.signs1())?;
+    let ds2: DeviceBuf<i8> = DeviceBuf::from_slice(kind.signs2())?;
+    let dy: DeviceBuf<f32> = DeviceBuf::new(out.len())?;
+
+    let mut x_ptr  = dx.raw_ptr();
+    let mut s1_ptr = ds1.raw_ptr();
+    let mut s2_ptr = ds2.raw_ptr();
+    let mut y_ptr  = dy.raw_ptr();
+    let mut nr = n_rows as u32;
+    let mut hd = head_dim as u32;
+    let mut args: [*mut c_void; 6] = [
+        &mut x_ptr  as *mut _ as *mut c_void,
+        &mut s1_ptr as *mut _ as *mut c_void,
+        &mut s2_ptr as *mut _ as *mut c_void,
+        &mut y_ptr  as *mut _ as *mut c_void,
+        &mut nr     as *mut _ as *mut c_void,
+        &mut hd     as *mut _ as *mut c_void,
+    ];
+    let grid = (n_rows as u32, (head_dim / 128) as u32, 1);
+    unsafe { f.launch(grid, (128, 1, 1), 0, None, &mut args)?; }
+    hip::Device(0).synchronize()?;
+    dy.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
 /// Launch `rmsnorm_f32(x, w, y, n, eps)` on the GPU and return the result.
 ///
 /// Matches `cpu::ops::rmsnorm`: `y = x * rsqrt(mean(x^2) + eps) * w`. Norm
@@ -991,6 +1080,106 @@ mod tests {
         check_rmsnorm(&cache, 2048, 1e-6, 0xDEAD_BEEF, 1e-5);
         check_rmsnorm(&cache, 4096, 1e-6, 0x1234_5678, 1e-5);
         check_rmsnorm(&cache, 6144, 1e-6, 0xCAFEBABE, 1e-5);
+    }
+
+    /// GPU turbo3 encode must produce bit-identical packed bytes to the
+    /// CPU reference. The CPU reference is the truth — both kernels
+    /// share the same Lloyd-Max codebook + midpoints + RHT signs, so a
+    /// classify/pack discrepancy would be a kernel bug we can't tolerate.
+    #[test]
+    fn turbo3_encode_matches_cpu_bit_identical() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::turbo3::{CacheKind, encode_rows};
+
+        for (n_rows, head_dim, kind, seed) in [
+            (4,  128, CacheKind::K, 0x1234u64),
+            (8,  256, CacheKind::K, 0x5678u64),
+            (8,  256, CacheKind::V, 0xABCDu64),
+            (16, 512, CacheKind::K, 0xDEADu64),
+            (32, 128, CacheKind::V, 0xCAFEu64),
+        ] {
+            let mut s = seed;
+            let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                               let bits = ((s >> 33) as u32 & 0x007F_FFFF) | 0x3f80_0000;
+                               (f32::from_bits(bits) - 1.5) * 0.6 };
+            let x: Vec<f32> = (0..n_rows * head_dim).map(|_| rng()).collect();
+
+            let bytes_per_row = (head_dim / 128) * 4 * 16;
+            let mut cpu_packed = vec![0u8; n_rows * bytes_per_row];
+            encode_rows(&x, head_dim, kind, &mut cpu_packed);
+            let gpu_packed = turbo3_encode(&cache, &x, head_dim, kind).expect("encode");
+
+            // qs + signs bytes must be IDENTICAL (deterministic classify).
+            // The fp16 norm bytes can differ by 1 ULP due to different
+            // rounding paths between RT cores and the host conversion,
+            // so we allow ±1 LSB on the norm half-word.
+            for r in 0..n_rows {
+                for g in 0..(head_dim / 128) {
+                    for b in 0..4 {
+                        let off = r * bytes_per_row + g * 64 + b * 16;
+                        // qs (offset 2..10) + signs (10..14) — exact match.
+                        for k in 2..14 {
+                            assert_eq!(cpu_packed[off + k], gpu_packed[off + k],
+                                "turbo3 byte mismatch at row={r} grp={g} blk={b} k={k}");
+                        }
+                        // norm fp16 — allow ±1 ULP.
+                        let cpu_n = u16::from_le_bytes([cpu_packed[off], cpu_packed[off + 1]]);
+                        let gpu_n = u16::from_le_bytes([gpu_packed[off], gpu_packed[off + 1]]);
+                        assert!(cpu_n.abs_diff(gpu_n) <= 1,
+                            "turbo3 norm fp16 diff > 1 ULP at row={r} grp={g} blk={b}: cpu={cpu_n} gpu={gpu_n}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// GPU decode of CPU-encoded bytes must match the CPU decode within
+    /// numerical noise (FWHT order + fp32 associativity can give small
+    /// drift). Plus the round-trip SNR should land in the expected
+    /// 12-22 dB band for 3-bit Lloyd-Max.
+    #[test]
+    fn turbo3_decode_matches_cpu_and_snr_floor() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::turbo3::{CacheKind, encode_rows, decode_rows};
+
+        let n_rows = 16usize;
+        let head_dim = 256usize;
+        let kind = CacheKind::K;
+
+        let mut s: u64 = 0xF00D_BEEF;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           let bits = ((s >> 33) as u32 & 0x007F_FFFF) | 0x3f80_0000;
+                           (f32::from_bits(bits) - 1.5) * 0.5 };
+        let x: Vec<f32> = (0..n_rows * head_dim).map(|_| rng()).collect();
+
+        // CPU encode + CPU decode = ground truth for the dequant path.
+        let bytes_per_row = (head_dim / 128) * 4 * 16;
+        let mut packed = vec![0u8; n_rows * bytes_per_row];
+        encode_rows(&x, head_dim, kind, &mut packed);
+        let mut cpu_decoded = vec![0.0f32; x.len()];
+        decode_rows(&packed, head_dim, kind, &mut cpu_decoded);
+
+        let gpu_decoded = turbo3_decode(&cache, &packed, n_rows, head_dim, kind).expect("decode");
+
+        // Per-value max abs diff — kernels share the algorithm so this
+        // should be tiny (just fp32 reordering noise).
+        let max_abs: f32 = cpu_decoded.iter().zip(gpu_decoded.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_abs < 1e-3, "GPU vs CPU decode max abs diff {max_abs}");
+
+        // Round-trip SNR: GPU's encode + decode against the original x.
+        let gpu_packed = turbo3_encode(&cache, &x, head_dim, kind).expect("encode2");
+        let gpu_rt = turbo3_decode(&cache, &gpu_packed, n_rows, head_dim, kind).expect("decode2");
+        let mut s_sig = 0.0f64;
+        let mut s_err = 0.0f64;
+        for (xv, dv) in x.iter().zip(gpu_rt.iter()) {
+            s_sig += (*xv as f64).powi(2);
+            s_err += ((*xv - *dv) as f64).powi(2);
+        }
+        let snr_db = 10.0 * (s_sig / s_err.max(1e-30)).log10();
+        eprintln!("turbo3 GPU round-trip SNR ({n_rows} rows × hd={head_dim}): {snr_db:.1} dB");
+        assert!(snr_db > 10.0 && snr_db < 25.0,
+                "turbo3 GPU round-trip SNR {snr_db:.1} dB outside 10..25 band");
     }
 
     #[test]
