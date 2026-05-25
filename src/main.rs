@@ -245,6 +245,38 @@ enum Command {
         #[arg(short = 'k', long, default_value_t = 2)]
         k: usize,
     },
+    /// End-to-end SuperQuant pipeline benchmark on synthetic K/V data.
+    /// Allocates a SuperQuantKvCache (2-tier: Warm int8 / Cold turbo3),
+    /// fills it via `write_step`, then runs the 2-tier attention kernel.
+    /// Reports per-stage timing + attention rel-L2 vs pure fp32.
+    ///
+    /// The env var REINSTINCT_KV_SUPERQUANT=1 is reserved for future
+    /// production integration into generate-text / serve forward passes;
+    /// this command always exercises SuperQuant.
+    SuperquantBench {
+        /// int8 Warm tier capacity (token positions).
+        #[arg(long, default_value_t = 2048)]
+        warm_cap: usize,
+        /// turbo3 Cold tier capacity (token positions).
+        #[arg(long, default_value_t = 4096)]
+        cold_cap: usize,
+        /// Number of KV heads to simulate (per-layer count).
+        #[arg(long, default_value_t = 2)]
+        n_kv: usize,
+        /// Query head count (must be a multiple of n_kv for GQA).
+        #[arg(long, default_value_t = 16)]
+        n_heads: usize,
+        /// Per-head dimension (multiple of 128 for the RHT group size).
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// Number of positions to write before running attention.
+        /// Caps to (hot_cap + warm_cap + cold_cap).
+        #[arg(long, default_value_t = 4096)]
+        n_writes: usize,
+        /// FlashDecoding split count for the attention kernel.
+        #[arg(long, default_value_t = 8)]
+        n_splits: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -267,6 +299,10 @@ fn main() -> anyhow::Result<()> {
                           temperature, top_k, seed, gpu),
         Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
             chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
+        Command::SuperquantBench { warm_cap, cold_cap, n_kv,
+                                    n_heads, head_dim, n_writes, n_splits } =>
+            superquant_bench_cli(warm_cap, cold_cap, n_kv, n_heads,
+                                 head_dim, n_writes, n_splits),
         Command::MtpDraft { target, drafter, prompt, system, k } =>
             mtp_draft_cli(&target, &drafter, prompt, system, k),
         Command::MtpGen { target, drafter, prompt, system, k, steps, temperature, seed } =>
@@ -1578,6 +1614,194 @@ fn chat_gemma4_cli(path: &std::path::Path, system: Option<String>,
 }
 
 /// Spec-decode smoke test for the Gemma 4 MTP drafter. Loads target +
+/// End-to-end SuperQuant pipeline bench on synthetic K/V tensors.
+/// Allocates the cache, fills via `write_step` (timed), runs the 3-tier
+/// attention kernel (timed), reports per-stage tok/s + the attention
+/// rel-L2 error vs a pure fp32 reference computed from the original
+/// pre-quantization tensors.
+fn superquant_bench_cli(warm_cap: usize, cold_cap: usize,
+                        n_kv: usize, n_heads: usize, head_dim: usize,
+                        n_writes: usize, n_splits: usize) -> anyhow::Result<()>
+{
+    use reinstinct_engine::hip::{self, DeviceBuf};
+    use reinstinct_engine::runtime::{KernelCache,
+        kv_superquant::{SuperQuantKvCache, SuperQuantConfig,
+                        launch_attn_partial_superquant}};
+
+    let n_kv_u  = n_kv;
+    let n_heads_u = n_heads;
+    let groups = n_heads_u / n_kv_u;
+    if n_heads_u % n_kv_u != 0 {
+        anyhow::bail!("n_heads ({n_heads_u}) must be a multiple of n_kv ({n_kv_u})");
+    }
+    if head_dim % 128 != 0 {
+        anyhow::bail!("head_dim ({head_dim}) must be a multiple of 128 for RHT groups");
+    }
+
+    let cfg = SuperQuantConfig { warm_cap, cold_cap };
+    let n_writes_actual = n_writes.min(cfg.total());
+    println!("SuperQuant bench (2-tier: Warm int8 / Cold turbo3):");
+    println!("  tier caps:    warm={warm_cap}  cold={cold_cap}  total={}", cfg.total());
+    println!("  shape:        n_heads={n_heads_u}  n_kv={n_kv_u}  groups={groups}  head_dim={head_dim}");
+    println!("  writes:       {n_writes_actual}  (requested {n_writes})");
+    println!("  n_splits:     {n_splits}");
+
+    let _ = hip::Device::set(0).map_err(|e| anyhow::anyhow!("set gpu: {e}"))?;
+    let cache = KernelCache::new().map_err(|e| anyhow::anyhow!(e))?;
+    let mut kv = SuperQuantKvCache::new(n_kv_u, head_dim, cfg)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Synthesize K/V — keep on host so we can compute the fp32 reference
+    // attention at the end.
+    let row_elems = n_kv_u * head_dim;
+    let mut rng_state: u64 = 0x5421_F00D;
+    let mut rng = || {
+        rng_state = rng_state.wrapping_mul(6364136223846793005)
+                              .wrapping_add(1442695040888963407);
+        let bits = ((rng_state >> 33) as u32 & 0x007F_FFFF) | 0x3f80_0000;
+        (f32::from_bits(bits) - 1.5) * 0.4
+    };
+    let mut ref_k: Vec<Vec<f32>> = Vec::with_capacity(n_writes_actual);
+    let mut ref_v: Vec<Vec<f32>> = Vec::with_capacity(n_writes_actual);
+    for _ in 0..n_writes_actual {
+        ref_k.push((0..row_elems).map(|_| rng()).collect());
+        ref_v.push((0..row_elems).map(|_| rng()).collect());
+    }
+    let q: Vec<f32> = (0..n_heads_u * head_dim).map(|_| rng()).collect();
+
+    // Time the write phase.
+    println!("\nphase 1: writes");
+    let t_write = std::time::Instant::now();
+    for (k, v) in ref_k.iter().zip(ref_v.iter()) {
+        let dk = DeviceBuf::<f32>::from_slice(k).map_err(|e| anyhow::anyhow!(e))?;
+        let dv = DeviceBuf::<f32>::from_slice(v).map_err(|e| anyhow::anyhow!(e))?;
+        kv.write_step(&cache, dk.raw_ptr(), dv.raw_ptr())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    let dt_write = t_write.elapsed();
+    let ms_per_write = dt_write.as_secs_f64() * 1000.0 / n_writes_actual as f64;
+    println!("  total = {:.2} s  ({:.3} ms/token, {:.0} tok/s)",
+        dt_write.as_secs_f64(), ms_per_write, n_writes_actual as f64 / dt_write.as_secs_f64());
+    println!("  tier counts: cold={} warm={}", kv.cold_count, kv.warm_count);
+
+    // Time the attention phase.
+    println!("\nphase 2: 3-tier attention");
+    let dq = DeviceBuf::<f32>::from_slice(&q).map_err(|e| anyhow::anyhow!(e))?;
+    let do_part = DeviceBuf::<f32>::new(n_heads_u * n_splits * head_dim).map_err(|e| anyhow::anyhow!(e))?;
+    let dm_part = DeviceBuf::<f32>::new(n_heads_u * n_splits).map_err(|e| anyhow::anyhow!(e))?;
+    let dl_part = DeviceBuf::<f32>::new(n_heads_u * n_splits).map_err(|e| anyhow::anyhow!(e))?;
+    let scaling = 1.0 / (head_dim as f32).sqrt();
+
+    // Warm + measure.
+    launch_attn_partial_superquant(&cache, &kv, dq.raw_ptr(),
+        do_part.raw_ptr(), dm_part.raw_ptr(), dl_part.raw_ptr(),
+        n_heads_u as u32, n_kv_u as u32, head_dim as u32, scaling, n_splits as u32)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+
+    let attn_iters = 8;
+    let t_attn = std::time::Instant::now();
+    for _ in 0..attn_iters {
+        launch_attn_partial_superquant(&cache, &kv, dq.raw_ptr(),
+            do_part.raw_ptr(), dm_part.raw_ptr(), dl_part.raw_ptr(),
+            n_heads_u as u32, n_kv_u as u32, head_dim as u32, scaling, n_splits as u32)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    let dt_attn = t_attn.elapsed();
+    let ms_per_attn = dt_attn.as_secs_f64() * 1000.0 / attn_iters as f64;
+    println!("  {} iter avg = {:.2} ms/call ({:.1} calls/s)",
+        attn_iters, ms_per_attn, attn_iters as f64 / dt_attn.as_secs_f64());
+    println!("  (one call = full attention over {n_writes_actual} positions across all {n_heads_u} q-heads)");
+
+    // Pull outputs + compute rel L2 vs fp32 reference.
+    let mut o_part = vec![0.0f32; n_heads_u * n_splits * head_dim];
+    let mut m_part = vec![0.0f32; n_heads_u * n_splits];
+    let mut l_part = vec![0.0f32; n_heads_u * n_splits];
+    do_part.copy_to_host(&mut o_part).map_err(|e| anyhow::anyhow!(e))?;
+    dm_part.copy_to_host(&mut m_part).map_err(|e| anyhow::anyhow!(e))?;
+    dl_part.copy_to_host(&mut l_part).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Merge n_splits partials per head into final output. Standard
+    // log-sum-exp merge: stable max across splits, then weighted sum.
+    let mut gpu_out = vec![0.0f32; n_heads_u * head_dim];
+    for h in 0..n_heads_u {
+        let mut mx = f32::NEG_INFINITY;
+        for s in 0..n_splits { mx = mx.max(m_part[h * n_splits + s]); }
+        let mut sum_l = 0.0f32;
+        let mut weighted = vec![0.0f32; head_dim];
+        for s in 0..n_splits {
+            let m_s = m_part[h * n_splits + s];
+            let l_s = l_part[h * n_splits + s];
+            if !m_s.is_finite() || l_s == 0.0 { continue; }
+            let scale = (m_s - mx).exp();
+            sum_l += l_s * scale;
+            for d in 0..head_dim {
+                weighted[d] += scale * o_part[(h * n_splits + s) * head_dim + d];
+            }
+        }
+        let inv_l = if sum_l > 0.0 { 1.0 / sum_l } else { 0.0 };
+        for d in 0..head_dim {
+            gpu_out[h * head_dim + d] = weighted[d] * inv_l;
+        }
+    }
+
+    // CPU reference: pure fp32 attention.
+    println!("\nphase 3: rel_l2 vs pure-fp32 reference");
+    let mut sum_l2_sig = 0.0f64;
+    let mut sum_l2_err = 0.0f64;
+    for h in 0..n_heads_u {
+        let kv_h = h / groups;
+        // Scores
+        let mut scores = vec![0.0f32; n_writes_actual];
+        for i in 0..n_writes_actual {
+            let mut s = 0.0f32;
+            for d in 0..head_dim {
+                s += q[h * head_dim + d] * ref_k[i][kv_h * head_dim + d];
+            }
+            scores[i] = s * scaling;
+        }
+        let m = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let mut e = vec![0.0f32; n_writes_actual];
+        let mut z = 0.0f32;
+        for i in 0..n_writes_actual { e[i] = (scores[i] - m).exp(); z += e[i]; }
+        for i in 0..n_writes_actual { e[i] /= z; }
+        for d in 0..head_dim {
+            let mut a = 0.0f32;
+            for i in 0..n_writes_actual {
+                a += e[i] * ref_v[i][kv_h * head_dim + d];
+            }
+            sum_l2_sig += (a as f64).powi(2);
+            sum_l2_err += ((a - gpu_out[h * head_dim + d]) as f64).powi(2);
+        }
+    }
+    let rel_l2 = (sum_l2_err.sqrt() / sum_l2_sig.sqrt()) as f32;
+    println!("  rel_l2 = {rel_l2:.4}");
+    println!("  (lower is better; expect <0.30 with cold tier dominating)");
+
+    println!("\nphase 4: memory accounting");
+    let sb = reinstinct_engine::runtime::kv_turbo3::slot_bytes(head_dim);
+    let warm_bytes = warm_cap * n_kv_u * head_dim + warm_cap * n_kv_u * 4;
+    let cold_bytes = cold_cap * n_kv_u * sb;
+    let fp16_baseline = (warm_cap + cold_cap) * n_kv_u * head_dim * 2;
+    let int8_baseline = (warm_cap + cold_cap) * (n_kv_u * head_dim + n_kv_u * 4);
+    let total = (warm_bytes + cold_bytes) * 2;                  // ×2 for K + V
+    println!("  per-layer footprint (K + V):");
+    println!("    fp16 (baseline):       {:>10} bytes  ({:.2} MiB)",
+             fp16_baseline * 2, (fp16_baseline * 2) as f64 / (1024.0 * 1024.0));
+    println!("    int8 KV (current):     {:>10} bytes  ({:.2} MiB)",
+             int8_baseline * 2, (int8_baseline * 2) as f64 / (1024.0 * 1024.0));
+    println!("    SuperQuant:            {:>10} bytes  ({:.2} MiB)",
+             total, total as f64 / (1024.0 * 1024.0));
+    println!("    capacity vs fp16:      {:.2}x",
+             (fp16_baseline * 2) as f64 / total as f64);
+    println!("    capacity vs int8:      {:.2}x",
+             (int8_baseline * 2) as f64 / total as f64);
+
+    Ok(())
+}
+
 /// drafter, prefills the prompt on the target (which establishes h_prev
 /// and populates the shared KV the drafter will attend), then runs the
 /// drafter K times printing each proposed token plus the target's own
