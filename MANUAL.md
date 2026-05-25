@@ -536,18 +536,22 @@ reinstinct-engine superquant-bench \
 ```
 
 Live measured on Gemma 4 31B (UD-Q4_K_XL), 28-token prompt + 64
-decode steps:
+decode steps (wave-parallel attention is the default):
 
 | Config | Decode tok/s | vs int8 |
 |---|---:|---:|
 | int8 baseline (default) | **27.0** | 1.00× |
-| SuperQuant warm=128 cold=128 | 18.0 | 0.67× |
-| SuperQuant warm=64 cold=128 | 16.6 | 0.61× |
+| SuperQuant warm=128 cold=128 | **19.1** | **0.71×** |
+| SuperQuant warm=8 cold=512 (cold-heavy) | 17.5 | 0.65× |
 
-Outputs are quality-equivalent (factually correct, minor word-choice
-divergence). Decode regression comes from the per-position cooperative
-iRHT on cold; rotated-space attention is the planned optimization
-(3-5× cold speedup).
+Three attention variants (all token-identical output):
+- `wp` (default): wave-parallel, no per-position sync
+- `rs`: rotated-space single-wave (`REINSTINCT_KV_SUPERQUANT_RS=1`)
+- naive: per-position cooperative iRHT (`REINSTINCT_KV_SUPERQUANT_NAIVE=1`)
+
+Outputs are quality-equivalent across all configs (factually correct,
+minor word-choice divergence). The wave-parallel kernel is what
+brought SuperQuant from −53% (naive) to −29% to −35% (wp) vs int8.
 
 Restrictions when SuperQuant is on: HIP graph capture disabled,
 snapshot/restore disabled, spec-decode mutually exclusive, sliding-

@@ -96,15 +96,29 @@ REINSTINCT_KV_SUPERQUANT=1 \
 ```
 
 End-to-end decode tok/s on Gemma 4 31B (UD-Q4_K_XL) with a 28-token
-prompt + 64 decode steps:
+prompt + 64 decode steps (wave-parallel attention is the default):
 
 | Config | Decode tok/s | vs int8 |
 |---|---:|---:|
 | int8 baseline (default) | **27.0** | 1.00× |
-| SuperQuant warm=128 cold=128 | 18.0 | 0.67× |
-| SuperQuant warm=64  cold=128 | 16.6 | 0.61× |
-| SuperQuant warm=32  cold=256 | 14.2 | 0.53× |
-| SuperQuant warm=64  cold=512 | 16.6 | 0.61× |
+| SuperQuant warm=128 cold=128 | **19.1** | **0.71×** |
+| SuperQuant warm=64 cold=128 | 18.3 | 0.68× |
+| SuperQuant warm=32 cold=256 | 17.6 | 0.65× |
+| SuperQuant warm=8 cold=512 | 17.5 | 0.65× |
+| SuperQuant warm=1 cold=512 (pure-turbo3) | 18.3 | 0.68× |
+
+Three attention variants are shipped, selected at runtime:
+
+| Variant | Env opt-in | Speed | When |
+|---|---|---|---|
+| Wave-parallel (`wp`) | default | fastest | always (new default) |
+| Rotated-space (`rs`) | `REINSTINCT_KV_SUPERQUANT_RS=1` | mid | A/B comparison |
+| Naive | `REINSTINCT_KV_SUPERQUANT_NAIVE=1` | slowest | A/B comparison |
+
+All three produce token-identical outputs — they differ only in
+cold-tier latency. Wave-parallel uses Wave64 implicit lockstep to
+process 4 cached positions in parallel without any per-position
+`__syncthreads`. Per-position barrier count drops from ~7 (FWHT) to 0.
 
 **Quality preserved.** Side-by-side outputs on the same prompt:
 - int8: `On July 20, 1969, NASA's Apollo 11 mission successfully
