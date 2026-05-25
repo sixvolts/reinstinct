@@ -50,6 +50,98 @@ use std::ffi::c_void;
 
 pub const KV_WRITE_FP16_SOURCE: &str =
     include_str!("../../kernels/kv_write_fp16.cpp");
+pub const ATTN_PARTIAL_SUPERQUANT_SOURCE: &str =
+    include_str!("../../kernels/attn_partial_superquant.cpp");
+
+/// Launch the SuperQuant 3-tier decode attention kernel.
+/// Returns partial (m, l, o) buffers; caller passes these to attn_merge
+/// to produce the final per-head output.
+///
+/// `q`: [n_heads × head_dim] fp32 on device.
+/// `head_dim` must be a multiple of ROT_GROUP (128).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_attn_partial_superquant(
+    cache: &KernelCache,
+    kv: &SuperQuantKvCache,
+    q: *mut c_void,
+    o_partial: *mut c_void,
+    m_partial: *mut c_void,
+    l_partial: *mut c_void,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    scaling: f32,
+    n_splits: u32,
+) -> Result<(), String>
+{
+    let hsaco = cache.compile("attn_partial_superquant", ATTN_PARTIAL_SUPERQUANT_SOURCE)?;
+    let module = Module::load(&hsaco)?;
+    let f = module.function("attn_partial_superquant_f32")?;
+
+    let block: u32 = 256;
+    let total_len = (kv.cold_count + kv.warm_count + kv.hot_count) as u32;
+    let chunk = (total_len + n_splits - 1) / n_splits;
+
+    // LDS: qf32 + scores + tmp(bs) + dqbuf(head_dim) + fwhtw(ROT_GROUP).
+    let smem_floats = head_dim as usize + chunk as usize + block as usize
+                    + head_dim as usize + ROT_GROUP;
+    let smem_bytes = (smem_floats * std::mem::size_of::<f32>()) as u32;
+
+    let mut q_p   = q;
+    let mut hk_p  = kv.hot_k.raw_ptr();
+    let mut hv_p  = kv.hot_v.raw_ptr();
+    let mut wk_p  = kv.warm_k.raw_ptr();
+    let mut wks_p = kv.warm_ks.raw_ptr();
+    let mut wv_p  = kv.warm_v.raw_ptr();
+    let mut wvs_p = kv.warm_vs.raw_ptr();
+    let mut ck_p  = kv.cold_k.raw_ptr();
+    let mut cv_p  = kv.cold_v.raw_ptr();
+    let mut s1k_p = kv.signs1_k.raw_ptr();
+    let mut s2k_p = kv.signs2_k.raw_ptr();
+    let mut s1v_p = kv.signs1_v.raw_ptr();
+    let mut s2v_p = kv.signs2_v.raw_ptr();
+    let mut op_p  = o_partial;
+    let mut mp_p  = m_partial;
+    let mut lp_p  = l_partial;
+    let mut nh    = n_heads;
+    let mut nkv   = n_kv_heads;
+    let mut hd    = head_dim;
+    let mut cc    = kv.cold_count as u32;
+    let mut wc    = kv.warm_count as u32;
+    let mut hc    = kv.hot_count  as u32;
+    let mut sc    = scaling;
+    let mut ns    = n_splits;
+
+    let mut args: [*mut c_void; 24] = [
+        &mut q_p   as *mut _ as *mut c_void,
+        &mut hk_p  as *mut _ as *mut c_void,
+        &mut hv_p  as *mut _ as *mut c_void,
+        &mut wk_p  as *mut _ as *mut c_void,
+        &mut wks_p as *mut _ as *mut c_void,
+        &mut wv_p  as *mut _ as *mut c_void,
+        &mut wvs_p as *mut _ as *mut c_void,
+        &mut ck_p  as *mut _ as *mut c_void,
+        &mut cv_p  as *mut _ as *mut c_void,
+        &mut s1k_p as *mut _ as *mut c_void,
+        &mut s2k_p as *mut _ as *mut c_void,
+        &mut s1v_p as *mut _ as *mut c_void,
+        &mut s2v_p as *mut _ as *mut c_void,
+        &mut op_p  as *mut _ as *mut c_void,
+        &mut mp_p  as *mut _ as *mut c_void,
+        &mut lp_p  as *mut _ as *mut c_void,
+        &mut nh    as *mut _ as *mut c_void,
+        &mut nkv   as *mut _ as *mut c_void,
+        &mut hd    as *mut _ as *mut c_void,
+        &mut cc    as *mut _ as *mut c_void,
+        &mut wc    as *mut _ as *mut c_void,
+        &mut hc    as *mut _ as *mut c_void,
+        &mut sc    as *mut _ as *mut c_void,
+        &mut ns    as *mut _ as *mut c_void,
+    ];
+    let grid = (n_heads, n_splits, 1);
+    unsafe { f.launch(grid, (block, 1, 1), smem_bytes, None, &mut args)?; }
+    Ok(())
+}
 
 /// Per-tier capacity configuration. All in token positions; the actual
 /// memory cost scales as n_kv × head_dim × bpv × cap.
@@ -366,6 +458,102 @@ mod tests {
         assert_eq!(kv.len(), 65);
         kv.reset();
         assert_eq!(kv.len(), 0);
+    }
+
+    /// SuperQuant 3-tier decode attention vs a pure fp32 reference
+    /// computed on the original (pre-quantization) K/V tensors. Output
+    /// is not bit-identical due to tier quantization noise, but
+    /// relative L2 error per head should land within a few %.
+    #[test]
+    fn three_tier_attention_matches_fp32_reference_within_quant_noise() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+
+        // Small cache. Hot=2, Warm=2, Cold=4 — total 8 positions.
+        let cfg = SuperQuantConfig { hot_cap: 2, warm_cap: 2, cold_cap: 4 };
+        let n_kv = 1;          // single KV head for simplicity
+        let n_heads = 1;       // single Q head
+        let head_dim = 128;
+        let mut kv = SuperQuantKvCache::new(n_kv, head_dim, cfg).expect("alloc");
+
+        // Generate 8 K/V tensors + the Q to attend with.
+        let row_elems = n_kv * head_dim;
+        let mut r = rng(0xABBA);
+        let mut ref_k: Vec<Vec<f32>> = Vec::with_capacity(8);
+        let mut ref_v: Vec<Vec<f32>> = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let k: Vec<f32> = (0..row_elems).map(|_| r()).collect();
+            let v: Vec<f32> = (0..row_elems).map(|_| r()).collect();
+            let dk = DeviceBuf::<f32>::from_slice(&k).unwrap();
+            let dv = DeviceBuf::<f32>::from_slice(&v).unwrap();
+            kv.write_step(&cache, dk.raw_ptr(), dv.raw_ptr()).expect("write_step");
+            ref_k.push(k); ref_v.push(v);
+        }
+        // After 8 writes with caps (2,2,4): 4 cold, 2 warm, 2 hot.
+        assert_eq!(kv.cold_count, 4);
+        assert_eq!(kv.warm_count, 2);
+        assert_eq!(kv.hot_count,  2);
+
+        // Query: random fp32.
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| r()).collect();
+        let dq = DeviceBuf::<f32>::from_slice(&q).unwrap();
+
+        // GPU attention.
+        let n_splits = 1u32;
+        let do_part = DeviceBuf::<f32>::new(n_heads * (n_splits as usize) * head_dim).unwrap();
+        let dm_part = DeviceBuf::<f32>::new(n_heads * (n_splits as usize)).unwrap();
+        let dl_part = DeviceBuf::<f32>::new(n_heads * (n_splits as usize)).unwrap();
+        let scaling = 1.0 / (head_dim as f32).sqrt();
+        launch_attn_partial_superquant(&cache, &kv, dq.raw_ptr(),
+            do_part.raw_ptr(), dm_part.raw_ptr(), dl_part.raw_ptr(),
+            n_heads as u32, n_kv as u32, head_dim as u32, scaling, n_splits)
+            .expect("attn launch");
+        hip::Device(0).synchronize().unwrap();
+
+        let mut o_part = vec![0.0f32; n_heads * (n_splits as usize) * head_dim];
+        let mut m_part = vec![0.0f32; n_heads * (n_splits as usize)];
+        let mut l_part = vec![0.0f32; n_heads * (n_splits as usize)];
+        do_part.copy_to_host(&mut o_part).unwrap();
+        dm_part.copy_to_host(&mut m_part).unwrap();
+        dl_part.copy_to_host(&mut l_part).unwrap();
+        // With n_splits=1 the partial IS the output, just needs / l.
+        let mut gpu_out = vec![0.0f32; n_heads * head_dim];
+        for d in 0..head_dim { gpu_out[d] = o_part[d] / l_part[0]; }
+
+        // CPU reference: standard scaled-dot-product attention on
+        // the original (un-quantized) K/V.
+        let mut scores = vec![0.0f32; 8];
+        for i in 0..8 {
+            let mut s = 0.0f32;
+            for d in 0..head_dim { s += q[d] * ref_k[i][d]; }
+            scores[i] = s * scaling;
+        }
+        let m = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let mut sum = 0.0f32;
+        let mut e = vec![0.0f32; 8];
+        for i in 0..8 { e[i] = (scores[i] - m).exp(); sum += e[i]; }
+        for i in 0..8 { e[i] /= sum; }
+        let mut cpu_out = vec![0.0f32; head_dim];
+        for d in 0..head_dim {
+            let mut a = 0.0f32;
+            for i in 0..8 { a += e[i] * ref_v[i][d]; }
+            cpu_out[d] = a;
+        }
+
+        // Per-head L2 relative error.
+        let mut s_sig = 0.0f64;
+        let mut s_err = 0.0f64;
+        for d in 0..head_dim {
+            s_sig += (cpu_out[d] as f64).powi(2);
+            s_err += ((cpu_out[d] - gpu_out[d]) as f64).powi(2);
+        }
+        let rel_l2 = (s_err.sqrt() / s_sig.sqrt()) as f32;
+        eprintln!("SuperQuant attention rel_l2 vs fp32 reference: {rel_l2:.4}");
+        // Tier mix: 4 cold (14 dB), 2 warm (48 dB), 2 hot (exact).
+        // Worst-case dominates → cold tier's 14 dB SNR contributes
+        // roughly ±0.2 relative error per cold position, dampened by
+        // softmax weight on each. Empirically ~5-15% L2 error.
+        assert!(rel_l2 < 0.30,
+                "SuperQuant attention diverges too far: rel_l2={rel_l2:.4}");
     }
 
     /// End-to-end: fill hot beyond capacity, verify demotion fires,
