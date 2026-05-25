@@ -30,6 +30,23 @@ Single MI50 32 GB, 300W TDP. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q
 
 reinstinct wins **10 of 10** tested configurations.
 
+### Prefill throughput (tok/s, pp512)
+
+| Model | reinstinct | llama.cpp | Delta |
+|---|---|---|---|
+| Qwen 3.5 4B | **915** | 882 | **+4%** |
+| Gemma 4 E4B | **1070** | 1070 | par |
+| Qwen 3.5 27B | **210** | 187 | **+12%** |
+| Qwen 3.6 27B | **211** | 187 | **+13%** |
+| Gemma 4 31B Dense | **177** | 172 | **+3%** |
+| Qwen 3.5 35B-A3B MoE | **820** | 803 | **+2%** |
+| Qwen 3.6 35B-A3B MoE | **809** | 802 | **+1%** |
+| Gemma 4 26B-A4B MoE | **768** | 621 | **+24%** |
+
+2D-tiled int8 MMQ GEMM (Q4_K, Q5_K, Q6_K, Q8_0) drives the dense
+prefill wins; a grouped-expert GEMM that gathers tokens by router
+choice drives the MoE wins.
+
 ### How does this compare to other hardware?
 
 | Hardware | Price (used) | VRAM | Qwen 3.5 35B MoE tok/s | Gemma 31B Dense tok/s |
@@ -59,7 +76,8 @@ MTP wins on factual/structured prompts, but costs performance on creative worklo
 - **Dense + MoE model support**: Gemma 4 (E4B, 26B MoE, 31B), Qwen 3.5 (0.8B-35B), Qwen 3.6 (27B, 35B MoE)
 - **Unsloth Dynamic GGUF**: Native support for UD-Q4_K_XL and UD-Q6_K_XL
 - **Repacked v2 quantization**: Custom weight layout with denser scale planes for better HBM utilization
-- **Q8 KV cache**: INT8 key/value cache with dp4a FlashAttention
+- **Q8 KV cache**: INT8 key/value cache with dp4a FlashAttention (default)
+- **SuperQuant tiered KV cache**: Opt-in 2-tier (int8 + turbo3) cache that extends context capacity ~1.7× vs int8 / ~3.3× vs fp16. Capacity feature, not a perf feature — trade ~30% decode tok/s for room to attend over longer contexts. Gemma 4 only today; see [docs/SUPERQUANT.md](docs/SUPERQUANT.md).
 - **MTP speculative decoding**: Multi-Token Prediction with per-request control
 - **OpenAI-compatible serve endpoint**: /v1/chat/completions with streaming, logprobs, prefix cache
 - **HIP graph capture**: Entire decode step as a single GPU submission

@@ -244,6 +244,72 @@ decode loop, so the drafter cost isn't amortized.
 - `REINSTINCT_DRAFTER_NO_BONUS=1` — disable the K+1 bonus-token
   semantics (advance by exactly K on full accept; measurement only).
 
+### qwen-mtp-probe
+
+```
+reinstinct-engine qwen-mtp-probe <PATH> [--prompt <TEXT>] [-n <STEPS>]
+```
+
+QMTP-1 diagnostic. Load a Qwen 3.6 MTP model, prefill the prompt, then
+decode N tokens with the main model while running the in-GGUF "nextn"
+MTP head alongside. Reports the K=1 spec-decode accept rate — the
+fraction of MTP drafts that match the main model's own next token. No
+acceptance loop or speedup yet; this is just an alignment check.
+
+### qwen-verify-check
+
+```
+reinstinct-engine qwen-verify-check <PATH> [--prompt <TEXT>] [-k <K>]
+```
+
+QMTP-2 self-consistency gate. Verify that `forward_tokens_verify` (the
+batched K-token verify forward) produces the same per-position argmax
+as decoding those K tokens one at a time. Use this to validate the
+batched-verify path before enabling `qwen-mtp-gen`.
+
+### qwen-mtp-gen
+
+```
+reinstinct-engine qwen-mtp-gen <PATH> [--prompt <TEXT>] [-n <TOKENS>] [-k <K>]
+```
+
+QMTP-3: generate text with MTP speculative decoding on a Qwen MTP
+model. Chains K drafts per round, runs an all-or-nothing batched verify,
+rolls back GDN state on rejection. Reports accept rate and decode tok/s
+against a plain single-token-decode baseline.
+
+**Status:** experimental. On MI50 the GDN-heavy architecture defeats
+speculative batching — measured ~0.58× best vs plain decode. Useful for
+correctness comparison and as a reference for porting MTP to other
+backends; not recommended for production throughput.
+
+### superquant-bench
+
+```
+reinstinct-engine superquant-bench [--warm-cap <N>] [--cold-cap <N>]
+                  [--n-kv <N>] [--n-heads <N>] [--head-dim <N>]
+                  [--n-writes <N>] [--n-splits <N>]
+```
+
+End-to-end SuperQuant pipeline benchmark on synthetic K/V data — no
+model needed. Allocates a `SuperQuantKvCache` (2-tier: Warm int8 / Cold
+turbo3), fills it via `write_step`, then runs the 2-tier attention
+kernel. Reports per-stage timing + attention rel-L2 vs pure fp32 + a
+memory-footprint accounting.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--warm-cap <N>` | 2048 | int8 Warm tier capacity (token positions). |
+| `--cold-cap <N>` | 4096 | turbo3 Cold tier capacity (token positions). |
+| `--n-kv <N>` | 2 | KV heads (per-layer count). |
+| `--n-heads <N>` | 16 | Query heads (must be a multiple of `--n-kv`). |
+| `--head-dim <N>` | 256 | Per-head dimension (multiple of 128 for the RHT group). |
+| `--n-writes <N>` | 4096 | Positions to write before running attention. Capped at `warm_cap + cold_cap`. |
+| `--n-splits <N>` | 8 | FlashDecoding split count for the attention kernel. |
+
+For real-model SuperQuant runs see the SuperQuant section under
+ENVIRONMENT and use `generate-text` with `REINSTINCT_KV_SUPERQUANT=1`.
+
 ### serve
 
 ```
@@ -274,6 +340,35 @@ Each port answers `POST /v1/completions` and `POST /v1/chat/completions`
 Request/response schemas live in `## API` below. Logs each request as
 `[serve] {target} {chat|completion}: {n_p} prompt + {n_c} gen tok in {wall}s`
 on stderr; spec-decode logs also include the per-call accept rate.
+
+**Production deployment assumptions.** `serve` is a single-process
+HTTP server intended to run **behind a reverse proxy** (nginx, Envoy,
+Caddy, etc.). It deliberately ships without:
+
+- **Authentication.** All endpoints are open. Bind the reverse proxy
+  to handle auth (mTLS, bearer tokens, oauth, etc.) before exposing.
+- **TLS.** Plain HTTP only. Terminate TLS at the proxy.
+- **Backpressure.** The request queue is unbounded mpsc; under load
+  the worker keeps draining FIFO but memory grows with the queue.
+  Configure the proxy to enforce a concurrency cap + per-IP rate
+  limit. Per-request body size is read against the configured timeout
+  (60 s default) so slowloris-style clients eventually drop.
+- **Graceful SIGTERM.** The worker thread blocks on `join`; signal
+  handling is left to the operator. For zero-downtime updates, drain
+  via the proxy (stop sending new requests, wait for in-flight to
+  finish wall-clock-deadline, then SIGKILL).
+
+Per-request panics are caught with `catch_unwind` and reported as
+HTTP 500 with the `request_id` logged — the worker thread does not
+crash on a single bad request. Wall-clock per-request timeout is
+configurable (default 600 s); the GPU forward pass surfaces errors
+as `Result::Err` rather than panicking when memory is exhausted.
+
+**Spec-decode + SuperQuant are mutually exclusive.** SuperQuant
+disables snapshot/restore and per-tier truncate, both of which the
+spec-decode verify path requires. Use one or the other per model.
+(SuperQuant is currently `generate-text` only; serve does not yet
+honor `REINSTINCT_KV_SUPERQUANT`.)
 
 ### debug-embed
 
@@ -611,6 +706,7 @@ cold-tier size.
 | `REINSTINCT_VERIFY_SMOKE` | Parity check: `verify_forward(K)` vs K sequential `forward_token` calls from a snapshotted state. Prints argmax-match + L1/Linf diff per position; exits without generating. |
 | `REINSTINCT_VERIFY_BENCH=N` | Warm-then-time `verify_forward(K)` over N calls; prints per-call average ms. |
 | `REINSTINCT_DRAFTER_NO_BONUS` | Disable the K+1 bonus-token semantics on a full accept (advance by exactly K — measurement only). |
+| `REINSTINCT_DRAFTER_P_MIN=F` | Minimum drafter probability under which a drafted token is suppressed (only `qwen-mtp-gen`). Default `0.0` (no suppression). Raising filters low-confidence drafts to avoid wasted verify work. |
 
 ### Debug / diagnostic
 
@@ -626,6 +722,9 @@ cold-tier size.
 | `REINSTINCT_OFFLOAD_ARCH` | Override the GPU arch passed to `hipcc` (default `gfx906`). Kernels are recompiled when this changes (it's in the cache key). |
 | `REINSTINCT_HIPCC_VERSION` | Override the probed `hipcc --version` string. Needed when running under `rocprof`, whose `LD_PRELOAD` makes `hipcc/clang` abort with an LLVM double-registered-CLI-option error. |
 | `REINSTINCT_GGUF_FIXTURE` | Path to a GGUF fixture for the tokenizer/test harness (test-only). |
+| `REINSTINCT_GEMMA_FIXTURE` | Path to a Gemma GGUF fixture for the tokenizer test harness (test-only). |
+| `REINSTINCT_MOE_SORT_CHECK` | qwen35 MoE: run a CPU verification pass after each MoE sort kernel (correctness gate, decode-only). |
+| `REINSTINCT_QWEN_NO_DP4A` | qwen35: disable the int8 dp4a fast path for K-quant matvec (debug / A-B). |
 
 ---
 
@@ -770,27 +869,31 @@ Comparison against `llama.cpp` (same machine, gfx906 build, llama-bench
 `pp512` and `tg64` defaults). Reinstinct prefill is the captured-graph
 steady-state (warmup pass discarded); decode is the average over 32
 forwards with a chat-templated prompt. 25% / 75% compute / cool duty
-cycle between runs.
+cycle between runs. Decode numbers last refreshed 2026-05-25 on a
+thermally-stable run; see `README.md` for the headline summary.
 
 ### Throughput vs llama.cpp
 
 | Model                  | reinstinct prefill | llama pp512 | Δ        | reinstinct decode | llama tg64 | Δ        |
 |------------------------|-------------------:|------------:|---------:|------------------:|-----------:|---------:|
-| qwen-3.5-4B            |          915       |    882      |   **+4%**|       101         |     89     |  **+14%**|
-| gemma4-E4B             |         1070       |   1070      |    par   |        92         |     81     |  **+14%**|
-| qwen-3.5-27B           |          210       |    187      |  **+12%**|        25.4       |     24     |   **+6%**|
-| qwen-3.6-27B           |          211       |    187      |  **+13%**|        26.2       |     23     |  **+14%**|
-| gemma4-31B             |          177       |    172      |   **+3%**|        27.0       |     21     |  **+29%**|
-| qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|        92.5       |     80     |  **+16%**|
-| qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.9       |     79     |  **+19%**|
-| gemma4-26B-MoE         |          768       |    621      |  **+24%**|        83.6       |     85     |    98%   |
+| qwen-3.5-0.8B          |          —         |    —        |    —     |       275.9       |    192.0   |  **+44%**|
+| qwen-3.5-4B            |          915       |    882      |   **+4%**|       111.2       |     75.9   |  **+47%**|
+| gemma4-E4B             |         1070       |   1070      |    par   |        96.6       |     81.2   |  **+19%**|
+| qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
+| qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
+| qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
+| gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
+| qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
+| qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
+| gemma4-26B-MoE         |          768       |    621      |  **+24%**|        86.5       |     85.5   |   **+1%**|
 
 Throughput in tok/s. Reinstinct prefill is the captured-graph
 steady state; decode is averaged over 32 forwards with a chat-templated
-prompt. **Reinstinct beats llama.cpp on 15 of 16 cells**; the one
-that doesn't (gemma-26B-MoE decode) is HBM-bandwidth-bound at 98% of
-llama's number — closing the last 2% would need an algorithmic
-change (spec-decode, KV quantization), not a kernel tweak.
+prompt. Reinstinct wins all measured decode cells; gemma-26B-MoE
+decode is the narrowest (+1%) — that one is HBM-bandwidth-bound at
+~99% of theoretical, and closing the last percent would need an
+algorithmic change (spec-decode, more aggressive KV quantization),
+not a kernel tweak.
 
 ### MTP spec-decode (Gemma 4 only)
 

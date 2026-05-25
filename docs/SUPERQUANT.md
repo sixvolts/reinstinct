@@ -8,9 +8,9 @@ remaining work.
 > **This is a VRAM / capacity feature, not a perf feature.** Enable
 > SuperQuant when you need more context than int8 KV can fit. Decode
 > is 29–35% slower than int8 on every realistic config we've
-> measured. The wave-parallel attention kernel closed most of the
-> reachable gap; further perf improvements are unlikely without a
-> fundamentally different decode shape.
+> measured (see live numbers below). The wave-parallel attention
+> kernel closed most of the reachable gap; further perf improvements
+> are unlikely without a fundamentally different decode shape.
 
 ## What it is
 
@@ -138,9 +138,9 @@ expected logit perturbation from int8/turbo3 quantization noise —
 not a meaning loss.
 
 **Caveats:**
-- Decode is 33–47% slower than int8. The cold-tier per-position
-  cooperative iRHT dominates; rotated-space attention (planned
-  optimization) would cut this 3–5×.
+- Decode is 29–35% slower than int8 (measured wp default; see the
+  live-integration table above). Cold-tier per-position dequant is
+  the dominant cost.
 - HIP graph capture disabled when SuperQuant is on (warm-cascade
   D2D memcpys can't capture). Adds ~10% per-token overhead from
   kernel launches.
@@ -149,6 +149,9 @@ not a meaning loss.
 - Sliding-window attention layers ignore the window when SuperQuant
   is active — SuperQuant uses tiering for the same context-length
   goal that sliding windows target.
+- Serve mode does not yet honor the SuperQuant env vars. Use
+  `generate-text` for SuperQuant workloads until serve integration
+  ships.
 
 ## Synthetic-bench measured numbers (Gemma 31B layer shape)
 
@@ -183,22 +186,21 @@ This is the obvious optimization target for a follow-up: rotated-
 space scoring would amortise the iRHT to once per attention call
 instead of once per cold position.
 
-## Live integration (next session)
+## Implementation notes
 
-To wire SuperQuant into the actual forward pass, replace
-`Gemma4KvCache` (or `GpuKvCache` for qwen35) construction with
-`SuperQuantKvCache` when `REINSTINCT_KV_SUPERQUANT=1`, and route
-the attention call to `attn_partial_superquant` instead of
-`attn_partial_q8`. The cache's `write_step` signature is
-intentionally close to what the existing decode path expects.
+Prefill always writes to the existing int8 KV path. A one-shot
+`migrate_int8_to_superquant` call runs after prefill: positions
+`[0, P - warm_cap)` are demoted to Cold via the `kv_promote_q8_to_turbo3`
+kernel; positions `[P - warm_cap, P)` are D2D-copied into the Warm
+buffer. Decode writes go to Warm; when Warm fills, the oldest entry
+slides to Cold.
 
-For prefill, the simplest first cut: prefill writes directly to
-the int8 KV (existing path), then a one-shot migration kernel
-copies populated Warm-eligible slots to SuperQuant's Warm buffer
-and demotes overflow to Cold. Migration code is not yet written.
+Spec-decode rollback (`truncate(n)`) would require per-tier handling
+(positions sliding back from Cold to Warm need a lossy dequant+requant
+round-trip). For now SuperQuant disables snapshot/restore and
+spec-decode; callers must pick one or the other.
 
-Spec-decode rollback (`truncate(n)`) needs per-tier handling:
-positions sliding back from Cold to Warm would require dequant +
-re-quant (lossy round-trip). For now the safe move is to **disable
-SuperQuant when spec-decode is enabled** — either skip the
-migration, or fall back to plain int8 KV.
+## Remaining work
+
+- Serve-mode wiring (currently `generate-text` only).
+- qwen35 / qwen35moe path (currently Gemma 4 only).

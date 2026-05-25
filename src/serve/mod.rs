@@ -866,18 +866,24 @@ impl ServerModel {
                 // KV prefix cache: scan LRU for the slot with the longest
                 // common prefix with this request. On hit, restore that
                 // slot's snapshot + truncate to the common prefix, then
-                // prefill only the suffix.
+                // prefill only the suffix. Skipped entirely when the
+                // state is SuperQuant — snapshot/restore/truncate are
+                // all per-tier operations that SuperQuant does not
+                // implement (see Gemma4GpuState::truncate).
                 let mut overlap = 0usize;
-                let restored = if let Some((idx, c)) = prefix_cache.best_match(&prompt) {
+                let restored = if state.is_superquant() {
+                    state.reset();
+                    false
+                } else if let Some((idx, c)) = prefix_cache.best_match(&prompt) {
                     let snap = prefix_cache.touch(idx);
                     state.restore(snap)?;
                     state.truncate(c);
                     overlap = c;
                     true
-                } else { false };
-                if !restored {
+                } else {
                     state.reset();
-                }
+                    false
+                };
 
                 if !do_spec {
                     // Plain prefill + decode. If we hit the prefix cache,
@@ -894,10 +900,13 @@ impl ServerModel {
                     // Snapshot the post-prompt state for future requests
                     // that share a prefix. Best-effort — a snapshot
                     // allocation failure shouldn't abort the request,
-                    // just skip caching this turn.
-                    match state.snapshot() {
-                        Ok(snap) => prefix_cache.insert(prompt.clone(), snap),
-                        Err(e) => eprintln!("[serve] prefix-cache snapshot failed: {e}"),
+                    // just skip caching this turn. SuperQuant states
+                    // never support snapshot, so skip silently there.
+                    if !state.is_superquant() {
+                        match state.snapshot() {
+                            Ok(snap) => prefix_cache.insert(prompt.clone(), snap),
+                            Err(e) => eprintln!("[serve] prefix-cache snapshot failed: {e}"),
+                        }
                     }
                     let vocab = logits.len();
                     let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
