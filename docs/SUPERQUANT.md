@@ -5,6 +5,13 @@
 opt-in is single env var. Serve integration + qwen35 path are the
 remaining work.
 
+> **This is a VRAM / capacity feature, not a perf feature.** Enable
+> SuperQuant when you need more context than int8 KV can fit. Decode
+> is 29–35% slower than int8 on every realistic config we've
+> measured. The wave-parallel attention kernel closed most of the
+> reachable gap; further perf improvements are unlikely without a
+> fundamentally different decode shape.
+
 ## What it is
 
 A two-tier KV cache that matches cache precision to attention

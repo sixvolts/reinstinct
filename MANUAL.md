@@ -507,26 +507,62 @@ serve mode. The serve startup logs WARN if any of them are active.
 
 ### SuperQuant tiered KV cache (opt-in, Gemma 4 live)
 
-A 2-tier KV cache (`int8` Warm + `turbo3` Cold) for long-context
-workloads. Trades attention rel-L2 error for capacity:
+> **This is a capacity feature, not a perf feature.** Enable
+> SuperQuant when you need a context window that wouldn't fit
+> with the default int8 KV cache. **Decode is 29–35% slower**
+> than int8 on every realistic config we've measured — there is
+> no "fast SuperQuant", and there isn't going to be one.
+
+Reinstinct's standard KV cache is already int8 with per-(token, head)
+fp32 scale — half the bytes of fp16, ~48 dB SNR, no measurable
+quality cost vs fp16. For most workloads on a 32 GB MI50 that's
+enough: gemma-31B at 8K context with full int8 KV is comfortable.
+
+SuperQuant exists for the **doesn't-fit-in-int8** case: a 2-tier KV
+cache that extends capacity by ~1.7× in exchange for a real decode
+hit. Inspired by the TurboQuant work in the atomic-llama-cpp-turboquant
+fork (which gets to 300K context on 4×MI50 by similar means).
 
 | Tier | Format | bpv | SNR | Holds |
 |---|---|---:|---:|---|
-| Warm | int8 + per-(slot,head) f32 scale | 8 | ~48 dB | writes + recent context |
+| Warm | int8 + per-(slot,head) f32 scale | 8 | ~48 dB | recent context |
 | Cold | turbo3 (RHT + Lloyd-Max 3-bit) | 3.5 | ~14.6 dB | older context |
 
-At Gemma 31B's layer shape (n_kv=2, head_dim=256) with 8K positions
-in Cold + 2K in Warm: **1.68× capacity vs the standard int8 KV** at
-~0.16 attention rel-L2 vs pure-fp32 reference. Write throughput
-~2200 tok/s, attention 9 ms/call over 10K positions. See
-`docs/SUPERQUANT.md` for per-cold-size measured table.
+**Capacity gain (per layer, K + V):**
+
+| Tier mix | Per-layer footprint vs fp16 | vs int8 |
+|---|---:|---:|
+| All int8 (default) | 0.50× | 1.00× |
+| SuperQuant warm=2K cold=8K | 0.29× | **0.59×** (1.68× more) |
+
+**Decode cost (Gemma 4 31B, 28-tok prompt + 64 decode):**
+
+| Config | Decode tok/s | vs int8 |
+|---|---:|---:|
+| int8 baseline (default) | **27.0** | 1.00× |
+| SuperQuant warm=128 cold=128 | 19.1 | 0.71× |
+| SuperQuant warm=8 cold=512 (cold-heavy) | 17.5 | 0.65× |
+| SuperQuant warm=1 cold=512 (≈pure-turbo3) | 18.3 | 0.68× |
+
+Note the bottom row: even pure-turbo3 (essentially no warm tier)
+runs at 18.3 tok/s, only modestly worse than mixed configs. The
+warm/cold split is mostly about precision floor — the per-position
+turbo3 dequant has irreducible cost regardless of how much you do
+of it. The wave-parallel attention kernel (see below) brought
+SuperQuant from −53% to −32% vs int8; further perf is unlikely.
+
+**Quality:** outputs are factually correct across all configs vs
+the int8 baseline (verified on Gemma 31B, 64-token completion of
+"summarize the moon landing": both produce "On July 20, 1969,
+NASA's Apollo 11 mission successfully landed the first humans on
+the moon..." with only minor word-choice divergence in the tail).
 
 ```bash
 # Live on Gemma 4 generate-text:
 REINSTINCT_KV_SUPERQUANT=1 \
-  REINSTINCT_KV_WARM_TOKENS=128 REINSTINCT_KV_COLD_TOKENS=512 \
+  REINSTINCT_KV_WARM_TOKENS=2048 REINSTINCT_KV_COLD_TOKENS=8192 \
   reinstinct-engine generate-text MODEL.gguf \
-  --system "..." --user "..." --steps 64 --gpu
+  --system "..." --user "..." --steps 256 --gpu
 
 # Synthetic correctness/perf bench (no model needed):
 reinstinct-engine superquant-bench \
@@ -535,27 +571,37 @@ reinstinct-engine superquant-bench \
   --n-writes 8192 --n-splits 8
 ```
 
-Live measured on Gemma 4 31B (UD-Q4_K_XL), 28-token prompt + 64
-decode steps (wave-parallel attention is the default):
+**Three attention variants ship**, all producing token-identical
+output (orthonormal RHT + wave-disjoint position dispatch are
+mathematically equivalent):
 
-| Config | Decode tok/s | vs int8 |
-|---|---:|---:|
-| int8 baseline (default) | **27.0** | 1.00× |
-| SuperQuant warm=128 cold=128 | **19.1** | **0.71×** |
-| SuperQuant warm=8 cold=512 (cold-heavy) | 17.5 | 0.65× |
+| Variant | Env opt-in | Cold tok/s* |
+|---|---|---:|
+| Wave-parallel (`wp`) | default | 17.4 (best) |
+| Rotated-space (`rs`) | `REINSTINCT_KV_SUPERQUANT_RS=1` | 14.8 |
+| Naive | `REINSTINCT_KV_SUPERQUANT_NAIVE=1` | 12.7 (slowest) |
 
-Three attention variants (all token-identical output):
-- `wp` (default): wave-parallel, no per-position sync
-- `rs`: rotated-space single-wave (`REINSTINCT_KV_SUPERQUANT_RS=1`)
-- naive: per-position cooperative iRHT (`REINSTINCT_KV_SUPERQUANT_NAIVE=1`)
+\* warm=8 cold=512 cold-heavy config.
 
-Outputs are quality-equivalent across all configs (factually correct,
-minor word-choice divergence). The wave-parallel kernel is what
-brought SuperQuant from −53% (naive) to −29% to −35% (wp) vs int8.
+The wave-parallel kernel exploits Wave64 implicit lockstep to
+dispatch 4 cached positions in parallel across the workgroup's 4
+wavefronts — no `__syncthreads` per position. That's the
+optimization that closed most of the gap to int8.
 
-Restrictions when SuperQuant is on: HIP graph capture disabled,
-snapshot/restore disabled, spec-decode mutually exclusive, sliding-
-window attention ignores the window. See `docs/SUPERQUANT.md`.
+**Restrictions when SuperQuant is on:**
+- HIP graph capture disabled (warm-cascade D2D memcpys can't be
+  captured into a graph)
+- `snapshot` / `restore` disabled — per-tier rollback not implemented
+- Spec-decode (`mtp-gen`) mutually exclusive
+- Sliding-window attention ignores the window — SuperQuant uses
+  tiering for the same context-bound goal
+
+**Currently Gemma 4 only.** Qwen 3.5/3.6 path is a future
+integration (the qwen35 state has a different KV layout and would
+need a parallel wiring effort).
+
+See `docs/SUPERQUANT.md` for the full design + measured table per
+cold-tier size.
 
 ### Spec-decode (`mtp-gen`)
 
