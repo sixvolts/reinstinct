@@ -1,8 +1,9 @@
 # SuperQuant — tiered KV cache (opt-in, 2-tier)
 
-**Status:** kernels + cache + attention + CLI bench shipped and tested.
-Live integration into `generate-text` and `serve` forward passes is
-follow-up work — currently only exercised via `superquant-bench`.
+**Status:** live-wired into Gemma 4 `generate-text` behind
+`REINSTINCT_KV_SUPERQUANT=1`. Real-model correctness validated;
+opt-in is single env var. Serve integration + qwen35 path are the
+remaining work.
 
 ## What it is
 
@@ -80,7 +81,57 @@ phase 4: memory accounting
     capacity vs int8:      1.68x
 ```
 
-## Measured numbers (Gemma 31B layer shape)
+## Live integration (Gemma 4 31B, real model)
+
+```bash
+# Enable SuperQuant. Defaults: warm=min(8192, max_seq), cold=remainder.
+REINSTINCT_KV_SUPERQUANT=1 reinstinct-engine generate-text MODEL.gguf \
+  --system "Be brief." --user "..." --steps 64 --gpu
+
+# Custom tier sizes:
+REINSTINCT_KV_SUPERQUANT=1 \
+  REINSTINCT_KV_WARM_TOKENS=128 REINSTINCT_KV_COLD_TOKENS=512 \
+  reinstinct-engine generate-text MODEL.gguf --system "..." --user "..." \
+  --steps 64 --gpu
+```
+
+End-to-end decode tok/s on Gemma 4 31B (UD-Q4_K_XL) with a 28-token
+prompt + 64 decode steps:
+
+| Config | Decode tok/s | vs int8 |
+|---|---:|---:|
+| int8 baseline (default) | **27.0** | 1.00× |
+| SuperQuant warm=128 cold=128 | 18.0 | 0.67× |
+| SuperQuant warm=64  cold=128 | 16.6 | 0.61× |
+| SuperQuant warm=32  cold=256 | 14.2 | 0.53× |
+| SuperQuant warm=64  cold=512 | 16.6 | 0.61× |
+
+**Quality preserved.** Side-by-side outputs on the same prompt:
+- int8: `On July 20, 1969, NASA's Apollo 11 mission successfully
+  landed the first humans on the moon. ... Lunar Module Eagle while
+  Michael`
+- SuperQuant warm=64 cold=256: `On July 20, 1969, NASA's Apollo 11
+  mission successfully landed the first humans on the moon. ...
+  Lunar Module Eagle at the`
+
+Both factually correct. The minor word-choice divergence is the
+expected logit perturbation from int8/turbo3 quantization noise —
+not a meaning loss.
+
+**Caveats:**
+- Decode is 33–47% slower than int8. The cold-tier per-position
+  cooperative iRHT dominates; rotated-space attention (planned
+  optimization) would cut this 3–5×.
+- HIP graph capture disabled when SuperQuant is on (warm-cascade
+  D2D memcpys can't capture). Adds ~10% per-token overhead from
+  kernel launches.
+- snapshot/restore + spec-decode mutually exclusive with SuperQuant
+  (per-tier rollback not implemented).
+- Sliding-window attention layers ignore the window when SuperQuant
+  is active — SuperQuant uses tiering for the same context-length
+  goal that sliding windows target.
+
+## Synthetic-bench measured numbers (Gemma 31B layer shape)
 
 n_kv=2, n_heads=16, head_dim=256, warm_cap=2048, n_splits=8. Each
 row is a separate `superquant-bench` invocation; n_writes scaled

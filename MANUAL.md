@@ -505,7 +505,7 @@ serve mode. The serve startup logs WARN if any of them are active.
 | `REINSTINCT_MOE_NO_GROUPED` | Opt out of the grouped-expert MMQ GEMM. Falls back to per-token expert matvecs (~2× slower MoE prefill). |
 | `REINSTINCT_MOE_PROFILE` | Per-stage decode timer (sync-per-lap). Disables graph capture as a side effect — big perf hit. |
 
-### SuperQuant tiered KV cache (opt-in, not yet wired into forward pass)
+### SuperQuant tiered KV cache (opt-in, Gemma 4 live)
 
 A 2-tier KV cache (`int8` Warm + `turbo3` Cold) for long-context
 workloads. Trades attention rel-L2 error for capacity:
@@ -522,17 +522,36 @@ in Cold + 2K in Warm: **1.68× capacity vs the standard int8 KV** at
 `docs/SUPERQUANT.md` for per-cold-size measured table.
 
 ```bash
-# End-to-end correctness + perf bench on synthetic K/V tensors.
+# Live on Gemma 4 generate-text:
+REINSTINCT_KV_SUPERQUANT=1 \
+  REINSTINCT_KV_WARM_TOKENS=128 REINSTINCT_KV_COLD_TOKENS=512 \
+  reinstinct-engine generate-text MODEL.gguf \
+  --system "..." --user "..." --steps 64 --gpu
+
+# Synthetic correctness/perf bench (no model needed):
 reinstinct-engine superquant-bench \
   --warm-cap 2048 --cold-cap 8192 \
   --n-kv 2 --n-heads 16 --head-dim 256 \
   --n-writes 8192 --n-splits 8
 ```
 
-See `docs/SUPERQUANT.md` for the full design + measured numbers per
-shape. The CLI is shipping; live integration into `generate-text` /
-`serve` is follow-up work (env var `REINSTINCT_KV_SUPERQUANT=1` is
-reserved).
+Live measured on Gemma 4 31B (UD-Q4_K_XL), 28-token prompt + 64
+decode steps:
+
+| Config | Decode tok/s | vs int8 |
+|---|---:|---:|
+| int8 baseline (default) | **27.0** | 1.00× |
+| SuperQuant warm=128 cold=128 | 18.0 | 0.67× |
+| SuperQuant warm=64 cold=128 | 16.6 | 0.61× |
+
+Outputs are quality-equivalent (factually correct, minor word-choice
+divergence). Decode regression comes from the per-position cooperative
+iRHT on cold; rotated-space attention is the planned optimization
+(3-5× cold speedup).
+
+Restrictions when SuperQuant is on: HIP graph capture disabled,
+snapshot/restore disabled, spec-decode mutually exclusive, sliding-
+window attention ignores the window. See `docs/SUPERQUANT.md`.
 
 ### Spec-decode (`mtp-gen`)
 
