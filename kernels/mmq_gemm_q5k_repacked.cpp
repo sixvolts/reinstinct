@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 #define BM 64
 #define BN 64
@@ -71,10 +72,12 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
         const unsigned int sb = sb0 + lk;
         const unsigned int wrow = row0 + lr;
         if (wrow < out_dim) {
-            sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
-            sWqh[lr][lk] = qhp[(size_t)wrow * nsp + sb];
-            const uint16_t sm = smp[(size_t)wrow * nsp + sb];
-            const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
+            // Weight streams: read-once-per-K-tile, never reused — bypass
+            // L1/L2 so the activation tile + LDS scales stay cache-resident.
+            sW  [lr][lk] = loadnt_uint4(nib + (size_t)wrow * nsp + sb);
+            sWqh[lr][lk] = loadnt(qhp + (size_t)wrow * nsp + sb);
+            const uint16_t sm = loadnt(smp + (size_t)wrow * nsp + sb);
+            const uint32_t dd = loadnt(ddp + (size_t)wrow * n_super + (sb >> 3));
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
             const uint16_t dmin_bits = (uint16_t)(dd >> 16);
             sWs[lr][lk] = make_float2(

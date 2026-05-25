@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "gfx906_dpp.h"
 
 #define BM 64
 #define BN 64
@@ -73,10 +74,10 @@ void mmq_gemm_q6k_repacked_f32(const unsigned char* __restrict__ wbase,
         const unsigned int sb = sb0 + lk;
         const unsigned int wrow = row0 + lr;
         if (wrow < out_dim) {
-            sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
-            sWh2[lr][lk] = h2p[(size_t)wrow * nsp + sb];
-            const uint16_t sm     = smp[(size_t)wrow * nsp + sb];
-            const uint16_t d_bits = ddp[(size_t)wrow * n_super + (sb >> 3)];
+            sW  [lr][lk] = loadnt_uint4(nib + (size_t)wrow * nsp + sb);
+            sWh2[lr][lk] = loadnt_uint2(h2p + (size_t)wrow * nsp + sb);
+            const uint16_t sm     = loadnt(smp + (size_t)wrow * nsp + sb);
+            const uint16_t d_bits = loadnt(ddp + (size_t)wrow * n_super + (sb >> 3));
             const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
             sWs[lr][lk] = make_float2(d * (float)(int)(int8_t)(sm & 0xFFu),
                                       d * (float)(int)(int8_t)(sm >> 8));

@@ -106,3 +106,41 @@ __device__ __forceinline__ float fast_rcp_f32(float x) {
     asm volatile("v_rcp_f32 %0, %1" : "=v"(r) : "v"(x));
     return r;
 }
+
+// Non-temporal HBM load (bypasses L1 + L2). Use on weight streams that
+// are read exactly once and never again — keeps the small (4 MB) MI50
+// L2 cache populated with reusable data (activation tiles, LDS-spilled
+// state) instead of being thrashed by one-shot weight reads.
+//
+// Compiles to `global_load_dword(x{2,4}) ... glc:1 slc:1` on gfx906.
+// Source: vllm-gfx906 (csrc/rocm/skinny_gemms.cu:121-132).
+//
+// `__builtin_nontemporal_load` only accepts scalar/pointer types; for
+// HIP vector types (uint4, float4) split into 4 dword loads. The
+// compiler fuses them back into a single `global_load_dwordx4 ... slc:1`.
+template <typename T>
+__device__ __forceinline__ T loadnt(const T* addr) {
+    return __builtin_nontemporal_load(addr);
+}
+
+__device__ __forceinline__ uint4 loadnt_uint4(const uint4* addr) {
+    const unsigned* p = reinterpret_cast<const unsigned*>(addr);
+    return make_uint4(__builtin_nontemporal_load(p),
+                      __builtin_nontemporal_load(p + 1),
+                      __builtin_nontemporal_load(p + 2),
+                      __builtin_nontemporal_load(p + 3));
+}
+
+__device__ __forceinline__ uint2 loadnt_uint2(const uint2* addr) {
+    const unsigned* p = reinterpret_cast<const unsigned*>(addr);
+    return make_uint2(__builtin_nontemporal_load(p),
+                      __builtin_nontemporal_load(p + 1));
+}
+
+__device__ __forceinline__ float4 loadnt_float4(const float4* addr) {
+    const float* p = reinterpret_cast<const float*>(addr);
+    return make_float4(__builtin_nontemporal_load(p),
+                       __builtin_nontemporal_load(p + 1),
+                       __builtin_nontemporal_load(p + 2),
+                       __builtin_nontemporal_load(p + 3));
+}

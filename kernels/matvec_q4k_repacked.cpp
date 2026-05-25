@@ -75,9 +75,9 @@ void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
             const int row = row0 + r;
             if (row >= (int)out_dim) continue;
 
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint16_t sm = smp[(size_t)row * nsp + sb];
-            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
+            const uint4    q  = loadnt_uint4(nib + (size_t)row * nsp + sb);
+            const uint16_t sm = loadnt(smp + (size_t)row * nsp + sb);
+            const uint32_t dd = loadnt(ddp + (size_t)row * n_super + (sb >> 3));
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
             const uint16_t dmin_bits = (uint16_t)(dd >> 16);
             const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
