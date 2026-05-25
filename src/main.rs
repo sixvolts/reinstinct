@@ -572,7 +572,28 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
         println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
 
-        let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+        // SuperQuant opt-in: REINSTINCT_KV_SUPERQUANT=1 swaps in the
+        // 2-tier (int8 Warm + turbo3 Cold) KV cache. Sizing comes from
+        // optional REINSTINCT_KV_WARM_TOKENS / REINSTINCT_KV_COLD_TOKENS.
+        // Defaults via SuperQuantConfig::chat_defaults(max_seq).
+        let mut state = if std::env::var_os("REINSTINCT_KV_SUPERQUANT").is_some() {
+            use reinstinct_engine::runtime::kv_superquant::SuperQuantConfig;
+            let mut cfg = SuperQuantConfig::chat_defaults(max_seq);
+            if let Ok(v) = std::env::var("REINSTINCT_KV_WARM_TOKENS") {
+                if let Ok(n) = v.parse::<usize>() { cfg.warm_cap = n.min(max_seq); }
+            }
+            if let Ok(v) = std::env::var("REINSTINCT_KV_COLD_TOKENS") {
+                if let Ok(n) = v.parse::<usize>() {
+                    cfg.cold_cap = n.min(max_seq.saturating_sub(cfg.warm_cap));
+                }
+            }
+            eprintln!("[KV] SuperQuant: warm_cap={} cold_cap={} (total {})",
+                cfg.warm_cap, cfg.cold_cap, cfg.total());
+            Gemma4GpuState::new_with_superquant(&model, max_seq, &cache, cfg)
+                .map_err(anyhow::Error::msg)?
+        } else {
+            Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?
+        };
 
         // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
         // print timing + top-10, and exit (skips generation).
@@ -633,8 +654,10 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         // decode then replays it with a single submission per token.
         // REINSTINCT_MOE_PROFILE needs the per-kernel path (its per-stage
         // timer syncs the stream, which a captured graph can't contain).
+        // SuperQuant also blocks graph capture (warm-cascade D2D memcpys).
         let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
-                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none();
+                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none()
+                     && !state.is_superquant();
         let t_cap = std::time::Instant::now();
         let graph = if use_graph {
             let g = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
@@ -657,6 +680,17 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         let pf = t_prefill.elapsed().as_secs_f64();
         println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token)",
                  pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64);
+        // SuperQuant: prefill went through the int8 cache (existing
+        // batched kernels). Migrate the populated int8 contents into
+        // the SuperQuant tiers so the decode-time attention reads from
+        // the right place. Decode-step writes thereafter route to
+        // SuperQuant by the block_forward branch.
+        if state.is_superquant() {
+            let t_mig = std::time::Instant::now();
+            state.migrate_int8_to_superquant(&cache).map_err(anyhow::Error::msg)?;
+            println!("kv migrate   = {:.1} ms (int8 → SuperQuant, {} positions)",
+                     t_mig.elapsed().as_secs_f64() * 1e3, state.pos);
+        }
         // Decode timer — generated tokens only.
         let t_decode = std::time::Instant::now();
         for _ in 0..steps {

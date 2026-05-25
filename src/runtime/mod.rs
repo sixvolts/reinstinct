@@ -32,6 +32,7 @@ pub const DEFAULT_ARCH: &str = "gfx906";
 pub const COMPILE_FLAGS: &[&str] = &["-O3", "-std=c++17"];
 
 /// Filesystem-backed compile cache for HIP kernel sources.
+#[derive(Clone)]
 pub struct KernelCache {
     cache_dir: PathBuf,
     arch: String,
