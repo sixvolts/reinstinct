@@ -375,6 +375,7 @@ pub fn attn_step_f32(cache: &KernelCache,
     assert!(k_cache.len() >= total_len * kv_row);
     assert!(v_cache.len() >= total_len * kv_row);
     assert_eq!(n_heads % n_kv_heads, 0);
+    assert!(total_len >= 1, "attn_step expects at least one populated KV position");
 
     let hsaco = cache.compile("attn_step", ATTN_STEP_SOURCE)?;
     let module = Module::load(&hsaco)?;
@@ -384,6 +385,9 @@ pub fn attn_step_f32(cache: &KernelCache,
     let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k_cache)?;
     let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v_cache)?;
     let dy: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim)?;
+    // Kernel reads decode position from device (`*pos_ptr + 1 = total_len`)
+    // to stay HIP-graph-compatible. Test path supplies a one-shot buffer.
+    let dpos: DeviceBuf<u32> = DeviceBuf::from_slice(&[(total_len - 1) as u32])?;
 
     let block: u32 = 256;
     let grid: u32 = n_heads as u32;
@@ -396,7 +400,7 @@ pub fn attn_step_f32(cache: &KernelCache,
     let mut nh = n_heads as u32;
     let mut nkv = n_kv_heads as u32;
     let mut hd = head_dim as u32;
-    let mut tl = total_len as u32;
+    let mut pp = dpos.raw_ptr();
     let mut sc = scaling;
     let mut args: [*mut c_void; 9] = [
         &mut q_ptr as *mut _ as *mut c_void,
@@ -406,7 +410,7 @@ pub fn attn_step_f32(cache: &KernelCache,
         &mut nh    as *mut _ as *mut c_void,
         &mut nkv   as *mut _ as *mut c_void,
         &mut hd    as *mut _ as *mut c_void,
-        &mut tl    as *mut _ as *mut c_void,
+        &mut pp    as *mut _ as *mut c_void,
         &mut sc    as *mut _ as *mut c_void,
     ];
     unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem_bytes, None, &mut args)?; }
@@ -439,6 +443,8 @@ pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
     let dx: DeviceBuf<f32>  = DeviceBuf::from_slice(x)?;
     let dc: DeviceBuf<f32>  = DeviceBuf::from_slice(cos)?;
     let ds: DeviceBuf<f32>  = DeviceBuf::from_slice(sin)?;
+    // Kernel reads pos from device for graph-capture compatibility.
+    let dpos: DeviceBuf<u32> = DeviceBuf::from_slice(&[pos as u32])?;
 
     let half = (rotary_dim / 2) as u32;
     let block: u32 = 64;
@@ -451,7 +457,7 @@ pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
     let mut hd = head_dim as u32;
     let mut rd = rotary_dim as u32;
     let mut nh = n_heads as u32;
-    let mut p  = pos as u32;
+    let mut pp = dpos.raw_ptr();
     let mut args: [*mut c_void; 7] = [
         &mut x_ptr as *mut _ as *mut c_void,
         &mut c_ptr as *mut _ as *mut c_void,
@@ -459,7 +465,7 @@ pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
         &mut hd    as *mut _ as *mut c_void,
         &mut rd    as *mut _ as *mut c_void,
         &mut nh    as *mut _ as *mut c_void,
-        &mut p     as *mut _ as *mut c_void,
+        &mut pp    as *mut _ as *mut c_void,
     ];
     unsafe { f.launch((grid_x, grid_y, 1), (block, 1, 1), 0, None, &mut args)?; }
     hip::Device(0).synchronize()?;

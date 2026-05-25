@@ -3992,6 +3992,12 @@ impl GpuQwen35 {
         // H2D the input.
         self.hidden_a.copy_from_host(input)?;
 
+        // Stage decode position into device-resident d_pos. Without this
+        // the KV write + attention kernel both read pos=0 every step,
+        // overwriting prior entries and limiting attention to a single
+        // token (see step_full_attention's launch_kv_write / launch_attn_step).
+        self.set_pos(kv_cache.len)?;
+
         // Sub-layer 1: attention with pre-norm + residual.
         self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
                                  &weights.attn, kv_cache)?;
@@ -4144,6 +4150,10 @@ impl GpuQwen35 {
     {
         assert_eq!(input.len(), self.hidden, "input must be hidden-sized");
         self.hidden_a.copy_from_host(input)?;
+        // Stage decode position into device-resident d_pos so the KV
+        // write + attention kernels see the right slot. Without this
+        // they read pos=0 every call.
+        self.set_pos(kv_cache.len)?;
         self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
                                  weights, kv_cache)?;
         self.stream.synchronize()?;

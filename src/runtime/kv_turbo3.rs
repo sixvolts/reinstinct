@@ -111,9 +111,14 @@ pub struct TurboKvCache {
 impl TurboKvCache {
     pub fn new(n_kv: usize, head_dim: usize, max_seq: usize) -> Result<Self, String> {
         let sb = slot_bytes(head_dim);
+        let total_bytes = max_seq * n_kv * sb;
+        // Zero-initialise so unwritten slots decode to zeros. `hipMalloc`
+        // returns uninitialised memory; readers that scan past the
+        // populated `len` would otherwise see leftover allocations.
+        let zeros = vec![0u8; total_bytes];
         Ok(Self {
-            k: DeviceBuf::new(max_seq * n_kv * sb)?,
-            v: DeviceBuf::new(max_seq * n_kv * sb)?,
+            k: DeviceBuf::from_slice(&zeros)?,
+            v: DeviceBuf::from_slice(&zeros)?,
             n_kv, head_dim, max_seq, len: 0,
             write_module: None,
             signs1_k: DeviceBuf::from_slice(CacheKind::K.signs1())?,
