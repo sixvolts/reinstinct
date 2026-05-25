@@ -15,6 +15,7 @@ pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod spec_decode;
 pub mod smoke;
+pub mod kv_turbo3;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
