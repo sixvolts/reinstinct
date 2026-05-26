@@ -1,18 +1,18 @@
 # reinstinct
 
-A custom HIP inference engine that brings AMD Instinct MI50/MI60 GPUs back from the dead for local AI inference. Outperforms llama.cpp on the same hardware by 20-47%, runs models up to 31B dense on a single $200 card, and delivers throughput competitive with hardware costing 4-17x more.
+A custom HIP inference engine that brings AMD Instinct MI50/MI60 GPUs back from the dead for local AI inference. Outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more.
 
 ## Why does this exist?
 
 GPUs are expensive. HBM is even harder to get. An NVIDIA RTX 3090 runs $800-1200 used. An M4 Max MacBook Pro starts at $3500. A single H100 rents for $2-3/hr.
 
-Meanwhile, AMD Instinct MI50s are $100-200 on eBay. They have **32 GB of HBM2** and **1 TB/s of memory bandwidth** — the same bandwidth class as an RTX 4090, with 33% more VRAM than a 3090. The reason they are cheap is that AMD declared them end-of-life in 2023 and stopped shipping optimized software. Stock inference frameworks leave 70-90% of the cards bandwidth on the table due to kernel launch overhead and unoptimized dispatch.
+Meanwhile, AMD Instinct MI50s are $400-500 on eBay. They have **32 GB of HBM2** and **1 TB/s of memory bandwidth** — the same bandwidth class as an RTX 4090, with 33% more VRAM than a 3090. The reason they are cheap is that AMD declared them end-of-life in 2023 and stopped shipping optimized software. Stock inference frameworks leave 70-90% of the cards bandwidth on the table due to kernel launch overhead and unoptimized dispatch.
 
 reinstinct is a from-scratch inference engine written in Rust + HIP that fixes that. Custom Wave64 kernels, repacked quantization formats, HIP graph capture, fused dequant+matmul, Q8 FlashAttention — all tuned specifically for the gfx906 architecture. No ROCm link-time dependency, no reliance on AMDs deprecated library support. Just libamdhip64.so and raw .hsaco kernel binaries.
 
 ## Performance
 
-Single MI50 32 GB, 300W TDP, ROCm 7.1+. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL.
+Single MI50 32 GB, 300W TDP, ROCm 7.x. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL.
 
 ### Decode throughput (tok/s)
 
@@ -35,14 +35,14 @@ reinstinct wins **10 of 10** tested configurations.
 
 | Hardware | Price (used) | VRAM | Qwen 3.5 35B MoE tok/s | Gemma 31B Dense tok/s |
 |---|---|---|---|---|
-| **MI50 + reinstinct** | **~$200** | 32 GB HBM2 | **101.3** | **27.5** |
+| **MI50 + reinstinct** | **~$500** | 32 GB HBM2 | **101.3** | **27.5** |
 | RTX 3090 + llama.cpp | $800-1200 | 24 GB GDDR6X | ~136 | ~21* |
 | M4 Max + llama.cpp | $3500+ | 36 GB unified | ~44 | ~20 |
 | M4 Max + MLX | $3500+ | 36 GB unified | ~92 | N/A |
 
 *3090 cannot comfortably fit Gemma 31B Q4 (17.5 GB weights + KV exceeds 24 GB at reasonable context lengths).
 
-The MI50 is the price/performance king for local inference on models up to 31B. It is the only sub-$300 card with 32 GB of HBM and 1 TB/s bandwidth.
+The MI50 is the price/performance king for local inference on models up to 31B. It is the only ~$500 card with 32 GB of HBM and 1 TB/s bandwidth.
 
 ### MTP speculative decoding (Gemma 4 31B, K=3)
 
@@ -53,7 +53,7 @@ The MI50 is the price/performance king for local inference on models up to 31B. 
 | Procedural ("How to make tea") | 25.7 | 63% | -7% |
 | Creative ("Write a haiku") | 23.6 | 55% | -14% |
 
-MTP wins on factual/structured prompts. The serve endpoint allows per-request MTP toggle.
+MTP wins on factual/structured prompts. The serve endpoint allows per-request MTP toggle so you can decide if you need it for the use cases where it performs well.
 
 ## Features
 
@@ -102,14 +102,15 @@ See [MANUAL.md](MANUAL.md) for full documentation.
 
 These are datacenter pulls. A little prep work goes a long way.
 
-### Repaste the GPU die
+### Replace the Thermal Interface Material (TIM)
 
-The factory thermal paste is almost certainly dried out after years in a server room. This is the single highest-impact thing you can do.
+Most of these cards originally shipped with a dry graphite pad designed to last the life of the card. You CAN leave the graphite pad, but if you are putting this somewhere where airflow is not perfect, I strongly recommend the upgrade. For sustained workloads on this kind of hardware, a Phase-change Pad is what I would recommend. Thermal Grizzly Phasesheet works great, is inexpensive and is available on Amazon. A single package is all you need for one card. $15-20 depending on the day. PTM7950 works well too, but lots of fake stuff is floating around. 
 
-1. Remove the heatsink (typically 4 spring-loaded screws around the die)
-2. Clean old paste with isopropyl alcohol
-3. Apply quality thermal paste (Thermal Grizzly Kryonaut, Noctua NT-H1, or similar)
-4. Reassemble and verify even contact pressure
+1. Remove the heatsink shroud - screws along the top/bottom sides of the card. 
+2. Scrape off the graphite pad with something soft - like a plastic card. 
+3. Clean the die and heastink with Isopropyl alcohol, wipe clean with a lint-free cloth or paper towel. 
+4. Apply quality Phase-change pad to the die. 
+5. Reassemble. You'll want to run a "burn in", like a benchmark, for a while to help the Phase change material work its way into the the two surfaces. 
 
 Expected improvement: 5-15C drop in junction temperature, preventing thermal throttling during sustained inference.
 
@@ -127,13 +128,18 @@ At 250W you lose about 5% throughput but gain significantly better thermals. At 
 
 ### Cooling
 
-MI50s are designed for 2U server chassis with high-CFM 80mm fans. In a workstation:
-
-- **Best**: Open-air bench with a 120mm fan directed at the heatsink
-- **Good**: 4U chassis with 80mm fans, or tower case with dedicated GPU fan duct
-- **Workable**: Standard ATX tower with good airflow (expect some throttling)
+MI50s are designed for 2U server chassis with high-CFM fans. For use in regular PC or on a bench, 3D print one of the fan adapters listed below and use a high-cfm and pressure fan. A quiet 80mm fan like a noctua will work, but if you are running more than intermittent loads, you'll probably throttle. 
 
 If junction temp exceeds 85-90C during sustained decode (watch with rocm-smi), repaste and improve airflow first.
+
+Fan Shrouds: 
+easiest, just add 80mm Fan - https://www.printables.com/model/1479089-amd-mi50-mi100-m210-gpu-80mm-fan-cooling-attachmen
+https://www.thingiverse.com/thing:7153218
+https://www.thingiverse.com/thing:7314821
+
+Fans:
+Best performance: ARCTIC P8 Max
+Silent but slower: Noctua NF-A8
 
 ## Architecture
 
@@ -150,5 +156,5 @@ reinstinct is built around a few key insights about the MI50:
 ## Acknowledgments
 
 - The gfx906 community: iacopPBK, arte-fact, nalanzeyu, Kaden-Schutt (hipfire)
-- Unsloth for the Dynamic GGUF quantization format
-- The llama.cpp project for the GGUF format specification and the baseline to beat
+- Unsloth for the Dynamic GGUF quantization format and their awesome quants. 
+- The llama.cpp project for the GGUF format specification and the foundational work. 
