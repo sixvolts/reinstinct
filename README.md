@@ -104,7 +104,7 @@ These are datacenter pulls. A little prep work goes a long way.
 
 ### Replace the Thermal Interface Material (TIM)
 
-Most of these cards originally shipped with a dry graphite pad designed to last the life of the card. You CAN leave the graphite pad, but if you are putting this somewhere where airflow is not perfect, I strongly recommend the upgrade. For sustained workloads on this kind of hardware, a Phase-change Pad is what I would recommend. Thermal Grizzly Phasesheet works great, is inexpensive and is available on Amazon. A single package is all you need for one card. $15-20 depending on the day. PTM7950 works well too, but lots of fake stuff is floating around. 
+Most of these cards originally shipped with a dry graphite pad designed to last the life of the card. You CAN leave the graphite pad, but if you are putting this somewhere where airflow is not perfect, I strongly recommend the upgrade. For sustained workloads on this kind of hardware, a phase-change pad is what I would recommend. Thermal Grizzly Phasesheet works great, is inexpensive and is available on Amazon. A single package is all you need for one card. $15-20 depending on the day. PTM7950 works well too, but lots of fake stuff is floating around. 
 
 1. Remove the heatsink shroud - screws along the top/bottom sides of the card. 
 2. Scrape off the graphite pad with something soft - like a plastic card. 
