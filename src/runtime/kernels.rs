@@ -1993,8 +1993,23 @@ mod tests {
         use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
         use crate::quant::half::f32_to_f16;
 
-      for &(in_dim, out_dim) in &[(5376usize, 21504usize), (5376, 8192),
-                                  (5376, 4096), (8192, 5376), (4096, 5376)] {
+      // Shapes spanning the real model out_dims we care about:
+      //   gemma 31B: hidden=5376, ffn=21504, q_full=16384 (head_dim=512×32),
+      //              q_swa=8192 (head_dim=256×32), kv=512
+      //   qwen 27B: hidden=5120, ffn=17408, q=6144, kv=1024
+      for &(in_dim, out_dim) in &[(5376usize, 21504usize),       // gemma ffn out
+                                  (21504, 5376),                  // gemma ffn_down
+                                  (5376, 16384),                  // gemma q_full
+                                  (5376, 8192),                   // gemma q_swa / hidden→8K
+                                  (5376, 5376),                   // attn_o on gemma hidden
+                                  (5376, 4096),                   // small
+                                  (5120, 17408),                  // qwen ffn out
+                                  (17408, 5120),                  // qwen ffn_down
+                                  (5120, 6144),                   // qwen q
+                                  (5120, 1024),                   // qwen kv (small/critical)
+                                  (5120, 5120),                   // qwen attn_o
+                                  (8192, 5376),                   // attn_o-like
+                                  (4096, 5376)] {                 // small in_dim
         let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
         let mut w = vec![0u8; total_blocks * BYTES_PER_BLOCK];
         let mut s: u64 = 0xBEEF_0001;
@@ -2028,9 +2043,10 @@ mod tests {
             unsafe { qf.launch(((in_dim as u32 + 255)/256,1,1),(256,1,1),0,Some(&stream),&mut a).unwrap(); }
         }
 
-        let bench = |module: &Module, kname: &str, wptr: *mut c_void, bytes: f64| -> (f64, f64) {
+        // rows_per_wg = ROWS_per_wave × 4 waves. ROWS=1→4, ROWS=2→8, ROWS=4→16.
+        let bench = |module: &Module, kname: &str, wptr: *mut c_void, rows_per_wg: u32, bytes: f64| -> (f64, f64) {
             let f = module.function(kname).unwrap();
-            let grid = (out_dim as u32 + 7) / 8;
+            let grid = (out_dim as u32 + rows_per_wg - 1) / rows_per_wg;
             let launch = || {
                 let mut wp = wptr; let mut qp = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
                 let mut id = in_dim as u32; let mut od = out_dim as u32;
@@ -2053,10 +2069,16 @@ mod tests {
 
         let q_bytes = (out_dim * (in_dim / BLOCK_SIZE) * BYTES_PER_BLOCK) as f64;
         let r_bytes = (out_dim * (in_dim / 32) * 20) as f64;
-        let (dm, dgb) = bench(&dp4a, "matvec_q4_k_dp4a_f32", dw_q.raw_ptr(), q_bytes);
-        let (rm, rgb) = bench(&repk, "matvec_q4k_repacked_f32", dw_r.raw_ptr(), r_bytes);
-        eprintln!("q4_k matvec {out_dim}x{in_dim}:  dp4a {dm:.4}ms {dgb:.0}GB/s  \
-                   repacked {rm:.4}ms {rgb:.0}GB/s  ({:.2}x)", dm / rm);
+        let (dm, dgb) = bench(&dp4a, "matvec_q4_k_dp4a_f32",      dw_q.raw_ptr(), 8, q_bytes);
+        let (r2m, r2gb) = bench(&repk, "matvec_q4k_repacked_f32",     dw_r.raw_ptr(), 8, r_bytes);
+        let (r1m, r1gb) = bench(&repk, "matvec_q4k_repacked_r1_f32",  dw_r.raw_ptr(), 4, r_bytes);
+        let (r4m, r4gb) = bench(&repk, "matvec_q4k_repacked_r4_f32",  dw_r.raw_ptr(), 16, r_bytes);
+        // pick best
+        let best = [(r1m,"r1",r1gb),(r2m,"r2",r2gb),(r4m,"r4",r4gb)]
+            .iter().cloned().fold((f64::INFINITY,"",0.0), |a,b| if b.0 < a.0 { b } else { a });
+        eprintln!("q4_k {:>5}x{:<5}: dp4a {:.3}ms {:.0}GB/s | r1 {:.3} {:.0} | r2 {:.3} {:.0} | r4 {:.3} {:.0} | best={} ({:.0}GB/s, {:.2}× vs r2)",
+                  out_dim, in_dim, dm, dgb, r1m, r1gb, r2m, r2gb, r4m, r4gb,
+                  best.1, best.2, r2m / best.0);
       }
     }
 

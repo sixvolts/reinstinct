@@ -20,15 +20,24 @@
 //
 //   dot = sum_sub [ dsc·dx·<nibbles·int8> - deff·xsum ]
 //
-// 256-thread workgroup: 4 independent wavefronts, ROWS=2 rows each.
-// grid = ceil(out_dim / 8).
+// Three entry points differ in (workgroup-waves, rows-per-wavefront).
+// All share `mv_q4k_repacked<ROWS, NW>`:
+//   * `_f32`     — 4 waves, ROWS=2, grid = ceil(out_dim/8). Default.
+//                  Best at mid-large out_dim — amortises x-fetch across
+//                  2 rows.
+//   * `_r1_f32`  — 4 waves, ROWS=1, grid = ceil(out_dim/4). 2× more
+//                  workgroups, half the work per wavefront. Wins at
+//                  tiny out_dim (≲ 1500) where the default leaves too
+//                  few wavefronts in flight to fill the CUs.
+//   * `_r4_f32`  — 4 waves, ROWS=4, grid = ceil(out_dim/16). Half the
+//                  workgroups. Currently never the best — kept as the
+//                  high-amortisation reference for future tuning.
+// The caller picks per matvec — see qwen35 / gemma4 launch_matvec.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include "gfx906_dpp.h"
-
-#define ROWS 2
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -37,12 +46,13 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
-extern "C" __global__
-void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
-                             const BlockQ8* __restrict__ xq,
-                             float*         __restrict__ y,
-                             unsigned int in_dim,
-                             unsigned int out_dim)
+template<int ROWS>
+__device__ __forceinline__
+void mv_q4k_repacked(const uint8_t* __restrict__ wbase,
+                     const BlockQ8* __restrict__ xq,
+                     float*         __restrict__ y,
+                     unsigned int in_dim,
+                     unsigned int out_dim)
 {
     const int wave = threadIdx.x >> 6;          // 0..3
     const int lane = threadIdx.x & 63;
@@ -103,4 +113,34 @@ void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
         float a = wave64_reduce_add_f32(acc[r]);
         if (lane == 0 && (row0 + r) < (int)out_dim) y[row0 + r] = a;
     }
+}
+
+extern "C" __global__
+void matvec_q4k_repacked_f32(const uint8_t* __restrict__ wbase,
+                             const BlockQ8* __restrict__ xq,
+                             float*         __restrict__ y,
+                             unsigned int in_dim,
+                             unsigned int out_dim)
+{
+    mv_q4k_repacked<2>(wbase, xq, y, in_dim, out_dim);
+}
+
+extern "C" __global__
+void matvec_q4k_repacked_r1_f32(const uint8_t* __restrict__ wbase,
+                                const BlockQ8* __restrict__ xq,
+                                float*         __restrict__ y,
+                                unsigned int in_dim,
+                                unsigned int out_dim)
+{
+    mv_q4k_repacked<1>(wbase, xq, y, in_dim, out_dim);
+}
+
+extern "C" __global__
+void matvec_q4k_repacked_r4_f32(const uint8_t* __restrict__ wbase,
+                                const BlockQ8* __restrict__ xq,
+                                float*         __restrict__ y,
+                                unsigned int in_dim,
+                                unsigned int out_dim)
+{
+    mv_q4k_repacked<4>(wbase, xq, y, in_dim, out_dim);
 }
