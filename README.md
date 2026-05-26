@@ -52,7 +52,7 @@ The MI50 is the price/performance king for local inference on models up to 31B. 
 | Procedural ("How to make tea") | 25.7 | 63% | -7% |
 | Creative ("Write a haiku") | 23.6 | 55% | -14% |
 
-MTP wins on factual/structured prompts. The serve endpoint allows per-request MTP toggle so you can decide if you need it for the use cases where it performs well.
+MTP wins on factual/structured prompts, but costs performance on creative workloads. The API endpoint allows per-request MTP toggle so you can decide if you need it for the use cases where it performs well. Area of future improvement for sure. 
 
 ## Features
 
@@ -73,9 +73,10 @@ MTP wins on factual/structured prompts. The serve endpoint allows per-request MT
 
 | GPU | Arch | VRAM | Status |
 |---|---|---|---|
-| AMD Instinct MI50 | gfx906 | 16 or 32 GB HBM2 | Primary target |
-| AMD Instinct MI60 | gfx906 | 32 GB HBM2 | Same ISA, 4 extra CUs |
-| AMD Radeon VII | gfx906 | 16 GB HBM2 | Same die, should work (untested) |
+| AMD Instinct MI50 | gfx906/Vega20 | 60 CUs | 16 or 32 GB HBM2 | Primary target |
+| AMD Instinct MI60 | gfx906/Vega20 | 64 CUs | 32 GB HBM2 | Same ISA, 4 extra CUs |
+| AMD Radeon VII | gfx906/Vega20 | 60 CUs | 16 GB HBM2 | Same die, should work (untested) |
+
 
 ## Quick start
 
@@ -150,7 +151,7 @@ reinstinct is built around a few key insights about the MI50:
 
 **Custom quantization layouts matter.** The v2 repacked format converts ragged cache-line-crossing access patterns into fully coalesced sequential reads, yielding 10-15% higher effective HBM bandwidth.
 
-**Q8 attention with dp4a.** INT8 KV cache with v_dot4_i32_i8 dot products halves attention bandwidth and increases throughput vs FP16 attention.
+**Q8 attention with dp4a.** INT8 KV cache with v_dot4_i32_i8 dot products halves attention bandwidth and increases throughput vs FP16 attention with relatively little precision loss. 
 
 ## Acknowledgments
 
