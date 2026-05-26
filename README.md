@@ -1,6 +1,6 @@
 # reinstinct
 
-A custom HIP inference engine that brings AMD Instinct MI50/MI60 GPUs back from the dead for local AI inference. Outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more.
+A custom HIP inference engine that brings AMD Instinct MI50/MI60 GPUs back from the dead for local AI inference. Outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
 
 ## Why does this exist?
 
@@ -12,8 +12,7 @@ reinstinct is a from-scratch inference engine written in Rust + HIP that fixes t
 
 ## Performance
 
-Single MI50 32 GB, 300W TDP, ROCm 7.x. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL.
-
+Single MI50 32 GB, 300W TDP. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL. 
 ### Decode throughput (tok/s)
 
 | Model | Params | reinstinct | llama.cpp | Delta |
