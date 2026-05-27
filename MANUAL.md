@@ -935,11 +935,15 @@ Decode is matvec-bandwidth-bound on this gfx906; the captured HIP
 graph eliminates per-kernel launch overhead. Key changes from the
 straight-line implementation:
 
-- int8 dp4a matvec (`v_dot4_i32_i8`) for K-quant + Q8_0 weights;
-  ROWS=2 per wavefront, ROWS=1 for `out_dim ≥ 4096` to keep wavefronts
-  in flight on bigger projections. IQ4_XS got the same dp4a treatment
-  (previously fell through to a fp32 wave64 fallback that cost 12% of
-  decode GPU time on qwen 27B; now ~4%).
+- int8 dp4a matvec (`v_dot4_i32_i8`) for K-quant + Q8_0 weights.
+  Q8_0 dispatches ROWS=1 (one row per wavefront) for `out_dim ≥ 4096`
+  to keep wavefronts in flight on bigger projections, ROWS=2 below.
+  K-quant uses a 256-thread / 8-row workgroup (ROWS=2 × 4 waves). A
+  ROWS=1 K-quant variant exists for research but isn't dispatched —
+  measured tradeoff space favours the default at production shapes.
+  IQ4_XS got the same dp4a treatment (previously fell through to a
+  fp32 wave64 fallback that cost 12% of decode GPU time on qwen 27B;
+  now ~4%).
 - int8 KV cache with per-head scale; dp4a Q·Kᵀ, dequant-V P·V.
 - `rmsnorm + add_residual` fused on Gemma 4. Per-layer output scale
   folded into the final fused `rmsnorm_add_scale`. The router weight
