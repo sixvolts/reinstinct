@@ -12,21 +12,28 @@ reinstinct is a from-scratch inference engine written in Rust + HIP that fixes t
 
 ## Performance
 
-Single MI50 32 GB, 300W TDP. All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL. 
+Single MI50 32 GB, 300W TDP, phase-change thermal pad, clocks pinned high.
+All models are Unsloth Dynamic GGUF at Q4_K_XL or Q6_K_XL. Numbers below
+are 5-run means with sample standard deviation. Bench methodology: 256
+decode tokens, `--temperature 0`, 25/75 compute/cool duty cycle between
+runs. *Measured on this specific MI50 — Vega 20 has ~5% card-to-card
+silicon variance, so your numbers may shift by that much in either
+direction.*
+
 ### Decode throughput (tok/s)
 
-| Model | Params | reinstinct | llama.cpp | Delta |
-|---|---|---|---|---|
-| Qwen 3.5 0.8B | 0.8B | **275.9** | 192.0 | **+44%** |
-| Qwen 3.5 4B | 4.2B | **111.2** | 75.9 | **+47%** |
-| Gemma 4 E4B | 7.5B | **96.6** | 81.2 | **+19%** |
-| Qwen 3.5 35B-A3B MoE | 3.3B active | **101.3** | 78.3 | **+29%** |
-| Qwen 3.6 35B-A3B MoE | 3.3B active | **93.5** | 77.1 | **+21%** |
-| Gemma 4 26B-A4B MoE | 4B active | **86.5** | 85.5 | **+1%** |
-| Gemma 4 31B Dense | 30.7B | **27.5** | 21.0 | **+31%** |
-| Qwen 3.5 27B (GDN hybrid) | 26.9B | **28.1** | 23.4 | **+20%** |
-| Qwen 3.6 27B-MTP | 26.9B | **28.4** | 23.2 | **+22%** |
-| Qwen 3.6 27B | 26.9B | **28.5** | 23.2 | **+23%** |
+| Model | Params | reinstinct (mean ± σ) | llama.cpp | Delta |
+|---|---|---|---:|---:|
+| Qwen 3.5 0.8B | 0.8B | **272.1 ± 1.1** | 192.0 | **+42%** |
+| Qwen 3.5 4B | 4.2B | **108.2 ± 0.3** | 75.9 | **+43%** |
+| Gemma 4 E4B | 7.5B | **105.7 ± 0.2** | 81.2 | **+30%** |
+| Qwen 3.5 35B-A3B MoE | 3.3B active | **92.6 ± 0.4** | 78.3 | **+18%** |
+| Qwen 3.6 35B-A3B MoE | 3.3B active | **92.7 ± 0.4** | 77.1 | **+20%** |
+| Gemma 4 26B-A4B MoE | 4B active | **91.5 ± 0.2** | 85.5 | **+7%** |
+| Gemma 4 31B Dense | 30.7B | **28.0 ± 0.2** | 21.0 | **+33%** |
+| Qwen 3.5 27B (GDN hybrid) | 26.9B | **27.4 ± 0.05** | 23.4 | **+17%** |
+| Qwen 3.6 27B-MTP | 26.9B | **28.1 ± 0.1** | 23.2 | **+21%** |
+| Qwen 3.6 27B | 26.9B | **27.7 ± 0.1** | 23.2 | **+19%** |
 
 reinstinct wins **10 of 10** tested configurations.
 
@@ -51,7 +58,7 @@ choice drives the MoE wins.
 
 | Hardware | Price (used) | VRAM | Qwen 3.5 35B MoE tok/s | Gemma 31B Dense tok/s |
 |---|---|---|---|---|
-| **MI50 + reinstinct** | **~$500** | 32 GB HBM2 | **101.3** | **27.5** |
+| **MI50 + reinstinct** | **~$500** | 32 GB HBM2 | **92.6** | **28.0** |
 | RTX 3090 + llama.cpp | $800-1200 | 24 GB GDDR6X | ~136 | ~21* |
 | M4 Max + llama.cpp | $3500+ | 36 GB unified | ~44 | ~20 |
 | M4 Max + MLX | $3500+ | 36 GB unified | ~92 | N/A |
@@ -60,16 +67,25 @@ choice drives the MoE wins.
 
 The MI50 is the price/performance king for local inference on models up to 31B. It is the only ~$500 card with 32 GB of HBM and 1 TB/s bandwidth.
 
-### MTP speculative decoding (Gemma 4 31B, K=3)
+### MTP speculative decoding (Gemma 4 31B, K=3, 5-run mean ± σ)
 
-| Prompt type | tok/s | Accept rate | vs baseline |
-|---|---|---|---|
-| Factual ("Capital of France?") | **32.8** | 89% | +19% |
-| Structured ("List 5 primes") | **31.8** | 85% | +16% |
-| Procedural ("How to make tea") | 25.7 | 63% | -7% |
-| Creative ("Write a haiku") | 23.6 | 55% | -14% |
+Same 25/75 thermal-stable methodology as the decode table. The prompts
+below are the exact strings used — MTP is highly prompt-shape-sensitive,
+so reproducibility requires fixed prompts.
 
-MTP wins on factual/structured prompts, but costs performance on creative workloads. The API endpoint allows per-request MTP toggle so you can decide if you need it for the use cases where it performs well. Area of future improvement for sure. 
+| Prompt class | Prompt | tok/s (mean ± σ) | Accept rate | vs 28.0 baseline |
+|---|---|---:|---:|---:|
+| Creative | "Write a haiku about the moon." | **33.8 ± 0.05** | 94% | **+21%** |
+| Factual | "What is the capital of France?" | **29.4 ± 0.6** | 79% | **+5%** |
+| Structured | "List the first 5 prime numbers." | **26.5 ± 0.05** | 67% | **−5%** |
+| Procedural | "Explain how to make a cup of tea, step by step." | **13.3 ± 0.00** | 33% | **−52%** |
+
+MTP throughput ranges roughly 0.5×–1.2× of baseline depending on how
+well the drafter agrees with the target on the specific prompt. High
+accept rate → meaningful win; low accept rate → mass verify-rejection
+that wastes more compute than it saves. The API endpoint allows
+per-request MTP toggle so callers can opt in only on prompts where
+the drafter is likely to land.
 
 ## Features
 
@@ -136,15 +152,53 @@ Expected improvement: 5-15C drop in junction temperature, preventing thermal thr
 
 ### Power and clocks
 
-```bash
-# Pin clocks for best performance
-sudo rocm-smi --setperflevel high
+Two layers control the MI50 power limit:
 
-# Set power limit (300W full power, or 250W for quieter operation)
-sudo rocm-smi --setpoweroverdrive 300
+1. **VBIOS power table — hard ceiling.** Workstation ROMs (Radeon VII /
+   Pro VII, device ID `0x66a1`) cap at **225W**. Server ROMs (MI50/MI60
+   `113-D1631700-XXX` family) allow **300W**. Check yours with
+   `rocm-smi --showmaxpower` — if it reports 225W you have a workstation
+   ROM.
+2. **Runtime limit** — `rocm-smi --setpoweroverdrive` only works within
+   the VBIOS ceiling. If the VBIOS says 225W, you can't go higher
+   through `rocm-smi` alone.
+
+#### Unlock 300W without reflashing (workstation VBIOS)
+
+Use [`upp`](https://github.com/sibradzic/upp) (PowerPlay table editor)
+to override the in-memory pp_table. Non-persistent — resets on reboot,
+so add it to a systemd unit if you want it permanent.
+
+```bash
+# Install upp (Python)
+sudo pip install --break-system-packages upp
+
+# Bump all four power-limit fields to 300W
+sudo upp -p /sys/class/drm/card0/device/pp_table set --write \
+  SmallPowerLimit1=300 \
+  SmallPowerLimit2=300 \
+  BoostPowerLimit=300 \
+  smcPPTable/SocketPowerLimitAc0=300 \
+  smcPPTable/SocketPowerLimitDc=300
+
+# Verify
+rocm-smi --showmaxpower         # should read 300W now
 ```
 
-At 250W you lose about 5% throughput but gain significantly better thermals. At 300W the card wants serious airflow.
+If `upp` errors or the values silently clamp back to 225W, the VBIOS
+itself needs flashing — use `amdvbflash` with a verified MI50 server
+ROM (TechPowerUp VBIOS database). Back up the original first:
+`sudo amdvbflash -s 0 backup.rom`.
+
+#### Pin clocks + set runtime power cap
+
+```bash
+sudo rocm-smi --setperflevel high      # pin sclk to level 8 (1725 MHz)
+sudo rocm-smi --setpoweroverdrive 300  # raise runtime cap (within VBIOS ceiling)
+```
+
+At 250W you lose about 5% throughput but gain significantly better
+thermals. At 300W the card wants serious airflow.
 
 ### Cooling
 
