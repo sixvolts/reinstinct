@@ -1313,6 +1313,14 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 // Clients like Open WebUI use this to
                                 // compute decode tok/s.
                                 if req.stream_include_usage {
+                                    // OpenAI-spec usage fields are what
+                                    // most clients read. Open WebUI's
+                                    // tok/s display, however, only reads
+                                    // Ollama-shape fields (eval_count +
+                                    // eval_duration in nanoseconds). Emit
+                                    // both so the display works on either
+                                    // backend type.
+                                    let wall_ns = (wall_us as u64).saturating_mul(1_000);
                                     let usage = Json::Obj(vec![
                                         ("id".into(),      Json::Str(stream_id.clone())),
                                         ("object".into(),  Json::Str(
@@ -1322,9 +1330,22 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                         ("model".into(),   Json::Str(model_name.clone())),
                                         ("choices".into(), Json::Arr(vec![])),
                                         ("usage".into(),   Json::Obj(vec![
+                                            // OpenAI-spec
                                             ("prompt_tokens".into(),     Json::Num(n_p as f64)),
                                             ("completion_tokens".into(), Json::Num(n_c as f64)),
                                             ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
+                                            // Ollama-compat (so OWUI's
+                                            // tok/s display computes
+                                            // n_c / wall_seconds).
+                                            // wall_ns conflates prefill +
+                                            // decode; OWUI's display is
+                                            // dominated by decode for any
+                                            // reasonable response length.
+                                            ("prompt_eval_count".into(),    Json::Num(n_p as f64)),
+                                            ("prompt_eval_duration".into(), Json::Num(0.0)),
+                                            ("eval_count".into(),           Json::Num(n_c as f64)),
+                                            ("eval_duration".into(),        Json::Num(wall_ns as f64)),
+                                            ("total_duration".into(),       Json::Num(wall_ns as f64)),
                                         ])),
                                     ]).to_string();
                                     let _ = reply_tx.send(StreamMsg::Chunk(usage));

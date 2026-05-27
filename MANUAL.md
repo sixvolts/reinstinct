@@ -374,6 +374,112 @@ spec-decode verify path requires. Use one or the other per model.
 (SuperQuant is currently `generate-text` only; serve does not yet
 honor `REINSTINCT_KV_SUPERQUANT`.)
 
+#### MVP chat with Open WebUI
+
+For a "drop a model in a web UI and chat with it" setup — useful for
+verifying the card is working with a real client, or hosting a small
+single-user chat on a tailnet — reinstinct's `serve` is OpenAI-shaped
+enough to plug straight into Open WebUI. This is intentional MVP
+scope: enough to chat, not a multi-user production deployment.
+
+**Prerequisites** (one-time, on the box hosting reinstinct):
+
+```bash
+# Container runtime — podman is rootless, no daemon, no usermod.
+sudo apt install -y podman
+
+# Pin clocks + power per the README "Preparing your MI50" section.
+sudo rocm-smi --setperflevel high
+sudo rocm-smi --setpoweroverdrive 300   # 225W on workstation VBIOS;
+                                         # see README for the upp dance.
+```
+
+**Start reinstinct serve.** `serve` requires both `--big` and `--small`;
+for an MVP chat with a single flagship model, use Qwen 3.5 0.8B (~500
+MB) as a throwaway `--small` to satisfy the arg. Bump `--max-seq` to
+8192 so multi-turn chats have headroom.
+
+```bash
+nohup ./target/release/reinstinct-engine serve \
+  --big   ~/models/gemma4-31b/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+  --small ~/models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
+  --max-seq 8192 \
+  > /tmp/reinstinct-serve.log 2>&1 &
+```
+
+Wait for `[serve] ready — serving requests.` in the log (~20s for
+Gemma 31B). The big model lives on port 8080, small on 8081.
+
+**Run Open WebUI** in a podman container with `--network=host` so it
+can reach reinstinct on localhost. The persistent volume keeps chat
+history + accounts across container restarts.
+
+```bash
+podman run -d \
+  --name open-webui \
+  --network=host \
+  -e PORT=3000 \
+  -e OPENAI_API_BASE_URL=http://localhost:8080/v1 \
+  -e OPENAI_API_KEY=sk-reinstinct-noauth \
+  -e WEBUI_NAME="reinstinct" \
+  -v open-webui-data:/app/backend/data \
+  ghcr.io/open-webui/open-webui:main
+```
+
+Open <http://localhost:3000> (or `http://<host>:3000` from the LAN /
+tailnet — `0.0.0.0` is the default bind). First account to sign up
+becomes the admin.
+
+**Required one-time config** (the OOTB OWUI defaults will look bad
+with reinstinct otherwise):
+
+1. **Bump `max_tokens`.** OWUI defaults to 256 — gets cut off
+   mid-paragraph. Admin Panel → Settings → Models → click the pencil
+   on the model → Advanced Params → **Max Tokens (num_predict)** =
+   `2048`. Save. (Or set it globally — the API endpoint
+   `POST /api/v1/configs/models` with body
+   `{"DEFAULT_MODEL_PARAMS":{"max_tokens":2048,"num_predict":2048}}`
+   applies to all models.)
+
+2. **Streaming is on by default** and renders cleanly — reinstinct
+   strips Gemma's `<|channel>thought` / `<|thought|>` markers and
+   Qwen's `<think>...</think>` blocks at the stream level. No
+   per-model toggle needed.
+
+3. **tok/s in the response footer** will show automatically — the
+   `stream_options.include_usage` is honored and the final SSE chunk
+   carries both OpenAI (`completion_tokens`) and Ollama
+   (`eval_count`/`eval_duration_ns`) fields. OWUI 0.9+ reads the
+   Ollama-shaped fields for the display.
+
+**Optional per-model overrides.** reinstinct sets loop-resistant
+defaults for `/v1/chat/completions` automatically when the client
+doesn't specify (`temperature=0.7`, `top_p=0.95`, `min_p=0.05`,
+`rep_penalty=1.1`, `freq_penalty=0.1`) — you can override any of
+them in OWUI's per-model Advanced Params if you want different
+behavior.
+
+**Remote access** (LAN or Tailscale). The OWUI container binds
+`0.0.0.0:3000` with `--network=host`, so any reachable interface
+works:
+
+```
+LAN:        http://<lan-ip>:3000
+Tailscale:  http://<machine-name>:3000   (MagicDNS) or http://<tailnet-ip>:3000
+```
+
+Tailscale traffic is wireguard-encrypted; LAN traffic is HTTP. If
+you're on an untrusted network, prefer the tailnet path or put OWUI
+behind a TLS-terminating reverse proxy.
+
+**What this MVP doesn't do.** No multi-user isolation, no SSO, no
+RAG/vector store, no native voice/image (use OWUI's defaults if you
+need them — they pull external services). reinstinct's serve is HTTP
+only, with no auth or backpressure — deploy behind a reverse proxy
+if exposing past trusted networks. For anything more than
+single-user chat-with-your-card, a full inference stack (vLLM, etc.)
+is the right tool.
+
 ### debug-embed
 
 ```
