@@ -136,6 +136,12 @@ struct GenReq {
     /// the socket, the next Chunk send fails (Receiver dropped) and the
     /// worker stops generating.
     stream: bool,
+    /// OpenAI `stream_options.include_usage`. When set with `stream:true`,
+    /// emit one extra SSE chunk at end-of-stream with the `usage` object
+    /// (prompt/completion/total token counts) — clients like Open WebUI
+    /// use this to compute decode tok/s for the display. No-op for
+    /// non-streaming responses (usage is always in the body there).
+    stream_include_usage: bool,
     /// OpenAI `logprobs`. `0` ⇒ omit logprobs entirely (the common case;
     /// no extra cost). `1..=N` ⇒ report the chosen token's logprob plus
     /// the top-(N-1) alternatives with theirs. Capped at 20 server-side.
@@ -203,9 +209,44 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Common decode + sampling fields shared by both endpoint parsers.
 /// Returns the parsed (GenReq fields). Accepts every OpenAI sampler
 /// knob plus a few extensions (min_p, repetition_penalty, mirostat).
-fn parse_common_fields(j: &Json)
+/// Per-endpoint default sampler settings. `/v1/chat/completions` gets
+/// loop-resistant defaults aimed at the "drop a model in OWUI and chat
+/// with it" path. Multiple layered defenses are needed because chat
+/// clients sometimes send `temperature: 0` explicitly (greedy), at
+/// which point only the rep/freq penalties stand between a confused
+/// prompt and an `own own own own` collapse:
+///
+///   * temperature 0.7  — fallback when client omits temp
+///   * top_p 0.95       — nucleus filter
+///   * min_p 0.05       — floors out the long tail loops dip into
+///   * rep_penalty 1.1  — divides logits of recently-seen tokens
+///   * freq_penalty 0.1 — adds a per-occurrence linear penalty
+///                        (compounds: 5× repeats = 5× penalty,
+///                        crushes greedy loops even at temp=0)
+///
+/// `/v1/completions` keeps leaner power-user defaults. Per-request
+/// fields always override — these only fill in when missing.
+#[derive(Copy, Clone)]
+struct SamplerDefaults {
+    temperature: f32,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+}
+
+const COMPLETION_DEFAULTS: SamplerDefaults = SamplerDefaults {
+    temperature: 0.8, top_p: 1.0, min_p: 0.0,
+    repetition_penalty: 1.0, frequency_penalty: 0.0,
+};
+const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
+    temperature: 0.7, top_p: 0.95, min_p: 0.05,
+    repetition_penalty: 1.1, frequency_penalty: 0.1,
+};
+
+fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
-        Option<std::time::Duration>, bool, usize)
+        Option<std::time::Duration>, bool, bool, usize)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
@@ -213,19 +254,19 @@ fn parse_common_fields(j: &Json)
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
-        .map(|n| n as f32).unwrap_or(0.8).max(0.0);
+        .map(|n| n as f32).unwrap_or(defaults.temperature).max(0.0);
     sp.top_k = j.get("top_k").and_then(Json::as_f64)
         .map(|n| n as usize).unwrap_or(40);
     sp.top_p = j.get("top_p").and_then(Json::as_f64)
-        .map(|n| n as f32).unwrap_or(1.0).clamp(0.0, 1.0);
+        .map(|n| n as f32).unwrap_or(defaults.top_p).clamp(0.0, 1.0);
     sp.min_p = j.get("min_p").and_then(Json::as_f64)
-        .map(|n| n as f32).unwrap_or(0.0).clamp(0.0, 1.0);
+        .map(|n| n as f32).unwrap_or(defaults.min_p).clamp(0.0, 1.0);
     sp.repetition_penalty = j.get("repetition_penalty").and_then(Json::as_f64)
-        .map(|n| n as f32).unwrap_or(1.0).max(0.0);
+        .map(|n| n as f32).unwrap_or(defaults.repetition_penalty).max(0.0);
     sp.repetition_window = j.get("repetition_window").and_then(Json::as_f64)
         .map(|n| n as usize).unwrap_or(64);
     sp.frequency_penalty = j.get("frequency_penalty").and_then(Json::as_f64)
-        .map(|n| n as f32).unwrap_or(0.0);
+        .map(|n| n as f32).unwrap_or(defaults.frequency_penalty);
     sp.presence_penalty = j.get("presence_penalty").and_then(Json::as_f64)
         .map(|n| n as f32).unwrap_or(0.0);
     sp.seed = j.get("seed").and_then(Json::as_f64).map(|n| n as u64).unwrap_or(0);
@@ -248,6 +289,14 @@ fn parse_common_fields(j: &Json)
         .map(|n| std::time::Duration::from_secs_f64(n.max(0.1).min(600.0)))
         .or(Some(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)));
     let stream = j.get("stream").and_then(Json::as_bool).unwrap_or(false);
+    // OpenAI streaming-usage extension. Either:
+    //   "stream_options": { "include_usage": true }
+    // or some clients shorthand the field at top level. Default off.
+    let stream_include_usage = j.get("stream_options")
+        .and_then(|s| s.get("include_usage"))
+        .and_then(Json::as_bool)
+        .or(j.get("include_usage").and_then(Json::as_bool))
+        .unwrap_or(false);
     // OpenAI `logprobs`: bool turns it on with a default top-N of 5;
     // an integer specifies the top-N directly. Capped at 20 so a
     // request can't ask us to sort the full vocab for diagnostics.
@@ -265,7 +314,7 @@ fn parse_common_fields(j: &Json)
         },
     };
     (max_tokens, sp, use_speculative, speculative_k, speculative_p_min,
-     request_timeout, stream, top_logprobs_n)
+     request_timeout, stream, stream_include_usage, top_logprobs_n)
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
@@ -397,10 +446,11 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream, top_logprobs_n) = parse_common_fields(&j);
+         request_timeout, stream, stream_include_usage, top_logprobs_n) =
+        parse_common_fields(&j, COMPLETION_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -435,10 +485,11 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         messages.push(ChatMessage { role, content: content.to_string() });
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream, top_logprobs_n) = parse_common_fields(&j);
+         request_timeout, stream, stream_include_usage, top_logprobs_n) =
+        parse_common_fields(&j, CHAT_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n })
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -475,11 +526,110 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
 }
 
 /// OpenAI-shaped `chat.completion` response. Same usage stats as the
+/// Closing markers for instruction-tuned models' chain-of-thought
+/// preambles. The user-facing response is everything after the LAST
+/// occurrence of any of these in the full text:
+///   * `</think>`     — Qwen 3.5/3.6 IT
+///   * `<channel|>`   — Gemma 4 IT (channel/thought variant)
+///   * `<|thought|>`  — Gemma 4 IT (alternate thought variant — also
+///                      acts as its own "close" in the model's emit
+///                      style: multiple bare `<|thought|>` then prose)
+const THINK_CLOSERS: &[&str] = &["</think>", "<channel|>", "<|thought|>"];
+
+/// Strip any thinking-mode preamble from a fully decoded response.
+/// Returns the slice after the LAST closing marker, or the full text
+/// unchanged if none are present.
+fn strip_thinking_channels(text: &str) -> &str {
+    let mut best_end: Option<usize> = None;
+    for m in THINK_CLOSERS {
+        if let Some(idx) = text.rfind(m) {
+            let end = idx + m.len();
+            if best_end.map_or(true, |b| end > b) {
+                best_end = Some(end);
+            }
+        }
+    }
+    match best_end {
+        Some(end) => text[end..].trim_start_matches(|c: char| c == '\n' || c == ' '),
+        None      => text,
+    }
+}
+
+/// Streaming-aware version of the same stripper. Buffers incoming text
+/// until either a closing marker is seen (then emits everything after
+/// it and switches to passthrough), or until enough text has been
+/// buffered with no marker that we conclude this response simply isn't
+/// using thinking mode (then flush the buffer verbatim and passthrough).
+pub struct ThinkingStripStream {
+    /// `true` once we've passed the closing marker (or decided there
+    /// won't be one). All subsequent input is forwarded verbatim.
+    passthrough: bool,
+    /// Cumulative pre-passthrough text. Bounded by `MAX_BUFFER`.
+    buf: String,
+}
+
+impl ThinkingStripStream {
+    const MAX_BUFFER: usize = 256;
+
+    pub fn new() -> Self {
+        Self { passthrough: false, buf: String::new() }
+    }
+
+    /// Push a streaming delta. Returns the (possibly empty) clean text
+    /// to forward downstream this call.
+    pub fn push(&mut self, chunk: &str) -> String {
+        if self.passthrough {
+            return chunk.to_string();
+        }
+        self.buf.push_str(chunk);
+        // Look for any closing marker in the cumulative buffer.
+        let mut best_end: Option<usize> = None;
+        for m in THINK_CLOSERS {
+            if let Some(idx) = self.buf.rfind(m) {
+                let end = idx + m.len();
+                if best_end.map_or(true, |b| end > b) { best_end = Some(end); }
+            }
+        }
+        if let Some(end) = best_end {
+            let tail = self.buf[end..]
+                .trim_start_matches(|c: char| c == '\n' || c == ' ')
+                .to_string();
+            self.passthrough = true;
+            self.buf.clear();
+            return tail;
+        }
+        // No closer yet. If the buffer has grown past our cap AND we
+        // never saw any opening marker, this response isn't using
+        // thinking mode — flush verbatim and start passing through.
+        if self.buf.len() > Self::MAX_BUFFER {
+            let opened = ["<think>", "<|channel>", "<|thought|>"]
+                .iter().any(|o| self.buf.contains(o));
+            if !opened {
+                self.passthrough = true;
+                let out = std::mem::take(&mut self.buf);
+                return out;
+            }
+        }
+        String::new()
+    }
+
+    /// Flush whatever is in the buffer at end-of-stream. The model may
+    /// have stopped mid-thinking (rare) or emitted an opener with no
+    /// matching closer — emit what we have so the user sees the response.
+    pub fn flush(&mut self) -> String {
+        if self.passthrough { return String::new(); }
+        let out = std::mem::take(&mut self.buf);
+        self.passthrough = true;
+        out
+    }
+}
+
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
 fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
                             n_completion: usize, hit_eos: bool,
                             logprobs: &[TokenLogprob]) -> String {
+    let text = strip_thinking_channels(text);
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let message = Json::Obj(vec![
         ("role".into(),    Json::Str("assistant".into())),
@@ -1088,14 +1238,27 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let stream_id_for_cb = stream_id.clone();
                     let model_name_for_cb = model_name.clone();
                     let reply_for_cb = reply_tx.clone();
+                    // Streaming thinking-marker stripper. Lives on the
+                    // worker thread; the closure mutates it through a
+                    // RefCell so we can also flush at end-of-stream from
+                    // outside the closure.
+                    let stripper = std::rc::Rc::new(std::cell::RefCell::new(
+                        ThinkingStripStream::new()));
+                    let stripper_cb = std::rc::Rc::clone(&stripper);
                     let on_token = move |delta: &str, lp: Option<&TokenLogprob>| -> bool {
                         if !is_stream { return true; }
+                        let clean = stripper_cb.borrow_mut().push(delta);
+                        if clean.is_empty() {
+                            // Still buffering inside a thinking block;
+                            // don't emit a frame this round.
+                            return true;
+                        }
                         let frame = if is_chat {
                             chat_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                ChatDelta { role: None, content: Some(delta) }, None, lp)
+                                ChatDelta { role: None, content: Some(&clean) }, None, lp)
                         } else {
                             completion_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                delta, None, lp)
+                                &clean, None, lp)
                         };
                         reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
                     };
@@ -1120,9 +1283,22 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
                                 if eos { "stop" } else { "length" }, is_stream);
                             if is_stream {
+                                // Flush any text still buffered by the
+                                // thinking-marker stripper (e.g. model
+                                // emitted an opener with no matching
+                                // closer — show the user what we have).
+                                let tail = stripper.borrow_mut().flush();
+                                if !tail.is_empty() {
+                                    let frame = if is_chat {
+                                        chat_stream_chunk(&stream_id, &model_name,
+                                            ChatDelta { role: None, content: Some(&tail) }, None, None)
+                                    } else {
+                                        completion_stream_chunk(&stream_id, &model_name,
+                                            &tail, None, None)
+                                    };
+                                    let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                                }
                                 // Final SSE frame: empty delta + finish_reason.
-                                // Then Done signals the connection handler
-                                // to write "data: [DONE]\n\n" and close.
                                 let fin = if eos { "stop" } else { "length" };
                                 let frame = if is_chat {
                                     chat_stream_chunk(&stream_id, &model_name,
@@ -1132,6 +1308,29 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                         "", Some(fin), None)
                                 };
                                 let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                                // Optional usage chunk per OpenAI spec
+                                // when stream_options.include_usage=true.
+                                // Clients like Open WebUI use this to
+                                // compute decode tok/s.
+                                if req.stream_include_usage {
+                                    let usage = Json::Obj(vec![
+                                        ("id".into(),      Json::Str(stream_id.clone())),
+                                        ("object".into(),  Json::Str(
+                                            if is_chat { "chat.completion.chunk" }
+                                            else       { "text_completion" }.into())),
+                                        ("created".into(), Json::Num(unix_now() as f64)),
+                                        ("model".into(),   Json::Str(model_name.clone())),
+                                        ("choices".into(), Json::Arr(vec![])),
+                                        ("usage".into(),   Json::Obj(vec![
+                                            ("prompt_tokens".into(),     Json::Num(n_p as f64)),
+                                            ("completion_tokens".into(), Json::Num(n_c as f64)),
+                                            ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
+                                        ])),
+                                    ]).to_string();
+                                    let _ = reply_tx.send(StreamMsg::Chunk(usage));
+                                }
+                                // Done signals the connection handler to
+                                // write "data: [DONE]\n\n" and close.
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
@@ -1182,7 +1381,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
 // --- connection handling ----------------------------------------------
 
 fn handle_conn(mut stream: std::net::TcpStream, target: Target,
-               tx: mpsc::Sender<Job>, metrics: Arc<Metrics>)
+               tx: mpsc::Sender<Job>, metrics: Arc<Metrics>,
+               model_name: Arc<String>)
 {
     let request_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
     let request = match http::read_request(&stream) {
@@ -1222,6 +1422,28 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         return;
     }
 
+    // GET /v1/models — OpenAI model-list endpoint. Each port advertises
+    // the single model loaded on it (empty list for the embed port until
+    // the encoder runtime lands). Open WebUI and other OpenAI-shaped
+    // clients use this to populate their model dropdown.
+    if is_get && path.ends_with("/v1/models") {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let body = if model_name.is_empty() {
+            r#"{"object":"list","data":[]}"#.to_string()
+        } else {
+            format!(
+                r#"{{"object":"list","data":[{{"id":"{}","object":"model","created":{},"owned_by":"reinstinct"}}]}}"#,
+                model_name, created)
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body);
+        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        return;
+    }
+
     // Route. LLM ports take /v1/completions (raw) or /v1/chat/completions
     // (messages, chat template applied server-side). Embed port takes
     // /v1/embeddings (answers 503 until the encoder lands).
@@ -1252,6 +1474,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 speculative_p_min: 0.0,
                 request_timeout: None,
                 stream: false,
+                stream_include_usage: false,
                 top_logprobs_n: 0,
             })
         }
@@ -1318,7 +1541,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
     }
 }
 
-fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>, metrics: Arc<Metrics>) {
+fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
+            metrics: Arc<Metrics>, model_name: Arc<String>) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => { eprintln!("[serve] FATAL: cannot bind port {port}: {e}"); return; }
@@ -1329,7 +1553,8 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>, metrics: Arc<Metri
             Ok(stream) => {
                 let tx = tx.clone();
                 let metrics = Arc::clone(&metrics);
-                thread::spawn(move || handle_conn(stream, target, tx, metrics));
+                let model_name = Arc::clone(&model_name);
+                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name));
             }
             Err(e) => eprintln!("[serve] accept error on :{port}: {e}"),
         }
@@ -1391,13 +1616,26 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
             .map_err(|e| e.to_string())?
     };
 
-    for (port, target) in [(big_port, Target::Big),
-                           (small_port, Target::Small),
-                           (embed_port, Target::Embed)] {
+    // Derive each port's advertised model name from the GGUF filename
+    // stem (same rule the worker uses for ServerModel.name). The embed
+    // port has no model loaded today, so its /v1/models returns an
+    // empty list.
+    let stem = |p: &PathBuf| -> String {
+        p.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
+    };
+    let big_name   = Arc::new(stem(&big));
+    let small_name = Arc::new(stem(&small));
+    let embed_name = Arc::new(String::new());
+
+    for (port, target, name) in [
+        (big_port,   Target::Big,   Arc::clone(&big_name)),
+        (small_port, Target::Small, Arc::clone(&small_name)),
+        (embed_port, Target::Embed, Arc::clone(&embed_name)),
+    ] {
         let tx = tx.clone();
         let metrics = Arc::clone(&metrics);
         thread::Builder::new().name(format!("accept-{}", target.label()))
-            .spawn(move || acceptor(port, target, tx, metrics))
+            .spawn(move || acceptor(port, target, tx, metrics, name))
             .map_err(|e| e.to_string())?;
     }
     drop(tx);   // only the acceptors hold senders now
@@ -1411,7 +1649,10 @@ mod logprobs_tests {
     use super::*;
 
     fn parse_lp(body: &str) -> usize {
-        parse_common_fields(&Json::parse(body).unwrap()).7
+        // tuple positions 0..8: max_tokens, sampler, use_speculative,
+        // speculative_k, speculative_p_min, request_timeout, stream,
+        // stream_include_usage, top_logprobs_n  (← .8)
+        parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS).8
     }
 
     #[test]
