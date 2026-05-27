@@ -5,6 +5,10 @@ written in Rust. Runs Gemma 4 (dense 31B, MoE 26B-A4B) and Qwen 3.5
 models straight from Unsloth Dynamic GGUF files — quantized weights stay
 quantized in VRAM, kernels are compiled on demand with `hipcc`.
 
+This file is the user-facing CLI reference. For the engineering
+overview — how the engine works, what gfx906 hardware forces, what
+each kernel does and why — see `docs/ARCHITECTURE.md`.
+
 ---
 
 ## SYNOPSIS

@@ -114,7 +114,9 @@ cargo build --release
 scripts/bench-all.sh
 ```
 
-See [MANUAL.md](MANUAL.md) for full documentation.
+- [MANUAL.md](MANUAL.md) — CLI reference, env vars, model list, perf tables
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine works and why; gfx906 hardware constraints and the kernel decisions they forced
+- [docs/SUPERQUANT.md](docs/SUPERQUANT.md) — opt-in tiered KV cache (VRAM/capacity feature)
 
 ## Preparing your MI50
 
