@@ -1313,14 +1313,20 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 // Clients like Open WebUI use this to
                                 // compute decode tok/s.
                                 if req.stream_include_usage {
-                                    // OpenAI-spec usage fields are what
-                                    // most clients read. Open WebUI's
-                                    // tok/s display, however, only reads
-                                    // Ollama-shape fields (eval_count +
-                                    // eval_duration in nanoseconds). Emit
-                                    // both so the display works on either
-                                    // backend type.
+                                    // Three shapes coexist for max client
+                                    // compatibility:
+                                    //   * OpenAI usage (prompt_tokens / completion_tokens / total_tokens)
+                                    //   * Ollama-style fields inside usage (eval_count / eval_duration ns)
+                                    //   * llama.cpp-style `timings` at the
+                                    //     top level (predicted_per_second
+                                    //     pre-computed) — OWUI specifically
+                                    //     merges this into the usage object
+                                    //     in its stream handler.
                                     let wall_ns = (wall_us as u64).saturating_mul(1_000);
+                                    let wall_ms = wall_us as f64 / 1000.0;
+                                    let tok_per_s_f = if n_c > 0 && wall_us > 0 {
+                                        n_c as f64 * 1_000_000.0 / wall_us as f64
+                                    } else { 0.0 };
                                     let usage = Json::Obj(vec![
                                         ("id".into(),      Json::Str(stream_id.clone())),
                                         ("object".into(),  Json::Str(
@@ -1334,18 +1340,30 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                             ("prompt_tokens".into(),     Json::Num(n_p as f64)),
                                             ("completion_tokens".into(), Json::Num(n_c as f64)),
                                             ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
-                                            // Ollama-compat (so OWUI's
-                                            // tok/s display computes
-                                            // n_c / wall_seconds).
-                                            // wall_ns conflates prefill +
-                                            // decode; OWUI's display is
-                                            // dominated by decode for any
-                                            // reasonable response length.
+                                            // Ollama-compat
                                             ("prompt_eval_count".into(),    Json::Num(n_p as f64)),
                                             ("prompt_eval_duration".into(), Json::Num(0.0)),
                                             ("eval_count".into(),           Json::Num(n_c as f64)),
                                             ("eval_duration".into(),        Json::Num(wall_ns as f64)),
                                             ("total_duration".into(),       Json::Num(wall_ns as f64)),
+                                        ])),
+                                        // llama.cpp `timings` — top-level
+                                        // sibling of `usage`. OWUI's
+                                        // middleware does:
+                                        //   raw_usage.update(data.get('timings', {}))
+                                        // so the per-second fields end up
+                                        // in the message's usage object and
+                                        // drive the tok/s display.
+                                        ("timings".into(),  Json::Obj(vec![
+                                            ("prompt_n".into(),                Json::Num(n_p as f64)),
+                                            ("prompt_ms".into(),               Json::Num(0.0)),
+                                            ("prompt_per_token_ms".into(),     Json::Num(0.0)),
+                                            ("prompt_per_second".into(),       Json::Num(0.0)),
+                                            ("predicted_n".into(),             Json::Num(n_c as f64)),
+                                            ("predicted_ms".into(),            Json::Num(wall_ms)),
+                                            ("predicted_per_token_ms".into(),  Json::Num(
+                                                if n_c > 0 { wall_ms / n_c as f64 } else { 0.0 })),
+                                            ("predicted_per_second".into(),    Json::Num(tok_per_s_f)),
                                         ])),
                                     ]).to_string();
                                     let _ = reply_tx.send(StreamMsg::Chunk(usage));

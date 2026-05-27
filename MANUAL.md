@@ -430,34 +430,46 @@ Open <http://localhost:3000> (or `http://<host>:3000` from the LAN /
 tailnet — `0.0.0.0` is the default bind). First account to sign up
 becomes the admin.
 
-**Required one-time config** (the OOTB OWUI defaults will look bad
-with reinstinct otherwise):
+**Required one-time config** — the OOTB OWUI defaults aren't usable
+for long responses:
 
-1. **Bump `max_tokens`.** OWUI defaults to 256 — gets cut off
-   mid-paragraph. Admin Panel → Settings → Models → click the pencil
-   on the model → Advanced Params → **Max Tokens (num_predict)** =
-   `2048`. Save. (Or set it globally — the API endpoint
-   `POST /api/v1/configs/models` with body
-   `{"DEFAULT_MODEL_PARAMS":{"max_tokens":2048,"num_predict":2048}}`
-   applies to all models.)
+1. **Bump `max_tokens` in the UI.** OWUI ships with `max_tokens=256`
+   and **its frontend builds the request payload itself, ignoring
+   server-side global defaults** (`POST /api/v1/configs/models` with
+   `DEFAULT_MODEL_PARAMS` does NOT propagate to outgoing requests —
+   tested 2026-05-27, OWUI 0.9.5). The setting that actually applies:
+   - Click your avatar (top-right) → **Settings** → **General** →
+     **Advanced Parameters** (expand) → **Max Tokens (num_predict)** →
+     change from default to `2048` (or `-1` for context-window-bound).
+   - Save. Future chats from this user will send `max_tokens=2048`.
+   - For multi-user deployments, each user has to set this themselves
+     in their own settings — or create a per-model "custom model" in
+     Admin Panel → Settings → Models with the params baked in, which
+     all users get when they select that model.
 
-2. **Streaming is on by default** and renders cleanly — reinstinct
-   strips Gemma's `<|channel>thought` / `<|thought|>` markers and
-   Qwen's `<think>...</think>` blocks at the stream level. No
-   per-model toggle needed.
+2. **Streaming renders cleanly out of the box** — reinstinct strips
+   Gemma's `<|channel>thought` / `<|thought|>` markers and Qwen's
+   `<think>...</think>` blocks at the stream level. No OWUI toggle
+   needed.
 
-3. **tok/s in the response footer** will show automatically — the
-   `stream_options.include_usage` is honored and the final SSE chunk
-   carries both OpenAI (`completion_tokens`) and Ollama
-   (`eval_count`/`eval_duration_ns`) fields. OWUI 0.9+ reads the
-   Ollama-shaped fields for the display.
+**The tok/s display in the response footer is unreliable on OWUI 0.9.5
+with the OpenAI-API connection type** — even though reinstinct emits
+all the right fields (OpenAI `completion_tokens`, Ollama `eval_count`
++ `eval_duration` ns, and a top-level `timings` object with
+llama.cpp-shape `predicted_per_second`), OWUI 0.9.5 doesn't render
+tok/s in the message footer for this connection. Same data is read
+correctly by Ollama-typed connections and by llama.cpp's own openai
+endpoint; OWUI's per-connection rendering is the variable, not the
+backend. If you need a tok/s readout: the serve log line emits
+`tok_s=X.X` per request (tail `/tmp/reinstinct-serve.log` or wherever
+you redirect serve's stderr). Treating this as an OWUI display quirk
+rather than a reinstinct bug.
 
-**Optional per-model overrides.** reinstinct sets loop-resistant
-defaults for `/v1/chat/completions` automatically when the client
-doesn't specify (`temperature=0.7`, `top_p=0.95`, `min_p=0.05`,
-`rep_penalty=1.1`, `freq_penalty=0.1`) — you can override any of
-them in OWUI's per-model Advanced Params if you want different
-behavior.
+**Sampler defaults.** reinstinct sets loop-resistant defaults for
+`/v1/chat/completions` automatically when the client doesn't specify
+(`temperature=0.7`, `top_p=0.95`, `min_p=0.05`, `rep_penalty=1.1`,
+`freq_penalty=0.1`) — you can override any of them in OWUI's per-user
+or per-model Advanced Params if you want different behavior.
 
 **Remote access** (LAN or Tailscale). The OWUI container binds
 `0.0.0.0:3000` with `--network=host`, so any reachable interface
