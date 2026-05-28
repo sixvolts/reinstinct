@@ -163,39 +163,43 @@ Two layers control the MI50 power limit:
    the VBIOS ceiling. If the VBIOS says 225W, you can't go higher
    through `rocm-smi` alone.
 
-#### Unlock 300W without reflashing (workstation VBIOS)
+#### Unlock 300W + safe clock overclock (workstation VBIOS)
 
-Use [`upp`](https://github.com/sibradzic/upp) (PowerPlay table editor)
-to override the in-memory pp_table. Non-persistent — resets on reboot,
-so add it to a systemd unit if you want it permanent.
+Both the 225W → 300W power lift and a small mclk/sclk overclock are
+non-persistent — the kernel re-reads the in-VBIOS pp_table on every
+boot. Use the bundled script + systemd unit to apply them automatically:
 
 ```bash
-# Install upp (Python)
+# Install upp (PowerPlay table editor)
 sudo pip install --break-system-packages upp
 
-# Bump all four power-limit fields to 300W
-sudo upp -p /sys/class/drm/card0/device/pp_table set --write \
-  SmallPowerLimit1=300 \
-  SmallPowerLimit2=300 \
-  BoostPowerLimit=300 \
-  smcPPTable/SocketPowerLimitAc0=300 \
-  smcPPTable/SocketPowerLimitDc=300
+# One-shot install: script + systemd unit, enabled on boot
+sudo ln -sfn "$PWD/scripts/reinstinct-gpu-tune.sh" /usr/local/bin/reinstinct-gpu-tune.sh
+sudo cp scripts/reinstinct-gpu-tune.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now reinstinct-gpu-tune.service
 
 # Verify
-rocm-smi --showmaxpower         # should read 300W now
+rocm-smi --showclocks      # should report sclk top=1825 MHz, mclk top=1125 MHz
+rocm-smi --showmaxpower    # should report 300W
 ```
+
+The script applies:
+- power limit: 300W (lifts 4 pp_table fields + runtime `--setpoweroverdrive`)
+- mclk top DPM: 1125 MHz (stock 1000 — +12.5% HBM bandwidth)
+- sclk top DPM: 1825 MHz (stock 1725 — +5.8% compute)
+- perflevel high
+
+These OC settings landed on after May-2026 sweeps where linear scaling
+held all the way to mclk=1150 / sclk=1850 with zero errors over 3-pass
+Gemma 31B decodes — 1125/1825 keeps one step of margin for long-uptime
+stability. Combined win on long-prompt Gemma 31B decode: **+~10% tok/s
+and ~6% lower prefill ms** vs stock 1000/1725.
 
 If `upp` errors or the values silently clamp back to 225W, the VBIOS
 itself needs flashing — use `amdvbflash` with a verified MI50 server
 ROM (TechPowerUp VBIOS database). Back up the original first:
 `sudo amdvbflash -s 0 backup.rom`.
-
-#### Pin clocks + set runtime power cap
-
-```bash
-sudo rocm-smi --setperflevel high      # pin sclk to level 8 (1725 MHz)
-sudo rocm-smi --setpoweroverdrive 300  # raise runtime cap (within VBIOS ceiling)
-```
 
 At 250W you lose about 5% throughput but gain significantly better
 thermals. At 300W the card wants serious airflow.

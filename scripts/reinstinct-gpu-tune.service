@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply reinstinct GPU tune for MI50 (300W cap + safe mclk/sclk OC)
+After=multi-user.target
+# Wait for the amdgpu/kfd kernel modules to expose the device sysfs nodes.
+ConditionPathExists=/sys/class/drm/card0/device/pp_table
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/reinstinct-gpu-tune.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
