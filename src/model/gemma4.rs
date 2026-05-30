@@ -62,7 +62,12 @@ pub enum AttnKind {
 pub struct Gemma4Config {
     pub block_count: u32,
     pub hidden_size: u32,
+    /// Maximum FFN width across all blocks — used for runtime buffer sizing.
+    /// Per-block widths in `ffn_sizes`; on uniform models the two agree.
     pub ffn_size: u32,
+    /// Per-layer FFN width. E2B has heterogeneous layers (15 blocks at
+    /// 6144 then 20 at 12288); 31B / E4B / 26B store one value broadcast.
+    pub ffn_sizes: Vec<u32>,
     pub vocab_size: u32,
     pub context_length: u32,
     pub rms_norm_eps: f32,
@@ -114,7 +119,14 @@ impl Gemma4Config {
 
         let block_count    = require_u32(gguf, "gemma4.block_count")?;
         let hidden_size    = require_u32(gguf, "gemma4.embedding_length")?;
-        let ffn_size       = require_u32(gguf, "gemma4.feed_forward_length")?;
+        let ffn_sizes = read_u32_vec_or_broadcast(
+            gguf, "gemma4.feed_forward_length", block_count as usize)?;
+        if ffn_sizes.len() != block_count as usize {
+            return Err(Gemma4Error::WrongArrayLength {
+                key: "gemma4.feed_forward_length",
+                got: ffn_sizes.len(), expected: block_count as usize });
+        }
+        let ffn_size = *ffn_sizes.iter().max().unwrap_or(&0);
         let context_length = require_u32(gguf, "gemma4.context_length")?;
         let rms_norm_eps   = require_f32(gguf, "gemma4.attention.layer_norm_rms_epsilon")?;
         let n_heads        = require_u32(gguf, "gemma4.attention.head_count")?;
@@ -181,7 +193,7 @@ impl Gemma4Config {
         let n_layer_kv_from_start = block_count.saturating_sub(n_kv_shared);
 
         Ok(Self {
-            block_count, hidden_size, ffn_size, vocab_size, context_length,
+            block_count, hidden_size, ffn_size, ffn_sizes, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
             n_heads, head_dim_full, head_dim_swa, sliding_window,
             rope_freq_base, rope_freq_base_swa, rope_dim_full, rope_dim_swa,

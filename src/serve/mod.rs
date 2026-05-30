@@ -1108,6 +1108,16 @@ impl ServerModel {
                 if d.verify_graphs[k].is_none() && !gpu.is_moe() {
                     d.verify_graphs[k] = Some(gpu.capture_verify_graph(state, k)?);
                 }
+                // Adaptive-K is ON by default in serve (chat is mixed
+                // workload — α study showed plain MTP is net -2.3% across
+                // 24-prompt benchmark; 0.55 threshold salvages structured-
+                // output wins without paying the creative/longform losses).
+                // Override via REINSTINCT_MTP_MIN_ALPHA env (set to 0 to
+                // disable adaptive and run plain MTP regardless of α).
+                let adaptive_alpha = std::env::var("REINSTINCT_MTP_MIN_ALPHA").ok()
+                    .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.55);
+                let adaptive_window = std::env::var("REINSTINCT_MTP_WINDOW").ok()
+                    .and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
                 let (gen_toks, stats) = crate::runtime::spec_decode::spec_decode_generate(
                     gpu, &d.runtime, state,
                     d.verify_graphs[k].as_ref(), k,
@@ -1116,9 +1126,11 @@ impl ServerModel {
                     *eos,
                     req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
                     req.speculative_p_min,
+                    adaptive_alpha, adaptive_window,
                 )?;
-                eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%)",
-                    stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
+                eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%){}",
+                    stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate(),
+                    if stats.adaptive_disabled { " [adaptive: MTP off]" } else { "" });
                 if want_lp > 0 {
                     eprintln!("[serve] note: logprobs requested but ignored on \
                                spec-decode path; pass use_speculative=false to enable");

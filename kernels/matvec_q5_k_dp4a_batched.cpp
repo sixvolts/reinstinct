@@ -12,7 +12,14 @@
 #include "gfx906_dpp.h"
 
 #define ROWS         2     // output rows per wavefront
-#define N_ROWS_MAX   4     // batch upper bound
+#define N_ROWS_MAX   4     // batch upper bound. Kept symmetric with the
+                           // per-layer batched kquant kernels (see
+                           // matvec_q4k_repacked_batched.cpp); going to 8
+                           // here doesn't help in practice because the
+                           // per-layer GEMMs cap K at 4 anyway — verify(K≥5)
+                           // falls through to MMQ in prefill.rs and that's
+                           // ~3.3× slower than batched, swamping any LM-head
+                           // win. Bump both together if you ever revisit.
 
 struct __attribute__((packed)) BlockQ5_K {
     uint16_t d;

@@ -2805,7 +2805,8 @@ impl GpuGemma4 {
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
 
             // --- FFN: shared MLP (GeGLU), batched ---
-            let ff = self.ffn as u32;
+            // Per-block FFN width (heterogeneous on E2B, uniform elsewhere).
+            let ff = b.ffn_gate.out_dim as u32;
             self.launch_rmsnorm_batched(x.raw_ptr(), b.ffn_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
             lap(&t_norm)?;
@@ -3217,7 +3218,10 @@ impl GpuGemma4 {
                 normed.raw_ptr(), hu, p as u32)?;
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
 
-            let ff = self.ffn as u32;
+            // Per-block FFN width — E2B has heterogeneous layers (e.g. 6144
+            // for first 15, 12288 for the rest). On uniform models this is
+            // just self.ffn.
+            let ff = b.ffn_gate.out_dim as u32;
             self.launch_rmsnorm_batched(x.raw_ptr(), b.ffn_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
             gemm_into(&b.ffn_gate, normed, gate_buf)?;
@@ -3687,7 +3691,7 @@ impl GpuGemma4 {
                     self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
                 }
                 self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
-                                  self.ffn_a.raw_ptr(), self.ffn as u32)?;
+                                  self.ffn_a.raw_ptr(), b.ffn_gate.out_dim as u32)?;
                 self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
                 // If there's no PLE residual after this, fold the per-layer
                 // output scale into the final rmsnorm_add (saves one launch).
@@ -3750,7 +3754,7 @@ impl GpuGemma4 {
             self.launch_matvec(&b.ffn_up,   self.normed.raw_ptr(), self.ffn_b.raw_ptr())?;
         }
         self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
-                          self.ffn_a.raw_ptr(), self.ffn as u32)?;
+                          self.ffn_a.raw_ptr(), b.ffn_gate.out_dim as u32)?;
         self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
         self.launch_rmsnorm(self.hidden_b.raw_ptr(), mw.post_ffw_norm_1.raw_ptr(),
                             self.cur_mlp.raw_ptr(), h)?;

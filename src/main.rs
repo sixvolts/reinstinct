@@ -277,6 +277,24 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         n_splits: usize,
     },
+    /// Lockstep argmax-alignment between two Gemma 4 models.
+    /// Prefills both with the same prompt (chat-templated), then steps
+    /// forward one token at a time. At each step both models predict the
+    /// next token from the SAME accepted prefix; we count argmax matches.
+    /// Reports the K=1 ceiling acceptance rate that a vanilla speculative
+    /// decode setup would see using `drafter` to draft for `target`.
+    /// Both KV caches advance with the TARGET's argmax, keeping the
+    /// drafter aligned exactly the way vanilla spec-decode would.
+    AlignCheck {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -313,7 +331,109 @@ fn main() -> anyhow::Result<()> {
             qwen_verify_check_cli(&path, prompt, k),
         Command::QwenMtpGen { path, prompt, tokens, k } =>
             qwen_mtp_gen_cli(&path, prompt, tokens, k),
+        Command::AlignCheck { target, drafter, prompt, system, steps } =>
+            align_check_cli(&target, &drafter, prompt, system, steps),
     }
+}
+
+/// Lockstep two GpuGemma4 forwards, advancing both with the target's
+/// argmax. Returns (accepted, total) — total is `steps`, accepted is the
+/// count of positions where the drafter's argmax matched the target's.
+fn align_check_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+                   prompt_text: Option<String>, system: Option<String>,
+                   steps: usize) -> anyhow::Result<()>
+{
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_engine::hip;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("align-check: pass --prompt or --system/--prompt");
+    };
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let t_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let d_model = Gemma4Model::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let max_seq = prompt.len() + steps + 8;
+    let t_gm = GpuGemma4::new(&t_model, &target_gguf,  &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let d_gm = GpuGemma4::new(&d_model, &drafter_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let mut t_state = Gemma4GpuState::new(&t_model, max_seq).map_err(anyhow::Error::msg)?;
+    let mut d_state = Gemma4GpuState::new(&d_model, max_seq).map_err(anyhow::Error::msg)?;
+    t_state.reset(); d_state.reset();
+
+    println!("target  = {} ({} layers, {} hidden)",
+             target_path.display(), t_model.config.block_count, t_model.config.hidden_size);
+    println!("drafter = {} ({} layers, {} hidden)",
+             drafter_path.display(), d_model.config.block_count, d_model.config.hidden_size);
+    println!("prompt  = {} tokens, steps = {}", prompt.len(), steps);
+
+    if d_model.config.vocab_size != t_model.config.vocab_size {
+        anyhow::bail!("vocab mismatch: target={} drafter={}",
+                      t_model.config.vocab_size, d_model.config.vocab_size);
+    }
+
+    // Prefill both — last forward leaves verify_logits = next-token logits.
+    let t_pf = std::time::Instant::now();
+    let _ = t_gm.prefill_forward(&prompt[..prompt.len()-1], &mut t_state)
+        .map_err(anyhow::Error::msg)?;
+    let mut t_logits = t_gm.forward_token(*prompt.last().unwrap(), &mut t_state)
+        .map_err(anyhow::Error::msg)?;
+    let _ = d_gm.prefill_forward(&prompt[..prompt.len()-1], &mut d_state)
+        .map_err(anyhow::Error::msg)?;
+    let mut d_logits = d_gm.forward_token(*prompt.last().unwrap(), &mut d_state)
+        .map_err(anyhow::Error::msg)?;
+    println!("prefill (both) = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
+
+    // Step in lockstep: at each step argmax both, count match, advance BOTH
+    // with target's argmax (= what vanilla spec-decode would commit).
+    let argmax = |v: &Vec<f32>| -> u32 {
+        let mut best = 0; let mut bv = f32::NEG_INFINITY;
+        for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; best = i; } }
+        best as u32
+    };
+
+    let eos = t_model.config.eos_token_id;
+    let mut accepted = 0usize;
+    let mut total = 0usize;
+    let mut accepted_text: Vec<u32> = Vec::new();
+    for _ in 0..steps {
+        let t_tok = argmax(&t_logits);
+        let d_tok = argmax(&d_logits);
+        total += 1;
+        if d_tok == t_tok { accepted += 1; }
+        accepted_text.push(t_tok);
+        if t_tok == eos { break; }
+        // Advance both states with TARGET's token (vanilla-spec alignment).
+        t_logits = t_gm.forward_token(t_tok, &mut t_state).map_err(anyhow::Error::msg)?;
+        d_logits = d_gm.forward_token(t_tok, &mut d_state).map_err(anyhow::Error::msg)?;
+    }
+
+    let pct = 100.0 * accepted as f64 / total as f64;
+    println!("argmax accept rate: {accepted} / {total} = {pct:.1}%");
+    println!("target text: {:?}", tok.decode(&accepted_text));
+    Ok(())
 }
 
 fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
@@ -2106,6 +2226,13 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     // matches the historical behaviour.
     let p_min_cli = std::env::var("REINSTINCT_DRAFTER_P_MIN").ok()
         .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+    // Adaptive-K MTP-disable on sustained low acceptance. Default OFF in
+    // the CLI for measurement work; serve enables by default. Env knob
+    // matches existing p_min style.
+    let adaptive_alpha = std::env::var("REINSTINCT_MTP_MIN_ALPHA").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+    let adaptive_window = std::env::var("REINSTINCT_MTP_WINDOW").ok()
+        .and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
     let (generated, stats) = reinstinct_engine::runtime::spec_decode::spec_decode_generate(
         &gm, &drafter, &mut state,
         verify_graph.as_ref(), k,
@@ -2114,6 +2241,7 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         cfg_eos,
         steps, k, temperature, seed,
         p_min_cli,
+        adaptive_alpha, adaptive_window,
     ).map_err(anyhow::Error::msg)?;
 
     let gen_secs = t_gen.elapsed().as_secs_f64();
@@ -2126,6 +2254,9 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     println!("draft accept rate: {} / {} = {:.0}%",
              stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
     if stats.hit_eos { println!("(hit EOS)"); }
+    if stats.adaptive_disabled {
+        println!("(adaptive-K disabled MTP mid-generation; trailing tokens via plain decode)");
+    }
     Ok(())
 }
 

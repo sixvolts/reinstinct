@@ -28,6 +28,10 @@ pub struct SpecStats {
     pub n_drafted:  usize,
     pub n_accepted: usize,
     pub hit_eos:    bool,
+    /// True if adaptive-K disabled MTP mid-generation after detecting
+    /// sustained low acceptance. When set, the trailing tokens were
+    /// generated via plain decode, not draft+verify.
+    pub adaptive_disabled: bool,
 }
 
 impl SpecStats {
@@ -72,6 +76,19 @@ pub fn spec_decode_generate(
     temperature: f32,
     seed: u64,
     p_min: f32,
+    // Adaptive-K threshold: if rolling-window per-round acceptance falls
+    // below this, switch to pure decode for the rest of the generation.
+    // `0.0` disables (always run MTP). Backed by the per-prompt α study
+    // 2026-05-30: on a 24-prompt diverse benchmark MTP was net -2.3% vs
+    // plain decode because creative/longform prompts ran at α ~0.4,
+    // losing ~25% throughput while structured prompts (α >= 0.7) only
+    // gained ~15%. Cutting MTP when α drops salvages the wins without
+    // the losses.
+    adaptive_min_alpha: f32,
+    // Window length (rounds) before adaptive can flip MTP off. Too short
+    // and a single bad streak kills MTP; too long and the -25% damage on
+    // low-α prompts goes on too long. 8 is roughly 16-24 tokens decided.
+    adaptive_window: usize,
 ) -> Result<(Vec<u32>, SpecStats), String> {
     let mut generated: Vec<u32> = Vec::new();
     let mut stats = SpecStats::default();
@@ -79,7 +96,29 @@ pub fn spec_decode_generate(
     let mut rng = Rng::new(seed);
     let no_bonus = std::env::var("REINSTINCT_DRAFTER_NO_BONUS").is_ok();
 
+    // Adaptive-K state: rolling per-round acceptance rates and the
+    // "MTP turned off" sticky flag (one-shot — once off, stays off for
+    // the remainder of THIS generation). Fresh-start each call.
+    let adaptive_on = adaptive_min_alpha > 0.0;
+    let mut accept_window: Vec<f32> = Vec::with_capacity(adaptive_window.max(1));
+    let mut mtp_off = false;
+
     while generated.len() < max_tokens {
+        // Adaptive-K K=0 fallback: drafter-free decode for the rest of
+        // the generation. `verify_logits` is the target's prediction for
+        // the next position (kept current by either the MTP path's
+        // bonus/rejection branch or the previous iteration of this loop).
+        if mtp_off {
+            let pick = if sampling { sample_from_logits(&verify_logits, temperature, &mut rng) }
+                       else        { argmax(&verify_logits) };
+            generated.push(pick);
+            last_tok = pick;
+            if pick == eos { stats.hit_eos = true; break; }
+            if generated.len() >= max_tokens { break; }
+            verify_logits = target.forward_token(pick, state)?;
+            continue;
+        }
+
         // --- DRAFT phase: K autoregressive drafter steps pinned to
         //     pos_const = state.pos - 1 (the last-validated position).
         let pos_const = state.pos - 1;
@@ -209,6 +248,29 @@ pub fn spec_decode_generate(
         }
         stats.n_drafted  += drafted.len();
         stats.n_accepted += accepted_this_round;
+
+        // Adaptive-K: record this round's α and, once we have a full
+        // window, decide whether to keep doing MTP. Single one-shot
+        // decision per generation — once disabled, stays disabled. A
+        // re-enable path could probe periodically, but the per-prompt α
+        // study showed acceptance is roughly stable per generation
+        // (drafter capability vs target's task), so probing is wasted.
+        if adaptive_on && !drafted.is_empty() {
+            let round_a = accepted_this_round as f32 / drafted.len() as f32;
+            accept_window.push(round_a);
+            if accept_window.len() >= adaptive_window {
+                let mean: f32 = accept_window.iter().sum::<f32>()
+                              / accept_window.len() as f32;
+                if mean < adaptive_min_alpha {
+                    mtp_off = true;
+                    stats.adaptive_disabled = true;
+                }
+                // Drop oldest sample so the window stays bounded if we
+                // don't trip on this check (keeps the rolling property
+                // for the *next* check).
+                accept_window.remove(0);
+            }
+        }
         if stats.hit_eos { break; }
     }
     Ok((generated, stats))
