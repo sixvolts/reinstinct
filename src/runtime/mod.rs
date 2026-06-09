@@ -69,7 +69,39 @@ impl KernelCache {
             Err(_) => Self::hipcc_version()?,
         };
         let headers_digest = Self::compute_headers_digest();
-        Ok(Self { cache_dir, arch, hipcc_version, headers_digest })
+        let cache = Self { cache_dir, arch, hipcc_version, headers_digest };
+        cache.verify_device_accepts_arch()?;
+        Ok(cache)
+    }
+
+    /// Compile (cached) and load a trivial kernel to verify the present
+    /// GPU actually accepts code objects for `self.arch`. Without this,
+    /// running on a non-{arch} machine surfaces as a cryptic
+    /// `hipModuleLoad: device kernel image is invalid` somewhere deep in
+    /// model load — and GPU tests *fail* instead of skipping, because
+    /// their "is a HIP device present" guard passes. Skipped when no HIP
+    /// device exists so the cache still works for cross-compiling.
+    /// Probed once per process (the arch can't change mid-run).
+    fn verify_device_accepts_arch(&self) -> Result<(), String> {
+        use std::sync::OnceLock;
+        static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+        PROBE.get_or_init(|| {
+            if crate::hip::device_count().ok().unwrap_or(0) < 1 {
+                return Ok(());
+            }
+            const PROBE_SRC: &str =
+                "extern \"C\" __global__ void reinstinct_arch_probe() {}\n";
+            let hsaco = self.compile("arch_probe", PROBE_SRC)?;
+            match crate::hip::Module::load(&hsaco) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!(
+                    "GPU rejects {arch} code objects ({e}); this machine's \
+                     device is not a {arch}. reinstinct targets {arch} — set \
+                     REINSTINCT_OFFLOAD_ARCH to cross-compile for a \
+                     different arch, or run on supported hardware.",
+                    arch = self.arch)),
+            }
+        }).clone()
     }
 
     /// Write the small shared `#include`-able headers to the cache dir
@@ -197,7 +229,8 @@ impl KernelCache {
         // us to it, the final file already exists and we just clean up.
         match std::fs::rename(&tmp_out, &out) {
             Ok(()) => {
-                eprintln!("kernel-cache: compiled {name} ({} ms) → {}", elapsed_ms, out.display());
+                tracing::info!("kernel-cache: compiled {name} ({} ms) → {}",
+                               elapsed_ms, out.display());
             }
             Err(_) if out.exists() => {
                 let _ = std::fs::remove_file(&tmp_out);

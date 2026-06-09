@@ -629,11 +629,13 @@ impl GpuFullAttnWeights {
 /// MTP-specific tensors. Designed to produce a +2 token candidate from
 /// `(prev_hidden, embed(next_tok))`:
 ///
-///     concat(enorm(embed_next), hnorm(prev_hidden))   ─ [2·hidden]
-///       → eh_proj → hidden                            ─ [hidden]
-///       → full transformer block (attn + ffn)         ─ [hidden]
-///       → shared_head_norm                            ─ [hidden]
-///       → tied lm_head                                ─ [vocab]
+/// ```text
+/// concat(enorm(embed_next), hnorm(prev_hidden))   ─ [2·hidden]
+///   → eh_proj → hidden                            ─ [hidden]
+///   → full transformer block (attn + ffn)         ─ [hidden]
+///   → shared_head_norm                            ─ [hidden]
+///   → tied lm_head                                ─ [vocab]
+/// ```
 ///
 /// Draft forward is `GpuQwen35::mtp_draft_forward`; the K=1 accept rate
 /// can be measured with `mtp_accept_probe` (the `qwen-mtp-probe` CLI) —
