@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use json::Json;
+use tracing::{error, info, warn};
 
 use crate::gguf::GgufFile;
 use crate::runtime::KernelCache;
@@ -824,13 +825,12 @@ impl ServerModel {
         {
             let fam = crate::chat::detect_chat_template(t);
             if fam.supported_by_serve() {
-                eprintln!("[serve]   chat template: {} (supported natively)",
-                          fam.label());
+                info!("  chat template: {} (supported natively)", fam.label());
             } else {
-                eprintln!("[serve]   chat template: {} — NOT applied by serve. \
-                           /v1/chat/completions will fail at format time. \
-                           Use /v1/completions and pre-template client-side.",
-                          fam.label());
+                warn!("  chat template: {} — NOT applied by serve. \
+                       /v1/chat/completions will fail at format time. \
+                       Use /v1/completions and pre-template client-side.",
+                      fam.label());
             }
         }
 
@@ -847,13 +847,12 @@ impl ServerModel {
             let tok = GemmaTokenizer::from_gguf(&g).map_err(|e| e.to_string())?;
             let bos = tok.bos_id;
             let drafter = if let Some(dp) = drafter_path {
-                eprintln!("[serve] loading big-drafter   {} ...", dp.display());
+                info!("loading big-drafter   {} ...", dp.display());
                 let t = std::time::Instant::now();
                 let dg = GgufFile::open(dp).map_err(|e| e.to_string())?;
                 let dm = Gemma4AssistantModel::load(&dg).map_err(|e| e.to_string())?;
                 let dr = GpuGemma4Assistant::new(&dm, &dg, &gpu, cache)?;
-                eprintln!("[serve]   loaded drafter in {:.1}s",
-                          t.elapsed().as_secs_f32());
+                info!("  loaded drafter in {:.1}s", t.elapsed().as_secs_f32());
                 let mut verify_graphs = Vec::with_capacity(5);
                 for _ in 0..5 { verify_graphs.push(None); }
                 Some(GemmaDrafter { runtime: dr, verify_graphs })
@@ -871,8 +870,8 @@ impl ServerModel {
             let state = Qwen35GpuState::new(&model, max_seq)?;
             let tok = Tokenizer::from_gguf(&g)?;
             if drafter_path.is_some() {
-                eprintln!("[serve] note: --big-drafter ignored on qwen35 target \
-                           (no supported drafter; see gemma4-mtp memory file)");
+                warn!("--big-drafter ignored on qwen35 target \
+                       (no supported drafter; see gemma4-mtp memory file)");
             }
             Ok(ServerModel::Qwen { gpu, state, tok, eos, max_seq, name })
         }
@@ -1040,9 +1039,9 @@ impl ServerModel {
                     // prefill only the suffix; otherwise full prompt.
                     let mut logits = if restored {
                         let suffix = &prompt[overlap..];
-                        eprintln!("[serve] req kv-cache hit: \
-                                   reused {overlap}/{} tokens; prefilling {} suffix",
-                                  prompt.len(), suffix.len());
+                        info!("req kv-cache hit: \
+                               reused {overlap}/{} tokens; prefilling {} suffix",
+                              prompt.len(), suffix.len());
                         gpu.prefill_forward(suffix, state)?
                     } else {
                         gpu.prefill_forward(&prompt, state)?
@@ -1055,7 +1054,7 @@ impl ServerModel {
                     if !state.is_superquant() {
                         match state.snapshot() {
                             Ok(snap) => prefix_cache.insert(prompt.clone(), snap),
-                            Err(e) => eprintln!("[serve] prefix-cache snapshot failed: {e}"),
+                            Err(e) => warn!("prefix-cache snapshot failed: {e}"),
                         }
                     }
                     let vocab = logits.len();
@@ -1128,12 +1127,12 @@ impl ServerModel {
                     req.speculative_p_min,
                     adaptive_alpha, adaptive_window,
                 )?;
-                eprintln!("[serve] spec-decode K={k}: {}/{} accept ({:.0}%){}",
+                info!("spec-decode K={k}: {}/{} accept ({:.0}%){}",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate(),
                     if stats.adaptive_disabled { " [adaptive: MTP off]" } else { "" });
                 if want_lp > 0 {
-                    eprintln!("[serve] note: logprobs requested but ignored on \
-                               spec-decode path; pass use_speculative=false to enable");
+                    warn!("logprobs requested but ignored on \
+                           spec-decode path; pass use_speculative=false to enable");
                 }
                 // No per-token logprobs from spec-decode today; the response
                 // shaper renders `logprobs: null` when the vec is empty.
@@ -1155,7 +1154,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
         let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>|
             -> Result<ServerModel, String>
         {
-            eprintln!("[serve] loading {label:5} model {} ...", path.display());
+            info!("loading {label:5} model {} ...", path.display());
             let t = std::time::Instant::now();
             let m = ServerModel::load(path, drafter, &cache, max_seq)
                 .map_err(|e| {
@@ -1173,7 +1172,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                         format!("{label} model: {e}")
                     }
                 })?;
-            eprintln!("[serve]   loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
+            info!("  loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
             Ok(m)
         };
         let big_m   = load("big",   &big,   big_drafter.as_ref())?;
@@ -1184,7 +1183,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
     let (_cache, mut big_m, mut small_m) = match setup {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[serve] FATAL: model load failed: {e}");
+            error!("FATAL: model load failed: {e}");
             // Drain the queue with 503s so clients don't hang forever.
             for job in rx {
                 let _ = job.reply.send(StreamMsg::Done(HttpReply {
@@ -1195,13 +1194,13 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             return;
         }
     };
-    eprintln!("[serve] ready — serving requests.");
+    info!("ready — serving requests.");
 
     for job in rx {
         let reply = match job.req {
             Err((status, status_text, msg)) => {
-                eprintln!("[serve] req={} target={} status={} reason={:?} msg={}",
-                          job.request_id, job.target.label(), status, status_text, msg);
+                warn!("req={} target={} status={} reason={:?} msg={}",
+                      job.request_id, job.target.label(), status, status_text, msg);
                 metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
                 HttpReply {
                     status, status_text, body: error_body(&msg, "invalid_request_error"),
@@ -1209,8 +1208,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             }
             Ok(req) => match job.target {
                 Target::Embed => {
-                    eprintln!("[serve] req={} target=embed status=503 reason=not-yet-available",
-                              job.request_id);
+                    warn!("req={} target=embed status=503 reason=not-yet-available",
+                          job.request_id);
                     metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
                     HttpReply {
                         status: 503, status_text: "Service Unavailable",
@@ -1288,8 +1287,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             let tok_per_s = if n_c > 0 && wall_us > 0 {
                                 n_c as f64 * 1_000_000.0 / wall_us as f64
                             } else { 0.0 };
-                            eprintln!("[serve] req={} target={} type={} status=200 \
-                                       n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={} stream={}",
+                            info!("req={} target={} type={} status=200 \
+                                   n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={} stream={}",
                                 job.request_id, job.target.label(),
                                 if is_chat { "chat" } else { "completion" },
                                 n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
@@ -1394,8 +1393,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             }
                         }
                         Ok(Err(e)) => {
-                            eprintln!("[serve] req={} target={} status=400 reason={:?}",
-                                      job.request_id, job.target.label(), e);
+                            warn!("req={} target={} status=400 reason={:?}",
+                                  job.request_id, job.target.label(), e);
                             metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
                             HttpReply {
                                 status: 400, status_text: "Bad Request",
@@ -1410,8 +1409,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             } else {
                                 "unknown panic in generate()".to_string()
                             };
-                            eprintln!("[serve] req={} target={} status=500 PANIC={}",
-                                      job.request_id, job.target.label(), msg);
+                            error!("req={} target={} status=500 PANIC={}",
+                                   job.request_id, job.target.label(), msg);
                             metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
                             metrics.panics_recovered.fetch_add(1, Ordering::Relaxed);
                             HttpReply {
@@ -1440,8 +1439,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         Ok(r) => r,
         Err(e) => {
             metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
-            eprintln!("[serve] req={request_id} target={} status=400 reason=malformed-http err={e}",
-                      target.label());
+            warn!("req={request_id} target={} status=400 reason=malformed-http err={e}",
+                  target.label());
             let _ = http::write_response(&mut stream, 400, "Bad Request",
                 &error_body(&format!("malformed HTTP request: {e}"), "invalid_request_error"));
             return;
@@ -1596,9 +1595,9 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
             metrics: Arc<Metrics>, model_name: Arc<String>) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
-        Err(e) => { eprintln!("[serve] FATAL: cannot bind port {port}: {e}"); return; }
+        Err(e) => { error!("FATAL: cannot bind port {port}: {e}"); return; }
     };
-    eprintln!("[serve] {} listening on :{port}", target.label());
+    info!("{} listening on :{port}", target.label());
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -1607,7 +1606,7 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
                 let model_name = Arc::clone(&model_name);
                 thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name));
             }
-            Err(e) => eprintln!("[serve] accept error on :{port}: {e}"),
+            Err(e) => warn!("accept error on :{port}: {e}"),
         }
     }
 }
@@ -1639,20 +1638,19 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
     ];
     for (var, is_perf_killer) in &env_warnings {
         if std::env::var_os(var).is_some() {
-            let tag = if *is_perf_killer { "WARN" } else { "info" };
-            eprintln!("[serve] {tag}: {var} is set — \
-                       {}", if *is_perf_killer {
-                "perf will regress significantly; unset for production"
+            if *is_perf_killer {
+                warn!("{var} is set — perf will regress significantly; \
+                       unset for production");
             } else {
-                "tracing on; expect verbose logs"
-            });
+                info!("{var} is set — tracing on; expect verbose logs");
+            }
         }
     }
 
     if let Some(e) = &embed {
-        eprintln!("[serve] note: --embed {} accepted but deferred — \
-                   the :{embed_port} port will answer 503 until the \
-                   nomic-bert encoder lands.", e.display());
+        info!("--embed {} accepted but deferred — \
+               the :{embed_port} port will answer 503 until the \
+               nomic-bert encoder lands.", e.display());
     }
 
     let (tx, rx) = mpsc::channel::<Job>();

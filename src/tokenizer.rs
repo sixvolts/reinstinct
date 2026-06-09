@@ -183,7 +183,7 @@ impl Tokenizer {
         for piece in &word {
             match self.vocab_map.get(piece) {
                 Some(&id) => out.push(id),
-                None => eprintln!("tokenizer: piece {piece:?} not in vocab — skipped"),
+                None => tracing::warn!("tokenizer: piece {piece:?} not in vocab — skipped"),
             }
         }
     }

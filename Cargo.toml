@@ -29,6 +29,9 @@ fancy-regex = "0.14"
 serde_json = "1.0"
 # f16 conversion for the trace binary format (hidden states stored fp16)
 half = "2.4"
+# Structured logging; level control via RUST_LOG (default `info`)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = 3

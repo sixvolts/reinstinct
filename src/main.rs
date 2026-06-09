@@ -324,6 +324,15 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Logging: RUST_LOG controls level/targets (e.g. RUST_LOG=debug or
+    // RUST_LOG=reinstinct_engine::serve=debug); default `info` keeps the
+    // pre-tracing stderr behaviour.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .init();
+
     match Cli::parse().cmd {
         Command::Inspect { path, verbose } => inspect(&path, verbose),
         Command::Model { path } => model(&path),
