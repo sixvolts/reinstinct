@@ -900,9 +900,9 @@ pub struct GpuGemma4 {
     m_attn_step_q8_b: Module,     // batched int8 attn over the decode KV cache
     m_permute_pf:  Module,
 
-    // Dimensions.
+    // Dimensions. (No `ffn` field: FFN width is per-block on E4B-style
+    // models — use `b.ffn_gate.out_dim` at the launch site instead.)
     hidden:     usize,
-    ffn:        usize,
     vocab:      usize,
     n_heads:    usize,
     rms_eps:    f32,
@@ -1145,7 +1145,7 @@ impl GpuGemma4 {
             rocblas, prefill_gemm,
             m_rope_pf, m_attn_pf, m_kvq_pf, m_permute_pf,
             m_rope_b, m_attn_step_q8_b,
-            hidden, ffn, vocab, n_heads,
+            hidden, vocab, n_heads,
             rms_eps: cfg.rms_norm_eps,
             softcap: cfg.final_logit_softcapping,
             sliding_window: cfg.sliding_window as usize,
@@ -3219,8 +3219,8 @@ impl GpuGemma4 {
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
 
             // Per-block FFN width — E2B has heterogeneous layers (e.g. 6144
-            // for first 15, 12288 for the rest). On uniform models this is
-            // just self.ffn.
+            // for first 15, 12288 for the rest). Uniform models broadcast
+            // the same width to every block.
             let ff = b.ffn_gate.out_dim as u32;
             self.launch_rmsnorm_batched(x.raw_ptr(), b.ffn_norm.raw_ptr(),
                 normed.raw_ptr(), hu, p as u32)?;
