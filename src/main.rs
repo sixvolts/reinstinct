@@ -295,6 +295,32 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 64)]
         steps: usize,
     },
+    /// Dump (prev_tok, label_tok, hidden_b[H]) training traces from a
+    /// Gemma 4 target over a JSONL of prompts. For training an EAGLE-
+    /// style drafter (see [[drafter-training-roadmap]] in memory).
+    /// Chat-template prefill per prompt, then greedy decode for `steps`
+    /// tokens, capturing the target's POST output-norm hidden state plus
+    /// the next-token label at each step. Hidden states stored as fp16.
+    /// Resume: scans the output file for completed seq_ids and skips them.
+    DumpTraces {
+        target: PathBuf,
+        /// Path to JSONL with {"prompt": str, "seq_id": u32, ...} per line.
+        #[arg(long)]
+        prompts: PathBuf,
+        /// Output binary file (appended; supports resume).
+        #[arg(long)]
+        out: PathBuf,
+        /// Tokens to decode per prompt (may finish earlier on EOS).
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+        /// Skip prompts with seq_id below this (additional manual offset).
+        #[arg(long, default_value_t = 0)]
+        skip: u32,
+        /// Stop after this many prompts have been processed in this run
+        /// (0 = no cap; resume picks up where the file ends).
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -333,6 +359,8 @@ fn main() -> anyhow::Result<()> {
             qwen_mtp_gen_cli(&path, prompt, tokens, k),
         Command::AlignCheck { target, drafter, prompt, system, steps } =>
             align_check_cli(&target, &drafter, prompt, system, steps),
+        Command::DumpTraces { target, prompts, out, steps, skip, limit } =>
+            dump_traces_cli(&target, &prompts, &out, steps, skip, limit),
     }
 }
 
@@ -433,6 +461,234 @@ fn align_check_cli(target_path: &std::path::Path, drafter_path: &std::path::Path
     let pct = 100.0 * accepted as f64 / total as f64;
     println!("argmax accept rate: {accepted} / {total} = {pct:.1}%");
     println!("target text: {:?}", tok.decode(&accepted_text));
+    Ok(())
+}
+
+// ===== dump-traces — EAGLE drafter training data dumper =====
+//
+// Binary trace format (little-endian, mmap-friendly):
+//
+//   File header (32 B):
+//     magic[8]          = b"RTRC0001"
+//     hidden_size: u32  = target's hidden dim (5376 for Gemma 31B)
+//     steps_per_prompt: u32 = command-line `--steps` value
+//     n_prompts: u32    = monotonically incremented as prompts complete
+//                         (caller must seek to byte 16 and overwrite this
+//                         field after each prompt — supports clean resume)
+//     flags: u32        = reserved (0)
+//     _pad: u64         = 0
+//
+//   Per-prompt record (16 B header + n_steps × per-step):
+//     seq_id: u32       = prompt seq_id from input JSONL
+//     prompt_len: u32   = encoded prompt token count
+//     n_steps: u32      = ACTUAL steps generated (≤ steps_per_prompt;
+//                         can be less if EOS hit early)
+//     _pad: u32
+//
+//   Per-step record (8 + 2·hidden_size B):
+//     prev_tok: u32     = the token fed into target at this step
+//     label_tok: u32    = target's argmax (= what the drafter should
+//                         predict; this becomes prev_tok at step+1)
+//     hidden_b[H]: f16  = target's POST output-norm hidden state AFTER
+//                         processing prev_tok (= the drafter's expected
+//                         pre_projection h_prev input — see gemma4-mtp
+//                         PRE-vs-POST norm finding)
+//
+// At H=5376 and steps=64: 32 (file hdr) + 50_000 × (16 + 64 × 10760)
+// ≈ 32.9 GB for the full 50k-prompt run.
+//
+// Resume strategy: on startup, scan the existing file to learn which
+// seq_ids have been written (the header's n_prompts count is the source
+// of truth; we read it + walk through that many prompt-records to skip
+// past them, then append). Re-running with --skip is also supported as
+// a manual override.
+
+const TRACE_MAGIC: &[u8; 8] = b"RTRC0001";
+const TRACE_HEADER_BYTES: u64 = 32;
+
+fn dump_traces_cli(target_path: &std::path::Path, prompts_path: &std::path::Path,
+                   out_path: &std::path::Path, steps: usize, skip: u32,
+                   limit: u32) -> anyhow::Result<()>
+{
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_engine::hip;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::fs::OpenOptions;
+
+    if steps == 0 || steps > 256 { anyhow::bail!("--steps must be in 1..=256"); }
+
+    let target_gguf = GgufFile::open(target_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let hidden = model.config.hidden_size as usize;
+    let eos = model.config.eos_token_id;
+    let max_seq_per_prompt = 2048;   // prompt header alone caps at ~1500 chars
+    let gm = GpuGemma4::new(&model, &target_gguf, &cache, max_seq_per_prompt)
+        .map_err(anyhow::Error::msg)?;
+
+    // --- Open output, write/validate header, learn resume cursor. ---
+    let mut out = OpenOptions::new().read(true).write(true).create(true).open(out_path)?;
+    let existing_len = out.metadata()?.len();
+    let mut already_done_seqs: std::collections::HashSet<u32> = Default::default();
+    if existing_len == 0 {
+        // Fresh file: write header.
+        let mut hdr = [0u8; TRACE_HEADER_BYTES as usize];
+        hdr[..8].copy_from_slice(TRACE_MAGIC);
+        hdr[ 8..12].copy_from_slice(&(hidden as u32).to_le_bytes());
+        hdr[12..16].copy_from_slice(&(steps as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&0u32.to_le_bytes());   // n_prompts; updated as we go
+        // flags + pad = zero
+        out.write_all(&hdr)?;
+        out.flush()?;
+        println!("[dump-traces] fresh file → {} (hidden={hidden}, steps={steps})",
+                 out_path.display());
+    } else {
+        // Resume: validate header, then walk records to collect done seq_ids.
+        out.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; TRACE_HEADER_BYTES as usize];
+        out.read_exact(&mut hdr)?;
+        if &hdr[..8] != TRACE_MAGIC { anyhow::bail!("trace file magic mismatch"); }
+        let h_hidden = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let h_steps  = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+        if h_hidden != hidden {
+            anyhow::bail!("trace file hidden={h_hidden} != target hidden={hidden}");
+        }
+        if h_steps != steps {
+            anyhow::bail!("trace file steps={h_steps} != cli --steps={steps} (would corrupt format)");
+        }
+        let n_done = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
+        // Walk forward to collect seq_ids that are already in the file.
+        let mut pos = TRACE_HEADER_BYTES;
+        for _ in 0..n_done {
+            out.seek(SeekFrom::Start(pos))?;
+            let mut prec = [0u8; 16];
+            out.read_exact(&mut prec)?;
+            let sid = u32::from_le_bytes(prec[0..4].try_into().unwrap());
+            let n_steps_this = u32::from_le_bytes(prec[8..12].try_into().unwrap()) as u64;
+            already_done_seqs.insert(sid);
+            pos += 16 + n_steps_this * (8 + 2 * hidden as u64);
+        }
+        out.seek(SeekFrom::End(0))?;
+        println!("[dump-traces] resume: {n_done} prompts already in {} ({} bytes); skipping their seq_ids",
+                 out_path.display(), existing_len);
+    }
+    let mut n_done_total = already_done_seqs.len() as u32;
+
+    // Allocate the KV-cache state ONCE and reuse it across all prompts.
+    // Earlier version allocated inside the per-prompt loop; HIP's allocator
+    // fragments HBM after a few hundred 1.5 GB alloc/free cycles and OOMs.
+    let mut state = Gemma4GpuState::new(&model, max_seq_per_prompt)
+        .map_err(anyhow::Error::msg)?;
+
+    // --- Iterate JSONL. ---
+    let f = std::fs::File::open(prompts_path)?;
+    let rdr = BufReader::new(f);
+    let mut processed_this_run = 0u32;
+    let t_start = std::time::Instant::now();
+
+    for line in rdr.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        // Quick-and-dirty extract — JSON parse only for the fields we need.
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+        let seq_id = v.get("seq_id").and_then(|x| x.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("missing seq_id in line"))? as u32;
+        let prompt_text = v.get("prompt").and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing prompt in line"))?;
+        if seq_id < skip { continue; }
+        if already_done_seqs.contains(&seq_id) { continue; }
+        if limit > 0 && processed_this_run >= limit { break; }
+
+        // Chat-template the prompt (matches mtp-gen behaviour so the
+        // trace matches what the drafter will see at inference time).
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: String::new() },
+            ChatMessage { role: Role::User,   content: prompt_text.to_owned() },
+        ];
+        let prompt: Vec<u32> = format_gemma4(&tok, &msgs, true)
+            .map_err(anyhow::Error::msg)?;
+        if prompt.len() + steps + 8 > max_seq_per_prompt {
+            eprintln!("[dump-traces] WARN: seq_id={seq_id} prompt+steps would exceed \
+                       max_seq ({}+{}>= {max_seq_per_prompt}); skipping",
+                       prompt.len(), steps);
+            continue;
+        }
+
+        // Reset KV cache for this prompt (state buffers are reused — see
+        // the hoisted allocation above the loop).
+        state.reset();
+        // Use the batched prefill (fast). The PrefillGemm path allocates a
+        // fresh DeviceBuf result per matmul which fragments HBM after a
+        // few hundred prompts of varying length — handled here by the
+        // CLI's `--limit` flag + an outer restart-wrapper. Process exits
+        // cleanly with a captured count; relaunching resumes via the file
+        // header counter.
+        let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+            .map_err(anyhow::Error::msg)?;
+        let mut logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+            .map_err(anyhow::Error::msg)?;
+
+        // Generate up to `steps` tokens; at each step record (prev, label, h_b).
+        let mut rec_bytes: Vec<u8> = Vec::with_capacity(steps * (8 + 2 * hidden));
+        let mut prev = *prompt.last().unwrap();
+        let mut n_steps_this = 0u32;
+        let mut hidden_buf = vec![0.0f32; hidden];
+        for _ in 0..steps {
+            // hidden_b currently reflects the forward we just did (for `prev`).
+            // Read it BEFORE the next forward overwrites it.
+            gm.last_hidden_state()  // ensures buffer is valid
+                .copy_to_host(&mut hidden_buf).map_err(anyhow::Error::msg)?;
+            let label = argmax(&logits);
+            // Append step record: prev, label, fp16(hidden_b)
+            rec_bytes.extend_from_slice(&prev.to_le_bytes());
+            rec_bytes.extend_from_slice(&label.to_le_bytes());
+            for &v in &hidden_buf {
+                let h = half::f16::from_f32(v);
+                rec_bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            n_steps_this += 1;
+            if label == eos { break; }
+            // Advance: feed the label token, get next logits + new hidden_b.
+            prev = label;
+            logits = gm.forward_token(prev, &mut state).map_err(anyhow::Error::msg)?;
+        }
+
+        // Write prompt header + step records.
+        let mut prec = [0u8; 16];
+        prec[0..4].copy_from_slice(&seq_id.to_le_bytes());
+        prec[4..8].copy_from_slice(&(prompt.len() as u32).to_le_bytes());
+        prec[8..12].copy_from_slice(&n_steps_this.to_le_bytes());
+        out.write_all(&prec)?;
+        out.write_all(&rec_bytes)?;
+        n_done_total += 1;
+        processed_this_run += 1;
+
+        // Update the header's n_prompts counter so a kill-mid-run leaves
+        // a consistent file (resumes find the right cursor).
+        out.flush()?;
+        out.seek(SeekFrom::Start(16))?;
+        out.write_all(&n_done_total.to_le_bytes())?;
+        out.seek(SeekFrom::End(0))?;
+
+        if processed_this_run % 50 == 0 {
+            let dt = t_start.elapsed().as_secs_f64();
+            let rate = processed_this_run as f64 / dt;
+            eprintln!("[dump-traces] +{processed_this_run} prompts in {dt:.1}s \
+                       ({rate:.2} prompt/s, total in file: {n_done_total})");
+        }
+    }
+
+    let dt = t_start.elapsed().as_secs_f64();
+    eprintln!("[dump-traces] done: +{processed_this_run} prompts this run in {dt:.1}s; \
+               file now has {n_done_total} total prompts");
     Ok(())
 }
 

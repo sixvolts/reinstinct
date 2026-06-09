@@ -25,6 +25,10 @@ rayon = "1.10"
 # Pre-tokenizer regex for the BPE encoder (needs lookahead, which the
 # linear-time `regex` crate doesn't support)
 fancy-regex = "0.14"
+# JSONL ingest for the dump-traces drafter-training data dumper
+serde_json = "1.0"
+# f16 conversion for the trace binary format (hidden states stored fp16)
+half = "2.4"
 
 [profile.release]
 opt-level = 3
