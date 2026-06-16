@@ -191,9 +191,10 @@ enum Command {
         /// where the drafter typically has low accept rate.
         #[arg(long)]
         big_drafter: Option<PathBuf>,
-        /// Small model GGUF (Qwen 3.5 4B or Gemma E4B).
+        /// Small model GGUF (Qwen 3.5 4B or Gemma E4B). Optional — omit to
+        /// skip the small-model port and save VRAM.
         #[arg(long)]
-        small: PathBuf,
+        small: Option<PathBuf>,
         /// Embedder GGUF (nomic-embed). Accepted but deferred — its
         /// port answers 503 until the encoder runtime lands.
         #[arg(long)]
