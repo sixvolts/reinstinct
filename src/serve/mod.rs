@@ -1146,9 +1146,9 @@ impl ServerModel {
 // --- the GPU worker ----------------------------------------------------
 
 fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: PathBuf, max_seq: usize, metrics: Arc<Metrics>)
+          small: Option<PathBuf>, max_seq: usize, metrics: Arc<Metrics>)
 {
-    let setup = (|| -> Result<(KernelCache, ServerModel, ServerModel), String> {
+    let setup = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
         crate::hip::Device::set(0)?;
         let cache = KernelCache::new()?;
         let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>|
@@ -1176,7 +1176,10 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             Ok(m)
         };
         let big_m   = load("big",   &big,   big_drafter.as_ref())?;
-        let small_m = load("small", &small, None)?;
+        let small_m = match small {
+            Some(sp) => Some(load("small", &sp, None)?),
+            None => None,
+        };
         Ok((cache, big_m, small_m))
     })();
 
@@ -1219,7 +1222,22 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     }
                 }
                 Target::Big | Target::Small => {
-                    let model = if job.target == Target::Big { &mut big_m } else { &mut small_m };
+                    let model: &mut ServerModel = if job.target == Target::Big {
+                        &mut big_m
+                    } else if let Some(ref mut sm) = small_m {
+                        sm
+                    } else {
+                        warn!("req={} target=small status=503 reason=--small not provided",
+                              job.request_id);
+                        metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+                        let _ = job.reply.send(StreamMsg::Done(HttpReply {
+                            status: 503, status_text: "Service Unavailable",
+                            body: error_body(
+                                "small model not loaded — start with --small PATH",
+                                "server_error"),
+                        }));
+                        continue;
+                    };
                     let t = std::time::Instant::now();
                     let is_chat = req.is_chat();
                     let is_stream = req.stream;
@@ -1612,8 +1630,8 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
-pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
-           small: PathBuf, embed: Option<PathBuf>,
+  pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
+           small: Option<PathBuf>, embed: Option<PathBuf>,
            big_port: u16, small_port: u16, embed_port: u16, max_seq: usize)
     -> Result<(), String>
 {
@@ -1673,14 +1691,24 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
         p.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
     };
     let big_name   = Arc::new(stem(&big));
-    let small_name = Arc::new(stem(&small));
     let embed_name = Arc::new(String::new());
 
-    for (port, target, name) in [
-        (big_port,   Target::Big,   Arc::clone(&big_name)),
-        (small_port, Target::Small, Arc::clone(&small_name)),
-        (embed_port, Target::Embed, Arc::clone(&embed_name)),
-    ] {
+    let acceptors: Vec<(u16, Target, Arc<String>)> = if let Some(ref sp) = small {
+        let small_name = Arc::new(stem(sp));
+        vec![
+            (big_port,   Target::Big,   Arc::clone(&big_name)),
+            (small_port, Target::Small, Arc::clone(&small_name)),
+            (embed_port, Target::Embed, Arc::clone(&embed_name)),
+        ]
+    } else {
+        info!("--small not given — small-model port disabled (VRAM saved)");
+        vec![
+            (big_port,   Target::Big,   Arc::clone(&big_name)),
+            (embed_port, Target::Embed, Arc::clone(&embed_name)),
+        ]
+    };
+
+    for (port, target, name) in acceptors {
         let tx = tx.clone();
         let metrics = Arc::clone(&metrics);
         thread::Builder::new().name(format!("accept-{}", target.label()))
