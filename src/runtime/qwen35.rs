@@ -27,7 +27,6 @@ use crate::gguf::{GgufFile, GgmlType};
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
-use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
 /// Per-stage GPU timing breakdown for one `forward_token` call,
 /// measured with HIP events (so each `*_ms` is genuine GPU time
@@ -76,6 +75,7 @@ const RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE: &str =
     include_str!("../../kernels/rmsnorm_gated_multihead_batched.cpp");
 
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
+const GEMM_F16_ROWS_SOURCE: &str = include_str!("../../kernels/gemm_f16_rows.cpp");
 const MATVEC_F32_B256_SOURCE: &str = include_str!("../../kernels/matvec_f32_b256.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
@@ -220,21 +220,37 @@ impl GpuMatvecTensor {
         }
         let in_dim  = shape[0] as u32;
         let out_dim = shape[1] as u32;
+        // `(bytes, dtype)` — dtype can differ from the on-disk type when a
+        // format without a repacked kernel is widened on the way in.
         let packed = match info.ggml_type {
-            GgmlType::Q4_K => Some(crate::quant::q4_k::repack_for_matvec(
-                bytes, in_dim as usize, out_dim as usize)),
-            GgmlType::Q5_K => Some(crate::quant::q5_k::repack_for_matvec(
-                bytes, in_dim as usize, out_dim as usize)),
-            GgmlType::Q6_K => Some(crate::quant::q6_k::repack_for_matvec(
-                bytes, in_dim as usize, out_dim as usize)),
-            GgmlType::Q8_0 => Some(crate::quant::q8_0::repack_for_matvec(
-                bytes, in_dim as usize, out_dim as usize)),
+            GgmlType::Q4_K => Some((crate::quant::q4_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::Q4_K)),
+            GgmlType::Q5_K => Some((crate::quant::q5_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::Q5_K)),
+            GgmlType::Q6_K => Some((crate::quant::q6_k::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::Q6_K)),
+            GgmlType::Q8_0 => Some((crate::quant::q8_0::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::Q8_0)),
+            // IQ4_XS has no repacked matvec or MMQ kernel, so it would fall
+            // through to the dequant→fp16→rocBLAS HGEMM path — which aborts
+            // outright on a rocBLAS built without gfx906 kernels (every ROCm
+            // 7.x distro build). The codebook fits int8 exactly, so widening
+            // to Q8_0 here is a near-exact relabelling (see
+            // `iq4_xs::transcode_to_q8_0`) that costs 4.25→8.5 bpw on the
+            // handful of IQ4_XS tensors in an Unsloth UD-XL file and puts
+            // them on the fast repacked int8 path instead.
+            GgmlType::IQ4_XS => {
+                let q8 = crate::quant::iq4_xs::transcode_to_q8_0(
+                    bytes, in_dim as usize * out_dim as usize);
+                Some((crate::quant::q8_0::repack_for_matvec(
+                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
+            }
             _ => None,
         };
         match packed {
-            Some(p) => Ok(Self {
+            Some((p, dtype)) => Ok(Self {
                 data: DeviceBuf::from_slice(&p)?,
-                dtype: info.ggml_type,
+                dtype,
                 in_dim, out_dim,
                 repacked: true,
             }),
@@ -1046,6 +1062,9 @@ pub struct GpuQwen35 {
     rmsnorm_gated_multihead_batched_module: Module,
 
     matvec_f16_module:     Module,
+    /// Multi-row fp16-weight GEMM — the fallback for dtypes with no
+    /// repacked MMQ kernel, replacing what used to be a rocBLAS HGEMM.
+    gemm_f16_rows_module:  Module,
     /// 256-thread/block fp32 matvec — wins over the wave64 path on
     /// small `out_dim` matvecs where wave64 starves the GPU. Used by
     /// the GDN `ssm_alpha` / `ssm_beta` projections (out_dim=n_heads=48).
@@ -1089,7 +1108,6 @@ pub struct GpuQwen35 {
     stream: Stream,
 
     // --- Batched prefill machinery ---
-    rocblas:           RocblasHandle,
     cvt_module:        Module,
     dequant_q4_k_module:   Module,
     dequant_q5_k_module:   Module,
@@ -1257,6 +1275,7 @@ impl GpuQwen35 {
         let rmsnorm_gated_multihead_batched_hsaco = cache.compile(
             "rmsnorm_gated_multihead_batched", RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
+        let gemm_f16_rows_hsaco = cache.compile("gemm_f16_rows", GEMM_F16_ROWS_SOURCE)?;
         let matvec_f32_b256_hsaco = cache.compile("matvec_f32_b256", MATVEC_F32_B256_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
         let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
@@ -1306,8 +1325,6 @@ impl GpuQwen35 {
         // The single stream all launches flow through.
         let stream = Stream::new()?;
         // rocBLAS handle for batched-prefill GEMMs, bound to our stream.
-        let rocblas_handle = RocblasHandle::new()?;
-        rocblas_handle.set_stream(&stream)?;
 
         Ok(Self {
             token_embd, output_norm, output_proj,
@@ -1346,11 +1363,11 @@ impl GpuQwen35 {
             rmsnorm_gated_multihead_batched_module:
                 Module::load(&rmsnorm_gated_multihead_batched_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
+            gemm_f16_rows_module: Module::load(&gemm_f16_rows_hsaco)?,
             matvec_f32_b256_module: Module::load(&matvec_f32_b256_hsaco)?,
             embed_lookup_q6_k_module: Module::load(&embed_lookup_q6_k_hsaco)?,
             embed_lookup_q4_k_module: Module::load(&embed_lookup_q4_k_hsaco)?,
             embed_lookup_q8_0_module: Module::load(&embed_lookup_q8_0_hsaco)?,
-            rocblas:                  rocblas_handle,
             cvt_module:               Module::load(&cache.compile("cvt_f32_f16", CVT_F32_F16_SOURCE)?)?,
             dequant_q4_k_module:      Module::load(&cache.compile("dequant_q4_k_f16", DEQUANT_Q4_K_F16_SOURCE)?)?,
             dequant_q5_k_module:      Module::load(&cache.compile("dequant_q5_k_f16", DEQUANT_Q5_K_F16_SOURCE)?)?,
@@ -3459,29 +3476,46 @@ impl GpuQwen35 {
             w_ptr = b.raw_ptr();
             dq = Some(b);
         }
-        // X → fp16. Pooled (capture-safe; pooled buffers aren't freed).
-        let x_f16 = self.pool_u16.take(n_rows * in_d)?;
-        self.launch_cvt("cvt_f32_to_f16", x_f32, x_f16.raw_ptr(), (n_rows * in_d) as u32)?;
-        // GEMM. rocBLAS handle shares self.stream, so it serialises after
-        // the dequant + cvt launches above — no explicit sync needed.
-        let y_f16 = self.pool_u16.take(n_rows * out_d)?;
-        unsafe {
-            self.rocblas.gemm_f16_f32acc(
-                RocblasOp::Transpose, RocblasOp::None,
-                out_d as i32, n_rows as i32, in_d as i32,
-                1.0,
-                w_ptr as *const c_void, in_d as i32,
-                x_f16.as_ptr() as *const c_void, in_d as i32,
-                0.0,
-                y_f16.as_ptr() as *mut c_void, out_d as i32,
-            )?;
-        }
-        self.launch_cvt("cvt_f16_to_f32", y_f16.raw_ptr(), y_f32, (n_rows * out_d) as u32)?;
-        // dq / x_f16 / y_f16 are pooled — returned to the pool on drop,
-        // not freed; next take() reuses them stream-ordered after these
-        // kernels, so no per-call sync is needed.
+        // Our own fp16 GEMM rather than rocBLAS: activations stay fp32 on
+        // both sides (no narrow-in/widen-out round trip), and gfx906 keeps
+        // working on ROCm 7.x, whose rocBLAS has no kernels for it and
+        // aborts the process the moment a handle is created.
+        self.launch_gemm_f16_rows(w_ptr, x_f32, y_f32, in_d, out_d, n_rows)?;
+        // dq is pooled — returned to the pool on drop, not freed; the next
+        // take() reuses it stream-ordered after this kernel, so no sync.
         let _ = dq;
         Ok(())
+    }
+
+    /// `Y[n_rows, out_d] = X[n_rows, in_d] · Wᵀ` for an fp16 weight.
+    /// Blocks are (out_d × ceil(n_rows/8)); each reduces `in_d` in LDS.
+    fn launch_gemm_f16_rows(&self, w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                            in_d: usize, out_d: usize, n_rows: usize)
+        -> Result<(), String>
+    {
+        const NR_TILE: usize = 8;   // must match gemm_f16_rows.cpp
+        let f = self.gemm_f16_rows_module.function("gemm_f16_rows_f32")?;
+        let block: u32 = 256;
+        let mut wp = w;
+        let mut xp = x;
+        let mut yp = y;
+        let mut ia = in_d as u32;
+        let mut oa = out_d as u32;
+        let mut na = n_rows as u32;
+        let mut args: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        let grid_y = ((n_rows + NR_TILE - 1) / NR_TILE) as u32;
+        let smem   = (NR_TILE * block as usize * std::mem::size_of::<f32>()) as u32;
+        unsafe {
+            f.launch((out_d as u32, grid_y, 1), (block, 1, 1), smem,
+                     Some(&self.stream), &mut args)
+        }
     }
 
     /// Small-N (`n_rows` ≤ 4) batched K-quant matvec: quantise X →

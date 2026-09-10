@@ -891,7 +891,6 @@ pub struct GpuGemma4 {
     /// reused by every `prefill_forward` call. Recreating these per call
     /// (rocBLAS init + ~16 module loads, ~150 ms) dominated small-model
     /// prefill latency.
-    rocblas:       crate::hip::rocblas::Handle,
     prefill_gemm:  crate::runtime::prefill::PrefillGemm,
     m_rope_pf:     Module,
     m_attn_pf:     Module,
@@ -1020,8 +1019,6 @@ impl GpuGemma4 {
             pmax_in  = pmax_in.max(w.in_dim as usize);
             pmax_out = pmax_out.max(w.out_dim as usize);
         }
-        let rocblas = crate::hip::rocblas::Handle::new()?;
-        rocblas.set_stream(&stream)?;
         let prefill_gemm = crate::runtime::prefill::PrefillGemm::new(
             cache, pmax_w.max(1), max_seq * pmax_in.max(1), max_seq * pmax_out.max(1))?;
         let m_rope_pf    = ld("rope_prefill", ROPE_PREFILL_SRC)?;
@@ -1142,7 +1139,7 @@ impl GpuGemma4 {
             max_verify_k: MAX_VERIFY_K,
             stream,
             kernel_cache: cache.clone(),
-            rocblas, prefill_gemm,
+            prefill_gemm,
             m_rope_pf, m_attn_pf, m_kvq_pf, m_permute_pf,
             m_rope_b, m_attn_step_q8_b,
             hidden, vocab, n_heads,
@@ -2669,7 +2666,7 @@ impl GpuGemma4 {
         // out of the captured region.
         let gemm = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>| -> Result<PooledBuf<'_, f32>, String> {
             let out = self.pool_f32.take(p * w.out_dim as usize)?;
-            self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, &out,
+            self.prefill_gemm.matmul_into(&self.stream, &out,
                       &w.data, w.dtype, w.repacked,
                       w.in_dim as usize, w.out_dim as usize, xin, p)?;
             Ok(out)
@@ -2870,7 +2867,7 @@ impl GpuGemma4 {
                     // projection → [P, n_expert].
                     self.launch_rmsnorm_batched(x.raw_ptr(), mw.gate_inp_s.raw_ptr(),
                                                 normed.raw_ptr(), hu, p as u32)?;
-                    self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, &pf_logits,
+                    self.prefill_gemm.matmul_into(&self.stream, &pf_logits,
                         &mw.gate_inp.data, mw.gate_inp.dtype, mw.gate_inp.repacked,
                         mw.gate_inp.in_dim as usize, mw.gate_inp.out_dim as usize,
                         &normed, p)?;
@@ -3152,7 +3149,7 @@ impl GpuGemma4 {
         let gemm_into = |w: &GpuMatvecTensor, xin: &DeviceBuf<f32>, dst: &DeviceBuf<f32>|
             -> Result<(), String>
         {
-            self.prefill_gemm.matmul_into(&self.rocblas, &self.stream, dst,
+            self.prefill_gemm.matmul_into(&self.stream, dst,
                                           &w.data, w.dtype, w.repacked,
                                           w.in_dim as usize, w.out_dim as usize, xin, p)
         };

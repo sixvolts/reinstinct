@@ -9,6 +9,7 @@
 //! path lives in `runtime/qwen35.rs` (and needs bulk dequant kernels
 //! to materialise fp16 weights from the on-disk Q4_K bytes).
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
@@ -120,21 +121,63 @@ pub fn rocblas() -> Result<&'static Rocblas, &'static str> {
 
 /// RAII handle. Dropping it issues `rocblas_destroy_handle`. Bind a
 /// stream once via `set_stream` before issuing GEMMs.
-pub struct Handle { raw: RocblasHandle }
+///
+/// Creation is **deferred to the first actual GEMM**. `rocblas_create_handle`
+/// loads the Tensile kernel library for the running arch and calls
+/// `abort()` — not a returnable error — when that arch is missing from the
+/// installed rocBLAS. Distro rocBLAS builds from ROCm 7.x ship no gfx906
+/// kernels, so eager construction at model-load time killed the process on
+/// exactly the hardware this engine targets. All repacked K-quant GEMMs go
+/// through our own MMQ / batched-matvec kernels, so on a normal run rocBLAS
+/// is never touched and the missing library never matters.
+pub struct Handle {
+    /// `null_mut()` until the first GEMM forces construction.
+    raw:    Cell<RocblasHandle>,
+    /// Stream to bind at construction time, recorded by `set_stream`.
+    stream: Cell<HipStream>,
+}
 
 impl Handle {
+    /// Records intent to use rocBLAS. Does not call into rocBLAS at all —
+    /// see the type-level note on deferred construction.
     pub fn new() -> Result<Self, String> {
+        Ok(Handle { raw: Cell::new(null_mut()), stream: Cell::new(null_mut()) })
+    }
+
+    /// Remembers the stream to bind once the handle is actually built.
+    pub fn set_stream(&self, stream: &Stream) -> Result<(), String> {
+        self.stream.set(stream.raw());
+        if !self.raw.get().is_null() {
+            let api = rocblas().map_err(|s| s.to_string())?;
+            let s = unsafe { (api.set_stream)(self.raw.get(), stream.raw()) };
+            if !s.is_ok() { return Err(format!("rocblas_set_stream: status {}", s.0)); }
+        }
+        Ok(())
+    }
+
+    /// Builds the handle on first use and binds the recorded stream.
+    ///
+    /// If the installed rocBLAS has no kernels for this GPU, rocBLAS aborts
+    /// inside this call rather than returning — hence the warning first, so
+    /// the log says which GEMM path pulled rocBLAS in.
+    fn ensure(&self) -> Result<RocblasHandle, String> {
+        if !self.raw.get().is_null() { return Ok(self.raw.get()); }
         let api = rocblas().map_err(|s| s.to_string())?;
+        tracing::warn!(
+            "creating rocBLAS handle for a non-repacked GEMM; on a rocBLAS \
+             without kernels for this arch (gfx906 is absent from ROCm 7.x \
+             distro builds) this call aborts the process"
+        );
         let mut h: RocblasHandle = null_mut();
         let s = unsafe { (api.create_handle)(&mut h) };
         if !s.is_ok() { return Err(format!("rocblas_create_handle: status {}", s.0)); }
-        Ok(Handle { raw: h })
-    }
-
-    pub fn set_stream(&self, stream: &Stream) -> Result<(), String> {
-        let api = rocblas().map_err(|s| s.to_string())?;
-        let s = unsafe { (api.set_stream)(self.raw, stream.raw()) };
-        if !s.is_ok() { Err(format!("rocblas_set_stream: status {}", s.0)) } else { Ok(()) }
+        let st = self.stream.get();
+        if !st.is_null() {
+            let s = unsafe { (api.set_stream)(h, st) };
+            if !s.is_ok() { return Err(format!("rocblas_set_stream: status {}", s.0)); }
+        }
+        self.raw.set(h);
+        Ok(h)
     }
 
     /// `C ← α · op(A) · op(B) + β · C`, all matrices fp16 column-major.
@@ -158,13 +201,14 @@ impl Handle {
     ) -> Result<(), String>
     {
         let api = rocblas().map_err(|s| s.to_string())?;
+        let raw = self.ensure()?;
         // alpha/beta are passed by pointer — keep them on the stack for
         // the duration of the call.
         let alpha = alpha_bits;
         let beta  = beta_bits;
         let s = unsafe {
             (api.hgemm)(
-                self.raw, trans_a, trans_b, m, n, k,
+                raw, trans_a, trans_b, m, n, k,
                 &alpha,
                 a as *const u16, lda,
                 b as *const u16, ldb,
@@ -197,11 +241,12 @@ impl Handle {
     ) -> Result<(), String>
     {
         let api = rocblas().map_err(|s| s.to_string())?;
+        let raw = self.ensure()?;
         let alpha = alpha;  // fp32 scalars, passed by pointer
         let beta  = beta;
         let s = unsafe {
             (api.gemm_ex)(
-                self.raw, trans_a, trans_b, m, n, k,
+                raw, trans_a, trans_b, m, n, k,
                 &alpha as *const f32 as *const c_void,
                 a, RocblasDatatype::F16R, lda,
                 b, RocblasDatatype::F16R, ldb,
@@ -220,8 +265,9 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            if let Ok(api) = rocblas() { unsafe { let _ = (api.destroy_handle)(self.raw); } }
+        let raw = self.raw.get();
+        if !raw.is_null() {
+            if let Ok(api) = rocblas() { unsafe { let _ = (api.destroy_handle)(raw); } }
         }
     }
 }
@@ -233,8 +279,19 @@ mod tests {
     use crate::quant::half::{f32_to_f16, f16_to_f32};
 
     /// Tiny C = A · B HGEMM end-to-end on real hardware.
+    ///
+    /// Opt-in via `REINSTINCT_TEST_ROCBLAS=1`. Nothing in the engine calls
+    /// rocBLAS any more — GEMMs go through our own kernels — and creating a
+    /// handle `abort()`s the whole test binary when the installed rocBLAS
+    /// has no kernels for the running arch, which is the normal case for
+    /// gfx906 on ROCm 7.x. Failing closed would take every other test with
+    /// it, so this runs only when asked for.
     #[test]
     fn hgemm_matches_cpu_reference() {
+        if std::env::var("REINSTINCT_TEST_ROCBLAS").is_err() {
+            eprintln!("skip: set REINSTINCT_TEST_ROCBLAS=1 to exercise rocBLAS");
+            return;
+        }
         if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip"); return; }
         let _dev = hip::Device::set(0).unwrap();
         let stream = Stream::new().expect("stream");

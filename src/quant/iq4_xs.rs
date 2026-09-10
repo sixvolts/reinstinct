@@ -70,6 +70,71 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Transcode IQ4_XS bytes into the equivalent Q8_0 bytes.
+///
+/// This is a *layout* change, not a requantization. An IQ4_XS sub-block is
+/// 32 weights sharing one scale `dl`, each weight a codebook entry from
+/// [`KVALUES_IQ4NL`] — and a Q8_0 block is 32 weights sharing one fp16
+/// scale, each an int8. The codebook spans −127..113, which fits int8
+/// exactly, so `w = dl * kvalue` maps onto `w = d * q` with `q = kvalue`
+/// and `d = dl` term for term. The only value that moves is `dl` itself:
+/// it is computed in f32 as `d * (ls - 32)` and then rounded to fp16 here,
+/// costing ~2⁻¹¹ relative — orders of magnitude below the 4-bit
+/// quantization noise already in the weight.
+///
+/// The sign of `dl` is folded into the quants so `d` stays non-negative,
+/// matching how every other Q8_0 producer writes the format. Negating a
+/// codebook entry is safe: the minimum is −127, so it never overflows i8.
+///
+/// Why bother: IQ4_XS has no repacked matvec/MMQ kernel, so weights in that
+/// format fall through to the dequant→fp16→rocBLAS HGEMM path. Distro
+/// rocBLAS builds from ROCm 7.x ship no gfx906 kernels and `abort()` on
+/// handle creation, and Unsloth UD-XL files put a handful of tensors in
+/// IQ4_XS. Widening to Q8_0 at load time costs 4.25→8.5 bpw on those few
+/// tensors and puts them on the fast repacked int8 path instead.
+///
+/// `bytes` must hold at least `n_weights / 256` whole super-blocks.
+pub fn transcode_to_q8_0(bytes: &[u8], n_weights: usize) -> Vec<u8> {
+    use crate::quant::half::f32_to_f16;
+    use crate::quant::q8_0::{BlockQ8_0, BYTES_PER_BLOCK as Q8_BYTES};
+
+    assert_eq!(n_weights % BLOCK_SIZE, 0,
+               "IQ4_XS transcode: n_weights must be a multiple of {BLOCK_SIZE}");
+    let n_blocks = n_weights / BLOCK_SIZE;
+    assert!(bytes.len() >= n_blocks * BYTES_PER_BLOCK);
+
+    let blocks: &[BlockIQ4_XS] =
+        bytemuck::cast_slice(&bytes[..n_blocks * BYTES_PER_BLOCK]);
+
+    // 8 Q8_0 blocks (32 weights each) per IQ4_XS super-block (256).
+    let mut out = vec![0u8; n_weights / crate::quant::q8_0::BLOCK_SIZE * Q8_BYTES];
+    let dst: &mut [BlockQ8_0] = bytemuck::cast_slice_mut(&mut out);
+
+    for (bi, b) in blocks.iter().enumerate() {
+        let d = f16_to_f32(b.d);
+
+        for ib in 0..8usize {
+            let ls_lo = (b.scales_l[ib / 2] >> (4 * (ib & 1))) & 0x0F;
+            let ls_hi = ((b.scales_h >> (2 * ib)) & 0x3) as u8;
+            let ls = (ls_lo | (ls_hi << 4)) as i32; // 0..63
+            let dl = d * (ls - 32) as f32;
+            let neg = dl < 0.0;
+
+            let o = &mut dst[bi * 8 + ib];
+            o.d = f32_to_f16(if neg { -dl } else { dl });
+
+            let qs_off = ib * 16;
+            for l in 0..16 {
+                let lo = KVALUES_IQ4NL[(b.qs[qs_off + l] & 0x0F) as usize];
+                let hi = KVALUES_IQ4NL[(b.qs[qs_off + l] >> 4) as usize];
+                o.qs[l]      = if neg { -lo } else { lo };
+                o.qs[l + 16] = if neg { -hi } else { hi };
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +142,45 @@ mod tests {
 
     /// All sub-block scales = `ls_value` (must fit in 6 bits, 0..63).
     /// All nibbles = `nibble`.
+    /// `transcode_to_q8_0` must reproduce the IQ4_XS values themselves,
+    /// not merely approximate them: the codebook fits int8, so the only
+    /// thing that moves is the sub-block scale being rounded to fp16.
+    #[test]
+    fn transcode_to_q8_0_matches_direct_dequant() {
+        const N_BLOCKS: usize = 64;
+        let mut seed: u64 = 0x5EED_4A17;
+        let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           (seed >> 56) as u8 };
+
+        // Random scales and nibbles per block; d spans several magnitudes
+        // so the fp16 rounding of `d * (ls - 32)` is exercised across the
+        // exponent range rather than at one scale.
+        let mut bytes = vec![0u8; N_BLOCKS * BYTES_PER_BLOCK];
+        for b in 0..N_BLOCKS {
+            let off = b * BYTES_PER_BLOCK;
+            let d = 10f32.powi(b as i32 % 5 - 3) * (1.0 + b as f32 / 64.0);
+            bytes[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 2..BYTES_PER_BLOCK { bytes[off + i] = rng(); }
+        }
+
+        let n = N_BLOCKS * BLOCK_SIZE;
+        let mut direct = vec![0.0f32; n];
+        dequantize_to_f32(&bytes, &mut direct);
+
+        let q8 = transcode_to_q8_0(&bytes, n);
+        let mut via_q8 = vec![0.0f32; n];
+        crate::quant::q8_0::dequantize_to_f32(&q8, &mut via_q8);
+
+        let mut max_rel = 0.0f32;
+        for (a, b) in direct.iter().zip(via_q8.iter()) {
+            let denom = a.abs().max(1e-30);
+            max_rel = max_rel.max((a - b).abs() / denom);
+        }
+        // fp16 has an 11-bit significand, so rounding one scale costs at
+        // most 2⁻¹¹ ≈ 4.9e-4 relative.
+        assert!(max_rel < 5e-4, "transcode max_rel {max_rel:.3e} exceeds 5e-4");
+    }
+
     fn synth_block(d: f32, ls_value: u8, nibble: u8) -> Vec<u8> {
         assert!(ls_value < 64 && nibble < 16);
         let mut bytes = vec![0u8; BYTES_PER_BLOCK];

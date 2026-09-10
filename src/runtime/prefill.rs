@@ -14,10 +14,13 @@ use std::ffi::c_void;
 
 use crate::gguf::GgmlType;
 use crate::hip::{self, DeviceBuf, Module};
-use crate::hip::rocblas::{self, Handle, RocblasOp};
 use super::KernelCache;
 
 const CVT_SOURCE: &str = include_str!("../../kernels/cvt_f32_f16.cpp");
+const GEMM_F16_ROWS_SOURCE: &str = include_str!("../../kernels/gemm_f16_rows.cpp");
+/// Activation rows each `gemm_f16_rows_f32` block handles. Must match
+/// `NR_TILE` in `kernels/gemm_f16_rows.cpp`.
+const GEMM_F16_NR_TILE: usize = 8;
 const QUANTIZE_Q8_SOURCE: &str = include_str!("../../kernels/quantize_q8.cpp");
 const MMQ_GEMM_Q4K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
@@ -68,17 +71,45 @@ pub fn dequant_dev_to_f16(cache: &KernelCache, w_dev: &DeviceBuf<u8>,
     Ok(out)
 }
 
-/// `Y = X · Wᵀ` via rocBLAS HGEMM.
+/// Launch `gemm_f16_rows_f32`: `Y[n_rows, out_dim] = X[n_rows, in_dim] · Wᵀ`
+/// for an fp16 weight, fp32 activations and output. Blocks are
+/// (out_dim × ceil(n_rows/NR_TILE)); each reduces `in_dim` in LDS.
+fn launch_gemm_f16_rows(module: &Module, stream: Option<&hip::Stream>,
+                        w_f16: *mut c_void, x: *mut c_void, y: *mut c_void,
+                        in_dim: usize, out_dim: usize, n_rows: usize)
+    -> Result<(), String>
+{
+    let f = module.function("gemm_f16_rows_f32")?;
+    let block: u32 = 256;
+    let mut wp = w_f16;
+    let mut xp = x;
+    let mut yp = y;
+    let mut ia = in_dim as u32;
+    let mut oa = out_dim as u32;
+    let mut na = n_rows as u32;
+    let mut args: [*mut c_void; 6] = [
+        &mut wp as *mut _ as *mut c_void,
+        &mut xp as *mut _ as *mut c_void,
+        &mut yp as *mut _ as *mut c_void,
+        &mut ia as *mut _ as *mut c_void,
+        &mut oa as *mut _ as *mut c_void,
+        &mut na as *mut _ as *mut c_void,
+    ];
+    let grid_y = ((n_rows + GEMM_F16_NR_TILE - 1) / GEMM_F16_NR_TILE) as u32;
+    let smem   = (GEMM_F16_NR_TILE * block as usize * std::mem::size_of::<f32>()) as u32;
+    unsafe { f.launch((out_dim as u32, grid_y, 1), (block, 1, 1), smem, stream, &mut args) }
+}
+
+/// `Y = X · Wᵀ` via the fp16-weight GEMM kernel.
 ///
 /// - `w_bytes` / `dtype`: the on-disk quantized weight, logical shape
 ///   `[out_dim, in_dim]` row-major (one output row per `j`).
 /// - `x`: activations, `[n_rows, in_dim]` row-major, fp32.
 /// - returns `Y` `[n_rows, out_dim]` row-major, fp32.
 ///
-/// Internally: dequant W→fp16, X→fp16, HGEMM, Y→fp32. The HGEMM is set
-/// up so the column-major result lands directly in row-major `[n_rows,
-/// out_dim]` order (see the layout derivation in the body).
-pub fn batched_matmul(cache: &KernelCache, handle: &Handle,
+/// Internally: dequant W→fp16, then one fp32-accumulate GEMM that writes
+/// `Y` straight out in row-major `[n_rows, out_dim]` order.
+pub fn batched_matmul(cache: &KernelCache,
                       w_bytes: &[u8], dtype: GgmlType,
                       x: &[f32], n_rows: usize, in_dim: usize, out_dim: usize)
     -> Result<Vec<f32>, String>
@@ -86,7 +117,7 @@ pub fn batched_matmul(cache: &KernelCache, handle: &Handle,
     assert_eq!(x.len(), n_rows * in_dim, "x shape mismatch");
     let w_dev: DeviceBuf<u8> = DeviceBuf::from_slice(w_bytes)?;
     let x_dev: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
-    let y_dev = batched_matmul_resident(cache, handle, &w_dev, dtype,
+    let y_dev = batched_matmul_resident(cache, &w_dev, dtype,
                                         in_dim, out_dim, &x_dev, n_rows)?;
     let mut out = vec![0.0f32; n_rows * out_dim];
     y_dev.copy_to_host(&mut out)?;
@@ -94,9 +125,9 @@ pub fn batched_matmul(cache: &KernelCache, handle: &Handle,
 }
 
 /// Device-resident `Y = X · Wᵀ`: weights stay quantized on device, X/Y
-/// are device fp32. Internally dequant W→fp16, X→fp16, fp32-accumulate
-/// HGEMM, Y→fp32 — the building block of the batched prefill forward.
-pub fn batched_matmul_resident(cache: &KernelCache, handle: &Handle,
+/// are device fp32. Internally dequant W→fp16 then one fp32-accumulate
+/// GEMM — the building block of the batched prefill forward.
+pub fn batched_matmul_resident(cache: &KernelCache,
                                w_dev: &DeviceBuf<u8>, dtype: GgmlType,
                                in_dim: usize, out_dim: usize,
                                x: &DeviceBuf<f32>, n_rows: usize)
@@ -105,44 +136,13 @@ pub fn batched_matmul_resident(cache: &KernelCache, handle: &Handle,
     // 1. Dequant W → fp16 [out_dim, in_dim].
     let w_f16 = dequant_dev_to_f16(cache, w_dev, dtype, out_dim * in_dim)?;
 
-    // 2. X → fp16 [n_rows, in_dim].
-    let cvt_module = Module::load(&cache.compile("cvt_f32_f16", CVT_SOURCE)?)?;
-    let to_f16 = cvt_module.function("cvt_f32_to_f16")?;
-    let to_f32 = cvt_module.function("cvt_f16_to_f32")?;
-    let cvt = |f: &crate::hip::Function, src: *mut c_void, dst: *mut c_void, n: u32|
-        -> Result<(), String> {
-        let block: u32 = 256;
-        let mut i=src; let mut o=dst; let mut na=n;
-        let mut args: [*mut c_void; 3] = [
-            &mut i as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
-            &mut na as *mut _ as *mut c_void];
-        unsafe { f.launch(((n+block-1)/block,1,1),(block,1,1),0,None,&mut args) }
-    };
-    let dx_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * in_dim)?;
-    cvt(&to_f16, x.raw_ptr(), dx_f16.raw_ptr(), (n_rows * in_dim) as u32)?;
-
-    // 3. HGEMM. W row-major [out,in] == col-major [in,out]; X r-m [rows,in]
-    //    == c-m [in,rows]; col-major C = Wᵀ·X [out,rows] == Y r-m [rows,out].
-    //    transA=T, transB=N, m=out, n=rows, k=in, lda=ldb=in, ldc=out.
-    let dy_f16: DeviceBuf<u16> = DeviceBuf::new(n_rows * out_dim)?;
-    hip::Device(0).synchronize()?;
-    unsafe {
-        handle.gemm_f16_f32acc(
-            RocblasOp::Transpose, RocblasOp::None,
-            out_dim as i32, n_rows as i32, in_dim as i32,
-            1.0,
-            w_f16.as_ptr() as *const c_void, in_dim as i32,
-            dx_f16.as_ptr() as *const c_void, in_dim as i32,
-            0.0,
-            dy_f16.as_ptr() as *mut c_void, out_dim as i32,
-        )?;
-    }
-
-    // 4. Y fp16 → fp32.
+    // 2. Y = X · Wᵀ. X and Y stay fp32 — the kernel widens each weight
+    //    element in registers, so there is no activation round trip.
     let dy_f32: DeviceBuf<f32> = DeviceBuf::new(n_rows * out_dim)?;
-    cvt(&to_f32, dy_f16.raw_ptr(), dy_f32.raw_ptr(), (n_rows * out_dim) as u32)?;
+    let module = Module::load(&cache.compile("gemm_f16_rows", GEMM_F16_ROWS_SOURCE)?)?;
+    launch_gemm_f16_rows(&module, None, w_f16.raw_ptr(), x.raw_ptr(),
+                         dy_f32.raw_ptr(), in_dim, out_dim, n_rows)?;
     hip::Device(0).synchronize()?;
-    let _ = rocblas::rocblas;
     Ok(dy_f32)
 }
 
@@ -156,6 +156,9 @@ pub fn batched_matmul_resident(cache: &KernelCache, handle: &Handle,
 /// scratch out of the call so the cost is paid once.
 pub struct PrefillGemm {
     cvt:       Module,
+    /// Multi-row fp16-weight GEMM. The fallback for dtypes with no
+    /// repacked MMQ kernel, in place of what used to be a rocBLAS HGEMM.
+    gemm_f16_rows: Module,
     deq_q4k:   Module,
     deq_q5k:   Module,
     deq_q6k:   Module,
@@ -174,19 +177,19 @@ pub struct PrefillGemm {
     mv_q5k_batched: Module,
     mv_q6k_batched: Module,
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
-    dx_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 activations
-    dy_f16: std::cell::RefCell<DeviceBuf<u16>>,   // fp16 GEMM output
     xq8:    std::cell::RefCell<DeviceBuf<u8>>,    // int8 activations (MMQ path)
 }
 
 impl PrefillGemm {
-    /// Pre-size the scratch to the largest weight/activation/output the
-    /// caller will pass. Buffers still grow on demand as a safety net.
-    pub fn new(cache: &KernelCache, max_w: usize, max_x: usize, max_y: usize)
+    /// Pre-size the scratch to the largest weight/activation the caller
+    /// will pass. Buffers still grow on demand as a safety net.
+    pub fn new(cache: &KernelCache, max_w: usize, max_x: usize, _max_y: usize)
         -> Result<Self, String>
     {
         Ok(Self {
             cvt:       Module::load(&cache.compile("cvt_f32_f16", CVT_SOURCE)?)?,
+            gemm_f16_rows: Module::load(&cache.compile("gemm_f16_rows",
+                           GEMM_F16_ROWS_SOURCE)?)?,
             deq_q4k:   Module::load(&cache.compile("dequant_q4_k_f16",
                            include_str!("../../kernels/dequant_q4_k_f16.cpp"))?)?,
             deq_q5k:   Module::load(&cache.compile("dequant_q5_k_f16",
@@ -221,8 +224,6 @@ impl PrefillGemm {
             mv_q6k_batched: Module::load(&cache.compile("matvec_q6k_repacked_batched",
                                                      MV_Q6K_REPACKED_BATCHED_SOURCE)?)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
-            dx_f16: std::cell::RefCell::new(DeviceBuf::new(max_x.max(1))?),
-            dy_f16: std::cell::RefCell::new(DeviceBuf::new(max_y.max(1))?),
             // int8 activations: one BlockQ8 (40 B) per 32-element sub-block.
             xq8:    std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
         })
@@ -245,103 +246,18 @@ impl PrefillGemm {
     /// allocated; the fp16 scratch is pooled.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul(&self, handle: &Handle, stream: &hip::Stream,
+    /// Allocating form of [`matmul_into`]: sizes and returns the output
+    /// buffer instead of writing into a caller-owned one.
+    pub fn matmul(&self, stream: &hip::Stream,
                   w_dev: &DeviceBuf<u8>, dtype: GgmlType, repacked: bool,
                   in_dim: usize, out_dim: usize,
                   x: &DeviceBuf<f32>, n_rows: usize)
         -> Result<DeviceBuf<f32>, String>
     {
-        // Repacked K-quants and Q8_0: the 2D-tiled int8 MMQ GEMM
-        // consumes the quantised weight directly — no dequant to fp16,
-        // no HGEMM.
-        if repacked && matches!(dtype,
-            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0) {
-            return self.matmul_mmq(stream, w_dev, dtype, in_dim, out_dim, x, n_rows);
-        }
-
-        let n_w = out_dim * in_dim;
-        let n_x = n_rows * in_dim;
-        let n_y = n_rows * out_dim;
-        Self::grow(&self.w_f16,  n_w, stream)?;
-        Self::grow(&self.dx_f16, n_x, stream)?;
-        Self::grow(&self.dy_f16, n_y, stream)?;
-        let w_f16  = self.w_f16.borrow();
-        let dx_f16 = self.dx_f16.borrow();
-        let dy_f16 = self.dy_f16.borrow();
-
-        // 1. Dequant W → fp16 scratch (in place reuse).
-        let mut w_ptr = w_dev.raw_ptr();
-        let mut o_ptr = w_f16.raw_ptr();
-        if repacked {
-            // Repacked weight: one HIP block per 32-weight sub-block.
-            let (module, kname) = match dtype {
-                GgmlType::Q5_K => (&self.deq_q5k_repacked, "dequant_q5k_repacked_f16"),
-                GgmlType::Q6_K => (&self.deq_q6k_repacked, "dequant_q6k_repacked_f16"),
-                GgmlType::Q8_0 => (&self.deq_q8_0_repacked, "dequant_q8_0_repacked_f16"),
-                _              => (&self.deq_q4k_repacked, "dequant_q4k_repacked_f16"),
-            };
-            let f = module.function(kname)?;
-            let mut ia = in_dim as u32;
-            let mut oa = out_dim as u32;
-            let mut da: [*mut c_void; 4] = [
-                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
-                &mut ia    as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void];
-            unsafe { f.launch(((n_w / 32) as u32, 1, 1), (32, 1, 1),
-                              0, Some(stream), &mut da)?; }
-        } else if dtype == GgmlType::F32 {
-            // F32 weight (e.g. E4B's PLE projections) → convert straight
-            // to the fp16 GEMM scratch.
-            let f = self.cvt.function("cvt_f32_to_f16")?;
-            let block: u32 = 256;
-            let mut nb = n_w as u32;
-            let mut da: [*mut c_void; 3] = [
-                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
-                &mut nb    as *mut _ as *mut c_void];
-            unsafe { f.launch(((n_w as u32 + block - 1) / block, 1, 1), (block, 1, 1),
-                              0, Some(stream), &mut da)?; }
-        } else {
-            let (module, kname, wpb, bt) = self.deq(dtype)?;
-            assert_eq!(n_w % wpb, 0, "weight elems not a block multiple");
-            let n_blocks = (n_w / wpb) as u32;
-            let f = module.function(kname)?;
-            let mut nb = n_blocks;
-            let mut da: [*mut c_void; 3] = [
-                &mut w_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
-                &mut nb    as *mut _ as *mut c_void];
-            unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
-        }
-
-        // 2. X → fp16 scratch.
-        let to_f16 = self.cvt.function("cvt_f32_to_f16")?;
-        let to_f32 = self.cvt.function("cvt_f16_to_f32")?;
-        let cvt = |f: &crate::hip::Function, src: *mut c_void, dst: *mut c_void, n: u32|
-            -> Result<(), String> {
-            let block: u32 = 256;
-            let mut i=src; let mut o=dst; let mut na=n;
-            let mut args: [*mut c_void; 3] = [
-                &mut i as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
-                &mut na as *mut _ as *mut c_void];
-            unsafe { f.launch(((n+block-1)/block,1,1),(block,1,1),0,Some(stream),&mut args) }
-        };
-        cvt(&to_f16, x.raw_ptr(), dx_f16.raw_ptr(), n_x as u32)?;
-
-        // 3. HGEMM (see batched_matmul_resident for the layout derivation).
-        unsafe {
-            handle.gemm_f16_f32acc(
-                RocblasOp::Transpose, RocblasOp::None,
-                out_dim as i32, n_rows as i32, in_dim as i32,
-                1.0,
-                w_f16.as_ptr() as *const c_void,  in_dim as i32,
-                dx_f16.as_ptr() as *const c_void, in_dim as i32,
-                0.0,
-                dy_f16.as_ptr() as *mut c_void,   out_dim as i32,
-            )?;
-        }
-
-        // 4. Y fp16 → fresh fp32.
-        let dy_f32: DeviceBuf<f32> = DeviceBuf::new(n_y)?;
-        cvt(&to_f32, dy_f16.raw_ptr(), dy_f32.raw_ptr(), n_y as u32)?;
-        Ok(dy_f32)
+        let dst: DeviceBuf<f32> = DeviceBuf::new(n_rows * out_dim)?;
+        self.matmul_into(stream, &dst, w_dev, dtype, repacked,
+                         in_dim, out_dim, x, n_rows)?;
+        Ok(dst)
     }
 
     /// Like [`matmul`] but writes into a caller-owned `dst` buffer
@@ -350,7 +266,7 @@ impl PrefillGemm {
     /// spec-decode round and cannot afford ~600 hipMallocs each call.
     /// `dst` must be at least `n_rows * out_dim` long.
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_into(&self, handle: &Handle, stream: &hip::Stream,
+    pub fn matmul_into(&self, stream: &hip::Stream,
                        dst: &DeviceBuf<f32>,
                        w_dev: &DeviceBuf<u8>, dtype: GgmlType, repacked: bool,
                        in_dim: usize, out_dim: usize,
@@ -396,13 +312,8 @@ impl PrefillGemm {
         }
 
         let n_w = out_dim * in_dim;
-        let n_x = n_rows * in_dim;
         Self::grow(&self.w_f16,  n_w, stream)?;
-        Self::grow(&self.dx_f16, n_x, stream)?;
-        Self::grow(&self.dy_f16, n_y, stream)?;
         let w_f16  = self.w_f16.borrow();
-        let dx_f16 = self.dx_f16.borrow();
-        let dy_f16 = self.dy_f16.borrow();
 
         let mut w_ptr = w_dev.raw_ptr();
         let mut o_ptr = w_f16.raw_ptr();
@@ -442,32 +353,12 @@ impl PrefillGemm {
             unsafe { f.launch((n_blocks,1,1),(bt,1,1), 0, Some(stream), &mut da)?; }
         }
 
-        let to_f16 = self.cvt.function("cvt_f32_to_f16")?;
-        let to_f32 = self.cvt.function("cvt_f16_to_f32")?;
-        let cvt = |f: &crate::hip::Function, src: *mut c_void, ddst: *mut c_void, n: u32|
-            -> Result<(), String> {
-            let block: u32 = 256;
-            let mut i=src; let mut o=ddst; let mut na=n;
-            let mut args: [*mut c_void; 3] = [
-                &mut i as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
-                &mut na as *mut _ as *mut c_void];
-            unsafe { f.launch(((n+block-1)/block,1,1),(block,1,1),0,Some(stream),&mut args) }
-        };
-        cvt(&to_f16, x.raw_ptr(), dx_f16.raw_ptr(), n_x as u32)?;
-
-        unsafe {
-            handle.gemm_f16_f32acc(
-                RocblasOp::Transpose, RocblasOp::None,
-                out_dim as i32, n_rows as i32, in_dim as i32,
-                1.0,
-                w_f16.as_ptr() as *const c_void,  in_dim as i32,
-                dx_f16.as_ptr() as *const c_void, in_dim as i32,
-                0.0,
-                dy_f16.as_ptr() as *mut c_void,   out_dim as i32,
-            )?;
-        }
-        cvt(&to_f32, dy_f16.raw_ptr(), dst.raw_ptr(), n_y as u32)?;
-        Ok(())
+        // Our own fp16 GEMM rather than rocBLAS: x and dst stay fp32 on
+        // both sides (no narrow-in/widen-out round trip), and gfx906 keeps
+        // working on ROCm 7.x, whose rocBLAS ships no kernels for it and
+        // aborts the process the moment a handle is created.
+        launch_gemm_f16_rows(&self.gemm_f16_rows, Some(stream), w_f16.raw_ptr(),
+                             x.raw_ptr(), dst.raw_ptr(), in_dim, out_dim, n_rows)
     }
 
     fn grow(buf: &std::cell::RefCell<DeviceBuf<u16>>, n: usize, stream: &hip::Stream)
@@ -479,60 +370,6 @@ impl PrefillGemm {
         }
         Ok(())
     }
-
-    /// Device-resident `Y = X · Wᵀ` for a repacked K-quant weight via the
-    /// 2D-tiled int8 MMQ GEMM: quantise X → BlockQ8, then one dp4a GEMM
-    /// straight off the quantised weight. All kernels ordered on `stream`.
-    fn matmul_mmq(&self, stream: &hip::Stream, w_dev: &DeviceBuf<u8>, dtype: GgmlType,
-                  in_dim: usize, out_dim: usize,
-                  x: &DeviceBuf<f32>, n_rows: usize)
-        -> Result<DeviceBuf<f32>, String>
-    {
-        let (module, kname) = match dtype {
-            GgmlType::Q5_K => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_f32"),
-            GgmlType::Q6_K => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_f32"),
-            GgmlType::Q8_0 => (&self.mmq_q8_0, "mmq_gemm_q8_0_repacked_f32"),
-            _              => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_f32"),
-        };
-        let n_xq8 = (n_rows * in_dim / 32) * 40;          // BlockQ8 bytes
-        if self.xq8.borrow().len() < n_xq8 {
-            stream.synchronize()?;
-            *self.xq8.borrow_mut() = DeviceBuf::new(n_xq8)?;
-        }
-        let xq8 = self.xq8.borrow();
-
-        // 1. Quantise X → BlockQ8 [n_rows, in_dim/32] (grid.y = row).
-        let qf = self.quantize_q8.function("quantize_q8_f32")?;
-        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
-        let mut ind = in_dim as u32;
-        let mut qa: [*mut c_void; 3] = [
-            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
-            &mut ind as *mut _ as *mut c_void];
-        unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
-                           (256, 1, 1), 0, Some(stream), &mut qa)?; }
-
-        // 2. MMQ GEMM → fresh fp32 Y [n_rows, out_dim].
-        let dy: DeviceBuf<f32> = DeviceBuf::new(n_rows * out_dim)?;
-        let gf = module.function(kname)?;
-        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dy.raw_ptr();
-        let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = n_rows as u32;
-        let mut ga: [*mut c_void; 6] = [
-            &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
-            &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
-        // grid: BM=64 output rows × BN=64 tokens per workgroup.
-        unsafe { gf.launch(((out_dim as u32 + 63) / 64, (n_rows as u32 + 63) / 64, 1),
-                           (256, 1, 1), 0, Some(stream), &mut ga)?; }
-        Ok(dy)
-    }
-
-    /// K=2..8 batched K-quant matvec — the spec-decode-verify path.
-    /// Quantises X to BlockQ8 in shared scratch, then one kernel launch
-    /// reads each weight sub-block once and dots it against all
-    /// `n_rows` activation rows. Output Y is `[n_rows, out_dim]` fp32,
-    /// written to caller-owned `dst`. `n_rows` must be ≤ 8 (the
-    /// kernel's accumulator-array bound, N_ROWS_MAX).
-    #[allow(clippy::too_many_arguments)]
     fn matmul_kquant_batched_into(&self, stream: &hip::Stream, dst: &DeviceBuf<f32>,
                                   w_dev: &DeviceBuf<u8>, dtype: GgmlType,
                                   in_dim: usize, out_dim: usize,
@@ -627,7 +464,6 @@ impl PrefillGemm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hip::Stream;
 
     #[test]
     fn batched_matmul_matches_sequential_q4_k() {
@@ -636,12 +472,6 @@ mod tests {
         let cache = match KernelCache::new() {
             Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return; }
         };
-        let stream = Stream::new().expect("stream");
-        let handle = match Handle::new() {
-            Ok(h) => h, Err(e) => { eprintln!("skip: rocblas: {e}"); return; }
-        };
-        handle.set_stream(&stream).expect("set_stream");
-
         // Synthesise a Q4_K weight + a batch of activations.
         use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
         let in_dim = 2048usize;
@@ -664,8 +494,8 @@ mod tests {
                              ((xs >> 40) as u32 as f32 / (1u32<<24) as f32) - 0.5 };
         let x: Vec<f32> = (0..n_rows*in_dim).map(|_| x_rng()).collect();
 
-        // Batched HGEMM result.
-        let gpu = batched_matmul(&cache, &handle, &w, GgmlType::Q4_K,
+        // Batched GEMM result.
+        let gpu = batched_matmul(&cache, &w, GgmlType::Q4_K,
                                  &x, n_rows, in_dim, out_dim).expect("batched_matmul");
 
         // Reference: per-row fused-dequant matvec (the fp32 decode path).
