@@ -33,6 +33,12 @@ const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp
 const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 
 const QUANTIZE_Q8_SOURCE:   &str = include_str!("../../kernels/quantize_q8.cpp");
+const MATVEC_Q4_0_REPACKED_SRC: &str =
+    include_str!("../../kernels/matvec_q4_0_repacked.cpp");
+const MATVEC_Q4_0_DP4A_SRC: &str =
+    include_str!("../../kernels/matvec_q4_0_dp4a.cpp");
+const MMQ_GEMM_Q4_0_REPACKED_SRC: &str =
+    include_str!("../../kernels/mmq_gemm_q4_0_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 
 // Test-only kernel sources for the consistency suites at the bottom of
@@ -1717,6 +1723,156 @@ mod tests {
         let e = rel_l2(&gpu, &cpu);
         eprintln!("matvec_q4_k_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
         assert!(e < DP4A_REL_L2_MAX, "q4_k dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
+    /// The Q4_0 embedding lookup — both the single-token and the batched
+    /// entry point — against the CPU dequant of the same rows. Not
+    /// covered by the matvec tests: a Q4_0 token_embd is read by these
+    /// kernels in its on-disk form, so a nibble-order or stride mistake
+    /// here corrupts every embedding without touching any matvec.
+    #[test]
+    fn embed_lookup_q4_0_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q4_0::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let hidden = 1024usize;
+        let vocab  = 12usize;
+        let blocks_per_row = hidden / BLOCK_SIZE;
+        let mut table = vec![0u8; vocab * blocks_per_row * BYTES_PER_BLOCK];
+        let mut s: u64 = 0xE9BE_D000;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..vocab * blocks_per_row {
+            let off = blk * BYTES_PER_BLOCK;
+            let d = ((blk % 19) as f32 - 9.0) * 0.004;
+            table[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 0..16 { table[off + 2 + i] = rng_u8(); }
+        }
+
+        let mut all = vec![0.0f32; vocab * hidden];
+        crate::quant::q4_0::dequantize_to_f32(&table, &mut all);
+
+        let module = Module::load(
+            &cache.compile("embed_lookup_q4_0",
+                           include_str!("../../kernels/embed_lookup_q4_0.cpp")).unwrap()).unwrap();
+        let dtab: DeviceBuf<u8> = DeviceBuf::from_slice(&table).unwrap();
+        let grid = ((hidden as u32) + 255) / 256;
+
+        // --- single-token entry point ---
+        let f = module.function("embed_lookup_q4_0_f32").unwrap();
+        for tok in [0u32, 5, 11] {
+            let didx: DeviceBuf<u32> = DeviceBuf::from_slice(&[tok]).unwrap();
+            let dout: DeviceBuf<f32> = DeviceBuf::new(hidden).unwrap();
+            let mut tp = dtab.raw_ptr(); let mut op = dout.raw_ptr();
+            let mut ip = didx.raw_ptr(); let mut h = hidden as u32;
+            let mut args: [*mut c_void; 4] = [
+                &mut tp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                &mut ip as *mut _ as *mut c_void, &mut h  as *mut _ as *mut c_void];
+            unsafe { f.launch((grid, 1, 1), (256, 1, 1), 0, None, &mut args).unwrap(); }
+            hip::Device(0).synchronize().unwrap();
+            let mut got = vec![0.0f32; hidden];
+            dout.copy_to_host(&mut got).unwrap();
+            let want = &all[tok as usize * hidden..(tok as usize + 1) * hidden];
+            // Exact: both sides do the same fp16→f32 widen and integer math.
+            assert_eq!(&got[..], want, "embed_lookup_q4_0 token {tok}");
+        }
+
+        // --- batched entry point ---
+        let fb = module.function("embed_lookup_q4_0_batched_f32").unwrap();
+        let toks: Vec<u32> = vec![3, 0, 11, 7];
+        let didx: DeviceBuf<u32> = DeviceBuf::from_slice(&toks).unwrap();
+        let dout: DeviceBuf<f32> = DeviceBuf::new(toks.len() * hidden).unwrap();
+        let mut tp = dtab.raw_ptr(); let mut op = dout.raw_ptr();
+        let mut ip = didx.raw_ptr(); let mut h = hidden as u32;
+        let mut args: [*mut c_void; 4] = [
+            &mut tp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void, &mut h  as *mut _ as *mut c_void];
+        unsafe { fb.launch((grid, toks.len() as u32, 1), (256, 1, 1), 0, None, &mut args).unwrap(); }
+        hip::Device(0).synchronize().unwrap();
+        let mut got = vec![0.0f32; toks.len() * hidden];
+        dout.copy_to_host(&mut got).unwrap();
+        for (r, &tok) in toks.iter().enumerate() {
+            let want = &all[tok as usize * hidden..(tok as usize + 1) * hidden];
+            assert_eq!(&got[r * hidden..(r + 1) * hidden], want,
+                       "embed_lookup_q4_0_batched row {r} (token {tok})");
+        }
+    }
+
+    /// Q4_0 across all three paths it can take — repacked matvec
+    /// (decode), on-disk dp4a matvec (a Q4_0 token_embd doubling as the
+    /// tied LM head, which cannot be repacked), and the MMQ GEMM
+    /// (prefill) — each against the CPU dequant oracle.
+    #[test]
+    fn q4_0_kernels_match_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q4_0::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0x4004_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            // Signed scales: Q4_0's d is free to be negative, and the
+            // −8 offset term must follow the sign with it.
+            let d = ((blk % 29) as f32 - 14.0) * 0.003;
+            w_bytes[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 0..16 { w_bytes[off + 2 + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x0FED_CBA9;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::q4_0::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        // --- repacked matvec (decode) ---
+        let packed = crate::quant::q4_0::repack_for_matvec(&w_bytes, in_dim, out_dim);
+        let gpu = run_repacked_matvec(&cache, "matvec_q4_0_repacked", MATVEC_Q4_0_REPACKED_SRC,
+            "matvec_q4_0_repacked_f32", &packed, &x, in_dim, out_dim).expect("q4_0 repacked");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_q4_0_repacked {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "q4_0 repacked rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+
+        // --- on-disk dp4a matvec (tied LM head) ---
+        let gpu = matvec_kquant_dp4a(&cache, "matvec_q4_0_dp4a", MATVEC_Q4_0_DP4A_SRC,
+            "matvec_q4_0_dp4a_f32", &w_bytes, &x, in_dim, out_dim).expect("q4_0 dp4a");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_q4_0_dp4a {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "q4_0 dp4a rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+
+        // --- MMQ GEMM (prefill) ---
+        let p_rows = 24usize;
+        let xm = mmq_test_x(p_rows, in_dim);
+        let mut cpu_m = vec![0.0f32; p_rows * out_dim];
+        for pr in 0..p_rows {
+            let mut row = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&xm[pr * in_dim..(pr + 1) * in_dim], &w_fp32,
+                                    in_dim, out_dim, &mut row);
+            cpu_m[pr * out_dim..(pr + 1) * out_dim].copy_from_slice(&row);
+        }
+        let gpu = run_mmq_gemm(&cache, "mmq_gemm_q4_0_repacked", MMQ_GEMM_Q4_0_REPACKED_SRC,
+            "mmq_gemm_q4_0_repacked_f32", &packed, &xm, p_rows, in_dim, out_dim)
+            .expect("mmq gemm q4_0");
+        let e = rel_l2(&gpu, &cpu_m);
+        eprintln!("mmq_gemm_q4_0_repacked {p_rows}x{out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "mmq gemm q4_0 rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
     #[test]

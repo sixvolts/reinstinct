@@ -223,6 +223,8 @@ impl GpuMatvecTensor {
         // `(bytes, dtype)` — dtype can differ from the on-disk type when a
         // format without a repacked kernel is widened on the way in.
         let packed = match info.ggml_type {
+            GgmlType::Q4_0 => Some((crate::quant::q4_0::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::Q4_0)),
             GgmlType::Q4_K => Some((crate::quant::q4_k::repack_for_matvec(
                 bytes, in_dim as usize, out_dim as usize), GgmlType::Q4_K)),
             GgmlType::Q5_K => Some((crate::quant::q5_k::repack_for_matvec(

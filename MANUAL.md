@@ -858,6 +858,7 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 |-----------------------------------------------|-------------|---------------------------------------------------------------|
 | `gemma-4-E4B-it-UD-Q4_K_XL.gguf`              | gemma4      | Dense + Per-Layer-Embeddings, 35 layers.                      |
 | `gemma-4-31B-it-UD-Q4_K_XL.gguf`              | gemma4      | Dense, 60 layers, head_dim 512 (full) / 256 (sliding).        |
+| `gemma-4-31B-it-qat-UD-Q4_K_XL.gguf`          | gemma4      | Same shape, QAT weights. Despite the name, **every** tensor is `Q4_0` — no K-quants at all. 16.1 GB vs 18 GB, and ~19% faster to decode (31.3 vs 26.2 tok/s at stock clocks) because Q4_0 has no 6-bit scale plane to unpack. |
 | `gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf`          | gemma4      | MoE, 128 experts top-8, dual FFN (shared MLP + routed).       |
 | `Qwen3.5-4B-UD-Q4_K_XL.gguf`                  | qwen35      | Hybrid Gated-DeltaNet + GQA, all dense layers.                |
 | `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
@@ -877,6 +878,17 @@ Unsloth "UD" Dynamic-quant files mix quant types **per tensor** — e.g. a
 nominally Q6_K MoE layer can carry a Q8_0 expert slab, and `UD-Q4_K_XL`
 contains `IQ4_XS` tensors. The loader dispatches kernels per tensor on
 the actual `ggml_type`.
+
+Do not read the quant from the filename. Google's QAT GGUFs keep the
+`UD-Q4_K_XL` suffix but are pure `Q4_0` throughout; `inspect` prints the
+real histogram.
+
+Weight dtypes with a full kernel set (repacked matvec, batched matvec,
+MMQ GEMM, embed lookup): `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`.
+`IQ4_XS` has no kernels of its own — it is transcoded to `Q8_0` at load
+(near-exact; the codebook fits int8), costing 4.25→8.5 bpw on the few
+tensors that use it. `F16`/`F32` matmul tensors go through the
+`gemm_f16_rows` fallback.
 
 ---
 
@@ -1078,7 +1090,7 @@ straight-line implementation:
 Prefill is mostly HBM-bound on the MoE grouped GEMM (47% of GPU time
 on qwen 35B-MoE). Key changes:
 
-- 2D-tiled int8 MMQ GEMM (Q4_K, Q5_K, Q6_K, Q8_0). No dequant-to-fp16
+- 2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0). No dequant-to-fp16
   scratch. BM = 64, BK = 4, occupancy 2. sX tile padded `[BN][BK+1]`
   to break a 4-way LDS bank conflict on `xq32` reads (-3% to -10%
   across MoE variants).

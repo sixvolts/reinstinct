@@ -33,6 +33,8 @@ const MATVEC_Q5K_DP4A_BATCHED_SRC: &str =
     include_str!("../../kernels/matvec_q5_k_dp4a_batched.cpp");
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MATVEC_Q4_0_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4_0_repacked.cpp");
+const MATVEC_Q4_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_0_dp4a.cpp");
 const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 /// Output rows per wavefront in the row-blocked K-quant matvecs — must
@@ -65,6 +67,7 @@ const MAX_VERIFY_K: usize = 8;
 /// are sized for one chunk so the batched topk + matvecs reuse them.
 const MOE_PREFILL_CHUNK: usize = 256;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
+const EMBED_Q4_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q4_0.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
 // MoE kernel sources.
@@ -811,6 +814,7 @@ pub struct GpuGemma4 {
     moe_prof_on:    bool,
     prof_mark:      std::cell::Cell<std::time::Instant>,
     prof_buckets:   std::cell::RefCell<Vec<(&'static str, f64)>>,
+    m_embed_q4_0: Module,
     m_embed_q5k: Module,
     m_embed_q8_0: Module,
     m_mv_f32:    Module,
@@ -830,6 +834,8 @@ pub struct GpuGemma4 {
     m_mv_q8_0_dp4a: Module,
     m_mv_q8_0_repacked: Module,
     m_mv_q4k_repacked: Module,
+    m_mv_q4_0_repacked: Module,
+    m_mv_q4_0_dp4a: Module,
     m_mv_q5k_repacked: Module,
     m_mv_q6k_repacked: Module,
     m_moe_topk:  Module,
@@ -1074,6 +1080,7 @@ impl GpuGemma4 {
             moe_prof_on:    std::env::var_os("REINSTINCT_MOE_PROFILE").is_some(),
             prof_mark:      std::cell::Cell::new(std::time::Instant::now()),
             prof_buckets:   std::cell::RefCell::new(Vec::new()),
+            m_embed_q4_0: ld("embed_lookup_q4_0", EMBED_Q4_0_SRC)?,
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
             m_mv_f32:     ld("matvec_f32_b256", MATVEC_F32_B256_SRC)?,
@@ -1091,6 +1098,8 @@ impl GpuGemma4 {
             m_mv_q8_0_dp4a: ld("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SRC)?,
             m_mv_q8_0_repacked: ld("matvec_q8_0_repacked", MATVEC_Q8_0_REPACKED_SRC)?,
             m_mv_q4k_repacked: ld("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?,
+            m_mv_q4_0_repacked: ld("matvec_q4_0_repacked", MATVEC_Q4_0_REPACKED_SRC)?,
+            m_mv_q4_0_dp4a: ld("matvec_q4_0_dp4a", MATVEC_Q4_0_DP4A_SRC)?,
             m_mv_q5k_repacked: ld("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC)?,
             m_mv_q6k_repacked: ld("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC)?,
             m_moe_topk:     ld("moe_topk", MOE_TOPK_SRC)?,
@@ -1456,6 +1465,8 @@ impl GpuGemma4 {
     {
         assert!(w.repacked, "launch_matvec_xq8 requires a repacked weight");
         let (module, kname, grid, kblock): (&Module, &str, u32, u32) = match w.dtype {
+            GgmlType::Q4_0 => (&self.m_mv_q4_0_repacked, "matvec_q4_0_repacked_f32",
+                               (w.out_dim + 7) / 8, 256),
             GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32",
                                (w.out_dim + 7) / 8, 256),
             GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32",
@@ -1498,6 +1509,7 @@ impl GpuGemma4 {
         // REINSTINCT_GEMMA_NO_DP4A forces the f32/wave64 path (A/B check).
         let dp4a = std::env::var_os("REINSTINCT_GEMMA_NO_DP4A").is_none()
             && match dtype {
+                GgmlType::Q4_0 => std::env::var_os("REINSTINCT_NO_DP4A_Q4_0").is_none(),
                 GgmlType::Q4_K => std::env::var_os("REINSTINCT_NO_DP4A_Q4").is_none(),
                 GgmlType::Q5_K => std::env::var_os("REINSTINCT_NO_DP4A_Q5").is_none(),
                 GgmlType::Q6_K => std::env::var_os("REINSTINCT_NO_DP4A_Q6").is_none(),
@@ -1509,6 +1521,7 @@ impl GpuGemma4 {
             // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
             // others: 64-thread, 2 rows per wavefront.
             let (module, kname, rows, kblock) = match dtype {
+                GgmlType::Q4_0 => (&self.m_mv_q4_0_dp4a, "matvec_q4_0_dp4a_f32", Q4K_ROWBLOCK, block),
                 GgmlType::Q4_K => (&self.m_mv_q4k_dp4a,  "matvec_q4_k_dp4a_f32", 8u32, 256u32),
                 GgmlType::Q5_K => (&self.m_mv_q5k_dp4a,  "matvec_q5_k_dp4a_f32", Q4K_ROWBLOCK, block),
                 GgmlType::Q6_K => (&self.m_mv_q6k_dp4a,  "matvec_q6_k_dp4a_f32", Q4K_ROWBLOCK, block),
@@ -1538,6 +1551,7 @@ impl GpuGemma4 {
                                  (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
             GgmlType::Q6_K   => (&self.m_mv_q6k,  "matvec_q6_k_rowblock_f32",
                                  (out_dim + Q4K_ROWBLOCK - 1) / Q4K_ROWBLOCK),
+            GgmlType::Q4_0   => (&self.m_mv_q4_0_dp4a, "matvec_q4_0_wave64_f32", out_dim),
             GgmlType::Q8_0   => (&self.m_mv_q8_0, "matvec_q8_0_wave64_f32", out_dim),
             GgmlType::F16    => (&self.m_mv_f16,  "matvec_f16_wave64_f32",  out_dim),
             other => return Err(format!(
@@ -1844,6 +1858,8 @@ impl GpuGemma4 {
     fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void) -> Result<(), String> {
         let hidden = table.in_dim;   // [hidden, vocab]
         let (module, kname, threads, grid): (&Module, &str, u32, u32) = match table.dtype {
+            GgmlType::Q4_0 => (&self.m_embed_q4_0, "embed_lookup_q4_0_f32", 256,
+                               (hidden + 255)/256),
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_f32", 256, hidden/256),
             GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_f32", 256, (hidden + 255)/256),
             other => return Err(format!("gemma4 embed: no kernel for {other:?} \
@@ -1866,6 +1882,8 @@ impl GpuGemma4 {
     {
         let hidden = table.in_dim;
         let (module, kname, grid_x): (&Module, &str, u32) = match table.dtype {
+            GgmlType::Q4_0 => (&self.m_embed_q4_0, "embed_lookup_q4_0_batched_f32",
+                               (hidden + 255)/256),
             GgmlType::Q5_K => (&self.m_embed_q5k, "embed_lookup_q5_k_batched_f32", hidden/256),
             GgmlType::Q8_0 => (&self.m_embed_q8_0, "embed_lookup_q8_0_batched_f32",
                                (hidden + 255)/256),

@@ -5,6 +5,7 @@
 
 pub mod half;
 pub mod iq4_xs;
+pub mod q4_0;
 pub mod q4_k;
 pub mod q5_k;
 pub mod q6_k;
@@ -70,6 +71,7 @@ pub fn dequantize_to_f32(
                 out[i] = half::bf16_to_f32(bits);
             }
         }
+        GgmlType::Q4_0   => q4_0::dequantize_to_f32(bytes, out),
         GgmlType::Q4_K   => q4_k::dequantize_to_f32(bytes, out),
         GgmlType::Q5_K   => q5_k::dequantize_to_f32(bytes, out),
         GgmlType::Q6_K   => q6_k::dequantize_to_f32(bytes, out),
