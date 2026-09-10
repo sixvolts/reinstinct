@@ -33,10 +33,16 @@ const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp
 const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 
 const QUANTIZE_Q8_SOURCE:   &str = include_str!("../../kernels/quantize_q8.cpp");
+// Q4_0 kernel sources. The runtime compiles these from gemma4.rs /
+// prefill.rs, which carry their own `include_str!`; these copies exist
+// only so the oracle tests below can drive each kernel standalone.
+#[cfg(test)]
 const MATVEC_Q4_0_REPACKED_SRC: &str =
     include_str!("../../kernels/matvec_q4_0_repacked.cpp");
+#[cfg(test)]
 const MATVEC_Q4_0_DP4A_SRC: &str =
     include_str!("../../kernels/matvec_q4_0_dp4a.cpp");
+#[cfg(test)]
 const MMQ_GEMM_Q4_0_REPACKED_SRC: &str =
     include_str!("../../kernels/mmq_gemm_q4_0_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");

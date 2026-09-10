@@ -866,11 +866,18 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 | `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | MoE, 256 experts top-8, hybrid GDN.                           |
 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | Same arch as 3.5-35B-MoE.                                     |
 
-MTP drafters (under `~/models/gemma4-mtp/`):
+MTP drafters (under `~/models/gemma4-mtp/`). Two naming generations are
+accepted: `general.architecture` may be `gemma4_assistant` or
+`gemma4-assistant` (the spelling also prefixes the metadata keys), the
+backbone width may be `n_embd_backbone` or `embedding_length_out`, and
+the projections may be `mtp.*` or `nextn.*`. `requires_target_arch` is
+optional — when absent the projection shapes are still cross-checked
+against the target, which is the constraint that matters.
 
 | File                                                | Target           |
 |-----------------------------------------------------|------------------|
 | `gemma-4-31B-it-assistant.Q8_0.gguf`                | Gemma 4 31B      |
+| `mtp-gemma-4-31B-it-Q8_0.gguf`                      | Gemma 4 31B (newer naming: `gemma4-assistant` arch, `nextn.*` projections, `embedding_length_out`) |
 | `gemma-4-31B-it-assistant.Q4_K_M.gguf`              | Gemma 4 31B (~5pp lower accept than Q8) |
 | `gemma-4-26B-A4B-it-assistant.Q8_0.gguf`            | Gemma 4 26B-A4B  |
 

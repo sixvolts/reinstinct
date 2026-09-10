@@ -7,9 +7,9 @@
 //!   plus `attention.k_eq_v = true` means every drafter layer reads
 //!   K (= V) directly from the target's KV cache.
 //! - Two top-level MTP tensors:
-//!     `mtp.pre_projection`   `[n_embd_backbone*2, hidden]`  — combines
+//!     `{mtp,nextn}.pre_projection`  `[n_embd_backbone*2, hidden]` — combines
 //!         target-side signals (10752 → 1024 on the 31B drafter).
-//!     `mtp.post_projection`  `[hidden, n_embd_backbone]`    — projects
+//!     `{mtp,nextn}.post_projection` `[hidden, n_embd_backbone]`   — projects
 //!         the drafter's hidden back to backbone dim for the next step.
 //! - `requires_target_arch` names the matching target architecture.
 //!
@@ -21,12 +21,16 @@ use thiserror::Error;
 use crate::gguf::{GgufFile, MetaValue};
 use crate::model::gemma4::AttnKind;
 
-const ARCH: &str = "gemma4_assistant";
+/// Accepted spellings of `general.architecture`. Older assistant GGUFs
+/// use the underscore; the ones Google ships now use a hyphen. The
+/// spelling also prefixes every metadata key in the file, so whichever
+/// one matched is reused when reading them.
+const ARCH: [&str; 2] = ["gemma4_assistant", "gemma4-assistant"];
 
 #[derive(Debug, Error)]
 pub enum Gemma4AssistantError {
-    #[error("not a Gemma 4 assistant file: general.architecture = {got:?}, expected {expected:?}")]
-    WrongArchitecture { got: String, expected: &'static str },
+    #[error("not a Gemma 4 assistant file: general.architecture = {got:?}, expected one of {expected:?}")]
+    WrongArchitecture { got: String, expected: &'static [&'static str] },
 
     #[error("missing required GGUF metadata key: {0}")]
     MissingMetadata(&'static str),
@@ -91,12 +95,13 @@ pub struct Gemma4AssistantConfig {
 impl Gemma4AssistantConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch = require_str(gguf, "general.architecture")?;
-        if arch != ARCH {
+        if !ARCH.contains(&arch) {
             return Err(Gemma4AssistantError::WrongArchitecture {
-                got: arch.to_owned(), expected: ARCH });
+                got: arch.to_owned(), expected: &ARCH });
         }
 
-        let p = "gemma4_assistant";
+        // Metadata keys carry the same spelling as general.architecture.
+        let p = arch;
         let block_count    = require_u32(gguf, &format!("{p}.block_count"))?;
         let hidden_size    = require_u32(gguf, &format!("{p}.embedding_length"))?;
         let ffn_size       = require_u32(gguf, &format!("{p}.feed_forward_length"))?;
@@ -134,7 +139,14 @@ impl Gemma4AssistantConfig {
         let vocab_size = *token_embd.shape().get(1).ok_or_else(||
             Gemma4AssistantError::MissingTensor("token_embd.weight (2D)".into()))? as u32;
 
-        let n_embd_backbone = require_u32(gguf, &format!("{p}.n_embd_backbone"))?;
+        // Newer assistant GGUFs name the backbone width
+        // `embedding_length_out`; older ones `n_embd_backbone`. Same
+        // quantity either way — the target's hidden size, which
+        // GpuGemma4Assistant cross-checks against the loaded target.
+        let n_embd_backbone = match optional_u32(gguf, &format!("{p}.n_embd_backbone")) {
+            Some(v) => v,
+            None => require_u32(gguf, &format!("{p}.embedding_length_out"))?,
+        };
         let n_centroids    = optional_u32(gguf, &format!("{p}.n_centroids")).unwrap_or(0);
         let centroid_top_k = optional_u32(gguf, &format!("{p}.centroid_top_k")).unwrap_or(0);
         let k_eq_v = match gguf.metadata_get(&format!("{p}.attention.k_eq_v")) {
@@ -146,6 +158,10 @@ impl Gemma4AssistantConfig {
         let shared_kv_layers = optional_u32(
             gguf, &format!("{p}.attention.shared_kv_layers")).unwrap_or(0);
 
+        // Optional: newer files omit it. Empty means "unspecified", and
+        // the runtime skips the target-arch check rather than failing —
+        // the pre/post-projection shapes are checked against the target
+        // regardless, which is the constraint that actually matters.
         let requires_target_arch = match gguf.metadata_get(
             &format!("{p}.requires_target_arch"))
         {
@@ -197,8 +213,8 @@ impl Gemma4AssistantModel {
         // Top-level
         require_tensor(gguf, "token_embd.weight")?;
         require_tensor(gguf, "output_norm.weight")?;
-        require_tensor(gguf, "mtp.pre_projection.weight")?;
-        require_tensor(gguf, "mtp.post_projection.weight")?;
+        let pre_name  = projection_name(gguf, "pre_projection")?;
+        let post_name = projection_name(gguf, "post_projection")?;
 
         // Per-block: Q-only attention (no K/V projections) + sandwich
         // norms + FFN + layer scale.
@@ -230,22 +246,22 @@ impl Gemma4AssistantModel {
 
         // Cross-check shape: pre_projection is [n_embd_backbone*2, hidden],
         // post_projection is [hidden, n_embd_backbone].
-        let pre = gguf.tensor("mtp.pre_projection.weight").ok_or_else(||
-            Gemma4AssistantError::MissingTensor("mtp.pre_projection.weight".into()))?;
+        let pre = gguf.tensor(&pre_name).ok_or_else(||
+            Gemma4AssistantError::MissingTensor(pre_name.clone()))?;
         let expect_pre_in = (self.config.n_embd_backbone * 2) as u64;
         if pre.shape() != [expect_pre_in, self.config.hidden_size as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "mtp.pre_projection.weight.shape",
+                key: "pre_projection.weight.shape",
                 got: pre.shape().len(),
                 expected: 2,
             });
         }
-        let post = gguf.tensor("mtp.post_projection.weight").ok_or_else(||
-            Gemma4AssistantError::MissingTensor("mtp.post_projection.weight".into()))?;
+        let post = gguf.tensor(&post_name).ok_or_else(||
+            Gemma4AssistantError::MissingTensor(post_name.clone()))?;
         if post.shape() != [self.config.hidden_size as u64,
                             self.config.n_embd_backbone as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "mtp.post_projection.weight.shape",
+                key: "post_projection.weight.shape",
                 got: post.shape().len(),
                 expected: 2,
             });
@@ -326,6 +342,18 @@ fn read_bool_vec(gguf: &GgufFile, key: &str) -> Result<Vec<bool>> {
             key: static_key, expected: "bool array" }),
         None => Err(Gemma4AssistantError::MissingMetadata(static_key)),
     }
+}
+
+/// Resolve a backbone projection's tensor name. Older assistant GGUFs
+/// prefix the pair `mtp.`, newer ones `nextn.`; the tensors and their
+/// shapes are identical, only the prefix moved.
+fn projection_name(gguf: &GgufFile, which: &str) -> Result<String> {
+    for prefix in ["mtp", "nextn"] {
+        let name = format!("{prefix}.{which}.weight");
+        if gguf.tensor(&name).is_some() { return Ok(name); }
+    }
+    Err(Gemma4AssistantError::MissingTensor(
+        format!("mtp.{which}.weight or nextn.{which}.weight")))
 }
 
 fn require_tensor(gguf: &GgufFile, name: &str) -> Result<()> {

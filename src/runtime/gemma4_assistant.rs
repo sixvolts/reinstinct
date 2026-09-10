@@ -135,7 +135,7 @@ impl GpuGemma4Assistant {
                  wrong drafter for this target",
                 cfg.n_embd_backbone, target.hidden_size()));
         }
-        if cfg.requires_target_arch != "gemma4" {
+        if !cfg.requires_target_arch.is_empty() && cfg.requires_target_arch != "gemma4" {
             return Err(format!("drafter requires_target_arch = {:?}, expected \"gemma4\"",
                                cfg.requires_target_arch));
         }
@@ -164,8 +164,8 @@ impl GpuGemma4Assistant {
         Ok(Self {
             token_embd:      GpuMatvecTensor::from_gguf_matvec(gguf, "token_embd.weight")?,
             output_norm:     load_fp32(gguf, "output_norm.weight")?,
-            pre_projection:  GpuMatvecTensor::from_gguf_matvec(gguf, "mtp.pre_projection.weight")?,
-            post_projection: GpuMatvecTensor::from_gguf_matvec(gguf, "mtp.post_projection.weight")?,
+            pre_projection:  load_projection(gguf, "pre_projection")?,
+            post_projection: load_projection(gguf, "post_projection")?,
 
             blocks,
 
@@ -334,6 +334,19 @@ impl GpuGemma4Assistant {
 }
 
 // ---- helpers ----
+
+/// Load one of the two backbone projections. Older assistant GGUFs
+/// prefix them `mtp.`, newer ones `nextn.` — same tensors, same shapes.
+fn load_projection(gguf: &GgufFile, which: &str) -> Result<GpuMatvecTensor, String> {
+    for prefix in ["mtp", "nextn"] {
+        let name = format!("{prefix}.{which}.weight");
+        if gguf.tensor(&name).is_some() {
+            return GpuMatvecTensor::from_gguf_matvec(gguf, &name);
+        }
+    }
+    Err(format!("drafter is missing {which}: looked for \"mtp.{which}.weight\" \
+                 and \"nextn.{which}.weight\""))
+}
 
 fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
     let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
