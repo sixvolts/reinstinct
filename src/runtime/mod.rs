@@ -13,6 +13,7 @@ pub mod prefill;
 pub mod qwen35;
 pub mod gemma4;
 pub mod gemma4_assistant;
+pub mod dflash;
 pub mod spec_decode;
 pub mod smoke;
 pub mod kv_turbo3;

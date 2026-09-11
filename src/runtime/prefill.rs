@@ -294,6 +294,22 @@ impl PrefillGemm {
         if dst.len() < n_y {
             return Err(format!("matmul_into: dst.len={} < n_rows*out_dim={n_y}", dst.len()));
         }
+        self.matmul_into_raw(stream, dst.raw_ptr(), w_dev, dtype, repacked,
+                             in_dim, out_dim, x.raw_ptr(), n_rows)
+    }
+
+    /// `matmul_into` over raw device pointers, for callers writing into a
+    /// slice of a larger buffer — DFlash projects a block's K/V straight
+    /// into the middle of its context cache, which no `&DeviceBuf` names.
+    /// Caller owns the bounds check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_into_raw(&self, stream: &hip::Stream,
+                           dst: *mut c_void,
+                           w_dev: &DeviceBuf<u8>, dtype: GgmlType, repacked: bool,
+                           in_dim: usize, out_dim: usize,
+                           x: *mut c_void, n_rows: usize)
+        -> Result<(), String>
+    {
         // Repacked Q8_0: no batched-matvec variant exists, so MMQ for
         // every K — still far beats the dequant→HGEMM fallback.
         if repacked && dtype == GgmlType::Q8_0 {
@@ -377,7 +393,7 @@ impl PrefillGemm {
         // working on ROCm 7.x, whose rocBLAS ships no kernels for it and
         // aborts the process the moment a handle is created.
         launch_gemm_f16_rows(&self.gemm_f16_rows, Some(stream), w_f16.raw_ptr(),
-                             x.raw_ptr(), dst.raw_ptr(), in_dim, out_dim, n_rows)
+                             x, dst, in_dim, out_dim, n_rows)
     }
 
     fn grow(buf: &std::cell::RefCell<DeviceBuf<u16>>, n: usize, stream: &hip::Stream)
@@ -389,10 +405,10 @@ impl PrefillGemm {
         }
         Ok(())
     }
-    fn matmul_kquant_batched_into(&self, stream: &hip::Stream, dst: &DeviceBuf<f32>,
+    fn matmul_kquant_batched_into(&self, stream: &hip::Stream, dst: *mut c_void,
                                   w_dev: &DeviceBuf<u8>, dtype: GgmlType,
                                   in_dim: usize, out_dim: usize,
-                                  x: &DeviceBuf<f32>, n_rows: usize)
+                                  x: *mut c_void, n_rows: usize)
         -> Result<(), String>
     {
         debug_assert!(n_rows >= 1 && n_rows <= 4,
@@ -418,7 +434,7 @@ impl PrefillGemm {
 
         // 1. Quantise X[n_rows, in_dim] → BlockQ8[n_rows, in_dim/32].
         let qf = self.quantize_q8.function("quantize_q8_f32")?;
-        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut xp = x; let mut qp = xq8.raw_ptr();
         let mut ind = in_dim as u32;
         let mut qa: [*mut c_void; 3] = [
             &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
@@ -428,7 +444,7 @@ impl PrefillGemm {
 
         // 2. Batched matvec — grid = ceil(out_dim / rows_per_wg).
         let gf = module.function(kname)?;
-        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
+        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst;
         let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut nr = n_rows as u32;
         let mut ga: [*mut c_void; 6] = [
             &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
@@ -441,10 +457,10 @@ impl PrefillGemm {
 
     /// Caller-owned-output sibling of [`matmul_mmq`].
     #[allow(clippy::too_many_arguments)]
-    fn matmul_mmq_into(&self, stream: &hip::Stream, dst: &DeviceBuf<f32>,
+    fn matmul_mmq_into(&self, stream: &hip::Stream, dst: *mut c_void,
                        w_dev: &DeviceBuf<u8>, dtype: GgmlType,
                        in_dim: usize, out_dim: usize,
-                       x: &DeviceBuf<f32>, n_rows: usize)
+                       x: *mut c_void, n_rows: usize)
         -> Result<(), String>
     {
         let (module, kname) = match dtype {
@@ -461,7 +477,7 @@ impl PrefillGemm {
         }
         let xq8 = self.xq8.borrow();
         let qf = self.quantize_q8.function("quantize_q8_f32")?;
-        let mut xp = x.raw_ptr(); let mut qp = xq8.raw_ptr();
+        let mut xp = x; let mut qp = xq8.raw_ptr();
         let mut ind = in_dim as u32;
         let mut qa: [*mut c_void; 3] = [
             &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
@@ -470,7 +486,7 @@ impl PrefillGemm {
                            (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
         let gf = module.function(kname)?;
-        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst.raw_ptr();
+        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst;
         let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = n_rows as u32;
         let mut ga: [*mut c_void; 6] = [
             &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,

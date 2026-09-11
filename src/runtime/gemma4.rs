@@ -57,9 +57,14 @@ const ATTN_MERGE_SRC:        &str = include_str!("../../kernels/attn_merge.cpp")
 const ATTN_MAX_SPLITS: u32 = 16;
 
 /// Max K (drafted tokens per round) supported by `verify_forward`'s
-/// preallocated scratch. Spec-decode rarely exceeds 4-8; sized small
-/// to keep the resident allocation cheap.
-const MAX_VERIFY_K: usize = 8;
+/// preallocated scratch.
+///
+/// Autoregressive spec-decode rarely exceeds 4-8, but DFlash denoises a
+/// whole 16-token block per round and verifies all of it in one pass, and
+/// 16 is fixed by the checkpoint (`dflash.block_size`) rather than tunable.
+/// The scratch is dominated by `v_logits` at K x vocab — 16.8 MB at K=16
+/// on a 262144 vocab — which is noise next to the model weights.
+const MAX_VERIFY_K: usize = 16;
 
 /// Prefill MoE batch size — `prefill_forward`'s MoE branch processes up
 /// to this many tokens per set of expert launches. Bounds the per-call
@@ -1431,7 +1436,7 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,p,1),(block,1,1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_softcap(&self, y: *mut c_void, n: u32) -> Result<(), String> {
+    pub(crate) fn launch_softcap(&self, y: *mut c_void, n: u32) -> Result<(), String> {
         let f = self.m_softcap.function("logit_softcap_f32")?;
         let block: u32 = 256;
         let grid = (n + block - 1) / block;
@@ -1949,7 +1954,7 @@ impl GpuGemma4 {
     /// Batched embedding lookup for prefill — one launch over all
     /// `n_tokens` token ids (resident in `tokens_dev`), writing row `r`
     /// of `out`. Replaces the per-token launch+sync embed loop.
-    fn launch_embed_batched(&self, table: &GpuMatvecTensor, out: *mut c_void,
+    pub(crate) fn launch_embed_batched(&self, table: &GpuMatvecTensor, out: *mut c_void,
                             tokens_dev: *mut c_void, n_tokens: u32) -> Result<(), String>
     {
         let hidden = table.in_dim;
@@ -2506,6 +2511,34 @@ impl GpuGemma4 {
     /// the post-norm result in `hidden_b`; `verify_forward` syncs the
     /// last verify row's post-norm into `hidden_b` too.
     pub fn last_hidden_state(&self) -> &DeviceBuf<f32> { &self.hidden_b }
+
+    /// The tied vocab head's weight — DFlash borrows it, having none.
+    pub(crate) fn vocab_head(&self) -> &GpuMatvecTensor { &self.token_embd }
+
+    /// Final-logit softcap from the target config (30.0 on Gemma 4), or
+    /// 0 when the model has none.
+    pub fn logit_softcap(&self) -> f32 { self.softcap }
+
+    /// Logits for `p` consecutive rows of `x` through the tied vocab head.
+    ///
+    /// Correctness-first: one matvec per row, so the 1.4 GB `token_embd`
+    /// is streamed `p` times. That is right for p=1 (decode) and is the
+    /// dominant cost of a DFlash 16-row block — ~22 ms of pure weight
+    /// traffic against a ~1.5 ms draft body. Fixing it needs a batched
+    /// on-disk dp4a matvec for Q4_K/Q4_0 (one exists only for Q5_K, and
+    /// caps at 4 rows). Deliberately deferred: acceptance rate, which is
+    /// what the drafter is being evaluated on, does not depend on it.
+    pub(crate) fn launch_lm_head_rows(&self, x: *mut c_void, out: *mut c_void, p: usize)
+        -> Result<(), String>
+    {
+        let h = self.hidden;
+        for i in 0..p {
+            let xi = unsafe { (x as *mut u8).add(i * h * 4) as *mut c_void };
+            let oi = unsafe { (out as *mut u8).add(i * self.vocab * 4) as *mut c_void };
+            self.launch_matvec(&self.token_embd, xi, oi)?;
+        }
+        Ok(())
+    }
 
     /// Last position's residual stream *before* the output norm — i.e.
     /// the final block's output. Kept in sync by the verify path; the
