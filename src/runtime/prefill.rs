@@ -27,6 +27,13 @@ const GEMM_F16_NR_TILE: usize = 8;
 /// the wide tile and wastes the rest.
 const NARROW_MMQ_ROWS: usize = 16;
 
+/// Workgroup size for the narrow MMQ tile. Must match
+/// `NARROW_THREADS` in the kernels. Smaller than 256 so each
+/// thread owns more of the BM x BN tile: with BM*BN fixed at
+/// 64x16, outputs-per-thread is 1024/THREADS, and that ratio is
+/// what sets LDS reads per sdot4.
+const NARROW_MMQ_THREADS: u32 = 64;
+
 /// Largest activation-row count the batched K-quant matvecs handle.
 /// Above this the MMQ GEMM takes over, and its BN=64 token tile wastes
 /// (64 - n_rows)/64 of every workgroup — at 16 rows that was the single
@@ -509,7 +516,7 @@ in={in_dim} out={out_dim} rows={n_rows}");
             (_, false)              => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_f32"),
             (_, true)               => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_narrow_f32"),
         };
-        let bm: u32 = if narrow { 32 } else { 64 };
+        let bm: u32 = if narrow { 16 } else { 64 };
         let bn: u32 = if narrow { 16 } else { 64 };
         let n_xq8 = (n_rows * in_dim / 32) * 40;
         if self.xq8.borrow().len() < n_xq8 {
@@ -533,8 +540,9 @@ in={in_dim} out={out_dim} rows={n_rows}");
             &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
             &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+        let threads: u32 = if narrow { NARROW_MMQ_THREADS } else { 256 };
         unsafe { gf.launch(((out_dim as u32 + bm - 1) / bm, (n_rows as u32 + bn - 1) / bn, 1),
-                           (256, 1, 1), 0, Some(stream), &mut ga)?; }
+                           (threads, 1, 1), 0, Some(stream), &mut ga)?; }
         Ok(())
     }
 }
@@ -576,8 +584,12 @@ mod tests {
         let gemm = PrefillGemm::new(&cache, out_dim * in_dim,
                                     max_rows * in_dim, max_rows * out_dim).unwrap();
 
-        // Every dtype with a batched variant.
-        for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+        // Every repacked dtype the GEMM dispatch can see. Q8_0 has no
+        // batched matvec and goes straight to MMQ at every row count, so
+        // it is the only dtype that exercises the narrow tile at 1..4 too —
+        // and it is what a DFlash drafter is made of.
+        for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K,
+                      GgmlType::Q6_K, GgmlType::Q8_0] {
             let (bs, bpb) = (dtype.block_size_elements() as usize,
                              dtype.bytes_per_block() as usize);
             let n_blocks = out_dim * (in_dim / bs);
@@ -605,6 +617,7 @@ mod tests {
                 GgmlType::Q4_0 => crate::quant::q4_0::dequantize_to_f32(&w, &mut w_f32),
                 GgmlType::Q4_K => crate::quant::q4_k::dequantize_to_f32(&w, &mut w_f32),
                 GgmlType::Q5_K => crate::quant::q5_k::dequantize_to_f32(&w, &mut w_f32),
+                GgmlType::Q8_0 => crate::quant::q8_0::dequantize_to_f32(&w, &mut w_f32),
                 _              => crate::quant::q6_k::dequantize_to_f32(&w, &mut w_f32),
             }
 
@@ -612,6 +625,7 @@ mod tests {
                 GgmlType::Q4_0 => crate::quant::q4_0::repack_for_matvec(&w, in_dim, out_dim),
                 GgmlType::Q4_K => crate::quant::q4_k::repack_for_matvec(&w, in_dim, out_dim),
                 GgmlType::Q5_K => crate::quant::q5_k::repack_for_matvec(&w, in_dim, out_dim),
+                GgmlType::Q8_0 => crate::quant::q8_0::repack_for_matvec(&w, in_dim, out_dim),
                 _              => crate::quant::q6_k::repack_for_matvec(&w, in_dim, out_dim),
             };
             let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();

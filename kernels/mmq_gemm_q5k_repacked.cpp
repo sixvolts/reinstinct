@@ -9,20 +9,23 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define TYG (256 / TXG)      // row groups in the 256-thread grid
+#define TYG (THREADS / TXG)  // row groups in the thread grid
 #define BM (TYG * TM)        // weight rows per workgroup tile
 #define BN (TXG * TN)        // tokens per workgroup tile
+#ifndef NARROW_THREADS
+#define NARROW_THREADS 64
+#endif
 #ifndef NARROW_TXG
-#define NARROW_TXG 16
+#define NARROW_TXG 4
 #endif
 #ifndef NARROW_BK
 #define NARROW_BK 4
 #endif
 #ifndef NARROW_TM
-#define NARROW_TM 2
+#define NARROW_TM 1
 #endif
 #ifndef NARROW_TN
-#define NARROW_TN 1
+#define NARROW_TN 4
 #endif
 
 struct __attribute__((packed)) BlockQ8 {
@@ -37,7 +40,7 @@ __device__ __forceinline__ uint32_t spread4(uint32_t h) {
     return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
 }
 
-template<int TM, int TN, int BK, int TXG>
+template<int TM, int TN, int BK, int TXG, int THREADS>
 __device__ __forceinline__
 void mmq_q5k_impl(const unsigned char* __restrict__ wbase,
                                const BlockQ8*       __restrict__ xq,
@@ -47,8 +50,8 @@ void mmq_q5k_impl(const unsigned char* __restrict__ wbase,
                                unsigned int p_rows)
 {
     const int t  = threadIdx.x;
-    const int tx = t & 15;
-    const int ty = t >> 4;
+    const int tx = t % TXG;              // token group  0..TXG-1
+    const int ty = t / TXG;              // row group    0..TYG-1
     const unsigned int row0 = blockIdx.x * BM;
     const unsigned int tok0 = blockIdx.y * BN;
 
@@ -81,7 +84,7 @@ void mmq_q5k_impl(const unsigned char* __restrict__ wbase,
         // which is only 256 at the default BM=BN=64, BK=4. The narrow
         // tile is smaller, so a fixed one-element-per-thread mapping
         // would run threads off the end of the LDS arrays.
-        for (int e = t; e < BM * BK; e += 256) {
+        for (int e = t; e < BM * BK; e += THREADS) {
             const int lr = e / BK, lk = e % BK;
             const unsigned int sb = sb0 + lk;
             const unsigned int wrow = row0 + lr;
@@ -101,7 +104,7 @@ void mmq_q5k_impl(const unsigned char* __restrict__ wbase,
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }
         }
-        for (int e = t; e < BN * BK; e += 256) {
+        for (int e = t; e < BN * BK; e += THREADS) {
             const int lr = e / BK, lk = e % BK;
             const unsigned int sb = sb0 + lk;
             const unsigned int xtok = tok0 + lr;
@@ -173,7 +176,7 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
                                unsigned int out_dim,
                                unsigned int p_rows)
 {
-    mmq_q5k_impl<4, 4, 4, 16>(wbase, xq, y, in_dim, out_dim, p_rows);
+    mmq_q5k_impl<4, 4, 4, 16, 256>(wbase, xq, y, in_dim, out_dim, p_rows);
 }
 
 // Narrow-token variant: TN=1 so BN=16 instead of 64.
@@ -184,7 +187,7 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
 // fixed 16-token block every round, so that waste was the single largest
 // cost in a round. Narrowing the tile also cuts each thread's accumulators
 // from TM*TN=16 to 4, which buys back occupancy.
-extern "C" __global__ __launch_bounds__(256, 4)
+extern "C" __global__ __launch_bounds__(NARROW_THREADS)
 void mmq_gemm_q5k_repacked_narrow_f32(const unsigned char* __restrict__ wbase,
                                const BlockQ8*       __restrict__ xq,
                                float*               __restrict__ y,
@@ -192,5 +195,5 @@ void mmq_gemm_q5k_repacked_narrow_f32(const unsigned char* __restrict__ wbase,
                                unsigned int out_dim,
                                unsigned int p_rows)
 {
-    mmq_q5k_impl<NARROW_TM, NARROW_TN, NARROW_BK, NARROW_TXG>(wbase, xq, y, in_dim, out_dim, p_rows);
+    mmq_q5k_impl<NARROW_TM, NARROW_TN, NARROW_BK, NARROW_TXG, NARROW_THREADS>(wbase, xq, y, in_dim, out_dim, p_rows);
 }
