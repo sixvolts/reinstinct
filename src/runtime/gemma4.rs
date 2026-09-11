@@ -68,6 +68,7 @@ const MAX_VERIFY_K: usize = 8;
 const MOE_PREFILL_CHUNK: usize = 256;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q4_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q4_0.cpp");
+const TAP_COPY_SRC:          &str = include_str!("../../kernels/tap_copy_f32.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
 // MoE kernel sources.
@@ -460,6 +461,12 @@ pub struct Gemma4GpuState {
     /// kernels do D2D memcpys on the null stream which can't be
     /// captured into a HIP graph.
     prefill_graphs: std::collections::HashMap<usize, GraphExec>,
+    /// DFlash target-context buffer, `[max_seq, n_taps * hidden]` — the
+    /// tapped layers concatenated along the feature axis per position.
+    /// `None` until `enable_target_tap` sizes it.
+    pub tap: Option<DeviceBuf<f32>>,
+    /// Feature width of one `tap` row (`n_taps * hidden`).
+    pub tap_stride: usize,
 }
 
 impl Gemma4GpuState {
@@ -473,7 +480,8 @@ impl Gemma4GpuState {
                 max_seq)?);
         }
         Ok(Self { caches, superquant: None, pos: 0,
-                  prefill_graphs: std::collections::HashMap::new() })
+                  prefill_graphs: std::collections::HashMap::new(),
+                  tap: None, tap_stride: 0 })
     }
 
     /// Opt-in constructor — allocates BOTH the standard int8 caches
@@ -814,6 +822,11 @@ pub struct GpuGemma4 {
     moe_prof_on:    bool,
     prof_mark:      std::cell::Cell<std::time::Instant>,
     prof_buckets:   std::cell::RefCell<Vec<(&'static str, f64)>>,
+    m_tap_copy: Module,
+    /// Target layers whose residual-stream output feeds a DFlash
+    /// drafter, as block indices. Empty = tap disabled (the default;
+    /// costs nothing but the branch).
+    tap_layers: std::cell::RefCell<Vec<usize>>,
     m_embed_q4_0: Module,
     m_embed_q5k: Module,
     m_embed_q8_0: Module,
@@ -1080,6 +1093,8 @@ impl GpuGemma4 {
             moe_prof_on:    std::env::var_os("REINSTINCT_MOE_PROFILE").is_some(),
             prof_mark:      std::cell::Cell::new(std::time::Instant::now()),
             prof_buckets:   std::cell::RefCell::new(Vec::new()),
+            m_tap_copy: ld("tap_copy_f32", TAP_COPY_SRC)?,
+            tap_layers: std::cell::RefCell::new(Vec::new()),
             m_embed_q4_0: ld("embed_lookup_q4_0", EMBED_Q4_0_SRC)?,
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
@@ -1853,6 +1868,63 @@ impl GpuGemma4 {
                           Some(&self.stream), &mut args) }
     }
 
+    /// Arm the DFlash target-context tap.
+    ///
+    /// `layers` are block indices whose residual-stream output (after the
+    /// block's `layer_output_scale`, i.e. HF's `hidden_states[i+1]`) is
+    /// gathered into `state.tap` as `[max_seq, layers.len() * hidden]`,
+    /// concatenated along the feature axis per position — the layout
+    /// DFlash's `fc` expects. Idempotent; call once per state.
+    ///
+    /// Note the off-by-one that bit us in the spec: a GGUF's
+    /// `dflash.target_layers` holds HF *hidden-state* indices, so callers
+    /// must subtract one before passing them here. See docs/DFLASH_PORT.md.
+    pub fn enable_target_tap(&self, layers: &[usize], state: &mut Gemma4GpuState,
+                             max_seq: usize) -> Result<(), String>
+    {
+        for &l in layers {
+            if l >= self.blocks.len() {
+                return Err(format!("target tap: block {l} out of range \
+                                    (model has {})", self.blocks.len()));
+            }
+        }
+        *self.tap_layers.borrow_mut() = layers.to_vec();
+        state.tap_stride = layers.len() * self.hidden;
+        state.tap = Some(DeviceBuf::new(max_seq * state.tap_stride)?);
+        Ok(())
+    }
+
+    /// Width of one target-context row, `n_taps * hidden`.
+    pub fn tap_stride(&self) -> usize { self.tap_layers.borrow().len() * self.hidden }
+
+    /// Copy block `li`'s output into its tap slot, if `li` is tapped.
+    /// No-op (one `position()` scan of a <=8-element vec) otherwise.
+    fn maybe_tap(&self, li: usize, x: *mut c_void, tap_dst: Option<*mut c_void>,
+                 tap_stride: usize, p: usize) -> Result<(), String>
+    {
+        let Some(dst) = tap_dst else { return Ok(()) };
+        let slot = match self.tap_layers.borrow().iter().position(|&l| l == li) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let f = self.m_tap_copy.function("tap_copy_f32")?;
+        let block: u32 = 256;
+        let mut sp = x;
+        let mut dp = dst;
+        let mut hh = self.hidden as u32;
+        let mut st = tap_stride as u32;
+        let mut sl = slot as u32;
+        let mut pp = p as u32;
+        let mut args: [*mut c_void; 6] = [
+            &mut sp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut hh as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void];
+        unsafe {
+            f.launch(((self.hidden as u32 + block - 1) / block, p as u32, 1),
+                     (block, 1, 1), 0, Some(&self.stream), &mut args)
+        }
+    }
+
     /// Embedding lookup — the token row is read from `d_token` on device
     /// (capturable). gemma4's token_embd is Q5_K (31B) or Q8_0 (26B).
     fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void) -> Result<(), String> {
@@ -2435,6 +2507,14 @@ impl GpuGemma4 {
     /// last verify row's post-norm into `hidden_b` too.
     pub fn last_hidden_state(&self) -> &DeviceBuf<f32> { &self.hidden_b }
 
+    /// Last position's residual stream *before* the output norm — i.e.
+    /// the final block's output. Kept in sync by the verify path; the
+    /// DFlash tap validates against it.
+    pub fn last_prenorm_hidden(&self) -> &DeviceBuf<f32> { &self.hidden_a }
+
+    /// Number of transformer blocks.
+    pub fn block_count(&self) -> usize { self.blocks.len() }
+
     /// Embed a single token via the target's `token_embd` table, writing
     /// the raw lookup (no `√hidden` scale) into the caller-provided
     /// device buffer. Output size = `hidden_size()` floats. Used by the
@@ -2744,6 +2824,10 @@ impl GpuGemma4 {
             Ok(())
         };
         if dbg { self.stream.synchronize()?; mark.set(std::time::Instant::now()); }
+        // Raw pointer + stride hoisted out so the tap does not contend
+        // with the mutable borrow `state.caches` holds inside the loop.
+        let tap_dst = state.tap.as_ref().map(|b| b.raw_ptr());
+        let tap_stride = state.tap_stride;
         for (li, b) in self.blocks.iter().enumerate() {
             let hd = b.head_dim;
             let n_kv = b.n_kv;
@@ -2967,6 +3051,10 @@ impl GpuGemma4 {
             }
             // Don't charge the diagnostic block above to the next layer.
             if dbg { mark.set(std::time::Instant::now()); }
+            // DFlash target-context tap: `x` is this block's output with
+            // layer_output_scale already applied, which is exactly HF's
+            // hidden_states[li+1]. No-op unless the block is tapped.
+            self.maybe_tap(li, x.raw_ptr(), tap_dst, tap_stride, p)?;
         }
 
         // --- output: last token only ---
@@ -3251,6 +3339,9 @@ impl GpuGemma4 {
                 normed.raw_ptr(), hu, p as u32)?;
             self.launch_add_batched(x.raw_ptr(), normed.raw_ptr(), hu, p as u32)?;
             self.launch_scale_batched(x.raw_ptr(), hu, b.layer_output_scale, p as u32)?;
+            // DFlash target-context tap — see the prefill path.
+            self.maybe_tap(li, x.raw_ptr(), state.tap.as_ref().map(|b| b.raw_ptr()),
+                           state.tap_stride, p)?;
         }
 
         // --- output norm + tied vocab head ---
