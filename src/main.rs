@@ -128,6 +128,13 @@ enum Command {
         /// `tokenizer.ggml.mask_token_id` (4 on Gemma 4).
         #[arg(long)]
         mask_token: Option<u32>,
+        /// How many of the block's positions to verify, 2..=block_size.
+        /// The drafter always denoises the full block in one pass — that
+        /// cost is fixed — but verify cost is linear in width while
+        /// acceptance saturates well below 16, so the product is not
+        /// maximised at the full block. Defaults to the full block.
+        #[arg(long)]
+        verify_width: Option<usize>,
     },
     /// Spec-decode smoke test: load a Gemma 4 target + its MTP drafter,
     /// prefill a prompt, then ask the drafter to propose K tokens at the
@@ -386,8 +393,8 @@ fn main() -> anyhow::Result<()> {
             qwen_mtp_probe_cli(&path, prompt, steps),
         Command::QwenVerifyCheck { path, prompt, k } =>
             qwen_verify_check_cli(&path, prompt, k),
-        Command::DflashGen { target, drafter, prompt, system, steps, mask_token } =>
-            dflash_gen_cli(&target, &drafter, prompt, system, steps, mask_token),
+        Command::DflashGen { target, drafter, prompt, system, steps, mask_token, verify_width } =>
+            dflash_gen_cli(&target, &drafter, prompt, system, steps, mask_token, verify_width),
         Command::QwenMtpGen { path, prompt, tokens, k } =>
             qwen_mtp_gen_cli(&path, prompt, tokens, k),
         Command::AlignCheck { target, drafter, prompt, system, steps } =>
@@ -2365,7 +2372,8 @@ use reinstinct_engine::sampling::argmax;
 /// round yields 1..16 tokens. See docs/DFLASH_PORT.md.
 fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
                   prompt_text: Option<String>, system: Option<String>,
-                  steps: usize, mask_token: Option<u32>) -> anyhow::Result<()>
+                  steps: usize, mask_token: Option<u32>,
+                  verify_width: Option<usize>) -> anyhow::Result<()>
 {
     use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
     use reinstinct_engine::hip;
@@ -2423,8 +2431,10 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let taps: Vec<usize> = draft.target_layers().iter().map(|&l| l as usize).collect();
     gm.enable_target_tap(&taps, &mut t_state, max_seq).map_err(anyhow::Error::msg)?;
 
+    let vw = verify_width.unwrap_or(b).clamp(2, b);
     println!("target  = {} ({} tok prompt)", target_path.display(), prompt.len());
-    println!("drafter = {}, block = {b}, taps = {taps:?}", drafter_path.display());
+    println!("drafter = {}, block = {b}, verify width = {vw}, taps = {taps:?}",
+             drafter_path.display());
 
     let argmax = |v: &[f32]| -> u32 {
         let mut best = 0usize;
@@ -2455,9 +2465,11 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         let preds = draft.draft_block(&d_state, &gm, anchor, mask)
             .map_err(anyhow::Error::msg)?;
         t_draft += td.elapsed().as_secs_f64();
-        let mut block = Vec::with_capacity(b);
+        // Draft the whole block (one pass regardless), but only hand the
+        // target the first `vw` positions: anchor + vw-1 drafted.
+        let mut block = Vec::with_capacity(vw);
         block.push(anchor);
-        block.extend_from_slice(&preds[1..]);
+        block.extend_from_slice(&preds[1..vw]);
 
         let tv = std::time::Instant::now();
         let vlogits = gm.verify_forward(&block, &mut t_state).map_err(anyhow::Error::msg)?;
@@ -2466,11 +2478,11 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         // Longest prefix the target agrees with. vlogits[j] predicts the
         // token at block position j+1.
         let mut accept = 0usize;
-        while accept < b - 1 && block[accept + 1] == argmax(&vlogits[accept]) {
+        while accept < vw - 1 && block[accept + 1] == argmax(&vlogits[accept]) {
             accept += 1;
         }
         let bonus = argmax(&vlogits[accept]);
-        n_drafted += b - 1;
+        n_drafted += vw - 1;
         n_accepted += accept;
         rounds += 1;
 

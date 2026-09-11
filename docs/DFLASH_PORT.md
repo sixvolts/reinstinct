@@ -201,49 +201,70 @@ is what determines the speedup ceiling:
 DFlash wins every class, including the creative and longform cases where
 the assistant drafter collapses and adaptive-K has to switch MTP off.
 
-**Throughput after the kernel work**: 22.0 tok/s against a 26.2 baseline,
-up from 11.0. Per round:
+**Throughput after the kernel work**: 26.2 tok/s, up from 11.0 — parity
+with plain decode (26.2). Per round:
 
 ```
                 draft     verify    ctx    total   tok/s
 before          48.5 ms   424.0 ms  3.5    477 ms   11.0
-after           28.0 ms   207.7 ms  1.9    238 ms   22.0
+after           28.8 ms   166.0 ms  2.2    198 ms   26.2
 ```
 
-Two kernels did it:
+Acceptance is unchanged to the digit across all eight classes, which is
+the check that the kernel work altered nothing but speed.
 
-1. **Narrow-token MMQ** (`*_narrow_f32`, TM=2/TN=1/BK=4). The default
-   `BN = 64` token tile leaves 16/64 of each workgroup useful on a
-   16-token verify. A BN=16 tile fixes that: verify(16) 412 -> 207 ms,
-   with K<=4 untouched (84 ms, unchanged).
-2. **Batched tied LM head at 16 rows.** `launch_lm_head_rows` ran one
-   full-vocab matvec per row; the tied head is the largest tensor in the
-   model (969 MB at Q5_K), so 16 rows meant ~15 GB of weight traffic.
-   Routed through the batched dp4a kernel, now one sweep: draft 48.5 ->
-   28.0 ms.
+### What moved it
 
-**It is still 0.84x of plain decode**, and the reason is structural.
-At K=16 verify is **compute-bound, not bandwidth-bound**: 16 tokens x
-31B params x 2 = ~1 TFLOP, and the wide MMQ's measured efficiency on this
-GPU is ~11 TOPS (from prefill: 512 tok at 177 tok/s). That puts a floor of
-**~91 ms** on verify(16) no matter how the weights are streamed. We are at
-207 ms, so the narrow tile is running at ~45% of the wide tile's compute
-efficiency.
+1. **Narrow-token MMQ.** `BN = 64` leaves 16/64 of a workgroup useful on a
+   16-token verify. Tile shape is now templated on
+   (TM, TN, BK, thread-grid split, workgroup size); the tuned point is a
+   **single-wave workgroup on a 16x16 tile** — TM=1, TN=4, BK=4, TXG=4,
+   THREADS=64. 4.7 KB LDS, 68 VGPRs, 3 waves/SIMD, 1344 workgroups.
+2. **Batched tied LM head at 16 rows**, 4 -> 16. The head is the largest
+   tensor in the model (969 MB at Q5_K), so a per-row loop meant ~15 GB of
+   traffic per block: draft 48.5 -> 28.8 ms.
 
-That floor also bounds what DFlash can be worth here:
+`--verify-width` was added because verify cost and acceptance scale
+differently: the drafter denoises the whole block for a fixed price, but
+the target's cost grows with how much of it you check. Measured, the
+product is flat from 8 to 16 (26.9 / 27.0 / 26.2 tok/s at 8 / 12 / 16),
+so the default stays at the full block.
 
-| | verify | round (5.25 tok) | tok/s | vs 26.2 |
-|---|---:|---:|---:|---:|
-| now | 207 ms | 238 ms | 22.0 | 0.84x |
-| at the compute floor | 91 ms | 122 ms | 43 | **1.6x** |
+### Why it stopped at 166 ms
 
-So there is one more ~2.3x in verify and it is the whole remaining
-question. Shapes already swept and rejected, all worse than TM=2/TN=1:
-TM in {4,8}, TN in {2,4}, BK=8, and a 4x64 thread split that keeps TN=4
-at BN=16 (259 ms). The tile that wins is the one with the *least* work
-per thread, which suggests occupancy rather than arithmetic intensity is
-binding — worth confirming with a register/occupancy dump before the next
-attempt.
+The remaining gap to the ~91 ms compute floor is **not** tile shape, and
+not the things that sound plausible. Each was measured and rejected:
+
+| Attempt | Result |
+|---|---|
+| Bigger tiles (TM 4-8, TN 2-4) | 218-320 ms — worse |
+| Double-buffered LDS | 182 ms — LDS 4.7 -> 9.4 KB halves occupancy, and at one wave per workgroup occupancy *is* the latency hiding |
+| `__launch_bounds__(64, 4)` to force a 4th wave | 178 ms — buys a wave, costs spills |
+| Deeper contraction (BK 8, 16) | 192 ms / LDS overflow |
+| Batched matvec extended to 5-16 rows | 206 ms at 8 rows vs MMQ's 149 — crossover really is at 4 |
+
+Fitting the two points that matter — verify(8) = 148.6 ms,
+verify(16) = 166.0 ms — gives a marginal of **2.2 ms/token** against a
+**131 ms fixed** term. The compute is essentially free; the fixed cost is
+a weight stream running at ~129 GB/s against ~474 GB/s achievable.
+
+That signature is **latency-bound, not bandwidth-bound**. Per chunk a wave
+issues 64 scattered 16-byte loads (BM=16 rows x BK=4 sub-blocks, so only
+64 contiguous bytes per row) and then has 128 sdot4 of work to hide them
+with. At 3 waves/SIMD that is ~384 cycles of compute against a ~500-cycle
+global load. Every fix for that either lengthens the contiguous run (which
+needs a bigger BK, which costs LDS, which costs occupancy) or prefetches
+(which costs LDS, same problem).
+
+The way out is a prefetch that does **not** live in LDS: stage the next
+chunk's weights in *registers* while computing the current one. TM=1 means
+a thread owns exactly one weight row, so its share of a chunk is 4 uint4 —
+16 VGPRs, against the 188 of headroom below the 3-wave cliff. That keeps
+LDS at 4.7 KB and occupancy at 3. It is the one untried idea with the
+right shape, and it is where the next attempt should start.
+
+If it lands, verify(16) goes to roughly the 91 ms floor: a round becomes
+~120 ms for 5.25 tokens, or **~44 tok/s against the 26.2 baseline (1.7x)**.
 
 ### Risks
 
