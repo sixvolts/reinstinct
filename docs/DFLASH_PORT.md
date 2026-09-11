@@ -179,12 +179,64 @@ already has.
 the same 8-class α benchmark for a like-for-like comparison against the
 assistant's 0.63.
 
+## Measured result
+
+All four stages are in. Per-class acceptance on Gemma 4 31B (Q4_K),
+chat-templated, 8 prompt classes, against the `gemma4-assistant` MTP
+drafter at its best K=3. Both are mean tokens accepted per round, which
+is what determines the speedup ceiling:
+
+| Class | MTP K=3 | DFlash | |
+|---|---:|---:|---:|
+| structured | 3.34 | **5.00** | +50% |
+| json | 2.56 | **5.10** | +99% |
+| code | 2.41 | **4.57** | +90% |
+| math | 2.56 | **3.76** | +47% |
+| factual | 2.26 | **3.25** | +44% |
+| procedural | 1.96 | **3.25** | +66% |
+| longform | 2.17 | **2.56** | +18% |
+| creative | 1.57 | **2.27** | +45% |
+| **mean** | **2.35** | **3.72** | **+58%** |
+
+DFlash wins every class, including the creative and longform cases where
+the assistant drafter collapses and adaptive-K has to switch MTP off.
+
+**Throughput is not yet a win** — 11 tok/s against a 26.2 baseline. The
+breakdown per round says why, and it is not the drafter:
+
+```
+draft 48.5 ms | verify 424.0 ms | ctx 3.5 ms | other 0.7 ms
+```
+
+`verify_forward` at K=16 costs 424 ms, roughly 11 single decode steps.
+The verify path was built for K<=4: `matmul_kquant_batched_into` caps
+there and anything larger falls through to the MMQ GEMM, whose `BN = 64`
+token tile leaves 16/64 = 25% of each workgroup doing useful work. That
+matches the known scaling (K=4 108 ms, K=8 177 ms) extrapolated to K=16.
+DFlash cannot avoid this: its block size is fixed at 16 by the checkpoint.
+
+So the work that turns the acceptance win into a throughput win is:
+
+1. **Batched K-quant matvec up to 16 rows.** Raising `N_ROWS_MAX` from 4,
+   or an MMQ variant with a narrow token tile. Worth ~424 -> ~60 ms.
+2. **Batched LM head.** The 48.5 ms draft is dominated by 16 separate
+   full-vocab matvecs (see `launch_lm_head_rows`); one batched on-disk
+   dp4a matvec for Q4_K/Q4_0 would read the 880 MB table once instead of
+   16 times. Worth ~48 -> ~5 ms.
+
+At those numbers a round is ~65 ms for 3.72 tokens — about 57 tok/s
+against the 26.2 baseline, which is the range the paper reports.
+
 ### Risks
 
 * The block-4 bidirectional attention has no analogue in the engine today;
   every existing attention kernel is causal or sliding-causal.
 * The `[ctx | block]` KV layout is not the engine's KV cache layout — the
   context rows are a separate, persistent, draft-owned cache.
-* The target-layer off-by-one above is silent if wrong. A/B it.
+* ~~The target-layer off-by-one above is silent if wrong. A/B it.~~
+  **Resolved**: A/B'd via `REINSTINCT_DFLASH_TAP_SHIFT`. Tapping blocks
+  [1,12,23,35,46,57] drafts a varied block that tracks the target;
+  [2,13,24,36,47,58] collapses to one token repeated. The spec's reading
+  was right.
 * Whether the tap can be folded into the existing HIP graph capture
   without breaking it is unknown; worst case the tap costs a graph break.

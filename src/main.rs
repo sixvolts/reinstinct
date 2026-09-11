@@ -2449,14 +2449,19 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let mut stopped = anchor == eos;
 
     let t0 = std::time::Instant::now();
+    let (mut t_draft, mut t_verify, mut t_ctx) = (0.0f64, 0.0f64, 0.0f64);
     while out.len() < steps && !stopped {
+        let td = std::time::Instant::now();
         let preds = draft.draft_block(&d_state, &gm, anchor, mask)
             .map_err(anyhow::Error::msg)?;
+        t_draft += td.elapsed().as_secs_f64();
         let mut block = Vec::with_capacity(b);
         block.push(anchor);
         block.extend_from_slice(&preds[1..]);
 
+        let tv = std::time::Instant::now();
         let vlogits = gm.verify_forward(&block, &mut t_state).map_err(anyhow::Error::msg)?;
+        t_verify += tv.elapsed().as_secs_f64();
 
         // Longest prefix the target agrees with. vlogits[j] predicts the
         // token at block position j+1.
@@ -2476,8 +2481,10 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         // Drop the rejected tail from the target's KV, then feed the
         // accepted rows' context features to the drafter.
         t_state.truncate(start + produced);
+        let tc = std::time::Instant::now();
         draft.append_context(&mut d_state, t_state.tap.as_ref().unwrap(), produced, start)
             .map_err(anyhow::Error::msg)?;
+        t_ctx += tc.elapsed().as_secs_f64();
 
         if out[out.len() - produced..].contains(&eos) { stopped = true; }
         anchor = bonus;
@@ -2492,6 +2499,10 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
              out.len() as f64 / rounds.max(1) as f64);
     println!("block accept rate: {n_accepted} / {n_drafted} = {:.0}%",
              100.0 * n_accepted as f64 / n_drafted.max(1) as f64);
+    let r = rounds.max(1) as f64;
+    println!("per round: draft {:.1} ms | verify {:.1} ms | ctx {:.1} ms | other {:.1} ms",
+             1e3 * t_draft / r, 1e3 * t_verify / r, 1e3 * t_ctx / r,
+             1e3 * (dt - t_draft - t_verify - t_ctx) / r);
     Ok(())
 }
 
