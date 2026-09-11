@@ -1021,7 +1021,13 @@ impl GpuGemma4 {
                            b.ffn_gate.in_dim, b.ffn_up.in_dim, b.ffn_down.in_dim])
             .chain(std::iter::once(token_embd.in_dim))
             .max().unwrap_or(0) as usize;
-        let xq8 = DeviceBuf::<u8>::new((max_in_dim / 32) * 40)?;
+        // Sized for MAX_VERIFY_K rows, not one. The single-row size only
+        // ever fit the batched lm_head's 4 rows by coincidence — the head's
+        // in_dim is `hidden` while `max_in_dim` is the widest FFN dim, and
+        // on the 31B those happen to differ by exactly 4x. Widening the
+        // batched head to 16 rows broke that coincidence; this makes the
+        // capacity explicit instead. 430 KB at K=16 on the 31B.
+        let xq8 = DeviceBuf::<u8>::new(MAX_VERIFY_K * (max_in_dim / 32) * 40)?;
 
         // --- Prefill context: built once, reused every prefill call. ---
         let stream = Stream::new()?;
@@ -2531,6 +2537,13 @@ impl GpuGemma4 {
     pub(crate) fn launch_lm_head_rows(&self, x: *mut c_void, out: *mut c_void, p: usize)
         -> Result<(), String>
     {
+        // Batched when the head's dtype has a batched dp4a kernel: one
+        // weight sweep instead of `p`. The tied head is the single largest
+        // tensor in the model (969 MB at Q5_K on the 31B), so at p=16 this
+        // is the difference between ~1 GB and ~15 GB of weight traffic.
+        if self.token_embd.dtype == GgmlType::Q5_K && p >= 1 && p <= MAX_VERIFY_K {
+            return self.launch_lm_head_q5k_batched(x, out, p as u32);
+        }
         let h = self.hidden;
         for i in 0..p {
             let xi = unsafe { (x as *mut u8).add(i * h * 4) as *mut c_void };
@@ -3385,7 +3398,7 @@ impl GpuGemma4 {
         // instead of K times); otherwise fall back to K serial calls.
         self.launch_rmsnorm_batched(x.raw_ptr(), self.output_norm.raw_ptr(),
                                     normed.raw_ptr(), hu, p as u32)?;
-        if self.token_embd.dtype == GgmlType::Q5_K && p >= 1 && p <= 4 {
+        if self.token_embd.dtype == GgmlType::Q5_K && p >= 1 && p <= MAX_VERIFY_K {
             self.launch_lm_head_q5k_batched(normed.raw_ptr(), logits_all.raw_ptr(),
                                             p as u32)?;
         } else {
@@ -3487,14 +3500,20 @@ impl GpuGemma4 {
                                    p: u32) -> Result<(), String>
     {
         debug_assert!(self.token_embd.dtype == GgmlType::Q5_K);
-        debug_assert!(p >= 1 && p <= 4, "batched lm_head supports K=1..4");
+        debug_assert!(p >= 1 && p <= MAX_VERIFY_K as u32,
+                      "batched lm_head supports K=1..={MAX_VERIFY_K}");
         let in_dim = self.token_embd.in_dim;     // hidden (5376 for 31B)
         let out_dim = self.token_embd.out_dim;   // vocab (262144)
         // 1) Quantize K input rows → BlockQ8 [K, in_dim/32] in self.xq8.
         self.launch_quantize_q8(in_ptr, self.xq8.raw_ptr(), in_dim, p)?;
         // 2) Batched matvec. Grid = ceil(out_dim / ROWS=2) — matches
         //    the K=1 dp4a layout for fair per-row work.
-        let f = self.m_mv_q5k_dp4a_batched.function("matvec_q5_k_dp4a_batched_f32")?;
+        // Two instantiations: (ROWS=2, N_ROWS_MAX=4) up to 4 rows, and
+        // (ROWS=1, N_ROWS_MAX=16) beyond — grid differs with ROWS.
+        let wide = p > 4;
+        let f = self.m_mv_q5k_dp4a_batched.function(
+            if wide { "matvec_q5_k_dp4a_batched16_f32" }
+            else    { "matvec_q5_k_dp4a_batched_f32" })?;
         let mut wp = self.token_embd.data.raw_ptr();
         let mut xp = self.xq8.raw_ptr();
         let mut yp = out_ptr;
@@ -3503,7 +3522,8 @@ impl GpuGemma4 {
             &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
             &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
             &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
-        let grid = (out_dim + 1) / 2;   // ROWS=2 in the kernel
+        let rows_per_wg = if wide { 1 } else { 2 };
+        let grid = (out_dim + rows_per_wg - 1) / rows_per_wg;
         unsafe { f.launch((grid, 1, 1), (64, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 

@@ -3,15 +3,19 @@
 // plane. See matvec_q4k_repacked_batched.cpp for the batching
 // rationale and matvec_q5k_repacked.cpp for the layout details.
 //
-// 256-thread workgroup, 4 waves × ROWS=2 per WG. grid = ceil(out_dim/8).
+// Two instantiations, differing only in (ROWS, N_ROWS_MAX):
+//   `_f32`          — ROWS=2, N_ROWS_MAX=4.  grid = ceil(out_dim/8).
+//   `batched16_f32` — ROWS=1, N_ROWS_MAX=16. grid = ceil(out_dim/4). For
+//     DFlash, whose block size is 16. Dropping ROWS holds the per-thread
+//     accumulator count at 16 rather than 32 while still streaming each
+//     weight sub-block once for all 16 activation rows.
+// 256-thread workgroup either way; the caller must match grid to the variant.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include "gfx906_dpp.h"
 
-#define ROWS         2
-#define N_ROWS_MAX   4   // K upper bound; see matvec_q4k_repacked_batched.cpp
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -24,8 +28,9 @@ __device__ __forceinline__ uint32_t spread4(uint32_t h) {
     return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
 }
 
-extern "C" __global__
-void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
+template<int ROWS, int N_ROWS_MAX>
+__device__ __forceinline__
+void mv_q5k_batched_impl(const uint8_t* __restrict__ wbase,
                                      const BlockQ8* __restrict__ xq,
                                      float*         __restrict__ y,
                                      unsigned int in_dim,
@@ -117,4 +122,31 @@ void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
             }
         }
     }
+}
+
+extern "C" __global__
+void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
+                                     const BlockQ8* __restrict__ xq,
+                                     float*         __restrict__ y,
+                                     unsigned int in_dim,
+                                     unsigned int out_dim,
+                                     unsigned int n_rows)
+{
+    mv_q5k_batched_impl<2, 4>(wbase, xq, y, in_dim, out_dim, n_rows);
+}
+
+// Wide variant for DFlash, whose block size is 16. ROWS drops to 1 so a
+// thread carries ROWS*N_ROWS_MAX = 16 accumulators rather than 32, keeping
+// register pressure near the 4-row kernel's while reading each weight
+// sub-block once for all 16 activation rows. Weight traffic is then
+// out_dim*in_dim total, the same as a single matvec.
+extern "C" __global__
+void matvec_q5k_repacked_batched16_f32(const uint8_t* __restrict__ wbase,
+                                     const BlockQ8* __restrict__ xq,
+                                     float*         __restrict__ y,
+                                     unsigned int in_dim,
+                                     unsigned int out_dim,
+                                     unsigned int n_rows)
+{
+    mv_q5k_batched_impl<1, 16>(wbase, xq, y, in_dim, out_dim, n_rows);
 }

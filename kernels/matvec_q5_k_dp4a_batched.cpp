@@ -11,15 +11,6 @@
 #include <stdint.h>
 #include "gfx906_dpp.h"
 
-#define ROWS         2     // output rows per wavefront
-#define N_ROWS_MAX   4     // batch upper bound. Kept symmetric with the
-                           // per-layer batched kquant kernels (see
-                           // matvec_q4k_repacked_batched.cpp); going to 8
-                           // here doesn't help in practice because the
-                           // per-layer GEMMs cap K at 4 anyway — verify(K≥5)
-                           // falls through to MMQ in prefill.rs and that's
-                           // ~3.3× slower than batched, swamping any LM-head
-                           // win. Bump both together if you ever revisit.
 
 struct __attribute__((packed)) BlockQ5_K {
     uint16_t d;
@@ -46,8 +37,9 @@ void gsm_q5k_dpb(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
     }
 }
 
-extern "C" __global__
-void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
+template<int ROWS, int N_ROWS_MAX>
+__device__ __forceinline__
+void mv_q5k_dp4a_batched_impl(const BlockQ5_K* __restrict__ w_blocks,
                                   const BlockQ8*   __restrict__ xq,
                                   float*           __restrict__ y,
                                   unsigned int in_dim,
@@ -135,4 +127,31 @@ void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
             }
         }
     }
+}
+
+extern "C" __global__
+void matvec_q5_k_dp4a_batched_f32(const BlockQ5_K* __restrict__ w_blocks,
+                                  const BlockQ8*   __restrict__ xq,
+                                  float*           __restrict__ y,
+                                  unsigned int in_dim,
+                                  unsigned int out_dim,
+                                  unsigned int n_rows)
+{
+    mv_q5k_dp4a_batched_impl<2, 4>(w_blocks, xq, y, in_dim, out_dim, n_rows);
+}
+
+// 16-row variant for a DFlash block. The tied vocab head is the single
+// largest weight in the model (969 MB at Q5_K on the 31B), so running it
+// as 16 separate matvecs streams ~15 GB where one batched pass streams
+// under one. ROWS drops to 1 so per-thread accumulators stay at 16 rather
+// than 32 — the same trade the repacked batched matvecs make.
+extern "C" __global__
+void matvec_q5_k_dp4a_batched16_f32(const BlockQ5_K* __restrict__ w_blocks,
+                                  const BlockQ8*   __restrict__ xq,
+                                  float*           __restrict__ y,
+                                  unsigned int in_dim,
+                                  unsigned int out_dim,
+                                  unsigned int n_rows)
+{
+    mv_q5k_dp4a_batched_impl<1, 16>(w_blocks, xq, y, in_dim, out_dim, n_rows);
 }

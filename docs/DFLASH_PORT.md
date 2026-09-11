@@ -201,31 +201,49 @@ is what determines the speedup ceiling:
 DFlash wins every class, including the creative and longform cases where
 the assistant drafter collapses and adaptive-K has to switch MTP off.
 
-**Throughput is not yet a win** — 11 tok/s against a 26.2 baseline. The
-breakdown per round says why, and it is not the drafter:
+**Throughput after the kernel work**: 22.0 tok/s against a 26.2 baseline,
+up from 11.0. Per round:
 
 ```
-draft 48.5 ms | verify 424.0 ms | ctx 3.5 ms | other 0.7 ms
+                draft     verify    ctx    total   tok/s
+before          48.5 ms   424.0 ms  3.5    477 ms   11.0
+after           28.0 ms   207.7 ms  1.9    238 ms   22.0
 ```
 
-`verify_forward` at K=16 costs 424 ms, roughly 11 single decode steps.
-The verify path was built for K<=4: `matmul_kquant_batched_into` caps
-there and anything larger falls through to the MMQ GEMM, whose `BN = 64`
-token tile leaves 16/64 = 25% of each workgroup doing useful work. That
-matches the known scaling (K=4 108 ms, K=8 177 ms) extrapolated to K=16.
-DFlash cannot avoid this: its block size is fixed at 16 by the checkpoint.
+Two kernels did it:
 
-So the work that turns the acceptance win into a throughput win is:
+1. **Narrow-token MMQ** (`*_narrow_f32`, TM=2/TN=1/BK=4). The default
+   `BN = 64` token tile leaves 16/64 of each workgroup useful on a
+   16-token verify. A BN=16 tile fixes that: verify(16) 412 -> 207 ms,
+   with K<=4 untouched (84 ms, unchanged).
+2. **Batched tied LM head at 16 rows.** `launch_lm_head_rows` ran one
+   full-vocab matvec per row; the tied head is the largest tensor in the
+   model (969 MB at Q5_K), so 16 rows meant ~15 GB of weight traffic.
+   Routed through the batched dp4a kernel, now one sweep: draft 48.5 ->
+   28.0 ms.
 
-1. **Batched K-quant matvec up to 16 rows.** Raising `N_ROWS_MAX` from 4,
-   or an MMQ variant with a narrow token tile. Worth ~424 -> ~60 ms.
-2. **Batched LM head.** The 48.5 ms draft is dominated by 16 separate
-   full-vocab matvecs (see `launch_lm_head_rows`); one batched on-disk
-   dp4a matvec for Q4_K/Q4_0 would read the 880 MB table once instead of
-   16 times. Worth ~48 -> ~5 ms.
+**It is still 0.84x of plain decode**, and the reason is structural.
+At K=16 verify is **compute-bound, not bandwidth-bound**: 16 tokens x
+31B params x 2 = ~1 TFLOP, and the wide MMQ's measured efficiency on this
+GPU is ~11 TOPS (from prefill: 512 tok at 177 tok/s). That puts a floor of
+**~91 ms** on verify(16) no matter how the weights are streamed. We are at
+207 ms, so the narrow tile is running at ~45% of the wide tile's compute
+efficiency.
 
-At those numbers a round is ~65 ms for 3.72 tokens — about 57 tok/s
-against the 26.2 baseline, which is the range the paper reports.
+That floor also bounds what DFlash can be worth here:
+
+| | verify | round (5.25 tok) | tok/s | vs 26.2 |
+|---|---:|---:|---:|---:|
+| now | 207 ms | 238 ms | 22.0 | 0.84x |
+| at the compute floor | 91 ms | 122 ms | 43 | **1.6x** |
+
+So there is one more ~2.3x in verify and it is the whole remaining
+question. Shapes already swept and rejected, all worse than TM=2/TN=1:
+TM in {4,8}, TN in {2,4}, BK=8, and a 4x64 thread split that keeps TN=4
+at BN=16 (259 ms). The tile that wins is the one with the *least* work
+per thread, which suggests occupancy rather than arithmetic intensity is
+binding — worth confirming with a register/occupancy dump before the next
+attempt.
 
 ### Risks
 

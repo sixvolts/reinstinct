@@ -25,13 +25,22 @@
 // occupancy 1 won P=512 by ~2.6% but lost P=128 and ran at 235 VGPR
 // (one edit from a catastrophic spill); BK=8 was slower. 4×4/occ-2 is
 // the robust choice — alternatives are within measurement noise.
-#define BK 4         // sub-blocks per contraction chunk
-#define TM 4         // rows  per thread micro-tile
-#define TN 4         // tokens per thread micro-tile
-#define BM (16 * TM) // weight rows per workgroup tile
-#define BN (16 * TN) // tokens per workgroup tile
-#define LDW (BM * BK / 256)   // weight tile elems loaded per thread
-#define LDX (BN * BK / 256)   // activation tile elems loaded per thread
+#ifndef NARROW_TXG
+#define NARROW_TXG 16
+#endif
+#ifndef NARROW_BK
+#define NARROW_BK 4
+#endif
+#ifndef NARROW_TM
+#define NARROW_TM 2
+#endif
+#ifndef NARROW_TN
+#define NARROW_TN 1
+#endif
+#define TYG (256 / TXG)      // row groups in the 256-thread grid
+#define BM (TYG * TM)        // weight rows per workgroup tile
+#define BM_STRIDE TYG
+#define BN (TXG * TN)        // tokens per workgroup tile
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -40,8 +49,9 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
-extern "C" __global__ __launch_bounds__(256, 2)
-void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
+template<int TM, int TN, int BK, int TXG>
+__device__ __forceinline__
+void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
                                const BlockQ8*       __restrict__ xq,
                                float*               __restrict__ y,
                                unsigned int in_dim,
@@ -49,8 +59,8 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
                                unsigned int p_rows)
 {
     const int t  = threadIdx.x;          // 0..255
-    const int tx = t & 15;               // token group  0..15
-    const int ty = t >> 4;               // row group    0..15
+    const int tx = t % TXG;              // token group  0..TXG-1
+    const int ty = t / TXG;              // row group    0..TYG-1
     const unsigned int row0 = blockIdx.x * BM;
     const unsigned int tok0 = blockIdx.y * BN;
 
@@ -75,9 +85,7 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
 
     for (unsigned int sb0 = 0; sb0 < n_sub; sb0 += BK) {
         // Cooperative load — consecutive threads → consecutive (row,sb).
-        #pragma unroll
-        for (int i = 0; i < LDW; i++) {
-            const int e  = t + i * 256;
+        for (int e = t; e < BM * BK; e += 256) {
             const int lr = e / BK, lk = e % BK;
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim) {
@@ -96,9 +104,7 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }
         }
-        #pragma unroll
-        for (int i = 0; i < LDX; i++) {
-            const int e  = t + i * 256;
+        for (int e = t; e < BN * BK; e += 256) {
             const int lr = e / BK, lk = e % BK;
             const unsigned int xtok = tok0 + lr;
             if (xtok < p_rows) {
@@ -116,14 +122,14 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
             float dsc[TM], deff[TM];
             #pragma unroll
             for (int r = 0; r < TM; r++) {
-                wq[r] = sW[ty + r * 16][kk];
-                const float2 s = sWs[ty + r * 16][kk];
+                wq[r] = sW[ty + r * TYG][kk];
+                const float2 s = sWs[ty + r * TYG][kk];
                 dsc[r]  = s.x;
                 deff[r] = s.y;
             }
             #pragma unroll
             for (int n = 0; n < TN; n++) {
-                const BlockQ8* xb   = &sX[tx + n * 16][kk];
+                const BlockQ8* xb   = &sX[tx + n * TXG][kk];
                 const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
                 const float    dx   = xb->d;
                 const float    xsum = xb->xsum;
@@ -147,12 +153,42 @@ void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
 
     #pragma unroll
     for (int r = 0; r < TM; r++) {
-        const unsigned int row = row0 + ty + r * 16;
+        const unsigned int row = row0 + ty + r * TYG;
         if (row >= out_dim) continue;
         #pragma unroll
         for (int n = 0; n < TN; n++) {
-            const unsigned int tok = tok0 + tx + n * 16;
+            const unsigned int tok = tok0 + tx + n * TXG;
             if (tok < p_rows) y[(size_t)tok * out_dim + row] = acc[r][n];
         }
     }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void mmq_gemm_q4k_repacked_f32(const unsigned char* __restrict__ wbase,
+                               const BlockQ8*       __restrict__ xq,
+                               float*               __restrict__ y,
+                               unsigned int in_dim,
+                               unsigned int out_dim,
+                               unsigned int p_rows)
+{
+    mmq_q4k_impl<4, 4, 4, 16>(wbase, xq, y, in_dim, out_dim, p_rows);
+}
+
+// Narrow-token variant: TN=1 so BN=16 instead of 64.
+//
+// The wide tile is right for prefill, where P is hundreds of tokens. It is
+// wrong for a 16-token verify: 16/64 of every workgroup does useful work
+// and the other 48 token columns are masked-off waste. DFlash verifies a
+// fixed 16-token block every round, so that waste was the single largest
+// cost in a round. Narrowing the tile also cuts each thread's accumulators
+// from TM*TN=16 to 4, which buys back occupancy.
+extern "C" __global__ __launch_bounds__(256, 4)
+void mmq_gemm_q4k_repacked_narrow_f32(const unsigned char* __restrict__ wbase,
+                               const BlockQ8*       __restrict__ xq,
+                               float*               __restrict__ y,
+                               unsigned int in_dim,
+                               unsigned int out_dim,
+                               unsigned int p_rows)
+{
+    mmq_q4k_impl<NARROW_TM, NARROW_TN, NARROW_BK, NARROW_TXG>(wbase, xq, y, in_dim, out_dim, p_rows);
 }

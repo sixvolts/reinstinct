@@ -9,11 +9,21 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-#define BM 64
-#define BN 64
-#define BK 4
-#define TM 4
-#define TN 4
+#define TYG (256 / TXG)      // row groups in the 256-thread grid
+#define BM (TYG * TM)        // weight rows per workgroup tile
+#define BN (TXG * TN)        // tokens per workgroup tile
+#ifndef NARROW_TXG
+#define NARROW_TXG 16
+#endif
+#ifndef NARROW_BK
+#define NARROW_BK 4
+#endif
+#ifndef NARROW_TM
+#define NARROW_TM 2
+#endif
+#ifndef NARROW_TN
+#define NARROW_TN 1
+#endif
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -27,8 +37,9 @@ __device__ __forceinline__ uint32_t spread4(uint32_t h) {
     return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
 }
 
-extern "C" __global__ __launch_bounds__(256, 2)
-void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
+template<int TM, int TN, int BK, int TXG>
+__device__ __forceinline__
+void mmq_q5k_impl(const unsigned char* __restrict__ wbase,
                                const BlockQ8*       __restrict__ xq,
                                float*               __restrict__ y,
                                unsigned int in_dim,
@@ -64,33 +75,42 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
         #pragma unroll
         for (int n = 0; n < TN; n++) acc[r][n] = 0.0f;
 
-    const int lr = t >> 2;
-    const int lk = t & 3;
 
     for (unsigned int sb0 = 0; sb0 < n_sub; sb0 += BK) {
-        const unsigned int sb = sb0 + lk;
-        const unsigned int wrow = row0 + lr;
-        if (wrow < out_dim) {
-            sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
-            sWqh[lr][lk] = qhp[(size_t)wrow * nsp + sb];
-            const uint16_t sm = smp[(size_t)wrow * nsp + sb];
-            const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
-            sWs[lr][lk] = make_float2(
-                __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                    * (float)(sm & 0xFFu),
-                __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                    * (float)(sm >> 8));
-        } else {
-            sWs[lr][lk] = make_float2(0.0f, 0.0f);
+        // Strided cooperative loads: the tile is BM*BK / BN*BK elements,
+        // which is only 256 at the default BM=BN=64, BK=4. The narrow
+        // tile is smaller, so a fixed one-element-per-thread mapping
+        // would run threads off the end of the LDS arrays.
+        for (int e = t; e < BM * BK; e += 256) {
+            const int lr = e / BK, lk = e % BK;
+            const unsigned int sb = sb0 + lk;
+            const unsigned int wrow = row0 + lr;
+            if (wrow < out_dim) {
+                sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
+                sWqh[lr][lk] = qhp[(size_t)wrow * nsp + sb];
+                const uint16_t sm = smp[(size_t)wrow * nsp + sb];
+                const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
+                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+                sWs[lr][lk] = make_float2(
+                    __half2float(*reinterpret_cast<const __half*>(&d_bits))
+                        * (float)(sm & 0xFFu),
+                    __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
+                        * (float)(sm >> 8));
+            } else {
+                sWs[lr][lk] = make_float2(0.0f, 0.0f);
+            }
         }
-        const unsigned int xtok = tok0 + lr;
-        if (xtok < p_rows) {
-            sX[lr][lk] = xq[(size_t)xtok * n_sub + sb];
-        } else {
-            sX[lr][lk].d = 0.0f;
-            sX[lr][lk].xsum = 0.0f;
+        for (int e = t; e < BN * BK; e += 256) {
+            const int lr = e / BK, lk = e % BK;
+            const unsigned int sb = sb0 + lk;
+            const unsigned int xtok = tok0 + lr;
+            if (xtok < p_rows) {
+                sX[lr][lk] = xq[(size_t)xtok * n_sub + sb];
+            } else {
+                sX[lr][lk].d = 0.0f;
+                sX[lr][lk].xsum = 0.0f;
+            }
         }
         __syncthreads();
 
@@ -100,15 +120,15 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
             float dsc[TM], deff[TM];
             #pragma unroll
             for (int r = 0; r < TM; r++) {
-                wq[r]  = sW  [ty + r * 16][kk];
-                wqh[r] = sWqh[ty + r * 16][kk];
-                const float2 s = sWs[ty + r * 16][kk];
+                wq[r]  = sW  [ty + r * TYG][kk];
+                wqh[r] = sWqh[ty + r * TYG][kk];
+                const float2 s = sWs[ty + r * TYG][kk];
                 dsc[r]  = s.x;
                 deff[r] = s.y;
             }
             #pragma unroll
             for (int n = 0; n < TN; n++) {
-                const BlockQ8* xb   = &sX[tx + n * 16][kk];
+                const BlockQ8* xb   = &sX[tx + n * TXG][kk];
                 const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
                 const float    dx   = xb->d;
                 const float    xsum = xb->xsum;
@@ -135,12 +155,42 @@ void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
 
     #pragma unroll
     for (int r = 0; r < TM; r++) {
-        const unsigned int row = row0 + ty + r * 16;
+        const unsigned int row = row0 + ty + r * TYG;
         if (row >= out_dim) continue;
         #pragma unroll
         for (int n = 0; n < TN; n++) {
-            const unsigned int tok = tok0 + tx + n * 16;
+            const unsigned int tok = tok0 + tx + n * TXG;
             if (tok < p_rows) y[(size_t)tok * out_dim + row] = acc[r][n];
         }
     }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void mmq_gemm_q5k_repacked_f32(const unsigned char* __restrict__ wbase,
+                               const BlockQ8*       __restrict__ xq,
+                               float*               __restrict__ y,
+                               unsigned int in_dim,
+                               unsigned int out_dim,
+                               unsigned int p_rows)
+{
+    mmq_q5k_impl<4, 4, 4, 16>(wbase, xq, y, in_dim, out_dim, p_rows);
+}
+
+// Narrow-token variant: TN=1 so BN=16 instead of 64.
+//
+// The wide tile is right for prefill, where P is hundreds of tokens. It is
+// wrong for a 16-token verify: 16/64 of every workgroup does useful work
+// and the other 48 token columns are masked-off waste. DFlash verifies a
+// fixed 16-token block every round, so that waste was the single largest
+// cost in a round. Narrowing the tile also cuts each thread's accumulators
+// from TM*TN=16 to 4, which buys back occupancy.
+extern "C" __global__ __launch_bounds__(256, 4)
+void mmq_gemm_q5k_repacked_narrow_f32(const unsigned char* __restrict__ wbase,
+                               const BlockQ8*       __restrict__ xq,
+                               float*               __restrict__ y,
+                               unsigned int in_dim,
+                               unsigned int out_dim,
+                               unsigned int p_rows)
+{
+    mmq_q5k_impl<NARROW_TM, NARROW_TN, NARROW_BK, NARROW_TXG>(wbase, xq, y, in_dim, out_dim, p_rows);
 }

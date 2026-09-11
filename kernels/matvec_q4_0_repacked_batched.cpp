@@ -18,17 +18,24 @@
 // Activation `xq` is [n_rows, n_sub, BlockQ8] (40-byte BlockQ8, per-row
 // per-block d/xsum/qs[32]). Output `y` is [n_rows, out_dim].
 //
-// 256-thread workgroup, 4 waves × ROWS=2 rows of output each (8 out_dim
-// rows / WG). grid.x = ceil(out_dim / 8).
+// Two instantiations, differing only in (ROWS, N_ROWS_MAX):
+//
+//   `_f32`   — ROWS=2, N_ROWS_MAX=4.  4 waves x 2 = 8 out_dim rows/WG,
+//              grid.x = ceil(out_dim / 8). The tuned K<=4 spec-decode path.
+//   `batched16_f32` — ROWS=1, N_ROWS_MAX=16. 4 waves x 1 = 4 out_dim rows/WG,
+//              grid.x = ceil(out_dim / 4). For DFlash, whose block size is
+//              16. Dropping ROWS keeps ROWS*N_ROWS_MAX accumulators at 16
+//              instead of 32, so register pressure stays near the 4-row
+//              kernel while the weight is still streamed once for all 16
+//              activation rows.
+//
+// The caller must match grid.x to the variant.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include "gfx906_dpp.h"
 
-#define ROWS         2     // output rows per wavefront
-#define N_ROWS_MAX   4     // K upper bound, matching the Q4_K kernel's cap
-                           // (MAX_VERIFY_K host-side).
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;
@@ -37,8 +44,9 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
-extern "C" __global__
-void matvec_q4_0_repacked_batched_f32(const uint8_t* __restrict__ wbase,
+template<int ROWS, int N_ROWS_MAX>
+__device__ __forceinline__
+void mv_q4_0_batched_impl(const uint8_t* __restrict__ wbase,
                                       const BlockQ8* __restrict__ xq,
                                       float*         __restrict__ y,
                                       unsigned int in_dim,
@@ -119,4 +127,31 @@ void matvec_q4_0_repacked_batched_f32(const uint8_t* __restrict__ wbase,
             }
         }
     }
+}
+
+extern "C" __global__
+void matvec_q4_0_repacked_batched_f32(const uint8_t* __restrict__ wbase,
+                                      const BlockQ8* __restrict__ xq,
+                                      float*         __restrict__ y,
+                                      unsigned int in_dim,
+                                      unsigned int out_dim,
+                                      unsigned int n_rows)
+{
+    mv_q4_0_batched_impl<2, 4>(wbase, xq, y, in_dim, out_dim, n_rows);
+}
+
+// Wide variant for DFlash, whose block size is 16. ROWS drops to 1 so a
+// thread carries ROWS*N_ROWS_MAX = 16 accumulators rather than 32, keeping
+// register pressure near the 4-row kernel's while reading each weight
+// sub-block once for all 16 activation rows. Weight traffic is then
+// out_dim*in_dim total, the same as a single matvec.
+extern "C" __global__
+void matvec_q4_0_repacked_batched16_f32(const uint8_t* __restrict__ wbase,
+                                      const BlockQ8* __restrict__ xq,
+                                      float*         __restrict__ y,
+                                      unsigned int in_dim,
+                                      unsigned int out_dim,
+                                      unsigned int n_rows)
+{
+    mv_q4_0_batched_impl<1, 16>(wbase, xq, y, in_dim, out_dim, n_rows);
 }
