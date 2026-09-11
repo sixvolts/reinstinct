@@ -108,6 +108,27 @@ enum Command {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+    /// Block-diffusion speculative decode with a DFlash drafter. Unlike
+    /// `mtp-gen`, which proposes tokens one at a time, DFlash denoises a
+    /// whole `dflash.block_size` block (16) in a single forward pass
+    /// conditioned on hidden states tapped from six target layers, so a
+    /// round costs one draft forward and one verify forward regardless of
+    /// block size. Greedy only — acceptance rate is the point.
+    DflashGen {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        /// Total tokens to generate.
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+        /// Mask token id. Defaults to the GGUF's
+        /// `tokenizer.ggml.mask_token_id` (4 on Gemma 4).
+        #[arg(long)]
+        mask_token: Option<u32>,
+    },
     /// Spec-decode smoke test: load a Gemma 4 target + its MTP drafter,
     /// prefill a prompt, then ask the drafter to propose K tokens at the
     /// prompt's last position. Prints each drafted token plus the
@@ -365,6 +386,8 @@ fn main() -> anyhow::Result<()> {
             qwen_mtp_probe_cli(&path, prompt, steps),
         Command::QwenVerifyCheck { path, prompt, k } =>
             qwen_verify_check_cli(&path, prompt, k),
+        Command::DflashGen { target, drafter, prompt, system, steps, mask_token } =>
+            dflash_gen_cli(&target, &drafter, prompt, system, steps, mask_token),
         Command::QwenMtpGen { path, prompt, tokens, k } =>
             qwen_mtp_gen_cli(&path, prompt, tokens, k),
         Command::AlignCheck { target, drafter, prompt, system, steps } =>
@@ -2334,6 +2357,144 @@ use reinstinct_engine::sampling::argmax;
 /// With sequential verify the per-round cost is `K·drafter + (n_acc+1)·target`,
 /// vs the K`drafter + 1`target a batched-verify path would hit. This is
 /// a correctness path, not a speed path — see the MTP memory file.
+/// Block-diffusion spec-decode with a DFlash drafter.
+///
+/// One round = one draft forward (16 tokens denoised together) + one
+/// target verify over those 16 positions. Accept the longest prefix the
+/// target agrees with, then take its own next token as a free bonus, so a
+/// round yields 1..16 tokens. See docs/DFLASH_PORT.md.
+fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+                  prompt_text: Option<String>, system: Option<String>,
+                  steps: usize, mask_token: Option<u32>) -> anyhow::Result<()>
+{
+    use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_engine::hip;
+    use reinstinct_engine::model::dflash::DFlashModel;
+    use reinstinct_engine::model::gemma4::Gemma4Model;
+    use reinstinct_engine::runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_engine::runtime::dflash::{DFlashState, GpuDFlash};
+    use reinstinct_engine::tokenizer::GemmaTokenizer;
+
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    let prompt: Vec<u32> = if let Some(sy) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: sy.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("dflash-gen: pass --prompt or --system/--prompt");
+    };
+
+    let mask = mask_token
+        .or_else(|| target_gguf.metadata_get("tokenizer.ggml.mask_token_id")
+                        .and_then(|v| v.as_u32()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "no mask token: the GGUF has no tokenizer.ggml.mask_token_id, \
+             pass --mask-token"))?;
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let t_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let d_model = DFlashModel::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let eos = t_model.config.eos_token_id;
+    let b = d_model.config.block_size as usize;
+    let max_seq = prompt.len() + steps + 2 * b + 8;
+
+    let gm = GpuGemma4::new(&t_model, &target_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let draft = GpuDFlash::new(&d_model, &drafter_gguf, &cache, &gm, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let mut t_state = Gemma4GpuState::new(&t_model, max_seq).map_err(anyhow::Error::msg)?;
+    let mut d_state = DFlashState::new(&draft.config, max_seq).map_err(anyhow::Error::msg)?;
+    t_state.reset();
+    d_state.reset();
+
+    let taps: Vec<usize> = draft.target_layers().iter().map(|&l| l as usize).collect();
+    gm.enable_target_tap(&taps, &mut t_state, max_seq).map_err(anyhow::Error::msg)?;
+
+    println!("target  = {} ({} tok prompt)", target_path.display(), prompt.len());
+    println!("drafter = {}, block = {b}, taps = {taps:?}", drafter_path.display());
+
+    let argmax = |v: &[f32]| -> u32 {
+        let mut best = 0usize;
+        for (i, x) in v.iter().enumerate() { if *x > v[best] { best = i; } }
+        best as u32
+    };
+
+    // Prefill over the WHOLE prompt — the tap needs every position, so
+    // this cannot use mtp-gen's prefill(n-1) + forward_token(last) split.
+    let t_pf = std::time::Instant::now();
+    let logits = gm.prefill_forward(&prompt, &mut t_state).map_err(anyhow::Error::msg)?;
+    let mut anchor = argmax(&logits);
+    draft.append_context(&mut d_state, t_state.tap.as_ref().unwrap(), prompt.len(), 0)
+        .map_err(anyhow::Error::msg)?;
+    println!("prefill = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
+
+    let mut out: Vec<u32> = vec![anchor];
+    let mut start = prompt.len();
+    let mut n_drafted = 0usize;
+    let mut n_accepted = 0usize;
+    let mut rounds = 0usize;
+    let mut stopped = anchor == eos;
+
+    let t0 = std::time::Instant::now();
+    while out.len() < steps && !stopped {
+        let preds = draft.draft_block(&d_state, &gm, anchor, mask)
+            .map_err(anyhow::Error::msg)?;
+        let mut block = Vec::with_capacity(b);
+        block.push(anchor);
+        block.extend_from_slice(&preds[1..]);
+
+        let vlogits = gm.verify_forward(&block, &mut t_state).map_err(anyhow::Error::msg)?;
+
+        // Longest prefix the target agrees with. vlogits[j] predicts the
+        // token at block position j+1.
+        let mut accept = 0usize;
+        while accept < b - 1 && block[accept + 1] == argmax(&vlogits[accept]) {
+            accept += 1;
+        }
+        let bonus = argmax(&vlogits[accept]);
+        n_drafted += b - 1;
+        n_accepted += accept;
+        rounds += 1;
+
+        for t in &block[1..=accept] { out.push(*t); }
+        out.push(bonus);
+        let produced = accept + 1;
+
+        // Drop the rejected tail from the target's KV, then feed the
+        // accepted rows' context features to the drafter.
+        t_state.truncate(start + produced);
+        draft.append_context(&mut d_state, t_state.tap.as_ref().unwrap(), produced, start)
+            .map_err(anyhow::Error::msg)?;
+
+        if out[out.len() - produced..].contains(&eos) { stopped = true; }
+        anchor = bonus;
+        start += produced;
+    }
+    let dt = t0.elapsed().as_secs_f64();
+
+    println!("\n--- generation ---\n{}", tok.decode(&out));
+    println!("\ngenerated {} tokens in {dt:.2} s = {:.1} tok/s",
+             out.len(), out.len() as f64 / dt);
+    println!("rounds = {rounds}, mean accepted length = {:.2} tok/round",
+             out.len() as f64 / rounds.max(1) as f64);
+    println!("block accept rate: {n_accepted} / {n_drafted} = {:.0}%",
+             100.0 * n_accepted as f64 / n_drafted.max(1) as f64);
+    Ok(())
+}
+
 fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
                prompt_text: Option<String>, system: Option<String>,
                k: usize, steps: usize, temperature: f32, seed: u64) -> anyhow::Result<()>
