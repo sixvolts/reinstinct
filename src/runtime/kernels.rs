@@ -101,10 +101,24 @@ pub fn attn_prefill_flash_f32(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f3
                               p: usize, n_heads: usize, n_kv: usize, head_dim: usize,
                               window: u32) -> Result<Vec<f32>, String>
 {
+    attn_prefill_flash_ext(cache, q, k, v, p, n_heads, n_kv, head_dim, window, 0, true)
+}
+
+/// Flash-attention over a K/V cache of `base_pos + p` positions, with the
+/// `p` queries sitting at the tail. `causal = false` selects the unmasked
+/// entry point, where a query also sees the keys after its own position —
+/// DFlash's `full_attention` draft layer. `window` is ignored then.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefill_flash_ext(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f32],
+                              p: usize, n_heads: usize, n_kv: usize, head_dim: usize,
+                              window: u32, base_pos: u32, causal: bool)
+    -> Result<Vec<f32>, String>
+{
     const BQ: u32 = 8;
     const BK: u32 = 8;
     let module = Module::load(&cache.compile("attn_prefill_flash", ATTN_PREFILL_FLASH_SRC)?)?;
-    let f = module.function("attn_prefill_flash_f32")?;
+    let f = module.function(if causal { "attn_prefill_flash_f32" }
+                            else       { "attn_prefill_flash_nc_f32" })?;
     let dq: DeviceBuf<f32> = DeviceBuf::from_slice(q)?;
     let dk: DeviceBuf<f32> = DeviceBuf::from_slice(k)?;
     let dv: DeviceBuf<f32> = DeviceBuf::from_slice(v)?;
@@ -114,7 +128,7 @@ pub fn attn_prefill_flash_f32(cache: &KernelCache, q: &[f32], k: &[f32], v: &[f3
     let mut qa=dq.raw_ptr(); let mut ka=dk.raw_ptr(); let mut va=dv.raw_ptr();
     let mut oa=dout.raw_ptr();
     let mut nh=n_heads as u32; let mut nkv=n_kv as u32; let mut hd=head_dim as u32;
-    let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=0u32;
+    let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=base_pos;
     let mut args: [*mut c_void; 11] = [
         &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
         &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
@@ -2040,6 +2054,82 @@ mod tests {
                                     .wrapping_add(1442695040888963407);
                              ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
         (0..p_rows * in_dim).map(|_| x_rng()).collect()
+    }
+
+    /// CPU reference for the flash kernel's exact contract: `p` queries
+    /// at positions `base_pos..base_pos+p` against a cache of
+    /// `base_pos+p` keys, GQA, optional causal mask and sliding window.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_reference(q: &[f32], k: &[f32], v: &[f32], p: usize, n_heads: usize,
+                      n_kv: usize, head_dim: usize, window: u32,
+                      base_pos: usize, causal: bool) -> Vec<f32>
+    {
+        let kv_len = base_pos + p;
+        let groups = n_heads / n_kv;
+        let mut out = vec![0.0f32; p * n_heads * head_dim];
+        for r in 0..p {
+            let q_pos = base_pos + r;
+            for h in 0..n_heads {
+                let kv_h = h / groups;
+                let qo = (r * n_heads + h) * head_dim;
+                let lo = if causal && window > 0 && q_pos + 1 > window as usize {
+                    q_pos + 1 - window as usize
+                } else { 0 };
+                let hi = if causal { q_pos } else { kv_len - 1 };
+                let mut scores = Vec::with_capacity(hi + 1 - lo);
+                for kp in lo..=hi {
+                    let ko = (kp * n_kv + kv_h) * head_dim;
+                    let mut d = 0.0f32;
+                    for i in 0..head_dim { d += q[qo + i] * k[ko + i]; }
+                    scores.push(d);
+                }
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() { *sc = (*sc - m).exp(); sum += *sc; }
+                for (idx, kp) in (lo..=hi).enumerate() {
+                    let w = scores[idx] / sum;
+                    let vo = (kp * n_kv + kv_h) * head_dim;
+                    for i in 0..head_dim { out[qo + i] += w * v[vo + i]; }
+                }
+            }
+        }
+        out
+    }
+
+    /// The unmasked entry point, plus the `base_pos > 0` shape DFlash
+    /// actually runs: a 16-query block attending to a populated context
+    /// cache. Checked against the CPU reference rather than the plain
+    /// kernel, which has no non-causal mode to compare with.
+    #[test]
+    fn attn_prefill_flash_noncausal_and_offset_match_reference() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (n_heads, n_kv, head_dim) = (8usize, 2usize, 128usize);
+        let mut s: u64 = 0xDF1A_5401;
+        let mut rng = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           ((s >> 40) as u32 as f32 / (1u32 << 24) as f32) - 0.5 };
+
+        // (queries, context length before them) — the second pair is the
+        // DFlash block shape: 16 draft tokens after 100 context rows.
+        for &(p, base_pos) in &[(70usize, 0usize), (16usize, 100usize)] {
+            let kv_len = base_pos + p;
+            let q: Vec<f32> = (0..p * n_heads * head_dim).map(|_| rng()).collect();
+            let k: Vec<f32> = (0..kv_len * n_kv * head_dim).map(|_| rng()).collect();
+            let v: Vec<f32> = (0..kv_len * n_kv * head_dim).map(|_| rng()).collect();
+
+            for &(causal, window) in &[(true, 0u32), (true, 24u32), (false, 0u32)] {
+                let want = attn_reference(&q, &k, &v, p, n_heads, n_kv, head_dim,
+                                          window, base_pos, causal);
+                let got = attn_prefill_flash_ext(&cache, &q, &k, &v, p, n_heads, n_kv,
+                                                 head_dim, window, base_pos as u32, causal)
+                    .expect("flash ext");
+                let e = rel_l2(&got, &want);
+                eprintln!("attn_flash p={p} base={base_pos} causal={causal} \
+window={window}: rel_l2={e:.3e}");
+                assert!(e < 1.0e-4,
+                    "p={p} base={base_pos} causal={causal} window={window}: \
+rel_l2 {e:.3e} too large");
+            }
+        }
     }
 
     #[test]

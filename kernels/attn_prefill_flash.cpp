@@ -14,7 +14,14 @@
 //
 // Query row r is the token at absolute position base_pos+r and attends
 // to cache positions [lo, base_pos+r] (lo from the sliding window, 0 for
-// full causal). A wavefront owns one query; lane l holds query elements
+// full causal).
+//
+// A second entry point, `attn_prefill_flash_nc_f32`, drops the mask
+// entirely: every query sees every key in the cache, including positions
+// after its own. DFlash's last draft layer needs that — it is declared
+// `full_attention`, which in the reference means both non-causal and
+// windowless, so the block of masked draft tokens can attend to itself
+// in both directions. `window` is ignored on that path. A wavefront owns one query; lane l holds query elements
 // l, l+64, … (head_dim must be a multiple of 64). grid = (n_heads,
 // ceil(n_rows/BQ)); block = 64·BQ. Dynamic LDS = 2·BK·head_dim f32.
 
@@ -24,18 +31,19 @@
 #define BK 8          // keys per key-tile
 #define DPL_MAX 8     // head_dim/64 upper bound (head_dim ≤ 512)
 
-extern "C" __global__
-void attn_prefill_flash_f32(const float* __restrict__ q,
-                            const float* __restrict__ k,
-                            const float* __restrict__ v,
-                            float*       __restrict__ out,
-                            unsigned int n_heads,
-                            unsigned int n_kv_heads,
-                            unsigned int head_dim,
-                            unsigned int window,        // 0 = full causal
-                            float        scaling,
-                            unsigned int n_rows,        // query rows
-                            unsigned int base_pos)      // abs pos of row 0
+template<bool CAUSAL>
+__device__ __forceinline__
+void attn_prefill_flash_impl(const float* __restrict__ q,
+                             const float* __restrict__ k,
+                             const float* __restrict__ v,
+                             float*       __restrict__ out,
+                             unsigned int n_heads,
+                             unsigned int n_kv_heads,
+                             unsigned int head_dim,
+                             unsigned int window,        // 0 = full causal
+                             float        scaling,
+                             unsigned int n_rows,        // query rows
+                             unsigned int base_pos)      // abs pos of row 0
 {
     extern __shared__ float lds[];
     float* kt = lds;                       // [BK, head_dim]
@@ -72,13 +80,24 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
     // Causal/window key range, in absolute cache positions. The workgroup
     // loops the union over its BQ queries.
     const int total = (int)q_pos + 1;
-    const int lo = (window > 0 && total > (int)window) ? (total - (int)window) : 0;
+    const int lo = CAUSAL
+        ? ((window > 0 && total > (int)window) ? (total - (int)window) : 0)
+        : 0;
     const int q0_pos = (int)base_pos + (int)qbase;     // smallest query pos
     const int q0t   = q0_pos + 1;
-    const int lo_min = (window > 0 && q0t > (int)window) ? (q0t - (int)window) : 0;
+    const int lo_min = CAUSAL
+        ? ((window > 0 && q0t > (int)window) ? (q0t - (int)window) : 0)
+        : 0;
     const int kt_start = (lo_min / BK) * BK;
-    int kt_end = (int)base_pos + (int)qbase + BQ;
-    if (kt_end > (int)kv_len) kt_end = (int)kv_len;
+    // Causal: stop after the workgroup's last query position. Unmasked:
+    // every key, including the ones after this query's own position.
+    int kt_end;
+    if (CAUSAL) {
+        kt_end = (int)base_pos + (int)qbase + BQ;
+        if (kt_end > (int)kv_len) kt_end = (int)kv_len;
+    } else {
+        kt_end = (int)kv_len;
+    }
 
     for (int kt0 = kt_start; kt0 < kt_end; kt0 += BK) {
         // Cooperative load of the K/V tile — coalesced over head_dim.
@@ -99,7 +118,9 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
             #pragma unroll
             for (int kk = 0; kk < BK; kk++) {
                 const int kpos = kt0 + kk;
-                const bool valid = (kpos >= lo) && (kpos <= (int)q_pos);
+                const bool valid = CAUSAL
+                    ? ((kpos >= lo) && (kpos <= (int)q_pos))
+                    : (kpos < (int)kv_len);
                 float score;
                 if (!valid) {
                     score = -INFINITY;
@@ -135,4 +156,40 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
                 out[((size_t)q_row * n_heads + h) * head_dim + lane + i * 64]
                     = acc[i] * inv;
     }
+}
+
+extern "C" __global__
+void attn_prefill_flash_f32(const float* __restrict__ q,
+                            const float* __restrict__ k,
+                            const float* __restrict__ v,
+                            float*       __restrict__ out,
+                            unsigned int n_heads,
+                            unsigned int n_kv_heads,
+                            unsigned int head_dim,
+                            unsigned int window,
+                            float        scaling,
+                            unsigned int n_rows,
+                            unsigned int base_pos)
+{
+    attn_prefill_flash_impl<true>(q, k, v, out, n_heads, n_kv_heads, head_dim,
+                                  window, scaling, n_rows, base_pos);
+}
+
+// Unmasked variant — see the header note. `window` is accepted for a
+// uniform call signature and ignored.
+extern "C" __global__
+void attn_prefill_flash_nc_f32(const float* __restrict__ q,
+                               const float* __restrict__ k,
+                               const float* __restrict__ v,
+                               float*       __restrict__ out,
+                               unsigned int n_heads,
+                               unsigned int n_kv_heads,
+                               unsigned int head_dim,
+                               unsigned int window,
+                               float        scaling,
+                               unsigned int n_rows,
+                               unsigned int base_pos)
+{
+    attn_prefill_flash_impl<false>(q, k, v, out, n_heads, n_kv_heads, head_dim,
+                                   window, scaling, n_rows, base_pos);
 }
