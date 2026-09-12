@@ -93,6 +93,14 @@ void mv_q4k_repacked(const uint8_t* __restrict__ wbase,
         const float    dx   = xb->d;
         const float    xsum = xb->xsum;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
+        // Every load of the trip is issued above. Without this fence the
+        // scheduler trades latency for registers and splits the trip into
+        // load -> wait -> dot phases with a full vmcnt(0) between each
+        // (five round trips per trip at 38 VGPRs); Q5_K, whose arrays
+        // forced 62 VGPRs, got the loads-first schedule by accident and
+        // ran faster with more bytes. Q6_K and Q4_0 are already scheduled
+        // loads-first and get slower with the fence — do not add it there.
+        __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);

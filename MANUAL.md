@@ -1184,9 +1184,9 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
-| qwen-3.8-27B           |          255       |     —       |    —     |        32.2       |      —     |    —     |
+| qwen-3.8-27B           |          255       |     —       |    —     |        33.1       |      —     |    —     |
 | qwen-3.8-27B Q8_K_XL, 2×MI50 |    419       |     —       |    —     |        20.3       |      —     |    —     |
-| gemma4-31B             |          217       |    172      |  **+26%**|        27.5       |     21.0   |  **+31%**|
+| gemma4-31B             |          217       |    172      |  **+26%**|        28.9       |     21.0   |  **+38%**|
 | gemma4-31B QAT (Q4_0)  |          265       |     —       |    —     |         —         |      —     |    —     |
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
@@ -1269,7 +1269,14 @@ on qwen 35B-MoE). Key changes:
   branch between the rows' loads and a `waitcnt` behind each, which
   held Q5_K at 540 GB/s and Q6_K at 590 against Q4_0's 690 (now 700 /
   690). Q5_K/Q6_K spread their high bits with a multiply instead of
-  bit-by-bit shifts. Q8_0's repacked layout is two 16-byte planes
+  bit-by-bit shifts. Q4_K needed one more thing: even branchless, the
+  scheduler split its trip into five load→wait→dot phases to hold
+  VGPRs at 38, exposing five memory round trips per trip; a
+  `__builtin_amdgcn_sched_barrier` after the load block forces the
+  loads-first schedule (620 → 700 GB/s). That fence is per-kernel
+  judgement, not a rule — Q6_K and Q4_0 were already loads-first and
+  get slower with it. Read the ISA (`hipcc --save-temps`) before
+  touching these; the instruction mix is the profile. Q8_0's repacked layout is two 16-byte planes
   (quants 0-15 of every sub-block, then 16-31): one 32-byte block per
   lane made every load instruction half-use its cache lines and capped
   Q8_0 at ~500 GB/s; the planes take it to 750. The kernel-read
