@@ -224,6 +224,24 @@ mod tests {
         }
     }
     #[test]
+    fn think_spec_reads_each_family_default() {
+        let q38 = "{%- if enable_thinking is undefined or enable_thinking is true %}\n\
+                   {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}";
+        assert_eq!(Qwen3ThinkSpec::from_template(q38),
+                   Qwen3ThinkSpec { default_on: true, reasoning_effort: true });
+        let q35 = "{%- if enable_thinking is defined and enable_thinking is true %}\n\
+                   {{- '<think>\n' }}";
+        assert_eq!(Qwen3ThinkSpec::from_template(q35), Qwen3ThinkSpec::QWEN35);
+    }
+    #[test]
+    fn reasoning_instruction_levels() {
+        assert!(qwen3_reasoning_instruction("xhigh").unwrap().is_some());
+        assert_eq!(qwen3_reasoning_instruction("high"), qwen3_reasoning_instruction("xhigh"));
+        assert!(qwen3_reasoning_instruction("medium").unwrap().is_none());
+        assert!(qwen3_reasoning_instruction("low").unwrap().is_some());
+        assert!(qwen3_reasoning_instruction("max").is_err());
+    }
+    #[test]
     fn supported_by_serve_is_correct() {
         assert!(ChatTemplateFamily::Qwen3.supported_by_serve());
         assert!(ChatTemplateFamily::Gemma4.supported_by_serve());
@@ -232,39 +250,131 @@ mod tests {
     }
 }
 
-/// Render `messages` into a Qwen 3.5/3.6 chat-template token sequence,
-/// matching `Qwen3.5-*/chat_template.jinja` for the basic chat case
-/// (system / user / assistant; no tool calls, no `<think>` channel).
+/// What a Qwen 3.x chat template does about thinking, read off the
+/// GGUF's jinja blob. The family changed its default between releases:
+///
+/// * Qwen 3.5 / 3.6: `enable_thinking is defined and … is true` — the
+///   generation prompt ends `<think>\n\n</think>\n\n` (thinking OFF)
+///   unless the caller asks for it.
+/// * Qwen 3.8: `enable_thinking is undefined or … is true` — thinking
+///   ON by default, the generation prompt ends with an opened
+///   `<think>\n`, and a `reasoning_effort` (`xhigh` default, `medium`,
+///   `low`; `high` maps to `xhigh`) prepends an instruction sentence to
+///   the system turn.
+///
+/// `format_qwen3` renders whichever the template calls for, so a model
+/// gets the same prompt it would from `apply_chat_template`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen3ThinkSpec {
+    /// Thinking on when the request does not say.
+    pub default_on: bool,
+    /// The template understands `reasoning_effort` (Qwen 3.8+).
+    pub reasoning_effort: bool,
+}
+
+impl Qwen3ThinkSpec {
+    /// Qwen 3.5-style: no thinking unless asked, no effort levels.
+    pub const QWEN35: Self = Self { default_on: false, reasoning_effort: false };
+
+    pub fn from_template(template: &str) -> Self {
+        let default_on = template.contains("enable_thinking is undefined or enable_thinking is true");
+        let reasoning_effort = template.contains("reasoning_effort");
+        Self { default_on, reasoning_effort }
+    }
+}
+
+/// Per-request thinking controls for `format_qwen3`. `None` means "the
+/// template's default".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Qwen3ThinkOpts {
+    pub enable_thinking: Option<bool>,
+    /// `xhigh` | `high` | `medium` | `low` (Qwen 3.8+; ignored elsewhere).
+    pub reasoning_effort: Option<String>,
+}
+
+/// The instruction sentence Qwen 3.8's template prepends to the system
+/// turn for a reasoning effort, if any (`medium` adds none). Verbatim
+/// from the template.
+fn qwen3_reasoning_instruction(effort: &str) -> Result<Option<&'static str>, String> {
+    Ok(match effort {
+        "xhigh" | "high" => Some("Reasoning effort is set to xhigh. Please think carefully \
+through the task, validate key assumptions, consider plausible alternatives, and \
+prioritize correctness, consistency, and clarity in the final answer."),
+        "low" => Some("Reasoning effort is set to low. Keep your thinking brief and \
+focused, moving directly to the conclusion without unnecessary elaboration."),
+        "medium" => None,
+        other => return Err(format!(
+            "qwen3 chat: unexpected reasoning_effort '{other}' (xhigh, medium, low)")),
+    })
+}
+
+/// Render `messages` into a Qwen 3.x chat-template token sequence,
+/// matching the model's `chat_template.jinja` for the basic chat case
+/// (system / user / assistant; no tool calls, no reasoning history).
 ///
 /// Qwen's chat template does **not** prepend BOS — the model expects to
 /// start with `<|im_start|>` directly. If `add_generation_prompt` is
-/// true, ends with `<|im_start|>assistant\n` so the model decodes the
-/// assistant turn directly.
-pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage],
-                    add_generation_prompt: bool) -> Result<Vec<u32>, String>
+/// true, ends with `<|im_start|>assistant\n` plus the thinking
+/// scaffold `spec` and `opts` resolve to: an opened `<think>\n` when
+/// thinking is on, a closed empty `<think>\n\n</think>\n\n` when off.
+pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage], add_generation_prompt: bool,
+                    spec: Qwen3ThinkSpec, opts: &Qwen3ThinkOpts) -> Result<Vec<u32>, String>
 {
+    let thinking = opts.enable_thinking.unwrap_or(spec.default_on);
+    // Reasoning-effort instruction (3.8+): part of the system turn,
+    // creating one if the conversation has none.
+    let instruction = if thinking && spec.reasoning_effort {
+        qwen3_reasoning_instruction(opts.reasoning_effort.as_deref().unwrap_or("xhigh"))?
+    } else { None };
+
     let approx = 8 + messages.iter().map(|m| 8 + m.content.len() / 2).sum::<usize>();
     let mut out = Vec::with_capacity(approx);
-    for m in messages {
+    let role = |name: &str| tok.token_id(name)
+        .ok_or_else(|| format!("qwen3 chat: role '{name}' not in vocab"));
+    let has_system = messages.first().map(|m| m.role == Role::System).unwrap_or(false);
+    if let (Some(instr), false) = (instruction, has_system) {
+        out.push(QWEN_IM_START);
+        out.push(role("system")?);
+        out.push(QWEN_NEWLINE);
+        out.extend(tok.encode(instr));
+        out.push(QWEN_IM_END);
+        out.push(QWEN_NEWLINE);
+    }
+    for (i, m) in messages.iter().enumerate() {
         let role_str = match m.role {
             Role::System    => "system",
             Role::User      => "user",
             Role::Assistant => "assistant",       // Qwen keeps "assistant" verbatim
         };
-        let role_id = tok.token_id(role_str).ok_or_else(|| format!(
-            "qwen3 chat: role '{role_str}' not in vocab"))?;
         out.push(QWEN_IM_START);
-        out.push(role_id);
+        out.push(role(role_str)?);
         out.push(QWEN_NEWLINE);
-        out.extend(tok.encode(&m.content));
+        if i == 0 && has_system {
+            if let Some(instr) = instruction {
+                out.extend(tok.encode(&format!("{instr}\n\n{}", m.content)));
+            } else {
+                out.extend(tok.encode(&m.content));
+            }
+        } else {
+            out.extend(tok.encode(&m.content));
+        }
         out.push(QWEN_IM_END);
         out.push(QWEN_NEWLINE);
     }
     if add_generation_prompt {
-        let role_id = tok.token_id("assistant").ok_or("qwen3 chat: 'assistant' not in vocab")?;
         out.push(QWEN_IM_START);
-        out.push(role_id);
+        out.push(role("assistant")?);
         out.push(QWEN_NEWLINE);
+        let think = tok.token_id("<think>").ok_or("qwen3 chat: '<think>' not in vocab")?;
+        out.push(think);
+        if thinking {
+            out.push(QWEN_NEWLINE);
+        } else {
+            let end_think = tok.token_id("</think>").ok_or("qwen3 chat: '</think>' not in vocab")?;
+            out.extend(tok.encode("\n\n"));
+            out.push(end_think);
+            out.extend(tok.encode("\n\n"));
+        }
     }
     Ok(out)
 }

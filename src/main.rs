@@ -86,6 +86,15 @@ enum Command {
         /// sum to the model's block count). Default: balanced by weight bytes.
         #[arg(long, value_delimiter = ',')]
         split: Option<Vec<usize>>,
+        /// Qwen 3.x chat path: force thinking on (Qwen 3.5/3.6 default off).
+        #[arg(long, conflicts_with = "no_think")]
+        think: bool,
+        /// Qwen 3.x chat path: force thinking off (Qwen 3.8 default on).
+        #[arg(long)]
+        no_think: bool,
+        /// Qwen 3.8+ chat path: reasoning effort — xhigh (default), medium, low.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
     /// Speculative decode against a Gemma 4 target using its MTP drafter.
     /// Currently sequential-verify (correctness, no speedup) — proves the
@@ -395,9 +404,15 @@ fn main() -> anyhow::Result<()> {
                                           big_port, small_port, embed_port, max_seq, gpus)
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
-                                temperature, top_k, seed, gpu, gpus, split } =>
+                                temperature, top_k, seed, gpu, gpus, split,
+                                think, no_think, reasoning_effort } => {
+            let think_opts = reinstinct_engine::chat::Qwen3ThinkOpts {
+                enable_thinking: if think { Some(true) } else if no_think { Some(false) } else { None },
+                reasoning_effort,
+            };
             generate_text(&path, prompt, system, user, tokens, steps,
-                          temperature, top_k, seed, gpu, &gpus, split.as_deref()),
+                          temperature, top_k, seed, gpu, &gpus, split.as_deref(), &think_opts)
+        }
         Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
             chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
         Command::SuperquantBench { warm_cap, cold_cap, n_kv,
@@ -755,7 +770,8 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
                  system: Option<String>, user: Option<String>,
                  tokens: Option<Vec<u32>>, steps: usize,
                  temperature: f32, top_k: usize, seed: u64, gpu: bool,
-                 gpus: &[i32], split: Option<&[usize]>) -> anyhow::Result<()> {
+                 gpus: &[i32], split: Option<&[usize]>,
+                 think_opts: &reinstinct_engine::chat::Qwen3ThinkOpts) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
     use reinstinct_engine::tokenizer::Tokenizer;
 
@@ -782,8 +798,10 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
         if !is_qwen {
             anyhow::bail!("--system / --user not supported for {arch}; only gemma4 and qwen35.");
         }
-        use reinstinct_engine::chat::{ChatMessage, Role, format_qwen3};
+        use reinstinct_engine::chat::{ChatMessage, Role, Qwen3ThinkSpec, format_qwen3};
         let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+        let spec = g.metadata_get("tokenizer.chat_template").and_then(|v| v.as_str())
+            .map(Qwen3ThinkSpec::from_template).unwrap_or(Qwen3ThinkSpec::QWEN35);
         let user_text = user.clone()
             .or_else(|| prompt_text.clone())
             .ok_or_else(|| anyhow::anyhow!(
@@ -793,7 +811,7 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             msgs.push(ChatMessage { role: Role::System, content: s.clone() });
         }
         msgs.push(ChatMessage { role: Role::User, content: user_text });
-        format_qwen3(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+        format_qwen3(&tok, &msgs, true, spec, think_opts).map_err(anyhow::Error::msg)?
     } else if let Some(text) = &prompt_text {
         let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
         let ids = tok.encode(text);

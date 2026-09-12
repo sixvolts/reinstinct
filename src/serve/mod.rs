@@ -122,6 +122,10 @@ struct GenReq {
     /// Per-request K override for spec-decode. `None` ⇒ server default
     /// (currently 3). Ignored when spec-decode is off.
     speculative_k: Option<usize>,
+    /// Qwen 3.x thinking controls: `enable_thinking` / `reasoning_effort`
+    /// at the top level or inside `chat_template_kwargs` (the vLLM /
+    /// HF convention). Unset = the model's template default.
+    think: crate::chat::Qwen3ThinkOpts,
     /// Drafter confidence early-stop threshold. After each AR draft step
     /// the drafter's chosen-token probability gets checked; if below
     /// `speculative_p_min`, the K-round terminates early. `0.0` (default)
@@ -247,7 +251,7 @@ const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
 
 fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
-        Option<std::time::Duration>, bool, bool, usize)
+        Option<std::time::Duration>, bool, bool, usize, crate::chat::Qwen3ThinkOpts)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
@@ -282,6 +286,14 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     }
 
     let use_speculative = j.get("use_speculative").and_then(Json::as_bool);
+    let kwargs = j.get("chat_template_kwargs");
+    let think = crate::chat::Qwen3ThinkOpts {
+        enable_thinking: j.get("enable_thinking").and_then(Json::as_bool)
+            .or_else(|| kwargs.and_then(|k| k.get("enable_thinking")).and_then(Json::as_bool)),
+        reasoning_effort: j.get("reasoning_effort").and_then(Json::as_str)
+            .or_else(|| kwargs.and_then(|k| k.get("reasoning_effort")).and_then(Json::as_str))
+            .map(str::to_string),
+    };
     let speculative_k = j.get("speculative_k").and_then(Json::as_f64)
         .map(|n| (n as usize).clamp(1, 4));
     let speculative_p_min = j.get("speculative_p_min").and_then(Json::as_f64)
@@ -315,7 +327,7 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
         },
     };
     (max_tokens, sp, use_speculative, speculative_k, speculative_p_min,
-     request_timeout, stream, stream_include_usage, top_logprobs_n)
+     request_timeout, stream, stream_include_usage, top_logprobs_n, think)
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
@@ -447,10 +459,10 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream, stream_include_usage, top_logprobs_n) =
+         request_timeout, stream, stream_include_usage, top_logprobs_n, think) =
         parse_common_fields(&j, COMPLETION_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
-                use_speculative, speculative_k, speculative_p_min,
+                use_speculative, think, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
 }
 
@@ -486,10 +498,10 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         messages.push(ChatMessage { role, content: content.to_string() });
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
-         request_timeout, stream, stream_include_usage, top_logprobs_n) =
+         request_timeout, stream, stream_include_usage, top_logprobs_n, think) =
         parse_common_fields(&j, CHAT_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
-                use_speculative, speculative_k, speculative_p_min,
+                use_speculative, think, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
 }
 
@@ -680,6 +692,14 @@ enum ServerModel {
         /// forbidden during capture). `None` under `REINSTINCT_NO_GRAPH`.
         graph: Option<crate::runtime::pipeline::PipelineGraph>,
         tok: crate::tokenizer::Tokenizer,
+        /// What this model's template does about thinking by default.
+        think: crate::chat::Qwen3ThinkSpec,
+        /// Token ids that close a thinking channel. Sampling penalties
+        /// restart after one: the chain of thought must not make the
+        /// visible answer avoid the numbers and words it just reasoned
+        /// with (repetition_penalty 1.1 over 64 tokens of thought turned
+        /// "17 × 23 = 391" into "\( \)").
+        think_closers: Vec<u32>,
         eos: u32,
         max_seq: usize,
         name: String,
@@ -690,6 +710,8 @@ enum ServerModel {
         /// Same as Qwen's; also `None` when capture is unsupported
         /// (SuperQuant KV), which falls back to per-kernel decode.
         graph: Option<crate::hip::GraphExec>,
+        /// As Qwen's `think_closers` (`<channel|>`, `<|thought|>`).
+        think_closers: Vec<u32>,
         tok: crate::tokenizer::GemmaTokenizer,
         eos: u32,
         bos: u32,
@@ -831,9 +853,10 @@ impl ServerModel {
 
         // Detect the chat template family from the GGUF's jinja blob;
         // log the family + warn if serve can't apply it natively.
-        if let Some(t) = g.metadata_get("tokenizer.chat_template")
-            .and_then(|v| v.as_str())
-        {
+        let template = g.metadata_get("tokenizer.chat_template").and_then(|v| v.as_str());
+        let think = template.map(crate::chat::Qwen3ThinkSpec::from_template)
+            .unwrap_or(crate::chat::Qwen3ThinkSpec::QWEN35);
+        if let Some(t) = template {
             let fam = crate::chat::detect_chat_template(t);
             if fam.supported_by_serve() {
                 info!("  chat template: {} (supported natively)", fam.label());
@@ -868,7 +891,9 @@ impl ServerModel {
                 for _ in 0..5 { verify_graphs.push(None); }
                 Some(GemmaDrafter { runtime: dr, verify_graphs })
             } else { None };
-            Ok(ServerModel::Gemma { gpu, state, graph: None, tok, eos, bos, max_seq, name, drafter,
+            let think_closers: Vec<u32> = ["<channel|>", "<|thought|>"].iter()
+                .filter_map(|t| tok.token_id(t)).collect();
+            Ok(ServerModel::Gemma { gpu, state, graph: None, think_closers, tok, eos, bos, max_seq, name, drafter,
                                     prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS) })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
@@ -889,7 +914,12 @@ impl ServerModel {
                 warn!("--big-drafter ignored on qwen35 target \
                        (no supported drafter; see gemma4-mtp memory file)");
             }
-            Ok(ServerModel::Qwen { gpu, state, graph: None, tok, eos, max_seq, name })
+            if think.default_on {
+                info!("  thinking: on by default (template); \
+                       requests can pass enable_thinking=false / reasoning_effort");
+            }
+            let think_closers: Vec<u32> = tok.token_id("</think>").into_iter().collect();
+            Ok(ServerModel::Qwen { gpu, state, graph: None, tok, think, think_closers, eos, max_seq, name })
         }
     }
 
@@ -925,14 +955,14 @@ impl ServerModel {
             .map(|d| std::time::Instant::now() + d);
 
         match self {
-            ServerModel::Qwen { gpu, state, graph, tok, eos, max_seq, .. } => {
+            ServerModel::Qwen { gpu, state, graph, tok, think, think_closers, eos, max_seq, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => tok.encode(text),
                     PromptInput::Chat(msgs) => {
                         // Qwen 3.5/3.6: render via the qwen template
                         // (no BOS — qwen expects to start at <|im_start|>),
                         // with assistant turn primed.
-                        crate::chat::format_qwen3(tok, msgs, true)?
+                        crate::chat::format_qwen3(tok, msgs, true, *think, &req.think)?
                     }
                 };
                 if prompt.is_empty() {
@@ -961,14 +991,21 @@ impl ServerModel {
                 let mut prev_text_len: usize = 0;
                 let mut full_text = String::new();
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                // Penalty history starts over after a thinking closer.
+                let mut answer_start = 0usize;
                 for _ in 0..req.max_tokens {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
                     }
-                    let res = sample_chain_lp(&mut logits, &mut sp, &out, &counts, &mut rng, want_lp);
+                    let res = sample_chain_lp(&mut logits, &mut sp, &out[answer_start..], &counts,
+                                              &mut rng, want_lp);
                     let t = res.token;
                     if t == *eos { hit_eos = true; break; }
                     out.push(t);
+                    if think_closers.contains(&t) {
+                        answer_start = out.len();
+                        counts.fill(0);
+                    }
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
                     // Re-decode the whole output: append-only token streams
                     // mean the previous prefix bytes are stable, so the
@@ -999,7 +1036,7 @@ impl ServerModel {
                 }
                 Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
-            ServerModel::Gemma { gpu, state, graph, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
+            ServerModel::Gemma { gpu, state, graph, think_closers, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => {
                         let mut p = vec![*bos];
@@ -1094,14 +1131,21 @@ impl ServerModel {
                     let mut prev_text_len: usize = 0;
                     let mut full_text = String::new();
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                    // Penalty history starts over after a thinking closer.
+                    let mut answer_start = 0usize;
                     for _ in 0..req.max_tokens {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
                         }
-                        let res = sample_chain_lp(&mut logits, &mut sp, &out, &counts, &mut rng, want_lp);
+                        let res = sample_chain_lp(&mut logits, &mut sp, &out[answer_start..], &counts,
+                                                  &mut rng, want_lp);
                         let t = res.token;
                         if t == *eos { hit_eos = true; break; }
                         out.push(t);
+                        if think_closers.contains(&t) {
+                            answer_start = out.len();
+                            counts.fill(0);
+                        }
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
@@ -1579,6 +1623,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 max_tokens: 0,
                 sampler: crate::sampling::SamplerParams::default(),
                 use_speculative: None,
+                think: crate::chat::Qwen3ThinkOpts::default(),
                 speculative_k: None,
                 speculative_p_min: 0.0,
                 request_timeout: None,

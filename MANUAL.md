@@ -163,6 +163,8 @@ Consume a prompt, then autoregressively sample `--steps` new tokens.
 | `--top-k <N>` | 40 | Top-k filter. `0` = full vocab. |
 | `--gpus <ID,...>` | `0` | HIP devices, in pipeline-stage order. More than one splits a `qwen35` model's layers across them (see *Multi-GPU*). |
 | `--split <N,...>` | by bytes | Blocks per stage, one entry per `--gpus` device, summing to the model's block count. |
+| `--think` / `--no-think` | template default | Qwen 3.x chat path (`--system`): force thinking on / off. Qwen 3.5/3.6 templates default off, Qwen 3.8 on. |
+| `--reasoning-effort <E>` | `xhigh` | Qwen 3.8+ chat path: `xhigh`, `medium`, `low`. |
 | `--seed <N>` | `0xC0FFEE` | PRNG seed. |
 | `--gpu` | off | Run on the GPU. |
 
@@ -710,6 +712,8 @@ instead of the flat `text` field on text_completion. Same `usage` block.
 | `request_timeout_seconds` | float | 120 | Wall-clock cap on the whole generation. On hit, returns with `finish_reason: length`. Clamped to `[0.1, 600]`. |
 | `use_speculative` | bool | drafter-present | Opt in/out of MTP spec-decode per request. `true` errors with 400 if no drafter was loaded (see `--big-drafter`). |
 | `speculative_k` | int | 3 | K override for spec-decode. Clamped to `[1, 4]`. Ignored when spec-decode is off. |
+| `enable_thinking` | bool | template default | Qwen 3.x: render the thinking scaffold the model's template calls for — an opened `<think>` (on) or an empty closed one (off). Default is the model's: Qwen 3.5/3.6 off, Qwen 3.8 on. Also accepted inside `chat_template_kwargs`. |
+| `reasoning_effort` | string | `xhigh` | Qwen 3.8+: `xhigh` (`high` maps to it), `medium`, `low` — prepends the template's effort instruction to the system turn when thinking is on. Also accepted inside `chat_template_kwargs`. |
 | `logprobs` | bool / int | — | `true` ⇒ return top-5 logprobs per token. `int N` ⇒ top-N (cap 20). Both response shapes supported (text-completions parallel arrays + chat-completions per-token objects). Streaming embeds the per-token logprobs in each SSE chunk. **Not supported on the MTP spec-decode path** — pass `use_speculative: false` if you need logprobs on a drafter-equipped server. |
 | `top_logprobs` | int | 5 | Chat-completions count companion to `logprobs: true`. Capped at 20. |
 
@@ -958,7 +962,7 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 | `Qwen3.5-4B-UD-Q4_K_XL.gguf`                  | qwen35      | Hybrid Gated-DeltaNet + GQA, all dense layers.                |
 | `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
 | `Qwen3.6-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.5-27B, retuned weights.                        |
-| `Qwen3.8-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.6-27B (config identical field for field), retuned weights, ships the `nextn` MTP head (block 65). Thinks by default: emits a `<think>` block before answering. |
+| `Qwen3.8-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.6-27B (config identical field for field), retuned weights, ships the `nextn` MTP head (block 65). Its template thinks by default (`xhigh` reasoning effort); `--no-think` / `enable_thinking: false` turns it off, `--reasoning-effort low` shortens it. |
 | `Qwen3.8-27B-UD-Q8_K_XL.gguf`                 | qwen35      | 29 GB — needs two MI50s (`--gpus 0,1`; 14.2 + 15.1 GiB). Q8_0 throughout except `output.weight` and the full-attention `attn_q`, which ship BF16 and are requantized to Q8_0 at load (gfx906 has no BF16 path; F32 would be 4x the bytes). |
 | `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | MoE, 256 experts top-8, hybrid GDN.                           |
 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | Same arch as 3.5-35B-MoE.                                     |
