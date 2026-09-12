@@ -123,6 +123,9 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
 const MOE_GEMM_BN: u32 = 16;
 /// Split-K partials for the GDN alpha|beta projection (`gdn_ab_project`).
 const AB_SPLIT: u32 = 4;
+/// GDN recurrent step geometry: 32-column slabs x 4 row groups.
+const GDN_COLS: u32 = 32;
+const GDN_GROUPS: u32 = 4;
 const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
@@ -1424,7 +1427,12 @@ impl GpuQwen35 {
         let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
-        let gdn_recurrent_step_fused_hsaco = cache.compile("gdn_recurrent_step_v2", GDN_RECURRENT_STEP_FUSED_SOURCE)?;
+        // Specialised on head_dim: the recurrent step's row loops unroll
+        // to a fixed trip count (see the kernel header).
+        let gdn_recurrent_step_fused_hsaco = cache.compile(
+            &format!("gdn_recurrent_step_v2_hd{}_g{}", gdn_head_dim, GDN_GROUPS),
+            &format!("#define GDN_HEAD_DIM {}\n#define COLS {}\n#define GROUPS {}\n{}",
+                     gdn_head_dim, GDN_COLS, GDN_GROUPS, GDN_RECURRENT_STEP_FUSED_SOURCE))?;
         let conv1d_step_silu_batched_hsaco = cache.compile(
             "conv1d_step_silu_batched", CONV1D_STEP_SILU_BATCHED_SOURCE)?;
         let l2norm_qk_batched_hsaco = cache.compile(
@@ -2423,13 +2431,16 @@ impl GpuQwen35 {
         n_part: u32, part_stride: u32) -> Result<(), String>
     {
         let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_v2_f32")?;
-        // v2 (kernels/gdn_recurrent_step_v2.cpp): 32-column slabs x 8
-        // row groups, 256 threads, the state column held in registers
-        // between the decay and update passes. LDS = q | k | red[8][32].
-        const COLS: u32 = 32;
-        const GROUPS: u32 = 8;
-        assert!(head_dim % (COLS * GROUPS / 32) == 0 && head_dim <= 256,
-                "gdn_recurrent_step_v2: head_dim {head_dim} must be a multiple of 8, <= 256");
+        // v2 (kernels/gdn_recurrent_step_v2.cpp): 32-column slabs x 4
+        // row groups, 128 threads, the state column held in registers
+        // between the decay and update passes. LDS = q | k | red[4][32].
+        // Compiled specialised on head_dim (see `new`); 4 groups x 32
+        // rows per thread measured fastest cold (18 vs 21 us for 8 x 16
+        // on the 27B: fewer barrier participants, more loads per wave).
+        assert!(head_dim % GDN_COLS == 0 && head_dim <= 256,
+                "gdn_recurrent_step_v2: head_dim {head_dim} must be a multiple of 32, <= 256");
+        const COLS: u32 = GDN_COLS;
+        const GROUPS: u32 = GDN_GROUPS;
         let block: u32 = COLS * GROUPS;
         let grid_y = (head_dim + COLS - 1) / COLS;
         let smem = (2 * head_dim + GROUPS * COLS) * std::mem::size_of::<f32>() as u32;

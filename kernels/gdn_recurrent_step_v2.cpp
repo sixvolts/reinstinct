@@ -13,18 +13,31 @@
 // row, so every load instruction is a full line; the previous 16-column
 // slab used half lines. The kv / out column sums span the 8 row groups
 // (different waves) and go through LDS.
+//
+// The launcher prepends `#define GDN_HEAD_DIM <head_dim>` so the row
+// loops have a compile-time trip count (no guards, no over-read); without
+// it the kernel is generic up to head_dim 256. `GROUPS` may be overridden
+// the same way (block = 32 * GROUPS).
 #include <hip/hip_runtime.h>
 
+#ifndef COLS
 #define COLS   32
+#endif
+#ifndef GROUPS
 #define GROUPS 8
-#define RMAX   32          // head_dim <= 256
+#endif
+#ifdef GDN_HEAD_DIM
+#define RMAX   (GDN_HEAD_DIM / GROUPS)
+#else
+#define RMAX   (256 / GROUPS)      // head_dim <= 256
+#endif
 
 __device__ __forceinline__ float softplus_stable_r(float x) {
     return (x > 0.0f) ? x + __logf(1.0f + __expf(-x))
                       :     __logf(1.0f + __expf(x));
 }
 
-extern "C" __global__ __launch_bounds__(256)
+extern "C" __global__ __launch_bounds__(COLS * GROUPS)
 void gdn_recurrent_step_v2_f32(const float* __restrict__ q_in,    // [n_k_heads, head_dim]
                                const float* __restrict__ k_in,    // [n_k_heads, head_dim]
                                const float* __restrict__ v_in,    // [n_heads,   head_dim]
@@ -44,13 +57,41 @@ void gdn_recurrent_step_v2_f32(const float* __restrict__ q_in,    // [n_k_heads,
     const int h   = blockIdx.x;
     const int kh  = h % (int)n_k_heads;
     const int tid = threadIdx.x;
-    const int g   = tid >> 5;                       // row group 0..7
-    const int c   = tid & 31;                       // column within the slab
+    const int g   = tid / COLS;                     // row group 0..GROUPS-1
+    const int c   = tid % COLS;                     // column within the slab
     const unsigned int vv = blockIdx.y * COLS + c;
     float* q_lds = lds;
     float* k_lds = lds + head_dim;
     float* red   = lds + 2 * head_dim;              // [GROUPS][COLS]
-    for (int i = tid; i < (int)head_dim; i += 256) {
+#ifdef GDN_HEAD_DIM
+    head_dim = GDN_HEAD_DIM;
+    const bool active = true;                       // head_dim % COLS == 0 asserted by the launcher
+    constexpr int R = RMAX;
+#else
+    const bool active = vv < head_dim;
+    const int R   = (int)head_dim / GROUPS;
+#endif
+    const int kk0 = g * R;
+    float* col = state + (size_t)h * head_dim * head_dim + (active ? vv : 0);
+    const size_t hd = head_dim;
+
+    // State loads first: this thread's R rows, issued as one batch before
+    // anything that waits on memory (the q/k LDS fill, the gate scalars).
+    // Left to itself the compiler paired each load with its FMA (load,
+    // wait, fma, ...), one row in flight per wave, and the cold-state
+    // kernel ran at 190 GB/s; with the q/k fill and its barrier ahead of
+    // the batch, a full memory latency sat in front of it. Rows beyond R
+    // (generic build only) re-read row R-1 — a cache hit, never used — so
+    // the batch has no branches in it.
+    float s[RMAX];
+    #pragma unroll
+    for (int i = 0; i < RMAX; i++) {
+        const int kk = kk0 + min(i, R - 1);
+        s[i] = col[(size_t)kk * hd];
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    for (int i = tid; i < (int)head_dim; i += COLS * GROUPS) {
         q_lds[i] = q_in[(size_t)kh * head_dim + i];
         k_lds[i] = k_in[(size_t)kh * head_dim + i];
     }
@@ -61,23 +102,16 @@ void gdn_recurrent_step_v2_f32(const float* __restrict__ q_in,    // [n_k_heads,
     }
     const float dec = __expf(ssm_a[h] * softplus_stable_r(a_h + dt_bias[h]));
     const float bet = 1.0f / (1.0f + __expf(-b_h));
-    const bool active = vv < head_dim;
     const float vval = active ? v_in[(size_t)h * head_dim + vv] : 0.0f;
-    const int R   = (int)head_dim / GROUPS;
-    const int kk0 = g * R;
-    float* col = state + (size_t)h * head_dim * head_dim + (active ? vv : 0);
-    const size_t hd = head_dim;
     __syncthreads();
 
-    // Decay pass: load this thread's R rows once, scale, and dot with k.
-    float s[RMAX];
+    // Decay pass: scale the rows and dot with k.
     float pkv = 0.0f;
     #pragma unroll
     for (int i = 0; i < RMAX; i++) {
         if (i < R) {
-            const int kk = kk0 + i;
-            s[i] = col[(size_t)kk * hd] * dec;
-            pkv += s[i] * k_lds[kk];
+            s[i] *= dec;
+            pkv += s[i] * k_lds[kk0 + i];
         }
     }
     red[g * COLS + c] = pkv;

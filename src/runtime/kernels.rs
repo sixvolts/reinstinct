@@ -2027,8 +2027,17 @@ mod tests {
     fn bench_matvec_repacked_kernels() {
         let Some(cache) = skip_if_no_gpu() else { return };
         use crate::quant::{q4_0, q4_k, q5_k, q6_k, q8_0, iq4_xs};
-        let shapes: [(usize, usize); 6] = [(5120, 17408), (17408, 5120), (5120, 8192),
-                                           (8192, 5120), (5120, 16384), (5120, 1024)];
+        // The 27B's decode projections plus the wide FFN shapes;
+        // REINSTINCT_MV_BENCH_SHAPES="in x out,in x out" overrides.
+        let mut shapes: Vec<(usize, usize)> = vec![
+            (5120, 17408), (17408, 5120), (5120, 12288), (5120, 10240), (5120, 6144),
+            (6144, 5120), (5120, 1024), (5120, 96)];
+        if let Ok(g) = std::env::var("REINSTINCT_MV_BENCH_SHAPES") {
+            shapes = g.split(',').map(|p| {
+                let v: Vec<usize> = p.split('x').map(|x| x.trim().parse().unwrap()).collect();
+                (v[0], v[1])
+            }).collect();
+        }
         let mut s: u64 = 0x3A7C_0001;
         let mut rng_u8 = || -> u8 {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -2057,6 +2066,11 @@ mod tests {
             let v: Vec<u32> = g.split(',').map(|x| x.parse().unwrap()).collect();
             kinds[4].3 = v[0]; kinds[4].4 = v[1];
         }
+        // REINSTINCT_MV_BENCH_R1=1 benches the one-row-per-wave `_r1`
+        // entries instead (kinds without one are skipped).
+        let r1 = std::env::var("REINSTINCT_MV_BENCH_R1").map(|v| v == "1").unwrap_or(false);
+        let r1_entries: [(&str, u32, u32); 4] = [
+            ("q4_0", 4, 256), ("q4_k", 4, 256), ("q8_0", 1, 64), ("iq4xs", 4, 256)];
         let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
         let mods: Vec<Module> = kinds.iter().map(|k| {
@@ -2077,6 +2091,14 @@ mod tests {
             unsafe { qf.launch((((in_dim as u32) + 255) / 256, 1, 1), (256, 1, 1), 0, Some(&stream), &mut qargs).unwrap(); }
             let mut line = format!("{:<14}", format!("{in_dim}x{out_dim}"));
             for (ki, k) in kinds.iter().enumerate() {
+                let mut k = *k;
+                if r1 {
+                    match r1_entries.iter().find(|e| e.0 == k.0) {
+                        Some(e) => { k.3 = e.1; k.4 = e.2; }
+                        None => { line.push_str(&format!("{:>12}", "-")); continue; }
+                    }
+                }
+                let kname = if r1 { format!("{}_r1_f32", k.1) } else { k.2.to_string() };
                 let (bs, bpb, d_off): (usize, usize, usize) = match k.0 {
                     "q4_0" => (32, q4_0::BYTES_PER_BLOCK, 0), "q4_k" => (256, q4_k::BYTES_PER_BLOCK, 0),
                     "q5_k" => (256, q5_k::BYTES_PER_BLOCK, 0), "q6_k" => (256, q6_k::BYTES_PER_BLOCK, 208),
@@ -2099,8 +2121,14 @@ mod tests {
                     _      => iq4_xs::repack_for_matvec(&w, in_dim, out_dim),
                 };
                 let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
-                let f = mods[ki].function(k.2).unwrap();
-                let grid = (out_dim as u32 + k.3 - 1) / k.3;
+                let f = mods[ki].function(&kname).unwrap();
+                // Lane-segmented K-quant entries take `seg` row groups per
+                // wave when a row is <= 32 sub-blocks (REINSTINCT_MV_BENCH_SEG=1).
+                let seg_on = std::env::var("REINSTINCT_MV_BENCH_SEG").map(|v| v == "1").unwrap_or(false);
+                let n_sub = (in_dim / 32) as u32;
+                let seg = if seg_on && bs == 256 && n_sub <= 32 { 64 / n_sub } else { 1 };
+                let rows_wg = k.3 * seg;
+                let grid = (out_dim as u32 + rows_wg - 1) / rows_wg;
                 let launch = |stream: &hip::Stream| {
                     let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
                     let mut ia = in_dim as u32; let mut oa = out_dim as u32;
@@ -2123,6 +2151,89 @@ mod tests {
             eprintln!("{line}");
         }
         eprintln!("(each cell: ms per launch, GB/s of repacked weight bytes)");
+    }
+
+    /// Can two independent decode matvecs overlap their ramp/drain? The
+    /// GDN block's qkv [5120->10240] and gate [5120->6144] projections
+    /// (both Q5_K here) read the same activation, so they can run
+    /// concurrently: sequential on one stream vs fork/join across two
+    /// streams, direct and inside a captured graph. `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_matvec_stream_overlap() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q5_k;
+        use crate::hip::{Graph, Event};
+        use crate::hip::sys::HipStreamCaptureMode;
+        let in_dim = 5120usize;
+        let pairs: [((usize, usize), (usize, usize)); 3] = [
+            ((in_dim, 10240), (in_dim, 6144)), ((in_dim, 17408), (in_dim, 17408)),
+            ((in_dim, 1024), (in_dim, 1024))];
+        let mut sd: u64 = 0x5EED_0007;
+        let mut rng_u8 = || -> u8 {
+            sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (sd >> 56) as u8
+        };
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/matvec_q5k_repacked.cpp")).unwrap();
+        let m = Module::load(&cache.compile("matvec_q5k_repacked", &src).unwrap()).unwrap();
+        let f = m.function("matvec_q5k_repacked_f32").unwrap();
+        let s0 = hip::Stream::new().unwrap();
+        let s1 = hip::Stream::new().unwrap();
+        let dxq: DeviceBuf<u8> = DeviceBuf::new((in_dim / 32) * 40).unwrap();
+        for (a, b) in pairs {
+            let mut mk = |(i, o): (usize, usize)| {
+                let n_blocks = o * (i / 256);
+                let mut w = vec![0u8; n_blocks * q5_k::BYTES_PER_BLOCK];
+                for x in &mut w { *x = rng_u8(); }
+                for blk in 0..n_blocks {
+                    w[blk * q5_k::BYTES_PER_BLOCK..][..2].copy_from_slice(
+                        &crate::quant::half::f32_to_f16(0.001).to_le_bytes());
+                }
+                let packed = q5_k::repack_for_matvec(&w, i, o);
+                let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
+                let dy: DeviceBuf<f32> = DeviceBuf::new(o).unwrap();
+                (dw, dy, packed.len())
+            };
+            let (wa, ya, la) = mk(a);
+            let (wb, yb, lb) = mk(b);
+            let launch = |w: &DeviceBuf<u8>, y: &DeviceBuf<f32>, o: usize, st: &hip::Stream| {
+                let mut wp = w.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut yp = y.raw_ptr();
+                let mut ia = in_dim as u32; let mut oa = o as u32;
+                let mut args: [*mut c_void; 5] = [
+                    &mut wp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+                    &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                    &mut oa as *mut _ as *mut c_void];
+                unsafe { f.launch(((o as u32 + 7) / 8, 1, 1), (256, 1, 1), 0, Some(st), &mut args).unwrap(); }
+            };
+            let seq = || { launch(&wa, &ya, a.1, &s0); launch(&wb, &yb, b.1, &s0); };
+            let fork = || {
+                let e = Event::new().unwrap(); e.record(&s0).unwrap(); s1.wait_event(&e).unwrap();
+                launch(&wa, &ya, a.1, &s0); launch(&wb, &yb, b.1, &s1);
+                let j = Event::new().unwrap(); j.record(&s1).unwrap(); s0.wait_event(&j).unwrap();
+            };
+            let time = |body: &dyn Fn()| -> f64 {
+                body(); body(); s0.synchronize().unwrap();
+                let (e0, e1) = (Event::new().unwrap(), Event::new().unwrap());
+                e0.record(&s0).unwrap();
+                for _ in 0..50 { body(); }
+                e1.record(&s0).unwrap(); e1.synchronize().unwrap();
+                Event::elapsed_time(&e0, &e1).unwrap() as f64 / 50.0
+            };
+            let t_seq = time(&seq);
+            let t_fork = time(&fork);
+            Graph::begin_capture(&s0, HipStreamCaptureMode::Global).unwrap();
+            seq();
+            let g_seq = Graph::end_capture(&s0).unwrap().instantiate().unwrap();
+            Graph::begin_capture(&s0, HipStreamCaptureMode::Global).unwrap();
+            fork();
+            let g_fork = Graph::end_capture(&s0).unwrap().instantiate().unwrap();
+            let t_gseq = time(&|| g_seq.launch(&s0).unwrap());
+            let t_gfork = time(&|| g_fork.launch(&s0).unwrap());
+            let bytes = (la + lb) as f64;
+            let gbs = |ms: f64| bytes / (ms * 1e-3) / 1e9;
+            eprintln!("{}x{} + {}x{}: seq {:.4} ms ({:.0} GB/s)  fork {:.4} ({:.0})  graph-seq {:.4} ({:.0})  graph-fork {:.4} ({:.0})",
+                a.0, a.1, b.0, b.1, t_seq, gbs(t_seq), t_fork, gbs(t_fork), t_gseq, gbs(t_gseq), t_gfork, gbs(t_gfork));
+        }
     }
 
     /// The register-resident GDN recurrent step (v2) against the
@@ -2155,17 +2266,22 @@ mod tests {
         let dv = DeviceBuf::from_slice(&v).unwrap(); let da = DeviceBuf::from_slice(&a).unwrap();
         let db = DeviceBuf::from_slice(&b).unwrap(); let dsa = DeviceBuf::from_slice(&ssm_a).unwrap();
         let ddt = DeviceBuf::from_slice(&dt).unwrap();
-        let run = |name: &str, kname: &str, block: u32, grid_y: u32, smem: u32, iters: usize|
+        let run = |name: &str, kname: &str, prefix: &str, block: u32, grid_y: u32, smem: u32, iters: usize|
             -> (Vec<f32>, Vec<f32>, f64)
         {
-            let m = Module::load(&cache.compile(name, &read(name)).unwrap()).unwrap();
+            let src = format!("{prefix}{}", read(name));
+            let m = Module::load(&cache.compile(&format!("{name}_bench_{}", block), &src).unwrap()).unwrap();
             let f = m.function(kname).unwrap();
             let dstate = DeviceBuf::from_slice(&state0).unwrap();
+            // Timing rotates over 16 further state copies (16 x 3 MB at the
+            // 27B shape, well past the 4 MB L2) so the bandwidth figure is
+            // the model's cold-state case, not an L2-resident replay.
+            let cold: Vec<DeviceBuf<f32>> = (0..16).map(|_| DeviceBuf::from_slice(&state0).unwrap()).collect();
             let dout: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
-            let launch = || {
+            let launch = |state: &DeviceBuf<f32>| {
                 let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut va = dv.raw_ptr();
                 let mut aa = da.raw_ptr(); let mut ba = db.raw_ptr(); let mut sa = dsa.raw_ptr();
-                let mut ta = ddt.raw_ptr(); let mut st = dstate.raw_ptr(); let mut oa = dout.raw_ptr();
+                let mut ta = ddt.raw_ptr(); let mut st = state.raw_ptr(); let mut oa = dout.raw_ptr();
                 let mut nh = n_heads as u32; let mut hd = head_dim as u32; let mut nkh = n_k_heads as u32;
                 let mut np = 1u32; let mut ps = 0u32;
                 let mut args: [*mut c_void; 14] = [
@@ -2179,24 +2295,26 @@ mod tests {
                 // v1 reads 12 of them; the extra two are harmless trailing args.
                 unsafe { f.launch((n_heads as u32, grid_y, 1), (block, 1, 1), smem, Some(&stream), &mut args).unwrap(); }
             };
-            launch(); stream.synchronize().unwrap();
+            launch(&dstate); stream.synchronize().unwrap();
             let mut st = vec![0.0f32; state0.len()]; dstate.copy_to_host(&mut st).unwrap();
             let mut out = vec![0.0f32; n_heads * head_dim]; dout.copy_to_host(&mut out).unwrap();
             // timing (state keeps evolving; fine for a bandwidth number)
             let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
             e0.record(&stream).unwrap();
-            for _ in 0..iters { launch(); }
+            for i in 0..iters { launch(&cold[i % cold.len()]); }
             e1.record(&stream).unwrap(); e1.synchronize().unwrap();
             (st, out, hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / iters as f64)
         };
         let hd = head_dim as u32;
-        let (st1, out1, ms1) = run("gdn_recurrent_step_fused", "gdn_recurrent_step_fused_f32",
+        let (st1, out1, ms1) = run("gdn_recurrent_step_fused", "gdn_recurrent_step_fused_f32", "",
                                    64, hd / 16, 2 * hd * 4, 50);
         // REINSTINCT_GDN_GEOM=cols,groups matches a variant's #defines.
         let (cols, groups) = std::env::var("REINSTINCT_GDN_GEOM").ok()
             .map(|g| { let v: Vec<u32> = g.split(',').map(|x| x.parse().unwrap()).collect(); (v[0], v[1]) })
-            .unwrap_or((32, 8));
-        let (st2, out2, ms2) = run("gdn_recurrent_step_v2", "gdn_recurrent_step_v2_f32",
+            .unwrap_or((32, 4));
+        // The launcher's specialisation, plus the groups override.
+        let prefix = format!("#define GDN_HEAD_DIM {hd}\n#define COLS {cols}\n#define GROUPS {groups}\n");
+        let (st2, out2, ms2) = run("gdn_recurrent_step_v2", "gdn_recurrent_step_v2_f32", &prefix,
                                    cols * groups, hd / cols, (2 * hd + groups * cols) * 4, 50);
         let e_state = rel_l2(&st2, &st1);
         let e_out = rel_l2(&out2, &out1);
