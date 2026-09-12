@@ -45,6 +45,8 @@ const MMQ_GEMM_Q4K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const MMQ_GEMM_Q4_0_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4_0_repacked.cpp");
+const MMQ_GEMM_IQ4XS_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_iq4xs_repacked.cpp");
 const MMQ_GEMM_Q5K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_SOURCE: &str =
@@ -53,6 +55,8 @@ const MMQ_GEMM_Q8_0_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q8_0_repacked.cpp");
 const MV_Q4_0_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q4_0_repacked_batched.cpp");
+const MV_IQ4XS_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_iq4xs_repacked_batched.cpp");
 const MV_Q4K_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q4k_repacked_batched.cpp");
 const MV_Q5K_REPACKED_BATCHED_SOURCE: &str =
@@ -189,17 +193,20 @@ pub struct PrefillGemm {
     deq_iq4xs: Module,
     deq_q4_0:  Module,
     deq_q4_0_repacked: Module,
+    deq_iq4xs_repacked: Module,
     deq_q4k_repacked: Module,
     deq_q5k_repacked: Module,
     deq_q6k_repacked: Module,
     deq_q8_0_repacked: Module,
     quantize_q8: Module,
     mmq_q4_0:    Module,
+    mmq_iq4xs:   Module,
     mmq_q4k:     Module,
     mmq_q5k:     Module,
     mmq_q6k:     Module,
     mmq_q8_0:    Module,
     mv_q4_0_batched: Module,   // K=2..4 batched Q4_0 matvec for verify
+    mv_iq4xs_batched: Module,  // same, IQ4_XS
     mv_q4k_batched: Module,    // K=2..8 batched K-quant matvec for verify
     mv_q5k_batched: Module,
     mv_q6k_batched: Module,
@@ -231,6 +238,8 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_q4_0_f16.cpp"))?)?,
             deq_q4_0_repacked: Module::load(&cache.compile("dequant_q4_0_repacked_f16",
                            include_str!("../../kernels/dequant_q4_0_repacked_f16.cpp"))?)?,
+            deq_iq4xs_repacked: Module::load(&cache.compile("dequant_iq4xs_repacked_f16",
+                           include_str!("../../kernels/dequant_iq4xs_repacked_f16.cpp"))?)?,
             deq_q4k_repacked: Module::load(&cache.compile("dequant_q4k_repacked_f16",
                            include_str!("../../kernels/dequant_q4k_repacked_f16.cpp"))?)?,
             deq_q5k_repacked: Module::load(&cache.compile("dequant_q5k_repacked_f16",
@@ -242,6 +251,8 @@ impl PrefillGemm {
             quantize_q8: Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE)?)?,
             mmq_q4_0:    Module::load(&cache.compile("mmq_gemm_q4_0_repacked",
                                                      MMQ_GEMM_Q4_0_SOURCE)?)?,
+            mmq_iq4xs:   Module::load(&cache.compile("mmq_gemm_iq4xs_repacked",
+                                                     MMQ_GEMM_IQ4XS_SOURCE)?)?,
             mmq_q4k:     Module::load(&cache.compile("mmq_gemm_q4k_repacked",
                                                      MMQ_GEMM_Q4K_SOURCE)?)?,
             mmq_q5k:     Module::load(&cache.compile("mmq_gemm_q5k_repacked",
@@ -252,6 +263,8 @@ impl PrefillGemm {
                                                      MMQ_GEMM_Q8_0_SOURCE)?)?,
             mv_q4_0_batched: Module::load(&cache.compile("matvec_q4_0_repacked_batched",
                                           MV_Q4_0_REPACKED_BATCHED_SOURCE)?)?,
+            mv_iq4xs_batched: Module::load(&cache.compile("matvec_iq4xs_repacked_batched",
+                                          MV_IQ4XS_REPACKED_BATCHED_SOURCE)?)?,
             mv_q4k_batched: Module::load(&cache.compile("matvec_q4k_repacked_batched",
                                                      MV_Q4K_REPACKED_BATCHED_SOURCE)?)?,
             mv_q5k_batched: Module::load(&cache.compile("matvec_q5k_repacked_batched",
@@ -329,22 +342,13 @@ impl PrefillGemm {
                            x: *mut c_void, n_rows: usize)
         -> Result<(), String>
     {
-        if std::env::var_os("REINSTINCT_GEMM_TRACE").is_some() {
-            let path = if repacked && dtype == GgmlType::Q8_0 { "mmq(q8_0)" }
-                else if repacked && matches!(dtype, GgmlType::Q4_0 | GgmlType::Q4_K
-                                                  | GgmlType::Q5_K | GgmlType::Q6_K) {
-                    if n_rows <= MAX_BATCHED_ROWS { "batched" } else { "mmq" }
-                } else { "f16-fallback" };
-            eprintln!("GEMM {path} dtype={dtype:?} repacked={repacked} \
-in={in_dim} out={out_dim} rows={n_rows}");
-        }
         // Repacked Q8_0: no batched-matvec variant exists, so MMQ for
         // every K — still far beats the dequant→HGEMM fallback.
         if repacked && dtype == GgmlType::Q8_0 {
             return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
         }
         if repacked && matches!(dtype,
-            GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
+            GgmlType::Q4_0 | GgmlType::IQ4_XS | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
             if n_rows >= 1 && n_rows <= 4 {
                 // K=1..4 small-batch: a per-dtype batched matvec that reads
                 // each weight sub-block once and dots against all n_rows
@@ -382,6 +386,7 @@ in={in_dim} out={out_dim} rows={n_rows}");
         if repacked {
             let (module, kname) = match dtype {
                 GgmlType::Q4_0 => (&self.deq_q4_0_repacked, "dequant_q4_0_repacked_f16"),
+                GgmlType::IQ4_XS => (&self.deq_iq4xs_repacked, "dequant_iq4xs_repacked_f16"),
                 GgmlType::Q5_K => (&self.deq_q5k_repacked, "dequant_q5k_repacked_f16"),
                 GgmlType::Q6_K => (&self.deq_q6k_repacked, "dequant_q6k_repacked_f16"),
                 GgmlType::Q8_0 => (&self.deq_q8_0_repacked, "dequant_q8_0_repacked_f16"),
@@ -456,6 +461,8 @@ in={in_dim} out={out_dim} rows={n_rows}");
             (GgmlType::Q4_K, true)  => (&self.mv_q4k_batched, "matvec_q4k_repacked_batched16_f32"),
             (GgmlType::Q4_0, false) => (&self.mv_q4_0_batched, "matvec_q4_0_repacked_batched_f32"),
             (GgmlType::Q4_0, true)  => (&self.mv_q4_0_batched, "matvec_q4_0_repacked_batched16_f32"),
+            (GgmlType::IQ4_XS, false) => (&self.mv_iq4xs_batched, "matvec_iq4xs_repacked_batched_f32"),
+            (GgmlType::IQ4_XS, true)  => (&self.mv_iq4xs_batched, "matvec_iq4xs_repacked_batched16_f32"),
             (other, _) => return Err(format!("matmul_kquant_batched_into: unsupported {other:?}")),
         };
         let rows_per_wg: u32 = if wide { 4 } else { 8 };
@@ -507,6 +514,8 @@ in={in_dim} out={out_dim} rows={n_rows}");
         let (module, kname) = match (dtype, narrow) {
             (GgmlType::Q4_0, false) => (&self.mmq_q4_0, "mmq_gemm_q4_0_repacked_f32"),
             (GgmlType::Q4_0, true)  => (&self.mmq_q4_0, "mmq_gemm_q4_0_repacked_narrow_f32"),
+            (GgmlType::IQ4_XS, false) => (&self.mmq_iq4xs, "mmq_gemm_iq4xs_repacked_f32"),
+            (GgmlType::IQ4_XS, true)  => (&self.mmq_iq4xs, "mmq_gemm_iq4xs_repacked_narrow_f32"),
             (GgmlType::Q5_K, false) => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_f32"),
             (GgmlType::Q5_K, true)  => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_narrow_f32"),
             (GgmlType::Q6_K, false) => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_f32"),
@@ -589,7 +598,7 @@ mod tests {
         // it is the only dtype that exercises the narrow tile at 1..4 too —
         // and it is what a DFlash drafter is made of.
         for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K,
-                      GgmlType::Q6_K, GgmlType::Q8_0] {
+                      GgmlType::Q6_K, GgmlType::Q8_0, GgmlType::IQ4_XS] {
             let (bs, bpb) = (dtype.block_size_elements() as usize,
                              dtype.bytes_per_block() as usize);
             let n_blocks = out_dim * (in_dim / bs);
@@ -618,6 +627,7 @@ mod tests {
                 GgmlType::Q4_K => crate::quant::q4_k::dequantize_to_f32(&w, &mut w_f32),
                 GgmlType::Q5_K => crate::quant::q5_k::dequantize_to_f32(&w, &mut w_f32),
                 GgmlType::Q8_0 => crate::quant::q8_0::dequantize_to_f32(&w, &mut w_f32),
+                GgmlType::IQ4_XS => crate::quant::iq4_xs::dequantize_to_f32(&w, &mut w_f32),
                 _              => crate::quant::q6_k::dequantize_to_f32(&w, &mut w_f32),
             }
 
@@ -626,6 +636,7 @@ mod tests {
                 GgmlType::Q4_K => crate::quant::q4_k::repack_for_matvec(&w, in_dim, out_dim),
                 GgmlType::Q5_K => crate::quant::q5_k::repack_for_matvec(&w, in_dim, out_dim),
                 GgmlType::Q8_0 => crate::quant::q8_0::repack_for_matvec(&w, in_dim, out_dim),
+                GgmlType::IQ4_XS => crate::quant::iq4_xs::repack_for_matvec(&w, in_dim, out_dim),
                 _              => crate::quant::q6_k::repack_for_matvec(&w, in_dim, out_dim),
             };
             let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();

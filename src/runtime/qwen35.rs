@@ -87,6 +87,10 @@ const DEQUANT_Q5_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q5_k_
 const DEQUANT_Q6_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q6_k_f16.cpp");
 const DEQUANT_Q8_0_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q8_0_f16.cpp");
 const DEQUANT_IQ4_XS_F16_SOURCE:&str = include_str!("../../kernels/dequant_iq4_xs_f16.cpp");
+const DEQUANT_Q4_0_REPACKED_F16_SOURCE: &str =
+    include_str!("../../kernels/dequant_q4_0_repacked_f16.cpp");
+const DEQUANT_IQ4XS_REPACKED_F16_SOURCE: &str =
+    include_str!("../../kernels/dequant_iq4xs_repacked_f16.cpp");
 const DEQUANT_Q4K_REPACKED_F16_SOURCE: &str =
     include_str!("../../kernels/dequant_q4k_repacked_f16.cpp");
 const DEQUANT_Q5K_REPACKED_F16_SOURCE: &str =
@@ -126,10 +130,14 @@ const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
+const MATVEC_Q4_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4_0_repacked.cpp");
+const MATVEC_IQ4XS_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_iq4xs_repacked.cpp");
 const MMQ_GEMM_Q4K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const MMQ_GEMM_Q5K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
 const MMQ_GEMM_Q6K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q6k_repacked.cpp");
 const MMQ_GEMM_Q8_0_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q8_0_repacked.cpp");
+const MMQ_GEMM_Q4_0_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4_0_repacked.cpp");
+const MMQ_GEMM_IQ4XS_SOURCE: &str = include_str!("../../kernels/mmq_gemm_iq4xs_repacked.cpp");
 const MATVEC_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
 const MATVEC_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_repacked.cpp");
@@ -233,20 +241,14 @@ impl GpuMatvecTensor {
                 bytes, in_dim as usize, out_dim as usize), GgmlType::Q6_K)),
             GgmlType::Q8_0 => Some((crate::quant::q8_0::repack_for_matvec(
                 bytes, in_dim as usize, out_dim as usize), GgmlType::Q8_0)),
-            // IQ4_XS has no repacked matvec or MMQ kernel, so it would fall
-            // through to the dequant→fp16→rocBLAS HGEMM path — which aborts
-            // outright on a rocBLAS built without gfx906 kernels (every ROCm
-            // 7.x distro build). The codebook fits int8 exactly, so widening
-            // to Q8_0 here is a near-exact relabelling (see
-            // `iq4_xs::transcode_to_q8_0`) that costs 4.25→8.5 bpw on the
-            // handful of IQ4_XS tensors in an Unsloth UD-XL file and puts
-            // them on the fast repacked int8 path instead.
-            GgmlType::IQ4_XS => {
-                let q8 = crate::quant::iq4_xs::transcode_to_q8_0(
-                    bytes, in_dim as usize * out_dim as usize);
-                Some((crate::quant::q8_0::repack_for_matvec(
-                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
-            }
+            // IQ4_XS gets its own repacked kernels: the layout is Q4_0's with
+            // the codebook applied in-kernel, so it stays at 4.25 bpw on
+            // device. It used to be transcoded to Q8_0 (see
+            // `iq4_xs::transcode_to_q8_0`, still there for the embed path);
+            // on Qwen3.8-27B that cost +21% VRAM and -21% decode because
+            // 2.9 GB of the file is IQ4_XS.
+            GgmlType::IQ4_XS => Some((crate::quant::iq4_xs::repack_for_matvec(
+                bytes, in_dim as usize, out_dim as usize), GgmlType::IQ4_XS)),
             // Same treatment for the other codebook formats Unsloth's
             // UD-XL files reach for — both relabel onto Q8_0 exactly.
             GgmlType::IQ4_NL => {
@@ -1114,6 +1116,8 @@ pub struct GpuQwen35 {
     matvec_q6_k_dp4a_module: Module,
     matvec_q8_0_dp4a_module: Module,
     matvec_q4k_repacked_module: Module,
+    matvec_q4_0_repacked_module: Module,
+    matvec_iq4xs_repacked_module: Module,
     matvec_q5k_repacked_module: Module,
     matvec_q6k_repacked_module: Module,
     /// K=2..4 batched K-quant matvec — the spec-decode verify path.
@@ -1142,6 +1146,8 @@ pub struct GpuQwen35 {
     dequant_q8_0_module:   Module,
     dequant_iq4_xs_module: Module,
     dequant_q4k_repacked_module: Module,
+    dequant_q4_0_repacked_module: Module,
+    dequant_iq4xs_repacked_module: Module,
     dequant_q5k_repacked_module: Module,
     dequant_q6k_repacked_module: Module,
     dequant_q8_0_repacked_module: Module,
@@ -1153,6 +1159,8 @@ pub struct GpuQwen35 {
     mmq_q5k_module:        Module,
     mmq_q6k_module:        Module,
     mmq_q8_0_module:       Module,
+    mmq_q4_0_module:       Module,
+    mmq_iq4xs_module:      Module,
 
     // Dimensions.
     hidden:     usize,
@@ -1321,6 +1329,10 @@ impl GpuQwen35 {
         let matvec_q8_0_dp4a_hsaco = cache.compile("matvec_q8_0_dp4a", MATVEC_Q8_0_DP4A_SOURCE)?;
         let matvec_q4k_repacked_hsaco =
             cache.compile("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SOURCE)?;
+        let matvec_q4_0_repacked_hsaco =
+            cache.compile("matvec_q4_0_repacked", MATVEC_Q4_0_REPACKED_SOURCE)?;
+        let matvec_iq4xs_repacked_hsaco =
+            cache.compile("matvec_iq4xs_repacked", MATVEC_IQ4XS_REPACKED_SOURCE)?;
         let matvec_q5k_repacked_hsaco =
             cache.compile("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SOURCE)?;
         let matvec_q6k_repacked_hsaco =
@@ -1403,6 +1415,10 @@ impl GpuQwen35 {
             dequant_iq4_xs_module:    Module::load(&cache.compile("dequant_iq4_xs_f16", DEQUANT_IQ4_XS_F16_SOURCE)?)?,
             dequant_q4k_repacked_module: Module::load(&cache.compile(
                 "dequant_q4k_repacked_f16", DEQUANT_Q4K_REPACKED_F16_SOURCE)?)?,
+            dequant_q4_0_repacked_module: Module::load(&cache.compile(
+                "dequant_q4_0_repacked_f16", DEQUANT_Q4_0_REPACKED_F16_SOURCE)?)?,
+            dequant_iq4xs_repacked_module: Module::load(&cache.compile(
+                "dequant_iq4xs_repacked_f16", DEQUANT_IQ4XS_REPACKED_F16_SOURCE)?)?,
             dequant_q5k_repacked_module: Module::load(&cache.compile(
                 "dequant_q5k_repacked_f16", DEQUANT_Q5K_REPACKED_F16_SOURCE)?)?,
             dequant_q6k_repacked_module: Module::load(&cache.compile(
@@ -1413,6 +1429,8 @@ impl GpuQwen35 {
             attn_step_batched_module: Module::load(&cache.compile("attn_prefill_flash", ATTN_STEP_BATCHED_SOURCE)?)?,
             mmq_q4k_module:           Module::load(&cache.compile("mmq_gemm_q4k_repacked", MMQ_GEMM_Q4K_SOURCE)?)?,
             mmq_q8_0_module:          Module::load(&cache.compile("mmq_gemm_q8_0_repacked", MMQ_GEMM_Q8_0_SOURCE)?)?,
+            mmq_q4_0_module:          Module::load(&cache.compile("mmq_gemm_q4_0_repacked", MMQ_GEMM_Q4_0_SOURCE)?)?,
+            mmq_iq4xs_module:         Module::load(&cache.compile("mmq_gemm_iq4xs_repacked", MMQ_GEMM_IQ4XS_SOURCE)?)?,
             mmq_q5k_module:           Module::load(&cache.compile("mmq_gemm_q5k_repacked", MMQ_GEMM_Q5K_SOURCE)?)?,
             mmq_q6k_module:           Module::load(&cache.compile("mmq_gemm_q6k_repacked", MMQ_GEMM_Q6K_SOURCE)?)?,
             matvec_q4_k_wave64_module:   Module::load(&matvec_q4_k_wave64_hsaco)?,
@@ -1428,6 +1446,8 @@ impl GpuQwen35 {
             matvec_q6_k_dp4a_module: Module::load(&matvec_q6_k_dp4a_hsaco)?,
             matvec_q8_0_dp4a_module: Module::load(&matvec_q8_0_dp4a_hsaco)?,
             matvec_q4k_repacked_module: Module::load(&matvec_q4k_repacked_hsaco)?,
+            matvec_q4_0_repacked_module: Module::load(&matvec_q4_0_repacked_hsaco)?,
+            matvec_iq4xs_repacked_module: Module::load(&matvec_iq4xs_repacked_hsaco)?,
             matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
             matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
             matvec_q4k_batched_module: Module::load(&matvec_q4k_batched_hsaco)?,
@@ -1843,8 +1863,17 @@ impl GpuQwen35 {
                 GgmlType::Q8_0 =>
                     (&self.matvec_q8_0_repacked_module, "matvec_q8_0_repacked_f32",
                      (out_d + 1) / 2, 64),
-                _              => (&self.matvec_q4k_repacked_module, "matvec_q4k_repacked_f32",
+                GgmlType::Q4_K => (&self.matvec_q4k_repacked_module, "matvec_q4k_repacked_f32",
                                    (out_d + 7) / 8, 256),
+                // Q4_0 and IQ4_XS share the Q4_K launch contract (4 waves x
+                // ROWS=2). Explicit arms: a catch-all here once silently ran a
+                // Q4_0 weight through the Q4_K kernel.
+                GgmlType::Q4_0 => (&self.matvec_q4_0_repacked_module, "matvec_q4_0_repacked_f32",
+                                   (out_d + 7) / 8, 256),
+                GgmlType::IQ4_XS => (&self.matvec_iq4xs_repacked_module, "matvec_iq4xs_repacked_f32",
+                                     (out_d + 7) / 8, 256),
+                other => return Err(format!(
+                    "qwen35 repacked matvec: no kernel for {other:?} ([{in_d}x{out_d}])")),
             };
             let f = module.function(kname)?;
             let mut wa = wp; let mut xa = self.xq8.raw_ptr(); let mut ya = y;
@@ -3417,7 +3446,10 @@ impl GpuQwen35 {
                 GgmlType::Q5_K => (&self.dequant_q5k_repacked_module, "dequant_q5k_repacked_f16"),
                 GgmlType::Q6_K => (&self.dequant_q6k_repacked_module, "dequant_q6k_repacked_f16"),
                 GgmlType::Q8_0 => (&self.dequant_q8_0_repacked_module, "dequant_q8_0_repacked_f16"),
-                _              => (&self.dequant_q4k_repacked_module, "dequant_q4k_repacked_f16"),
+                GgmlType::Q4_K => (&self.dequant_q4k_repacked_module, "dequant_q4k_repacked_f16"),
+                GgmlType::Q4_0 => (&self.dequant_q4_0_repacked_module, "dequant_q4_0_repacked_f16"),
+                GgmlType::IQ4_XS => (&self.dequant_iq4xs_repacked_module, "dequant_iq4xs_repacked_f16"),
+                other => return Err(format!("qwen35 repacked dequant: no kernel for {other:?}")),
             };
             let f = module.function(kname)?;
             let n_sub_total = (n / 32) as u32;   // out_dim * (in_dim/32)
@@ -3488,7 +3520,8 @@ impl GpuQwen35 {
         // fp16, no HGEMM. Q8_0 covers the GDN ssm_out weights (and
         // Unsloth's per-tensor Q8_0 layer overrides).
         if w.repacked && matches!(w.dtype,
-            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0) {
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0
+            | GgmlType::Q4_0 | GgmlType::IQ4_XS) {
             return self.bmm_mmq(w, x_f32, n_rows, y_f32);
         }
 
@@ -3590,7 +3623,10 @@ impl GpuQwen35 {
             GgmlType::Q5_K => (&self.mmq_q5k_module, "mmq_gemm_q5k_repacked_f32"),
             GgmlType::Q6_K => (&self.mmq_q6k_module, "mmq_gemm_q6k_repacked_f32"),
             GgmlType::Q8_0 => (&self.mmq_q8_0_module, "mmq_gemm_q8_0_repacked_f32"),
-            _              => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
+            GgmlType::Q4_0 => (&self.mmq_q4_0_module, "mmq_gemm_q4_0_repacked_f32"),
+            GgmlType::IQ4_XS => (&self.mmq_iq4xs_module, "mmq_gemm_iq4xs_repacked_f32"),
+            GgmlType::Q4_K => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
+            other => return Err(format!("bmm_mmq: no MMQ kernel for {other:?}")),
         };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
         let xq8 = self.pool_u8.take(n_rows * (in_d / 32) * 40)?;

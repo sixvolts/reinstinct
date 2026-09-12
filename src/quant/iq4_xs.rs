@@ -135,6 +135,71 @@ pub fn transcode_to_q8_0(bytes: &[u8], n_weights: usize) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Repacked two-plane layout — identical to Q4_0's, on purpose.
+// ---------------------------------------------------------------------------
+
+/// Padded sub-block count per repacked row. Same anti-aliasing rule as the
+/// other repacks: a power-of-two count lands every row on one HBM channel.
+pub fn repacked_n_sub_padded(in_dim: usize) -> usize {
+    let n = in_dim / 32;
+    if n.is_power_of_two() { n + 1 } else { n }
+}
+
+/// Bytes a [`repack_for_matvec`] result occupies.
+pub fn repacked_len(in_dim: usize, out_dim: usize) -> usize {
+    let nsp = repacked_n_sub_padded(in_dim);
+    out_dim * nsp * 16 + out_dim * nsp * 2
+}
+
+/// Repack an IQ4_XS matvec weight `[out_dim, in_dim]` into the same
+/// two-plane layout `q4_0::repack_for_matvec` produces:
+///
+///   * **nibble plane** — `out_dim * nsp * 16` bytes, one 16-byte chunk per
+///     32-weight sub-block, copied verbatim: on disk a sub-block's 16 bytes
+///     already hold weight `k` in the low nibble and `k+16` in the high,
+///     the order `sdot4` wants.
+///   * **scale plane**  — `out_dim * nsp * 2` bytes, fp16 per sub-block,
+///     with the super-block `d` and the 6-bit sub-scale pre-folded:
+///     `dl = d * (ls - 32)`. Signed; the kernel just multiplies by it.
+///
+/// Folding costs one fp16 rounding of `dl` (~2^-11 relative) and buys the
+/// kernel one fewer plane to read. The kernels differ from Q4_0's only in
+/// mapping each nibble through [`KVALUES_IQ4NL`] before the dot — that is
+/// what makes 4.25 bpw on device possible, versus the 8.5 of the Q8_0
+/// transcode this replaces.
+pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8> {
+    use crate::quant::half::f32_to_f16;
+    assert_eq!(in_dim % BLOCK_SIZE, 0, "IQ4_XS in_dim must be a multiple of 256");
+    let n_blocks = in_dim / BLOCK_SIZE;      // 256-weight super-blocks per row
+    let nsp      = repacked_n_sub_padded(in_dim);
+    let nib_len  = out_dim * nsp * 16;
+    let mut out  = vec![0u8; nib_len + out_dim * nsp * 2];
+
+    let blocks: &[BlockIQ4_XS] =
+        bytemuck::cast_slice(&bytes[..out_dim * n_blocks * BYTES_PER_BLOCK]);
+
+    for row in 0..out_dim {
+        for blk in 0..n_blocks {
+            let b = &blocks[row * n_blocks + blk];
+            let d = f16_to_f32(b.d);
+            for ib in 0..8usize {
+                let sb = blk * 8 + ib;                   // sub-block index in the row
+                let ls_lo = (b.scales_l[ib / 2] >> (4 * (ib & 1))) & 0x0F;
+                let ls_hi = ((b.scales_h >> (2 * ib)) & 0x3) as u8;
+                let ls = (ls_lo | (ls_hi << 4)) as i32;
+                let dl = d * (ls - 32) as f32;
+
+                let dst_nib = (row * nsp + sb) * 16;
+                out[dst_nib..dst_nib + 16].copy_from_slice(&b.qs[ib * 16..ib * 16 + 16]);
+                let dst_d = nib_len + (row * nsp + sb) * 2;
+                out[dst_d..dst_d + 2].copy_from_slice(&f32_to_f16(dl).to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +207,50 @@ mod tests {
 
     /// All sub-block scales = `ls_value` (must fit in 6 bits, 0..63).
     /// All nibbles = `nibble`.
+    /// Reading the repacked planes back through the kernel's own index
+    /// arithmetic must reproduce the direct dequant, to the fp16 rounding
+    /// of the folded scale.
+    #[test]
+    fn repacked_layout_dequants_to_the_same_weights() {
+        let in_dim = 512usize;    // 2 super-blocks = 16 sub-blocks -> pow2 -> nsp = 17
+        let out_dim = 3usize;
+        let n_blocks = in_dim / BLOCK_SIZE;
+        let nsp = repacked_n_sub_padded(in_dim);
+        assert_eq!(nsp, 17);
+        let mut seed: u64 = 0x1A4A_5EED;
+        let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           (seed >> 56) as u8 };
+        let mut raw = vec![0u8; out_dim * n_blocks * BYTES_PER_BLOCK];
+        for blk in 0..out_dim * n_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            raw[off..off + 2].copy_from_slice(&f32_to_f16(0.02 * (blk as f32 + 1.0)).to_le_bytes());
+            for i in 2..BYTES_PER_BLOCK { raw[off + i] = rng(); }
+        }
+        let mut direct = vec![0.0f32; out_dim * in_dim];
+        dequantize_to_f32(&raw, &mut direct);
+        let packed = repack_for_matvec(&raw, in_dim, out_dim);
+        assert_eq!(packed.len(), repacked_len(in_dim, out_dim));
+        let nib_len = out_dim * nsp * 16;
+        let mut max_rel = 0.0f32;
+        for row in 0..out_dim {
+            for sb in 0..in_dim / 32 {
+                let dd = nib_len + (row * nsp + sb) * 2;
+                let dl = f16_to_f32(u16::from_le_bytes([packed[dd], packed[dd + 1]]));
+                let dn = (row * nsp + sb) * 16;
+                for k in 0..16 {
+                    let byte = packed[dn + k];
+                    let lo = dl * KVALUES_IQ4NL[(byte & 0x0F) as usize] as f32;
+                    let hi = dl * KVALUES_IQ4NL[(byte >> 4) as usize] as f32;
+                    let base = row * in_dim + sb * 32;
+                    for (got, want) in [(lo, direct[base + k]), (hi, direct[base + k + 16])] {
+                        max_rel = max_rel.max((got - want).abs() / want.abs().max(1e-30));
+                    }
+                }
+            }
+        }
+        assert!(max_rel < 5e-4, "repack round-trip max_rel {max_rel:.3e}");
+    }
+
     /// `transcode_to_q8_0` must reproduce the IQ4_XS values themselves,
     /// not merely approximate them: the codebook fits int8, so the only
     /// thing that moves is the sub-block scale being rounded to fp16.

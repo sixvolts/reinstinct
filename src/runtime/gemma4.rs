@@ -34,6 +34,7 @@ const MATVEC_Q5K_DP4A_BATCHED_SRC: &str =
 const MATVEC_Q6K_DP4A_SRC:   &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
 const MATVEC_Q4K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const MATVEC_Q4_0_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q4_0_repacked.cpp");
+const MATVEC_IQ4XS_REPACKED_SRC: &str = include_str!("../../kernels/matvec_iq4xs_repacked.cpp");
 const MATVEC_Q4_0_DP4A_SRC: &str = include_str!("../../kernels/matvec_q4_0_dp4a.cpp");
 const MATVEC_Q5K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q5k_repacked.cpp");
 const MATVEC_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q6k_repacked.cpp");
@@ -853,6 +854,7 @@ pub struct GpuGemma4 {
     m_mv_q8_0_repacked: Module,
     m_mv_q4k_repacked: Module,
     m_mv_q4_0_repacked: Module,
+    m_mv_iq4xs_repacked: Module,
     m_mv_q4_0_dp4a: Module,
     m_mv_q5k_repacked: Module,
     m_mv_q6k_repacked: Module,
@@ -1125,6 +1127,7 @@ impl GpuGemma4 {
             m_mv_q8_0_repacked: ld("matvec_q8_0_repacked", MATVEC_Q8_0_REPACKED_SRC)?,
             m_mv_q4k_repacked: ld("matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC)?,
             m_mv_q4_0_repacked: ld("matvec_q4_0_repacked", MATVEC_Q4_0_REPACKED_SRC)?,
+            m_mv_iq4xs_repacked: ld("matvec_iq4xs_repacked", MATVEC_IQ4XS_REPACKED_SRC)?,
             m_mv_q4_0_dp4a: ld("matvec_q4_0_dp4a", MATVEC_Q4_0_DP4A_SRC)?,
             m_mv_q5k_repacked: ld("matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC)?,
             m_mv_q6k_repacked: ld("matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC)?,
@@ -1493,6 +1496,8 @@ impl GpuGemma4 {
         let (module, kname, grid, kblock): (&Module, &str, u32, u32) = match w.dtype {
             GgmlType::Q4_0 => (&self.m_mv_q4_0_repacked, "matvec_q4_0_repacked_f32",
                                (w.out_dim + 7) / 8, 256),
+            GgmlType::IQ4_XS => (&self.m_mv_iq4xs_repacked, "matvec_iq4xs_repacked_f32",
+                                 (w.out_dim + 7) / 8, 256),
             GgmlType::Q5_K => (&self.m_mv_q5k_repacked, "matvec_q5k_repacked_f32",
                                (w.out_dim + 7) / 8, 256),
             GgmlType::Q6_K => (&self.m_mv_q6k_repacked, "matvec_q6k_repacked_f32",

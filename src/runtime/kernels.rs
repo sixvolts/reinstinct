@@ -45,6 +45,12 @@ const MATVEC_Q4_0_DP4A_SRC: &str =
 #[cfg(test)]
 const MMQ_GEMM_Q4_0_REPACKED_SRC: &str =
     include_str!("../../kernels/mmq_gemm_q4_0_repacked.cpp");
+#[cfg(test)]
+const MATVEC_IQ4XS_REPACKED_SRC: &str =
+    include_str!("../../kernels/matvec_iq4xs_repacked.cpp");
+#[cfg(test)]
+const MMQ_GEMM_IQ4XS_REPACKED_SRC: &str =
+    include_str!("../../kernels/mmq_gemm_iq4xs_repacked.cpp");
 const ATTN_PREFILL_SRC:     &str = include_str!("../../kernels/attn_prefill.cpp");
 
 // Test-only kernel sources for the consistency suites at the bottom of
@@ -1819,6 +1825,68 @@ mod tests {
             assert_eq!(&got[r * hidden..(r + 1) * hidden], want,
                        "embed_lookup_q4_0_batched row {r} (token {tok})");
         }
+    }
+
+    /// IQ4_XS native kernels against the CPU dequant oracle: the repacked
+    /// matvec (decode) and the MMQ GEMM (prefill). The in-kernel codebook
+    /// lookup is the one thing these have that no other kernel does, so a
+    /// wrong LUT (or a wrong nibble order feeding it) shows up here first.
+    #[test]
+    fn iq4xs_kernels_match_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::iq4_xs::{BLOCK_SIZE, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0x1A4A_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let d = ((blk % 23) as f32 - 11.0) * 0.005;
+            w_bytes[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 2..BYTES_PER_BLOCK { w_bytes[off + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x9876_FACE;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::iq4_xs::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        let packed = crate::quant::iq4_xs::repack_for_matvec(&w_bytes, in_dim, out_dim);
+        let gpu = run_repacked_matvec(&cache, "matvec_iq4xs_repacked", MATVEC_IQ4XS_REPACKED_SRC,
+            "matvec_iq4xs_repacked_f32", &packed, &x, in_dim, out_dim).expect("iq4xs repacked");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_iq4xs_repacked {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "iq4xs repacked rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+
+        let p_rows = 24usize;
+        let xm = mmq_test_x(p_rows, in_dim);
+        let mut cpu_m = vec![0.0f32; p_rows * out_dim];
+        for pr in 0..p_rows {
+            let mut row = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&xm[pr * in_dim..(pr + 1) * in_dim], &w_fp32,
+                                    in_dim, out_dim, &mut row);
+            cpu_m[pr * out_dim..(pr + 1) * out_dim].copy_from_slice(&row);
+        }
+        let gpu = run_mmq_gemm(&cache, "mmq_gemm_iq4xs_repacked", MMQ_GEMM_IQ4XS_REPACKED_SRC,
+            "mmq_gemm_iq4xs_repacked_f32", &packed, &xm, p_rows, in_dim, out_dim)
+            .expect("mmq gemm iq4xs");
+        let e = rel_l2(&gpu, &cpu_m);
+        eprintln!("mmq_gemm_iq4xs_repacked {p_rows}x{out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "mmq gemm iq4xs rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
     /// Q4_0 across all three paths it can take — repacked matvec

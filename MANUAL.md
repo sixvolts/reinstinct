@@ -42,9 +42,9 @@ The GPU path has two modes for consuming tokens:
   Multiple `rmsnorm + add_residual` pairs are fused, and Q/K/V/O on a
   shared post-norm activation quantize once (not once per matvec).
 - **Prefill** — process a whole prompt of P tokens in one pass. The
-  K-quant and Q8_0 paths use a hand-written 2D-tiled int8 MMQ GEMM
-  (dp4a, BM=64 × BN=64 tiles) — no dequant pass. F16 / F32 / IQ4_XS
-  weights fall back to dequant + rocBLAS HGEMM. The MoE branch uses a
+  K-quant, Q4_0, Q8_0 and IQ4_XS paths use a hand-written 2D-tiled
+  int8 MMQ GEMM (dp4a, BM=64 × BN=64 tiles) — no dequant pass. F16 /
+  F32 weights fall back to dequant + the `gemm_f16_rows` HGEMM. The MoE branch uses a
   grouped-expert GEMM: counting-sort tokens by expert, then one tiled
   GEMM per expert. The whole prefill kernel chain is captured into a
   HIP graph (one launch per call) and on Gemma 4 the instantiated
@@ -892,24 +892,32 @@ Do not read the quant from the filename. Google's QAT GGUFs keep the
 real histogram.
 
 Weight dtypes with a full kernel set (repacked matvec, batched matvec,
-MMQ GEMM, embed lookup): `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`.
+MMQ GEMM): `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `IQ4_XS`. `IQ4_XS` is
+repacked at load into the Q4_0 two-plane layout (nibble plane copied
+verbatim, the super-block `d` and 6-bit sub-scale pre-folded into one
+fp16 per 32) and its kernels are the Q4_0 kernels with the 16-entry
+IQ4_NL codebook applied in registers via `v_perm_b32` — two perms and a
+select per four nibbles, no memory lookup. In the MMQ GEMM the codebook
+is applied once at tile-load time, so the inner loop is the plain int8
+dot; it lands within 1.5% of the Q8_0 MMQ at half the weight bytes.
 
-Four more parse and load by **transcoding to `Q8_0` at load time**, so
+Three more parse and load by **transcoding to `Q8_0` at load time**, so
 they run on the Q8_0 kernels rather than needing their own:
 
 | on disk  | how                                   | exact?            | bpw       |
 |----------|---------------------------------------|-------------------|-----------|
-| `IQ4_XS` | codebook relabel                      | yes (scale→fp16)  | 4.25→8.5  |
 | `IQ4_NL` | codebook relabel                      | yes, bit for bit  | 4.5→8.5   |
 | `IQ3_S`  | grid+sign relabel                     | yes (scale→fp16)  | 3.44→8.5  |
 | `Q3_K`   | dequantize → requantize per 32-block  | no; ≤0.6 Q8 step  | 3.44→8.5  |
 
-The price is VRAM and bandwidth on those tensors, and it is not small on
-files that lean on them. `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with
-2.9 GB of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`; on device that
-is ~19.8 GB, +21%, and decode lands 21% below 3.6-27B (22.6 vs 28.5 tok/s)
-— the whole gap is transcode bytes. A native repacked `IQ4_XS` kernel is
-the follow-up that would recover most of it. `F16`/`F32` matmul tensors go
+The price is VRAM and bandwidth on those tensors, which is why `IQ4_XS`
+got native kernels: `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with
+2.9 GB of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`. With `IQ4_XS`
+transcoded it sat at ~19.8 GB on device (+21%) and decoded 21% below the
+architecturally identical 3.6-27B (22.6 vs 28.5 tok/s) — the whole gap
+was transcode bytes. Native `IQ4_XS` brings it to 18.4 GiB peak and
+26.4 tok/s; the remaining ~7% is the ~0.4 GB that still transcodes plus
+the retuned weights' own dtype mix. `F16`/`F32` matmul tensors go
 through the `gemm_f16_rows` fallback.
 
 ---
@@ -1038,7 +1046,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
-| qwen-3.8-27B           |          192       |     —       |    —     |        22.6       |      —     |    —     |
+| qwen-3.8-27B           |          189       |     —       |    —     |        26.4       |      —     |    —     |
 | gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
