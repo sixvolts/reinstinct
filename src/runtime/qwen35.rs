@@ -111,6 +111,8 @@ const MOE_MV_Q5K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_
 const MOE_MV_Q6K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_down.cpp");
 const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_repacked.cpp");
 const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
+const MOE_MV_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q8_0_repacked.cpp");
+const MOE_MMQ_Q8_0_GROUPED_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q8_0_grouped.cpp");
 const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.cpp");
 const MOE_EXPERT_SORT_SOURCE: &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MOE_MMQ_Q4K_GROUPED_SOURCE: &str =
@@ -375,36 +377,31 @@ impl GpuExpertTensor {
         let out_dim  = shape[1] as usize;
         let n_expert = shape[2] as usize;
         let bpe = bytes.len() / n_expert;
-        // K-quant experts repack per slice; other dtypes load on-disk.
-        let repack_one = |slice: &[u8]| -> Option<Vec<u8>> {
-            match info.ggml_type {
-                GgmlType::Q4_K => Some(crate::quant::q4_k::repack_for_matvec(slice, in_dim, out_dim)),
-                GgmlType::Q5_K => Some(crate::quant::q5_k::repack_for_matvec(slice, in_dim, out_dim)),
-                GgmlType::Q6_K => Some(crate::quant::q6_k::repack_for_matvec(slice, in_dim, out_dim)),
-                _ => None,
-            }
-        };
-        if repack_one(&bytes[..bpe]).is_some() {
-            let mut packed = Vec::new();
-            for e in 0..n_expert {
-                packed.extend_from_slice(&repack_one(&bytes[e * bpe..(e + 1) * bpe]).unwrap());
-            }
-            Ok(Self {
-                bytes_per_expert: packed.len() / n_expert,
-                dtype: info.ggml_type,
-                in_dim: in_dim as u32, out_dim: out_dim as u32,
-                data: DeviceBuf::from_slice(&packed)?,
-                repacked: true,
-            })
-        } else {
-            Ok(Self {
-                bytes_per_expert: bpe,
-                dtype: info.ggml_type,
-                in_dim: in_dim as u32, out_dim: out_dim as u32,
-                data: DeviceBuf::from_slice(bytes)?,
-                repacked: false,
-            })
+        // Every expert slice repacks into its dtype's contiguous matvec
+        // layout; a dtype without MoE kernels fails here, at load, with
+        // the tensor name, rather than at the first routed matvec.
+        let mut packed = Vec::new();
+        for e in 0..n_expert {
+            let slice = &bytes[e * bpe..(e + 1) * bpe];
+            let rep = match info.ggml_type {
+                GgmlType::Q4_K => crate::quant::q4_k::repack_for_matvec(slice, in_dim, out_dim),
+                GgmlType::Q5_K => crate::quant::q5_k::repack_for_matvec(slice, in_dim, out_dim),
+                GgmlType::Q6_K => crate::quant::q6_k::repack_for_matvec(slice, in_dim, out_dim),
+                GgmlType::Q8_0 => crate::quant::q8_0::repack_for_matvec(slice, in_dim, out_dim),
+                GgmlType::Q5_1 => crate::quant::q5_1::repack_for_matvec(slice, in_dim, out_dim),
+                other => return Err(format!(
+                    "expert tensor {name}: no MoE kernels for {other:?} \
+                     (experts must be Q4_K, Q5_K, Q6_K, Q8_0 or Q5_1)")),
+            };
+            packed.extend_from_slice(&rep);
         }
+        Ok(Self {
+            bytes_per_expert: packed.len() / n_expert,
+            dtype: info.ggml_type,
+            in_dim: in_dim as u32, out_dim: out_dim as u32,
+            data: DeviceBuf::from_slice(&packed)?,
+            repacked: true,
+        })
     }
 }
 
@@ -532,6 +529,12 @@ struct MoeRuntime {
     m_mv_q4k:     Module,
     m_mv_q5k:     Module,
     m_mv_q6k:     Module,
+    /// Repacked Q8_0 experts: generic matvec + row-packed down entry.
+    m_q8_0:       Module,
+    /// Q5_1 experts: the Q5_K kernels compiled with Q5_1_SCALES.
+    m_mv_q5_1:    Module,
+    m_down_q5_1:  Module,
+    m_grouped_q5_1: Module,
     /// Fused gate+up matvec + SwiGLU (Q4_K experts) — decode fast path.
     m_gate_up_swiglu_q4k: Module,
     /// Row-packed expert DOWN matvec — all 64 lanes busy at in_dim≈512.
@@ -545,6 +548,7 @@ struct MoeRuntime {
     m_grouped_q4k: Module,
     m_grouped_q5k: Module,
     m_grouped_q6k: Module,
+    m_grouped_q8_0: Module,
     // Scratch — sized for MOE_PREFILL_CHUNK rows; decode uses row 0 only.
     logits:  DeviceBuf<f32>,   // [n_tok, n_expert] router logits
     ids:     DeviceBuf<i32>,   // [n_tok, n_used] selected expert ids
@@ -593,6 +597,14 @@ impl MoeRuntime {
                               "moe_matvec_q5k_repacked", MOE_MV_Q5K_REPACKED_SOURCE)?)?,
             m_mv_q6k:     Module::load(&cache.compile(
                               "moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SOURCE)?)?,
+            m_q8_0:       Module::load(&cache.compile(
+                              "moe_matvec_q8_0_repacked", MOE_MV_Q8_0_REPACKED_SOURCE)?)?,
+            m_mv_q5_1:    Module::load(&cache.compile("moe_matvec_q5_1_repacked",
+                              &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_REPACKED_SOURCE))?)?,
+            m_down_q5_1:  Module::load(&cache.compile("moe_matvec_q5_1_down",
+                              &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_DOWN_SOURCE))?)?,
+            m_grouped_q5_1: Module::load(&cache.compile("mmq_gemm_q5_1_grouped",
+                              &crate::quant::q5_1::kernel_source(MOE_MMQ_Q5K_GROUPED_SOURCE))?)?,
             m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
             m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
             m_expert_sort: Module::load(&cache.compile(
@@ -603,6 +615,8 @@ impl MoeRuntime {
                               "mmq_gemm_q5k_grouped", MOE_MMQ_Q5K_GROUPED_SOURCE)?)?,
             m_grouped_q6k: Module::load(&cache.compile(
                               "mmq_gemm_q6k_grouped", MOE_MMQ_Q6K_GROUPED_SOURCE)?)?,
+            m_grouped_q8_0: Module::load(&cache.compile(
+                              "mmq_gemm_q8_0_grouped", MOE_MMQ_Q8_0_GROUPED_SOURCE)?)?,
             logits:  DeviceBuf::new(c * n_expert)?,
             ids:     DeviceBuf::new(c * n_used)?,
             weights: DeviceBuf::new(c * n_used)?,
@@ -2786,7 +2800,10 @@ impl GpuQwen35 {
         let (module, kname) = match et.dtype {
             GgmlType::Q5_K => (&moe.m_grouped_q5k, "mmq_gemm_q5k_grouped_f32"),
             GgmlType::Q6_K => (&moe.m_grouped_q6k, "mmq_gemm_q6k_grouped_f32"),
-            _              => (&moe.m_grouped_q4k, "mmq_gemm_q4k_grouped_f32"),
+            GgmlType::Q8_0 => (&moe.m_grouped_q8_0, "mmq_gemm_q8_0_grouped_f32"),
+            GgmlType::Q5_1 => (&moe.m_grouped_q5_1, "mmq_gemm_q5k_grouped_f32"),
+            GgmlType::Q4_K => (&moe.m_grouped_q4k, "mmq_gemm_q4k_grouped_f32"),
+            other => return Err(format!("moe grouped GEMM: dtype {other:?}")),
         };
         let f = module.function(kname)?;
         let n_entries = n_tok * moe.n_used as u32;
@@ -2820,6 +2837,8 @@ impl GpuQwen35 {
             GgmlType::Q4_K => (&moe.m_mv_q4k, "moe_matvec_q4k_repacked_f32"),
             GgmlType::Q5_K => (&moe.m_mv_q5k, "moe_matvec_q5k_repacked_f32"),
             GgmlType::Q6_K => (&moe.m_mv_q6k, "moe_matvec_q6k_repacked_f32"),
+            GgmlType::Q8_0 => (&moe.m_q8_0,   "moe_matvec_q8_0_repacked_f32"),
+            GgmlType::Q5_1 => (&moe.m_mv_q5_1, "moe_matvec_q5k_repacked_f32"),
             other => return Err(format!("moe expert matvec: dtype {other:?}")),
         };
         let f = module.function(kname)?;
@@ -2852,6 +2871,8 @@ impl GpuQwen35 {
         let (module, kname) = match et.dtype {
             GgmlType::Q5_K => (&moe.m_down_q5k, "moe_matvec_q5k_down_f32"),
             GgmlType::Q6_K => (&moe.m_down_q6k, "moe_matvec_q6k_down_f32"),
+            GgmlType::Q8_0 => (&moe.m_q8_0,     "moe_matvec_q8_0_repacked_down_f32"),
+            GgmlType::Q5_1 => (&moe.m_down_q5_1, "moe_matvec_q5k_down_f32"),
             _ => return self.launch_moe_expert_matvec(moe, et, xq8, y, in_dim, out_dim,
                                                       n_tok, xq_tok_stride, xq_slot_stride),
         };

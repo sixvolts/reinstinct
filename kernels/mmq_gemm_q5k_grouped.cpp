@@ -61,11 +61,17 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
     const uint4*    nib = reinterpret_cast<const uint4*>(wbase);
     const uint32_t* qhp = reinterpret_cast<const uint32_t*>(
         wbase + (size_t)out_dim * nsp * 16);
-    const uint16_t* smp = reinterpret_cast<const uint16_t*>(
+#ifdef Q5_1_SCALES
+    // Q5_1 (quant::q5_1::repack_for_matvec): raw fp16 d|m per sub-block.
+    const uint32_t* dmp = reinterpret_cast<const uint32_t*>(
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4);
-    const uint32_t* ddp = reinterpret_cast<const uint32_t*>(
+#else
+    const uint16_t* smp = reinterpret_cast<const uint16_t*>(   // v2: sc|m per sub-block
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4);
+    const uint32_t* ddp = reinterpret_cast<const uint32_t*>(   // v2: d|dmin per superblock
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4
               + (size_t)out_dim * nsp * 2);
+#endif
 
     __shared__ uint4    sW  [BM][BK];
     __shared__ uint32_t sWqh[BM][BK];
@@ -86,6 +92,14 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
                 const unsigned int sb = sb0 + lk;
                 sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
                 sWqh[lr][lk] = qhp[(size_t)wrow * nsp + sb];
+#ifdef Q5_1_SCALES
+                const uint32_t dm = dmp[(size_t)wrow * nsp + sb];
+                const uint16_t d_bits = (uint16_t)(dm & 0xFFFF);
+                const uint16_t m_bits = (uint16_t)(dm >> 16);
+                sWs[lr][lk] = make_float2(
+                     __half2float(*reinterpret_cast<const __half*>(&d_bits)),
+                    -__half2float(*reinterpret_cast<const __half*>(&m_bits)));
+#else
                 const uint16_t sm = smp[(size_t)wrow * nsp + sb];
                 const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
                 const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
@@ -95,6 +109,7 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
                         * (float)(sm & 0xFFu),
                     __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
                         * (float)(sm >> 8));
+#endif
             } else {
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }

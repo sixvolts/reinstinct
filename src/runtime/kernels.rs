@@ -1843,6 +1843,180 @@ mod tests {
             "mmq gemm iq3s rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
+    /// The repacked Q8_0 routed-expert matvec (generic and row-packed
+    /// down entries) against a CPU oracle: three synthetic experts, two
+    /// routed slots picking experts 2 and 0, gate/up-style shared
+    /// activation for the generic entry and per-slot activations for
+    /// the down entry.
+    #[test]
+    fn moe_matvec_q8_0_repacked_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q8_0::{self, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+        let (in_dim, out_dim, n_expert, n_used) = (512usize, 96usize, 3usize, 2usize);
+        let ids: Vec<i32> = vec![2, 0];
+        let mut s: u64 = 0x0E8_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        let n_blocks = out_dim * (in_dim / 32);
+        let mut experts_f32 = Vec::new();
+        let mut slab = Vec::new();
+        for e in 0..n_expert {
+            let mut w = vec![0u8; n_blocks * BYTES_PER_BLOCK];
+            for b in &mut w { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let d = (((blk + e) % 19) as f32 + 1.0) * 0.002;
+                w[blk * BYTES_PER_BLOCK..blk * BYTES_PER_BLOCK + 2]
+                    .copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            }
+            let mut f = vec![0.0f32; out_dim * in_dim];
+            q8_0::dequantize_to_f32(&w, &mut f);
+            experts_f32.push(f);
+            slab.extend_from_slice(&q8_0::repack_for_matvec(&w, in_dim, out_dim));
+        }
+        let bpe = slab.len() / n_expert;
+        let mut xs: u64 = 0x5EED_0E8;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        // Two activation rows: row 0 for the shared (gate/up) case, rows
+        // 0 and 1 as per-slot inputs for the down case.
+        let x: Vec<f32> = (0..2 * in_dim).map(|_| x_rng()).collect();
+
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
+        let dxq: DeviceBuf<u8> = DeviceBuf::new(2 * (in_dim / 32) * 40).unwrap();
+        let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut ind = in_dim as u32;
+        let mut qargs: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, 2, 1), (256, 1, 1), 0, None, &mut qargs).unwrap(); }
+        let mmod = Module::load(&cache.compile("moe_matvec_q8_0_repacked",
+            include_str!("../../kernels/moe_matvec_q8_0_repacked.cpp")).unwrap()).unwrap();
+        let dslab: DeviceBuf<u8> = DeviceBuf::from_slice(&slab).unwrap();
+        let dids: DeviceBuf<i32> = DeviceBuf::from_slice(&ids).unwrap();
+        let dy: DeviceBuf<f32> = DeviceBuf::new(n_used * out_dim).unwrap();
+
+        for (kname, slot_stride, grid_x) in [
+            ("moe_matvec_q8_0_repacked_f32", 0u32, (out_dim as u32 + 7) / 8),
+            ("moe_matvec_q8_0_repacked_down_f32", (in_dim / 32) as u32,
+             (out_dim as u32 + (256 / (in_dim / 32)) as u32 - 1) / (256 / (in_dim / 32)) as u32),
+        ] {
+            let f = mmod.function(kname).unwrap();
+            let mut sa = dslab.raw_ptr(); let mut ia = dids.raw_ptr();
+            let mut xa = dxq.raw_ptr(); let mut ya = dy.raw_ptr();
+            let mut ind = in_dim as u32; let mut outd = out_dim as u32; let mut bpe_a = bpe as u32;
+            let mut tst = 0u32; let mut sst = slot_stride; let mut nu = n_used as u32;
+            let mut args: [*mut c_void; 10] = [
+                &mut sa as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+                &mut ind as *mut _ as *mut c_void, &mut outd as *mut _ as *mut c_void,
+                &mut bpe_a as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+                &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+            unsafe { f.launch((grid_x, n_used as u32, 1), (256, 1, 1), 0, None, &mut args).unwrap(); }
+            hip::Device(0).synchronize().unwrap();
+            let mut got = vec![0.0f32; n_used * out_dim];
+            dy.copy_to_host(&mut got).unwrap();
+            for slot in 0..n_used {
+                let xrow = if slot_stride == 0 { 0 } else { slot };
+                let mut want = vec![0.0f32; out_dim];
+                crate::cpu::ops::matvec(&x[xrow * in_dim..(xrow + 1) * in_dim],
+                                        &experts_f32[ids[slot] as usize], in_dim, out_dim, &mut want);
+                let e = rel_l2(&got[slot * out_dim..(slot + 1) * out_dim], &want);
+                eprintln!("{kname} slot {slot} (expert {}): rel_l2={e:.3e}", ids[slot]);
+                assert!(e < DP4A_REL_L2_MAX, "{kname} slot {slot} rel_l2 {e:.3e}");
+            }
+        }
+    }
+
+    /// The Q5_K MoE kernels compiled with Q5_1_SCALES over a Q5_1 slab
+    /// (generic and down entries) against the CPU dequant oracle.
+    #[test]
+    fn moe_matvec_q5_1_via_q5k_kernels_matches_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::q5_1::{self, BYTES_PER_BLOCK};
+        use crate::quant::half::f32_to_f16;
+        let (in_dim, out_dim, n_expert, n_used) = (512usize, 96usize, 3usize, 2usize);
+        let ids: Vec<i32> = vec![1, 2];
+        let mut s: u64 = 0x051_0002;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        let n_blocks = out_dim * (in_dim / 32);
+        let mut experts_f32 = Vec::new();
+        let mut slab = Vec::new();
+        for e in 0..n_expert {
+            let mut w = vec![0u8; n_blocks * BYTES_PER_BLOCK];
+            for b in &mut w { *b = rng_u8(); }
+            for blk in 0..n_blocks {
+                let off = blk * BYTES_PER_BLOCK;
+                let d = (((blk + e) % 19) as f32 + 1.0) * 0.002;
+                w[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                w[off + 2..off + 4].copy_from_slice(&f32_to_f16(-0.01 * ((blk % 5) as f32)).to_le_bytes());
+            }
+            let mut f = vec![0.0f32; out_dim * in_dim];
+            q5_1::dequantize_to_f32(&w, &mut f);
+            experts_f32.push(f);
+            slab.extend_from_slice(&q5_1::repack_for_matvec(&w, in_dim, out_dim));
+        }
+        let bpe = slab.len() / n_expert;
+        let mut xs: u64 = 0x5EED_051;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..2 * in_dim).map(|_| x_rng()).collect();
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
+        let dxq: DeviceBuf<u8> = DeviceBuf::new(2 * (in_dim / 32) * 40).unwrap();
+        let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut ind = in_dim as u32;
+        let mut qargs: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, 2, 1), (256, 1, 1), 0, None, &mut qargs).unwrap(); }
+        let mv = Module::load(&cache.compile("moe_matvec_q5_1_repacked",
+            &q5_1::kernel_source(include_str!("../../kernels/moe_matvec_q5k_repacked.cpp"))).unwrap()).unwrap();
+        let dn = Module::load(&cache.compile("moe_matvec_q5_1_down",
+            &q5_1::kernel_source(include_str!("../../kernels/moe_matvec_q5k_down.cpp"))).unwrap()).unwrap();
+        let dslab: DeviceBuf<u8> = DeviceBuf::from_slice(&slab).unwrap();
+        let dids: DeviceBuf<i32> = DeviceBuf::from_slice(&ids).unwrap();
+        let dy: DeviceBuf<f32> = DeviceBuf::new(n_used * out_dim).unwrap();
+        let rpb = 256 / (in_dim / 32);
+        for (module, kname, slot_stride, grid_x) in [
+            (&mv, "moe_matvec_q5k_repacked_f32", 0u32, (out_dim as u32 + 7) / 8),
+            (&dn, "moe_matvec_q5k_down_f32", (in_dim / 32) as u32, ((out_dim + rpb - 1) / rpb) as u32),
+        ] {
+            let f = module.function(kname).unwrap();
+            let mut sa = dslab.raw_ptr(); let mut ia = dids.raw_ptr();
+            let mut xa = dxq.raw_ptr(); let mut ya = dy.raw_ptr();
+            let mut ind = in_dim as u32; let mut outd = out_dim as u32; let mut bpe_a = bpe as u32;
+            let mut tst = 0u32; let mut sst = slot_stride; let mut nu = n_used as u32;
+            let mut args: [*mut c_void; 10] = [
+                &mut sa as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                &mut xa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+                &mut ind as *mut _ as *mut c_void, &mut outd as *mut _ as *mut c_void,
+                &mut bpe_a as *mut _ as *mut c_void, &mut tst as *mut _ as *mut c_void,
+                &mut sst as *mut _ as *mut c_void, &mut nu as *mut _ as *mut c_void];
+            unsafe { f.launch((grid_x, n_used as u32, 1), (256, 1, 1), 0, None, &mut args).unwrap(); }
+            hip::Device(0).synchronize().unwrap();
+            let mut got = vec![0.0f32; n_used * out_dim];
+            dy.copy_to_host(&mut got).unwrap();
+            for slot in 0..n_used {
+                let xrow = if slot_stride == 0 { 0 } else { slot };
+                let mut want = vec![0.0f32; out_dim];
+                crate::cpu::ops::matvec(&x[xrow * in_dim..(xrow + 1) * in_dim],
+                                        &experts_f32[ids[slot] as usize], in_dim, out_dim, &mut want);
+                let e = rel_l2(&got[slot * out_dim..(slot + 1) * out_dim], &want);
+                eprintln!("q5_1 {kname} slot {slot} (expert {}): rel_l2={e:.3e}", ids[slot]);
+                assert!(e < DP4A_REL_L2_MAX, "q5_1 {kname} slot {slot} rel_l2 {e:.3e}");
+            }
+        }
+    }
+
     /// Wall-clock of every wide MMQ GEMM at the 27B's FFN shape
     /// (644 tokens x 5120 -> 17408), from HIP events over 20 launches.
     /// Run with `--ignored --nocapture`; the per-kernel ms and effective

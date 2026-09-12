@@ -54,11 +54,17 @@ void moe_matvec_q5k_repacked_f32(const unsigned char* __restrict__ slab,
     const unsigned int n_super = n_sub >> 3;
     const uint32_t* qhp = reinterpret_cast<const uint32_t*>(
         wbase + (size_t)out_dim * nsp * 16);
+#ifdef Q5_1_SCALES
+    // Q5_1 (quant::q5_1::repack_for_matvec): raw fp16 d|m per sub-block.
+    const uint32_t* dmp = reinterpret_cast<const uint32_t*>(
+        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4);
+#else
     const uint16_t* smp = reinterpret_cast<const uint16_t*>(   // v2: sc|m per sub-block
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4);
     const uint32_t* ddp = reinterpret_cast<const uint32_t*>(   // v2: d|dmin per superblock
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4
               + (size_t)out_dim * nsp * 2);
+#endif
 
     float acc[ROWS];
     #pragma unroll
@@ -77,6 +83,13 @@ void moe_matvec_q5k_repacked_f32(const unsigned char* __restrict__ slab,
 
             const uint4    q  = nib[(size_t)row * nsp + sb];
             const uint32_t qh = qhp[(size_t)row * nsp + sb];
+#ifdef Q5_1_SCALES
+            const uint32_t dm = dmp[(size_t)row * nsp + sb];
+            const uint16_t d_bits = (uint16_t)(dm & 0xFFFF);
+            const uint16_t m_bits = (uint16_t)(dm >> 16);
+            const float dsc  =  __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            const float deff = -__half2float(*reinterpret_cast<const __half*>(&m_bits));
+#else
             const uint16_t sm = smp[(size_t)row * nsp + sb];
             const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
@@ -85,6 +98,7 @@ void moe_matvec_q5k_repacked_f32(const unsigned char* __restrict__ slab,
                                * (float)(sm & 0xFFu);
             const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
                                * (float)(sm >> 8);
+#endif
 
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             int idot = 0;

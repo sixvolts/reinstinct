@@ -981,6 +981,7 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 | `gemma-4-31B-it-UD-Q4_K_XL.gguf`              | gemma4      | Dense, 60 layers, head_dim 512 (full) / 256 (sliding).        |
 | `gemma-4-31B-it-qat-UD-Q4_K_XL.gguf`          | gemma4      | Same shape, QAT weights. Despite the name, **every** tensor is `Q4_0` — no K-quants at all. 16.1 GB vs 18 GB, and ~19% faster to decode (31.3 vs 26.2 tok/s at stock clocks) because Q4_0 has no 6-bit scale plane to unpack. |
 | `gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf`          | gemma4      | MoE, 128 experts top-8, dual FFN (shared MLP + routed).       |
+| `gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf`          | gemma4      | Same MoE; Q4_K gate_up experts and **Q5_1** down experts (5.3 GB of the file) — 92 tok/s decode, 1150 tok/s pp505 on one MI50. |
 | `Qwen3.5-4B-UD-Q4_K_XL.gguf`                  | qwen35      | Hybrid Gated-DeltaNet + GQA, all dense layers.                |
 | `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
 | `Qwen3.6-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.5-27B, retuned weights.                        |
@@ -1037,6 +1038,15 @@ bytes wider than they need to be:
 have their codebook words `#ifndef`-guarded, and `quant::iq3_s::
 kernel_source` compiles them a second time with `{−15,−13,…,15}`. All
 three used to transcode to `Q8_0` (8.5 bpw, and lossy for `Q3_K`).
+
+**MoE experts** (both runtimes) repack per expert slice at load and run
+on their own routed matvec / row-packed down / grouped-GEMM kernels:
+`Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, and `Q5_1`. `Q5_1` is the legacy 6-bpw
+asymmetric format Unsloth puts on MoE down experts; a Q5_1 block is a
+Q5_K sub-block with its own fp16 `d`/`m`, so it repacks into the Q5_K
+layout plus an fp16 `(d, m)` plane and runs on the Q5_K kernels
+compiled with `Q5_1_SCALES` — exact. Any other expert dtype fails at
+load with the tensor name.
 
 Why it matters: `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with 2.9 GB
 of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`. With everything
@@ -1181,6 +1191,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
 | gemma4-26B-MoE         |          768       |    621      |  **+24%**|        86.5       |     85.5   |   **+1%**|
+| gemma4-26B-MoE Q4_K_XL |         1147       |     —       |    —     |        92.1       |      —     |    —     |
 
 Throughput in tok/s. Reinstinct prefill is the captured-graph
 steady state; decode is averaged over 32 forwards with a chat-templated
