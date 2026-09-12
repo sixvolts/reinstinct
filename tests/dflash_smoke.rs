@@ -14,14 +14,8 @@ use reinstinct_engine::gguf::GgufFile;
 use reinstinct_engine::hip;
 use reinstinct_engine::model::dflash::DFlashModel;
 use reinstinct_engine::model::gemma4::Gemma4Model;
-use reinstinct_engine::runtime::KernelCache;
 use reinstinct_engine::runtime::dflash::{DFlashState, GpuDFlash};
 use reinstinct_engine::runtime::gemma4::{Gemma4GpuState, GpuGemma4};
-
-fn env_path(k: &str) -> Option<std::path::PathBuf> {
-    let p = std::path::PathBuf::from(std::env::var(k).ok()?);
-    p.exists().then_some(p)
-}
 
 fn argmax(v: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -31,14 +25,10 @@ fn argmax(v: &[f32]) -> u32 {
 
 #[test]
 fn drafts_a_block_the_target_mostly_accepts() {
-    let (Some(tp), Some(dp)) = (env_path("REINSTINCT_GEMMA_FIXTURE"),
-                                env_path("REINSTINCT_DFLASH_FIXTURE")) else {
-        eprintln!("skip: set REINSTINCT_GEMMA_FIXTURE and REINSTINCT_DFLASH_FIXTURE");
-        return;
-    };
-    if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+    use reinstinct_engine::test_support as fx;
+    let (Some(tp), Some(dp)) = (fx::gemma_fixture(), fx::dflash_fixture()) else { return };
+    let Some(cache) = fx::kernel_cache() else { return };
     let _dev = hip::Device::set(0).unwrap();
-    let cache = KernelCache::new().expect("kernel cache");
 
     let t_gguf = GgufFile::open(&tp).expect("open target");
     let d_gguf = GgufFile::open(&dp).expect("open drafter");

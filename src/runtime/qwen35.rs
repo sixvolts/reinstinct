@@ -4488,19 +4488,14 @@ mod tests {
     use crate::gguf::GgufFile;
 
     fn fixture_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("REINSTINCT_GGUF_FIXTURE") {
-            return Some(PathBuf::from(p));
-        }
-        let home = std::env::var_os("HOME")?;
-        let p = PathBuf::from(home).join("models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf");
-        p.exists().then_some(p)
+        crate::test_support::qwen_fixture()
     }
 
     #[test]
     fn embed_norm_proj_matches_cpu_chain() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4563,9 +4558,9 @@ mod tests {
 
     #[test]
     fn swiglu_ffn_matches_cpu_for_real_block() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4628,9 +4623,9 @@ mod tests {
 
     #[test]
     fn forward_token_matches_cpu_oracle() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4700,9 +4695,9 @@ mod tests {
 
     #[test]
     fn forward_tokens_batched_matches_sequential() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return }
         };
@@ -4776,9 +4771,9 @@ mod tests {
 
     #[test]
     fn linear_attention_step_matches_cpu_for_real_block() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4856,9 +4851,9 @@ mod tests {
 
     #[test]
     fn linear_attention_block_matches_cpu_for_real_block() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4932,9 +4927,9 @@ mod tests {
 
     #[test]
     fn full_attention_block_matches_cpu_for_real_block() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5009,9 +5004,9 @@ mod tests {
 
     #[test]
     fn full_attention_step_matches_cpu_for_real_block() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5102,9 +5097,9 @@ mod tests {
 
     #[test]
     fn embed_norm_proj_is_deterministic() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+        if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF fixture"); return };
+        let Some(path) = fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }

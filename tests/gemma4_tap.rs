@@ -7,14 +7,11 @@
 
 use reinstinct_engine::model::gemma4::Gemma4Model;
 use reinstinct_engine::runtime::gemma4::{Gemma4GpuState, GpuGemma4};
-use reinstinct_engine::runtime::KernelCache;
 use reinstinct_engine::hip;
 use reinstinct_engine::gguf::GgufFile;
 
 fn fixture() -> Option<std::path::PathBuf> {
-    let p = std::env::var("REINSTINCT_GEMMA_FIXTURE").ok()?;
-    let p = std::path::PathBuf::from(p);
-    if p.exists() { Some(p) } else { None }
+    reinstinct_engine::test_support::gemma_fixture()
 }
 
 /// Tapping the LAST block must reproduce `last_prenorm_hidden()` exactly:
@@ -27,9 +24,8 @@ fn tap_of_final_block_matches_prenorm_hidden() {
         eprintln!("skip: set REINSTINCT_GEMMA_FIXTURE to a Gemma 4 GGUF");
         return;
     };
-    if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP device"); return; }
+    let Some(cache) = reinstinct_engine::test_support::kernel_cache() else { return };
     let _dev = hip::Device::set(0).unwrap();
-    let cache = match KernelCache::new() { Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return; } };
 
     let gguf = GgufFile::open(&path).expect("open gguf");
     let model = Gemma4Model::load(&gguf).expect("load gemma4");

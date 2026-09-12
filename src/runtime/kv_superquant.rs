@@ -323,11 +323,9 @@ mod tests {
     use crate::hip;
 
     fn skip_if_no_gpu() -> Option<KernelCache> {
-        if hip::device_count().ok().unwrap_or(0) < 1 {
-            eprintln!("skip: no HIP device"); return None;
-        }
+        let cache = crate::test_support::kernel_cache()?;
         let _ = hip::Device::set(0).ok()?;
-        KernelCache::new().ok()
+        Some(cache)
     }
 
     fn rng(seed: u64) -> impl FnMut() -> f32 {

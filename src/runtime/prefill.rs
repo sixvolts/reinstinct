@@ -579,11 +579,8 @@ mod tests {
     /// 16-token block depends on.
     #[test]
     fn matmul_into_matches_oracle_across_row_counts() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP"); return; }
+        let Some(cache) = crate::test_support::kernel_cache() else { return };
         let _dev = hip::Device::set(0).unwrap();
-        let cache = match KernelCache::new() {
-            Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return; }
-        };
         let stream = hip::Stream::new().expect("stream");
 
         let in_dim = 1024usize;
@@ -687,11 +684,8 @@ mod tests {
 
     #[test]
     fn batched_matmul_matches_sequential_q4_k() {
-        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP"); return; }
+        let Some(cache) = crate::test_support::kernel_cache() else { return };
         let _dev = hip::Device::set(0).unwrap();
-        let cache = match KernelCache::new() {
-            Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return; }
-        };
         // Synthesise a Q4_K weight + a batch of activations.
         use crate::quant::q4_k::{BLOCK_SIZE, BYTES_PER_BLOCK};
         let in_dim = 2048usize;

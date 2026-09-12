@@ -1023,14 +1023,9 @@ mod tests {
     use crate::cpu::ops::rmsnorm as cpu_rmsnorm;
 
     fn skip_if_no_gpu() -> Option<KernelCache> {
-        if hip::device_count().ok().unwrap_or(0) < 1 {
-            eprintln!("skip: no HIP device"); return None;
-        }
+        let cache = crate::test_support::kernel_cache()?;
         let _ = hip::Device::set(0).ok()?;
-        match KernelCache::new() {
-            Ok(c) => Some(c),
-            Err(e) => { eprintln!("skip: kernel cache: {e}"); None }
-        }
+        Some(cache)
     }
 
     fn check_rmsnorm(cache: &KernelCache, n: usize, eps: f32, seed: u64, tol_rel: f32) {

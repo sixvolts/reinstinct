@@ -7,8 +7,7 @@ use reinstinct_engine::gguf::GgufFile;
 use reinstinct_engine::model::dflash::{DFlashAttn, DFlashModel};
 
 fn fixture() -> Option<std::path::PathBuf> {
-    let p = std::path::PathBuf::from(std::env::var("REINSTINCT_DFLASH_FIXTURE").ok()?);
-    p.exists().then_some(p)
+    reinstinct_engine::test_support::dflash_fixture()
 }
 
 #[test]
@@ -57,11 +56,7 @@ fn loads_gemma4_31b_dflash_with_expected_topology() {
 #[test]
 fn rejects_a_non_dflash_file() {
     // Any non-DFlash GGUF will do; reuse the Gemma fixture when present.
-    let Some(p) = std::env::var("REINSTINCT_GEMMA_FIXTURE").ok()
-        .map(std::path::PathBuf::from).filter(|p| p.exists()) else {
-        eprintln!("skip: set REINSTINCT_GEMMA_FIXTURE");
-        return;
-    };
+    let Some(p) = reinstinct_engine::test_support::gemma_fixture() else { return };
     let gguf = GgufFile::open(&p).expect("open");
     assert!(DFlashModel::load(&gguf).is_err(),
             "a gemma4 file must not parse as dflash");

@@ -195,11 +195,9 @@ mod tests {
     use crate::quant::turbo3::{decode_rows, CacheKind};
 
     fn skip_if_no_gpu() -> Option<KernelCache> {
-        if hip::device_count().ok().unwrap_or(0) < 1 {
-            eprintln!("skip: no HIP device"); return None;
-        }
+        let cache = crate::test_support::kernel_cache()?;
         let _ = hip::Device::set(0).ok()?;
-        KernelCache::new().ok()
+        Some(cache)
     }
 
     /// End-to-end: write one fp32 K tensor through the kernel, copy the

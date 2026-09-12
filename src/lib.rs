@@ -12,4 +12,5 @@ pub mod quant;
 pub mod runtime;
 pub mod sampling;
 pub mod serve;
+pub mod test_support;
 pub mod tokenizer;

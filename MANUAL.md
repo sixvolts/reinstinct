@@ -105,6 +105,27 @@ The binary lands at `./target/release/reinstinct-engine`.
 
 ---
 
+### Tests
+
+```
+cargo test --release
+```
+
+Model- and GPU-dependent tests look for fixtures and **skip** when they
+are absent, so a checkout without models passes vacuously. Fixtures:
+
+| Variable | Fixture | Default |
+|---|---|---|
+| `REINSTINCT_GGUF_FIXTURE` | Qwen 3.5 0.8B GGUF (golden logits, consistency, pipeline) | `~/models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf` |
+| `REINSTINCT_GEMMA_FIXTURE` | A Gemma 4 GGUF (tap, DFlash smoke, tokenizer) | — |
+| `REINSTINCT_DFLASH_FIXTURE` | The Gemma 4 31B DFlash drafter GGUF | — |
+
+On a machine that has them, run with `REINSTINCT_REQUIRE_FIXTURES=1`
+and a missing fixture or GPU **fails** the test instead of skipping it —
+the difference between "the golden test passed" and "it never ran".
+The `tests/golden` fixtures are checked in; `tests/golden/build.sh`
+regenerates the llama.cpp reference logits.
+
 ## COMMANDS
 
 ### inspect
@@ -793,6 +814,7 @@ OpenAI-shaped error body on non-2xx:
 | `REINSTINCT_PREFILL_TWICE` | Used with `REINSTINCT_PREFILL=1`. Two passes: first warms the pool + captures the graph, second is the captured measurement. Prints both timings. The captured number is what's fair to compare against `llama-bench pp512` (steady state). |
 | `REINSTINCT_PREFILL_THRICE` | (Gemma 4 only) As `_TWICE` but also runs a third pass to measure the cache-replay path that skips `end_capture + instantiate`. Reports `warmup → captured → replay → fresh`. |
 | `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown (`=2` also prints every block by global index). Diagnostic; breaks graph capture. |
+| `REINSTINCT_REQUIRE_FIXTURES` | `cargo test`: a missing model fixture or GPU fails the test instead of skipping it (see *Tests*). |
 | `REINSTINCT_PREFILL_CHUNK` | Multi-GPU pipeline: largest micro-batch (tokens) a prompt is prefilled in (default 256; rounded to 64). The prompt is cut into at least four equal chunks so the stages overlap; see *Multi-GPU*. |
 
 ### Disabling optimizations (A/B + diagnosis)

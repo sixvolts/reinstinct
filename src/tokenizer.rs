@@ -403,22 +403,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("REINSTINCT_GGUF_FIXTURE") {
-            return Some(PathBuf::from(p));
-        }
-        let home = std::env::var_os("HOME")?;
-        let p = PathBuf::from(home).join("models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf");
-        p.exists().then_some(p)
+        crate::test_support::qwen_fixture()
     }
 
     fn gemma_fixture() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("REINSTINCT_GEMMA_FIXTURE") {
-            return Some(PathBuf::from(p));
-        }
-        let home = std::env::var_os("HOME")?;
-        let p = PathBuf::from(home)
-            .join("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf");
-        p.exists().then_some(p)
+        crate::test_support::gguf_fixture("REINSTINCT_GEMMA_FIXTURE",
+            Some("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf"))
     }
 
     #[test]

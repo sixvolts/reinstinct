@@ -13,12 +13,7 @@ use reinstinct_engine::cpu::qwen3_5::Qwen35F32Model;
 use reinstinct_engine::gguf::GgufFile;
 
 fn fixture_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("REINSTINCT_GGUF_FIXTURE") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home).join("models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf");
-    p.exists().then_some(p)
+    reinstinct_engine::test_support::qwen_fixture()
 }
 
 #[derive(Debug)]
