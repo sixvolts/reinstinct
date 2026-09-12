@@ -269,6 +269,20 @@ impl GpuMatvecTensor {
                 Some((crate::quant::q6_k::repack_for_matvec(
                     &q6, in_dim as usize, out_dim as usize), GgmlType::Q6_K))
             }
+            // BF16 matvec weights (Unsloth's Q8_K_XL keeps `output.weight`
+            // and the full-attention `attn_q` in BF16) requantize to Q8_0:
+            // gfx906 has no BF16 ALU, `from_gguf` would widen them to F32
+            // (4x the bytes, on the non-dp4a matvec), and a Q8_0 step is
+            // 1/254 of the block peak — far below what the rest of the
+            // file already carries at 8 bits.
+            GgmlType::BF16 => {
+                let n = in_dim as usize * out_dim as usize;
+                let u16s: &[u16] = bytemuck::cast_slice(&bytes[..n * 2]);
+                let f: Vec<f32> = u16s.iter().map(|&b| crate::quant::half::bf16_to_f32(b)).collect();
+                let q8 = crate::quant::q8_0::quantize_from_f32(&f);
+                Some((crate::quant::q8_0::repack_for_matvec(
+                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
+            }
             _ => None,
         };
         match packed {
@@ -469,7 +483,7 @@ const VERIFY_MAX_TOKENS: usize = 16;
 /// buffers are never freed mid-run, so kernels still reading them on the
 /// single engine stream stay safe without a per-call sync — which is
 /// what makes the per-round spec-decode verify cheap.
-pub(crate) struct DeviceBufPool<T> {
+pub struct DeviceBufPool<T> {
     free: std::cell::RefCell<std::collections::HashMap<usize, Vec<DeviceBuf<T>>>>,
 }
 
@@ -481,7 +495,7 @@ impl<T: Copy> DeviceBufPool<T> {
     /// A buffer of exactly `len` elements — reused from the pool when
     /// available, freshly allocated otherwise. Contents are unspecified
     /// (same contract as `DeviceBuf::new`).
-    pub(crate) fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
+    pub fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
         let reused = self.free.borrow_mut().get_mut(&len).and_then(|v| v.pop());
         let buf = match reused {
             Some(b) => b,
@@ -493,7 +507,7 @@ impl<T: Copy> DeviceBufPool<T> {
 
 /// A `DeviceBuf` borrowed from a `DeviceBufPool`; returns to the pool
 /// when dropped. Derefs to `DeviceBuf<T>` so call sites are unchanged.
-pub(crate) struct PooledBuf<'a, T> {
+pub struct PooledBuf<'a, T> {
     buf:  Option<DeviceBuf<T>>,
     pool: &'a DeviceBufPool<T>,
     len:  usize,
@@ -847,11 +861,20 @@ pub struct Qwen35GpuState {
 
 impl Qwen35GpuState {
     pub fn new(model: &Qwen35Model, max_seq: usize) -> Result<Self, String> {
+        Self::new_stage(model, max_seq, 0..model.block_kinds.len())
+    }
+
+    /// State for the blocks in `range` only — the KV caches / GDN states
+    /// a pipeline stage built with `GpuQwen35::new_stage(.., range)`
+    /// steps. Allocated on the current device.
+    pub fn new_stage(model: &Qwen35Model, max_seq: usize, range: std::ops::Range<usize>)
+        -> Result<Self, String>
+    {
         use crate::model::qwen3_5::BlockKind;
         let cfg = &model.config;
         let conv_dim = cfg.gdn_qkv_concat_dim() as usize;
-        let mut block_states = Vec::with_capacity(model.block_kinds.len());
-        for &kind in &model.block_kinds {
+        let mut block_states = Vec::with_capacity(range.len());
+        for &kind in &model.block_kinds[range] {
             block_states.push(match kind {
                 BlockKind::FullAttention => GpuBlockState::Full(GpuKvCache::new(
                     max_seq,
@@ -981,11 +1004,45 @@ impl GpuKvCache {
     pub fn reset(&mut self) { self.len = 0; }
 }
 
+/// The block range a `GpuQwen35` instance owns, and its place in a
+/// pipeline. `dev` is the HIP device every buffer and module of the
+/// instance lives on; callers must have it current (`hip::Device::set`)
+/// whenever they touch the instance.
+#[derive(Clone, Copy, Debug)]
+pub struct StageInfo {
+    pub dev: i32,
+    pub first_block: usize,
+    pub end_block: usize,
+    pub n_blocks_total: usize,
+}
+
+impl StageInfo {
+    pub fn is_first(&self) -> bool { self.first_block == 0 }
+    pub fn is_last(&self) -> bool { self.end_block == self.n_blocks_total }
+    pub fn n_blocks(&self) -> usize { self.end_block - self.first_block }
+}
+
+/// What one stage hands the next: the device pointer its running hidden
+/// activation lives at, the device it lives on, and an event that
+/// completes once the stage's kernels have written it. The next stage
+/// waits on the event and peer-copies from the pointer.
+pub struct StageOutput {
+    pub act: *mut c_void,
+    pub dev: i32,
+    pub done: Event,
+}
+
 pub struct GpuQwen35 {
+    /// Which slice of the model this instance holds. A single-GPU engine
+    /// is the one stage `0..n_blocks`; a pipeline builds one instance per
+    /// device with a sub-range (`new_stage`), and only the first stage
+    /// embeds / only the last runs the output head.
+    stage: StageInfo,
     // Resident weights.
-    token_embd: GpuMatvecTensor,           // [hidden, vocab] (GGUF shape order)
-    output_norm: DeviceBuf<f32>,           // [hidden]
-    /// `None` when `tied_embeddings` — `output_proj` reuses `token_embd`.
+    token_embd: Option<GpuMatvecTensor>,   // [hidden, vocab]; first stage (and tied/MTP last)
+    output_norm: Option<DeviceBuf<f32>>,   // [hidden]; last stage only
+    /// `None` when `tied_embeddings` — `output_proj` reuses `token_embd` —
+    /// and on every stage but the last.
     output_proj: Option<GpuMatvecTensor>,  // [hidden, vocab]
 
     // Per-call activation scratch (persistent across calls; overwritten each call).
@@ -1193,7 +1250,29 @@ impl GpuQwen35 {
     pub fn new(model: &Qwen35Model, gguf: &GgufFile, cache: &KernelCache, max_seq: usize)
         -> Result<Self, String>
     {
+        Self::new_stage(model, gguf, cache, max_seq, 0..model.block_kinds.len())
+    }
+
+    /// Build the engine for blocks `range` only, on the current HIP
+    /// device. The embedding is loaded on the first stage (and on the
+    /// last when the output is tied to it or MTP heads need it); the
+    /// output norm / projection and the MTP heads on the last. Every
+    /// other buffer and kernel module is per-instance, so a pipeline of
+    /// stages is a set of independent engines that pass one hidden
+    /// activation between them (`prefill_stage`, `decode_stage`).
+    pub fn new_stage(model: &Qwen35Model, gguf: &GgufFile, cache: &KernelCache,
+                     max_seq: usize, range: std::ops::Range<usize>)
+        -> Result<Self, String>
+    {
         let cfg = &model.config;
+        let n_blocks_total = model.block_kinds.len();
+        assert!(range.start < range.end && range.end <= n_blocks_total,
+                "new_stage: block range {range:?} out of 0..{n_blocks_total}");
+        let stage = StageInfo {
+            dev: hip::Device::current()?,
+            first_block: range.start, end_block: range.end, n_blocks_total,
+        };
+        let has_mtp = !model.mtp_block_kinds().is_empty();
         let hidden     = cfg.hidden_size      as usize;
         let ffn        = cfg.ffn_size         as usize;
         let vocab      = cfg.vocab_size       as usize;
@@ -1222,12 +1301,20 @@ impl GpuQwen35 {
             .max(gdn_value_dim).max(gdn_conv_dim)
             .max(cfg.moe.as_ref().map(|m| m.shared_expert_ff as usize).unwrap_or(0));
 
-        let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
-        let output_norm = load_fp32_tensor(gguf, "output_norm.weight")?;
-        let output_proj = if cfg.tied_embeddings {
+        let need_embd = stage.is_first()
+            || (stage.is_last() && (cfg.tied_embeddings || has_mtp));
+        let token_embd = if need_embd {
+            Some(GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?)
+        } else { None };
+        let output_norm = if stage.is_last() {
+            Some(load_fp32_tensor(gguf, "output_norm.weight")?)
+        } else { None };
+        // The output projection is a pure matvec weight, so it takes the
+        // repacked layout like every block weight (and BF16 -> Q8_0).
+        let output_proj = if cfg.tied_embeddings || !stage.is_last() {
             None
         } else {
-            Some(GpuMatvecTensor::from_gguf(gguf, "output.weight")?)
+            Some(GpuMatvecTensor::from_gguf_matvec(gguf, "output.weight")?)
         };
 
         let hidden_a    = DeviceBuf::new(hidden)?;
@@ -1346,16 +1433,20 @@ impl GpuQwen35 {
         let matvec_q6k_batched_hsaco =
             cache.compile("matvec_q6k_repacked_batched", MATVEC_Q6K_REPACKED_BATCHED_SOURCE)?;
 
-        // Load every per-layer block's weights from GGUF.
-        let mut blocks = Vec::with_capacity(model.block_kinds.len());
-        for (i, &kind) in model.block_kinds.iter().enumerate() {
+        // Load this stage's per-layer block weights from GGUF (global
+        // block indices — the GGUF names are `blk.<i>.*`).
+        let mut blocks = Vec::with_capacity(stage.n_blocks());
+        for i in range.clone() {
+            let kind = model.block_kinds[i];
             blocks.push(GpuBlock::from_gguf(gguf, i as u32, kind, true, model.config.is_moe())?);
         }
         // MTP next-N predictor heads (Unsloth Qwen 3.6 MTP). Loaded once
-        // here; invoked only by the spec-decode drafter.
-        let mtp: Vec<GpuMtpHead> = model.mtp_block_kinds().iter()
-            .map(|&(i, _kind)| GpuMtpHead::from_gguf(gguf, i, true, model.config.is_moe()))
-            .collect::<Result<_, _>>()?;
+        // here on the last stage; invoked only by the spec-decode drafter.
+        let mtp: Vec<GpuMtpHead> = if stage.is_last() {
+            model.mtp_block_kinds().iter()
+                .map(|&(i, _kind)| GpuMtpHead::from_gguf(gguf, i, true, model.config.is_moe()))
+                .collect::<Result<_, _>>()?
+        } else { Vec::new() };
         let moe_runtime = match &cfg.moe {
             Some(mc) => Some(MoeRuntime::new(mc, hidden, cache)?),
             None => None,
@@ -1366,6 +1457,7 @@ impl GpuQwen35 {
         // rocBLAS handle for batched-prefill GEMMs, bound to our stream.
 
         Ok(Self {
+            stage,
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
             pool_f32, pool_u8, pool_u16, prefill_warm_p, ffn_a, ffn_b,
@@ -1491,8 +1583,21 @@ impl GpuQwen35 {
     /// The matvec tensor used for the final output projection. Same as
     /// `output_proj` if separate; falls back to `token_embd` if tied.
     fn output_proj_tensor(&self) -> &GpuMatvecTensor {
-        self.output_proj.as_ref().unwrap_or(&self.token_embd)
+        self.output_proj.as_ref().unwrap_or_else(|| self.token_embd())
     }
+
+    fn token_embd(&self) -> &GpuMatvecTensor {
+        self.token_embd.as_ref()
+            .expect("token_embd is only loaded on the first pipeline stage (or a tied/MTP last stage)")
+    }
+
+    fn output_norm(&self) -> &DeviceBuf<f32> {
+        self.output_norm.as_ref()
+            .expect("output_norm is only loaded on the last pipeline stage")
+    }
+
+    /// This instance's block range / device.
+    pub fn stage(&self) -> StageInfo { self.stage }
 
     // ---- Per-op launchers ---------------------------------------------------
     //
@@ -2285,8 +2390,8 @@ impl GpuQwen35 {
     /// forward), but every kernel and every device pointer in the
     /// pipeline is exercised.
     pub fn embed_norm_proj(&self, token: u32) -> Result<Vec<f32>, String> {
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
-        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+        self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm().raw_ptr(),
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
         self.launch_matvec_dispatch(self.output_proj_tensor(),
                                     self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
@@ -2920,7 +3025,7 @@ impl GpuQwen35 {
         let scr     = self.hidden_b.raw_ptr() as *mut f32;      // emb / scratch / normed
 
         self.launch_embed_lookup_dispatch(
-            &self.token_embd, scr as *mut c_void, embed_next)?;
+            self.token_embd(), scr as *mut c_void, embed_next)?;
         self.launch_rmsnorm(scr as *mut c_void, mtp.enorm.raw_ptr(),
                             concat as *mut c_void, h, self.rms_eps)?;
         self.launch_rmsnorm(prev_hidden, mtp.hnorm.raw_ptr(),
@@ -3182,7 +3287,7 @@ impl GpuQwen35 {
 
         // Embed lookup → hidden_a
         self.set_pos(state.pos)?;
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
 
         // Walk blocks, but for `traced_block_idx` (which must be a Linear
         // block) we expand the chain manually with events between kernels.
@@ -3260,7 +3365,7 @@ impl GpuQwen35 {
         }
 
         // Output norm + projection
-        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm().raw_ptr(),
                             self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
         self.launch_matvec_dispatch(self.output_proj_tensor(),
                                     self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
@@ -3293,7 +3398,7 @@ impl GpuQwen35 {
 
         events[0].record(&self.stream)?;
         self.set_pos(state.pos)?;
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
         events[1].record(&self.stream)?;
 
         for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
@@ -3311,7 +3416,7 @@ impl GpuQwen35 {
             events[i + 2].record(&self.stream)?;
         }
 
-        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
+        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm().raw_ptr(),
                             self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
         events[n_blocks + 2].record(&self.stream)?;
 
@@ -3360,11 +3465,72 @@ impl GpuQwen35 {
                 _ => return Err("block kind mismatch between weights and state".into()),
             }
         }
-        self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
-                            self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
-        self.launch_matvec_dispatch(self.output_proj_tensor(),
-                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        if self.stage.is_last() {
+            self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm().raw_ptr(),
+                                self.hidden_b.raw_ptr(), self.hidden as u32, self.rms_eps)?;
+            self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                        self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        }
         Ok(())
+    }
+
+    // ===== Pipeline stage entry points ======================================
+    //
+    // A pipeline drives one `GpuQwen35` per device. Each step, stage 0
+    // embeds the token and runs its blocks; every later stage waits for
+    // the previous stage's `StageOutput`, peer-copies the hidden
+    // activation into its own buffer, and runs its blocks; the last
+    // stage also runs the output head and returns logits. The caller
+    // must have this stage's device current for the whole call.
+
+    /// One decode step for this stage. `input` is the previous stage's
+    /// output (None on the first stage, which embeds `token` instead).
+    /// `graph` is this stage's captured decode body (`capture_forward_graph`),
+    /// or None to launch per kernel. Returns this stage's output handoff
+    /// and, on the last stage, the logits.
+    pub fn decode_stage(&self, token: u32, state: &mut Qwen35GpuState,
+                        graph: Option<&GraphExec>, input: Option<&StageOutput>)
+        -> Result<(StageOutput, Option<Vec<f32>>), String>
+    {
+        debug_assert_eq!(hip::Device::current()?, self.stage.dev);
+        self.set_pos(state.pos)?;
+        match input {
+            None => {
+                assert!(self.stage.is_first(), "decode_stage: no input on a non-first stage");
+                self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
+            }
+            Some(prev) => self.receive_activation(prev, self.hidden_a.raw_ptr(), self.hidden)?,
+        }
+        match graph {
+            Some(g) => g.launch(&self.stream)?,
+            None    => self.enqueue_decode_body(state)?,
+        }
+        let done = Event::new()?;
+        done.record(&self.stream)?;
+        state.pos += 1;
+        let logits = if self.stage.is_last() {
+            self.stream.synchronize()?;
+            let mut out = vec![0.0f32; self.vocab];
+            self.logits.copy_to_host(&mut out)?;
+            Some(out)
+        } else { None };
+        Ok((StageOutput { act: self.hidden_a.raw_ptr(), dev: self.stage.dev, done }, logits))
+    }
+
+    /// Wait for `prev` and peer-copy `count` floats from its activation
+    /// into `dst` on this stage, stream-ordered ahead of everything this
+    /// stage launches next.
+    fn receive_activation(&self, prev: &StageOutput, dst: *mut c_void, count: usize)
+        -> Result<(), String>
+    {
+        self.stream.wait_event(&prev.done)?;
+        let api = hip::sys::hip().map_err(|s| s.to_string())?;
+        let e = unsafe { (api.memcpy_peer_async)(
+            dst, self.stage.dev, prev.act as *const c_void, prev.dev,
+            count * std::mem::size_of::<f32>(), self.stream.raw()) };
+        if e.is_ok() { Ok(()) } else {
+            Err(format!("hipMemcpyPeerAsync (stage handoff): {}", api.err_str(e)))
+        }
     }
 
     /// On-device portion of `forward_token`: stage the position, embed
@@ -3373,7 +3539,7 @@ impl GpuQwen35 {
         -> Result<(), String>
     {
         self.set_pos(state.pos)?;
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
         self.prof_reset();
         self.enqueue_decode_body(state)
     }
@@ -3402,7 +3568,7 @@ impl GpuQwen35 {
         -> Result<Vec<f32>, String>
     {
         self.set_pos(state.pos)?;
-        self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+        self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
         exec.launch(&self.stream)?;
         self.stream.synchronize()?;
         state.pos += 1;
@@ -3733,19 +3899,40 @@ impl GpuQwen35 {
     pub fn forward_tokens_batched(&self, tokens: &[u32], state: &mut Qwen35GpuState)
         -> Result<Vec<f32>, String>
     {
-        assert!(!tokens.is_empty(), "forward_tokens_batched needs ≥1 token");
+        assert!(self.stage.is_first() && self.stage.is_last(),
+                "forward_tokens_batched drives a whole-model engine; pipeline stages use prefill_stage");
+        let (_act, _out, logits) = self.prefill_stage(tokens, state, None)?;
+        Ok(logits.expect("last stage returns logits"))
+    }
+
+    /// Batched prefill of `tokens` through this stage's blocks. On the
+    /// first stage the rows are embedded here; otherwise they are
+    /// peer-copied from `input` (the previous stage's `[n, hidden]`
+    /// activation). The last stage also runs the output head on the last
+    /// row and returns its logits. The returned `PooledBuf` is the
+    /// activation the handoff points into — the caller keeps it alive
+    /// until the next stage has consumed it.
+    pub fn prefill_stage<'a>(&'a self, tokens: &[u32], state: &mut Qwen35GpuState,
+                             input: Option<&StageOutput>)
+        -> Result<(PooledBuf<'a, f32>, StageOutput, Option<Vec<f32>>), String>
+    {
+        assert!(!tokens.is_empty(), "prefill_stage needs ≥1 token");
+        debug_assert_eq!(hip::Device::current()?, self.stage.dev);
         let n = tokens.len();
         let h     = self.hidden;
-        let q_dim = self.q_dim();
-        let kv_dim = self.kv_dim();
-        let vdim  = self.gdn_value_dim;
-        let cdim  = self.gdn_conv_dim;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
         // Per-call batched activation buffers.
         let ba    = self.pool_f32.take(n * h)?;        // running hidden
         let bb    = self.pool_f32.take(n * h)?;        // scratch
         let bnorm = self.pool_f32.take(n * h)?;        // normed scratch
+
+        // The handoff copy is issued before capture: a cross-device
+        // memcpy is not a graph node we want to depend on.
+        match input {
+            None => assert!(self.stage.is_first(), "prefill_stage: no input on a non-first stage"),
+            Some(prev) => self.receive_activation(prev, ba.raw_ptr(), n * h)?,
+        }
 
         // HIP graph capture around the prefill kernel chain. The first
         // prefill at each `n` runs uncaptured so the inner-block buffer
@@ -3762,10 +3949,12 @@ impl GpuQwen35 {
             Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
         }
 
-        // 1) Embed all tokens into ba (one row each).
-        for (r, &tok) in tokens.iter().enumerate() {
-            let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
-            self.launch_embed_lookup_dispatch(&self.token_embd, row_ptr, tok)?;
+        // 1) Embed all tokens into ba (one row each) — first stage only.
+        if input.is_none() {
+            for (r, &tok) in tokens.iter().enumerate() {
+                let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
+                self.launch_embed_lookup_dispatch(self.token_embd(), row_ptr, tok)?;
+            }
         }
 
         // 2) Every block. Optional per-block timing trace
@@ -3803,14 +3992,15 @@ impl GpuQwen35 {
             eprintln!("[prefill-trace]   GDN linear {:>7.1} ms total  ({:>5.2} ms/block)",
                 sl, if nl > 0 { sl / nl as f64 } else { 0.0 });
         }
-        let _ = (q_dim, kv_dim, vdim, cdim);
 
-        // 3) Output norm + projection on the LAST row only.
-        let last_in = unsafe { (ba.raw_ptr() as *mut f32).add((n - 1) * h) } as *mut c_void;
-        self.launch_rmsnorm(last_in, self.output_norm.raw_ptr(),
-                            self.hidden_b.raw_ptr(), h as u32, self.rms_eps)?;
-        self.launch_matvec_dispatch(self.output_proj_tensor(),
-                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        // 3) Output norm + projection on the LAST row only — last stage.
+        if self.stage.is_last() {
+            let last_in = unsafe { (ba.raw_ptr() as *mut f32).add((n - 1) * h) } as *mut c_void;
+            self.launch_rmsnorm(last_in, self.output_norm().raw_ptr(),
+                                self.hidden_b.raw_ptr(), h as u32, self.rms_eps)?;
+            self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                        self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        }
 
         if !no_graph {
             let g = Graph::end_capture(&self.stream)?;
@@ -3822,11 +4012,17 @@ impl GpuQwen35 {
             self.prefill_warm_p.borrow_mut().insert(n);
         }
 
-        self.stream.synchronize()?;
+        let done = Event::new()?;
+        done.record(&self.stream)?;
         state.pos += n;
-        let mut out = vec![0.0f32; self.vocab];
-        self.logits.copy_to_host(&mut out)?;
-        Ok(out)
+        let logits = if self.stage.is_last() {
+            self.stream.synchronize()?;
+            let mut out = vec![0.0f32; self.vocab];
+            self.logits.copy_to_host(&mut out)?;
+            Some(out)
+        } else { None };
+        let out = StageOutput { act: ba.raw_ptr(), dev: self.stage.dev, done };
+        Ok((ba, out, logits))
     }
 
     /// QMTP-2 — K-token verify forward. Runs `tokens` through the main
@@ -3856,7 +4052,7 @@ impl GpuQwen35 {
 
         for (r, &tok) in tokens.iter().enumerate() {
             let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
-            self.launch_embed_lookup_dispatch(&self.token_embd, row_ptr, tok)?;
+            self.launch_embed_lookup_dispatch(self.token_embd(), row_ptr, tok)?;
         }
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
@@ -3876,7 +4072,7 @@ impl GpuQwen35 {
         // per-row decode matvec: the (tied) output weight is not in the
         // repacked layout, so routing it through `bmm` would hit the
         // dequant-to-fp16 fallback — far worse than n fast matvecs.
-        self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),
+        self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm().raw_ptr(),
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
         let logits_all = self.pool_f32.take(n * self.vocab)?;
         for r in 0..n {

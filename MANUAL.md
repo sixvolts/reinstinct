@@ -52,6 +52,25 @@ The GPU path has two modes for consuming tokens:
   prefills skip `end_capture + instantiate`. `generate-text --gpu`
   uses prefill automatically for the prompt; `serve` does too.
 
+### Multi-GPU (pipeline parallelism)
+
+A dense `qwen35` model larger than one card is split by **layers**
+across several: `--gpus 0,1` builds one engine per device holding a
+contiguous block range, the first also holding the embedding and the
+last the output head. A forward walks the stages in order; each hands
+the next its running hidden activation (`hidden` floats per token —
+20 KB on a 27B) with a stream-ordered `hipMemcpyPeerAsync`, ~7 µs over
+PCIe 4.0 x8 when peer access is available (host bounce otherwise).
+The split is planned by weight bytes (equal bytes ≈ equal decode time
+per stage, embedding / head charged to their stages) or set with
+`--split <blocks,...>`. Each stage captures its own decode graph.
+
+This buys capacity, not speed: stages are sequential for one sequence,
+so decode is still one weight pass per token, now split across cards
+— `Qwen3.8-27B-UD-Q8_K_XL` (29 GB) runs at 16.0 tok/s across two
+MI50s, 95% of the two-card bandwidth roofline. Gemma 4 and the
+spec-decode paths (`mtp-gen`, `dflash-gen`) remain single-GPU.
+
 ### Requirements
 
 - ROCm with `hipcc` on `PATH` (developed against ROCm 7.1).
@@ -114,7 +133,7 @@ position.
 ```
 reinstinct-engine generate-text <PATH> [--prompt <TEXT> | --system <TEXT> --user <TEXT>]
                   [--tokens <ID,...>] [-n <N>] [--temperature <F>] [--top-k <N>]
-                  [--seed <N>] [--gpu]
+                  [--seed <N>] [--gpu] [--gpus <ID,...>] [--split <N,...>]
 ```
 
 Consume a prompt, then autoregressively sample `--steps` new tokens.
@@ -128,6 +147,8 @@ Consume a prompt, then autoregressively sample `--steps` new tokens.
 | `-n`, `--steps <N>` | 32 | New tokens to sample after the prompt. `-n 0` consumes the prompt only. |
 | `--temperature <F>` | 0.0 | Sampling temperature. `0` = greedy/argmax. |
 | `--top-k <N>` | 40 | Top-k filter. `0` = full vocab. |
+| `--gpus <ID,...>` | `0` | HIP devices, in pipeline-stage order. More than one splits a `qwen35` model's layers across them (see *Multi-GPU*). |
+| `--split <N,...>` | by bytes | Blocks per stage, one entry per `--gpus` device, summing to the model's block count. |
 | `--seed <N>` | `0xC0FFEE` | PRNG seed. |
 | `--gpu` | off | Run on the GPU. |
 
@@ -319,7 +340,7 @@ ENVIRONMENT and use `generate-text` with `REINSTINCT_KV_SUPERQUANT=1`.
 ```
 reinstinct-engine serve --big <PATH> --small <PATH> [--big-drafter <PATH>]
                   [--embed <PATH>] [--big-port <N>] [--small-port <N>]
-                  [--embed-port <N>] [--max-seq <N>]
+                  [--embed-port <N>] [--max-seq <N>] [--gpus <ID,...>]
 ```
 
 Multi-model HTTP server. Three ports — **Big LLM**, **Small LLM**,
@@ -338,6 +359,7 @@ runs the target model, and replies. Models never run concurrently
 | `--small-port <N>` | 8081 | TCP port for the small LLM. |
 | `--embed-port <N>` | 8082 | TCP port for the embedder. |
 | `--max-seq <N>` | 4096 | Context window (prompt + generated tokens) per request. |
+| `--gpus <ID,...>` | `0` | HIP devices for the big model, in pipeline-stage order; a `qwen35` big model splits its layers across them. The small model sits on the first. |
 
 Each port answers `POST /v1/completions` and `POST /v1/chat/completions`
 (or `POST /v1/embeddings` on the embed port — currently 503).
@@ -864,6 +886,7 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 | `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
 | `Qwen3.6-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.5-27B, retuned weights.                        |
 | `Qwen3.8-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.6-27B (config identical field for field), retuned weights, ships the `nextn` MTP head (block 65). Thinks by default: emits a `<think>` block before answering. |
+| `Qwen3.8-27B-UD-Q8_K_XL.gguf`                 | qwen35      | 29 GB — needs two MI50s (`--gpus 0,1`; 14.2 + 15.1 GiB). Q8_0 throughout except `output.weight` and the full-attention `attn_q`, which ship BF16 and are requantized to Q8_0 at load (gfx906 has no BF16 path; F32 would be 4x the bytes). |
 | `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | MoE, 256 experts top-8, hybrid GDN.                           |
 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | Same arch as 3.5-35B-MoE.                                     |
 
@@ -1053,6 +1076,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
 | qwen-3.8-27B           |          187       |     —       |    —     |        26.9       |      —     |    —     |
+| qwen-3.8-27B Q8_K_XL, 2×MI50 |    307       |     —       |    —     |        16.0       |      —     |    —     |
 | gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
@@ -1194,7 +1218,8 @@ forward-pass divergence to a specific layer.
   for exact control-token sequences.
 - `model` typed-parses `qwen35` only; `generate` / `generate-text`
   cover `gemma4` and `qwen35`.
-- Single-GPU only.
+- Multi-GPU is layer pipelining of `qwen35` models only (`--gpus`).
+  Gemma 4, `chat`, and the spec-decode commands run on one device.
 - `chat` (KV-prefix-reuse, snapshot/restore) is gemma4-only — the
   qwen35 hybrid attention + GDN state needs separate snapshot
   machinery (not yet built).

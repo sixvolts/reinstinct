@@ -11,6 +11,7 @@
 pub mod kernels;
 pub mod prefill;
 pub mod qwen35;
+pub mod pipeline;
 pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod dflash;

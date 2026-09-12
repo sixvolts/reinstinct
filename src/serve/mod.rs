@@ -672,8 +672,8 @@ fn error_body(message: &str, kind: &str) -> String {
 /// reusable decode state. `generate` runs one prompt→completion.
 enum ServerModel {
     Qwen {
-        gpu: crate::runtime::qwen35::GpuQwen35,
-        state: crate::runtime::qwen35::Qwen35GpuState,
+        gpu: crate::runtime::pipeline::Qwen35Pipeline,
+        state: crate::runtime::pipeline::Qwen35PipelineState,
         tok: crate::tokenizer::Tokenizer,
         eos: u32,
         max_seq: usize,
@@ -810,8 +810,11 @@ impl ServerModel {
     /// `drafter_path` is honoured only on Gemma 4 targets — qwen35 has no
     /// supported drafter (Qwen 3.6 MTP loads but its forward path is
     /// unwritten; see the gemma4-mtp memory file for the round arithmetic).
+    /// `devices`: the HIP devices a qwen35 model is pipelined across, in
+    /// stage order (one = the ordinary single-GPU engine). Gemma 4 runs on
+    /// the first only.
     fn load(path: &PathBuf, drafter_path: Option<&PathBuf>, cache: &KernelCache,
-            max_seq: usize) -> Result<ServerModel, String>
+            max_seq: usize, devices: &[i32]) -> Result<ServerModel, String>
     {
         let g = GgufFile::open(path).map_err(|e| e.to_string())?;
         let arch = g.metadata_get("general.architecture")
@@ -862,12 +865,17 @@ impl ServerModel {
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
             use crate::model::qwen3_5::Qwen35Model;
-            use crate::runtime::qwen35::{GpuQwen35, Qwen35GpuState};
+            use crate::runtime::pipeline::Qwen35Pipeline;
             use crate::tokenizer::Tokenizer;
             let model = Qwen35Model::load(&g).map_err(|e| e.to_string())?;
             let eos = model.config.eos_token_id;
-            let gpu = GpuQwen35::new(&model, &g, cache, max_seq)?;
-            let state = Qwen35GpuState::new(&model, max_seq)?;
+            let gpu = Qwen35Pipeline::new(&model, &g, cache, max_seq, devices, None)?;
+            if gpu.n_stages() > 1 {
+                for (dev, r) in gpu.layout() {
+                    info!("pipeline stage: device {dev} blocks {}..{}", r.start, r.end);
+                }
+            }
+            let state = gpu.new_state(&model, max_seq)?;
             let tok = Tokenizer::from_gguf(&g)?;
             if drafter_path.is_some() {
                 warn!("--big-drafter ignored on qwen35 target \
@@ -1146,17 +1154,17 @@ impl ServerModel {
 // --- the GPU worker ----------------------------------------------------
 
 fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: Option<PathBuf>, max_seq: usize, metrics: Arc<Metrics>)
+          small: Option<PathBuf>, max_seq: usize, devices: Vec<i32>, metrics: Arc<Metrics>)
 {
     let setup = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
-        crate::hip::Device::set(0)?;
+        crate::hip::Device::set(devices[0])?;
         let cache = KernelCache::new()?;
-        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>|
+        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>, devs: &[i32]|
             -> Result<ServerModel, String>
         {
             info!("loading {label:5} model {} ...", path.display());
             let t = std::time::Instant::now();
-            let m = ServerModel::load(path, drafter, &cache, max_seq)
+            let m = ServerModel::load(path, drafter, &cache, max_seq, devs)
                 .map_err(|e| {
                     // VRAM-exhaustion → add a hint about model size vs VRAM.
                     if e.to_lowercase().contains("memory") {
@@ -1175,9 +1183,10 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             info!("  loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
             Ok(m)
         };
-        let big_m   = load("big",   &big,   big_drafter.as_ref())?;
+        let big_m   = load("big",   &big,   big_drafter.as_ref(), &devices)?;
         let small_m = match small {
-            Some(sp) => Some(load("small", &sp, None)?),
+            // The small model is not worth pipelining; it sits on the first device.
+            Some(sp) => Some(load("small", &sp, None, &devices[..1])?),
             None => None,
         };
         Ok((cache, big_m, small_m))
@@ -1632,9 +1641,11 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 /// Start the three-port multi-model server. Blocks forever.
   pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
            small: Option<PathBuf>, embed: Option<PathBuf>,
-           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize)
+           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize,
+           devices: Vec<i32>)
     -> Result<(), String>
 {
+    if devices.is_empty() { return Err("--gpus needs at least one device".into()); }
     // Surface any REINSTINCT_* env vars at startup. Several of them are
     // perf-killers if set unintentionally on a serve box (graph capture
     // off, dp4a path off, etc) — better to log them than have an
@@ -1678,8 +1689,9 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
         let (big, big_drafter, small) =
             (big.clone(), big_drafter.clone(), small.clone());
         let metrics = Arc::clone(&metrics);
+        let devices = devices.clone();
         thread::Builder::new().name("gpu-worker".into())
-            .spawn(move || worker(rx, big, big_drafter, small, max_seq, metrics))
+            .spawn(move || worker(rx, big, big_drafter, small, max_seq, devices, metrics))
             .map_err(|e| e.to_string())?
     };
 

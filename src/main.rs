@@ -78,6 +78,14 @@ enum Command {
         /// Run on GPU.
         #[arg(long)]
         gpu: bool,
+        /// HIP devices to run on, in pipeline-stage order (qwen35 only;
+        /// e.g. `--gpus 0,1` splits the layers across two cards).
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        gpus: Vec<i32>,
+        /// Blocks per pipeline stage (one entry per --gpus device; must
+        /// sum to the model's block count). Default: balanced by weight bytes.
+        #[arg(long, value_delimiter = ',')]
+        split: Option<Vec<usize>>,
     },
     /// Speculative decode against a Gemma 4 target using its MTP drafter.
     /// Currently sequential-verify (correctness, no speedup) — proves the
@@ -243,6 +251,10 @@ enum Command {
         /// Context window (prompt + generated tokens) per request.
         #[arg(long, default_value_t = 4096)]
         max_seq: usize,
+        /// HIP devices for the big model, in pipeline-stage order (qwen35
+        /// models split their layers across them; Gemma 4 uses the first).
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        gpus: Vec<i32>,
     },
     /// QMTP-1 diagnostic: load a Qwen 3.6 MTP model, prefill a prompt,
     /// then decode N tokens with the main model while running the
@@ -378,14 +390,14 @@ fn main() -> anyhow::Result<()> {
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
         Command::Serve { big, big_drafter, small, embed,
-                         big_port, small_port, embed_port, max_seq } =>
+                         big_port, small_port, embed_port, max_seq, gpus } =>
             reinstinct_engine::serve::run(big, big_drafter, small, embed,
-                                          big_port, small_port, embed_port, max_seq)
+                                          big_port, small_port, embed_port, max_seq, gpus)
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
-                                temperature, top_k, seed, gpu } =>
+                                temperature, top_k, seed, gpu, gpus, split } =>
             generate_text(&path, prompt, system, user, tokens, steps,
-                          temperature, top_k, seed, gpu),
+                          temperature, top_k, seed, gpu, &gpus, split.as_deref()),
         Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
             chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
         Command::SuperquantBench { warm_cap, cold_cap, n_kv,
@@ -742,7 +754,8 @@ fn dump_traces_cli(target_path: &std::path::Path, prompts_path: &std::path::Path
 fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
                  system: Option<String>, user: Option<String>,
                  tokens: Option<Vec<u32>>, steps: usize,
-                 temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
+                 temperature: f32, top_k: usize, seed: u64, gpu: bool,
+                 gpus: &[i32], split: Option<&[usize]>) -> anyhow::Result<()> {
     use reinstinct_engine::sampling::{Rng, sample_temp_topk};
     use reinstinct_engine::tokenizer::Tokenizer;
 
@@ -802,12 +815,22 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
     let t0 = std::time::Instant::now();
     if gpu {
         use reinstinct_engine::hip;
-        use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+        use reinstinct_engine::runtime::{KernelCache, pipeline::Qwen35Pipeline};
         if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
-        let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        if gpus.is_empty() { anyhow::bail!("--gpus needs at least one device"); }
+        let _dev = hip::Device::set(gpus[0]).map_err(anyhow::Error::msg)?;
         let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
-        let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
-        let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+        // One engine per device, the layers split across them; a single
+        // device is the ordinary single-GPU engine.
+        let gpu = Qwen35Pipeline::new(&model, &g, &cache, max_seq, gpus, split)
+            .map_err(anyhow::Error::msg)?;
+        if gpu.n_stages() > 1 {
+            for (dev, r) in gpu.layout() {
+                println!("pipeline    = device {dev}: blocks {}..{} ({} blocks)",
+                         r.start, r.end, r.end - r.start);
+            }
+        }
+        let mut state = gpu.new_state(&model, max_seq).map_err(anyhow::Error::msg)?;
 
         // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
         // print timing + top-10, and exit (skips generation). Mirrors the
@@ -818,7 +841,7 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             if do_twice {
                 // Warmup pass (cold pools → uncaptured), then a fresh-state
                 // second pass that uses the captured graph.
-                let mut s_warm = Qwen35GpuState::new(&model, max_seq)
+                let mut s_warm = gpu.new_state(&model, max_seq)
                     .map_err(anyhow::Error::msg)?;
                 let t1 = std::time::Instant::now();
                 let _ = gpu.forward_tokens_batched(&prompt, &mut s_warm)

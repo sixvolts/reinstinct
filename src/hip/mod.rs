@@ -73,6 +73,35 @@ impl Device {
         let api = hip().map_err(|s| s.to_string())?;
         unsafe { ck(api, (api.device_synchronize)(), "hipDeviceSynchronize") }
     }
+
+    /// The runtime's active device for this thread.
+    pub fn current() -> Result<HipDevice> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut id: i32 = 0;
+        unsafe { ck(api, (api.get_device)(&mut id), "hipGetDevice")?; }
+        Ok(id)
+    }
+
+    /// Whether `device` can read `peer`'s memory directly (PCIe / xGMI
+    /// peer access). Without it `hipMemcpyPeer` still works, bounced
+    /// through host memory.
+    pub fn can_access_peer(device: HipDevice, peer: HipDevice) -> Result<bool> {
+        let api = hip().map_err(|s| s.to_string())?;
+        let mut can: i32 = 0;
+        unsafe { ck(api, (api.device_can_access_peer)(&mut can, device, peer),
+                    "hipDeviceCanAccessPeer")?; }
+        Ok(can != 0)
+    }
+
+    /// Enable direct access from the *current* device to `peer`'s memory.
+    /// Idempotent: an already-enabled pair is not an error.
+    pub fn enable_peer_access(peer: HipDevice) -> Result<()> {
+        const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: i32 = 704;
+        let api = hip().map_err(|s| s.to_string())?;
+        let e = unsafe { (api.device_enable_peer_access)(peer, 0) };
+        if e.0 == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED { return Ok(()); }
+        ck(api, e, "hipDeviceEnablePeerAccess")
+    }
 }
 
 /// RAII HIP stream. Drops issue `hipStreamDestroy`.
@@ -92,6 +121,14 @@ impl Stream {
     }
 
     pub fn raw(&self) -> HipStream { self.raw }
+
+    /// Make all future work on this stream wait for `event` (recorded on
+    /// any stream, on any device) to complete. Asynchronous — the host
+    /// does not block.
+    pub fn wait_event(&self, event: &Event) -> Result<()> {
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe { ck(api, (api.stream_wait_event)(self.raw, event.raw, 0), "hipStreamWaitEvent") }
+    }
 }
 
 impl Drop for Stream {
@@ -175,6 +212,26 @@ impl<T: Copy> DeviceBuf<T> {
                                         count * std::mem::size_of::<T>(),
                                         HipMemcpyKind::DeviceToDevice, stream.raw),
                "hipMemcpyAsync D2D range")
+        }
+    }
+
+    /// Stream-ordered copy of `count` elements from `src`, which lives on
+    /// device `src_dev`, into the start of `self` on device `dst_dev`.
+    /// The direct PCIe/xGMI path when peer access is enabled between the
+    /// two, a host bounce otherwise — either way asynchronous on `stream`,
+    /// which must belong to one of the two devices.
+    pub fn copy_from_peer_async(&self, dst_dev: HipDevice, src: &DeviceBuf<T>,
+                                src_dev: HipDevice, count: usize, stream: &Stream)
+        -> Result<()>
+    {
+        assert!(count <= src.len && count <= self.len,
+                "copy_from_peer_async: count {count} exceeds src {} / dst {}", src.len, self.len);
+        let api = hip().map_err(|s| s.to_string())?;
+        unsafe {
+            ck(api, (api.memcpy_peer_async)(self.ptr as *mut c_void, dst_dev,
+                                            src.ptr as *const c_void, src_dev,
+                                            count * std::mem::size_of::<T>(), stream.raw),
+               "hipMemcpyPeerAsync")
         }
     }
 
