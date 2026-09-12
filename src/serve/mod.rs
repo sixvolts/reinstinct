@@ -1007,6 +1007,12 @@ impl ServerModel {
                         counts.fill(0);
                     }
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
+                    // Start the next step now; the text decode and the
+                    // stream write below overlap it.
+                    let launched = match graph {
+                        Some(g) => { gpu.decode_launch(t, state, Some(g))?; true }
+                        None => false,
+                    };
                     // Re-decode the whole output: append-only token streams
                     // mean the previous prefix bytes are stable, so the
                     // delta is the suffix past prev_text_len. Multi-token
@@ -1029,10 +1035,7 @@ impl ServerModel {
                     } else if let Some(t) = tlp {
                         all_lp.push(t);
                     }
-                    logits = match graph {
-                        Some(g) => gpu.forward_token_via_graph(g, t, state)?,
-                        None    => gpu.forward_token(t, state)?,
-                    };
+                    logits = if launched { gpu.decode_finish()? } else { gpu.forward_token(t, state)? };
                 }
                 Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
@@ -1149,6 +1152,10 @@ impl ServerModel {
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
+                        let launched = match graph {
+                            Some(g) => { gpu.forward_via_graph_launch(g, t, state)?; true }
+                            None => false,
+                        };
                         full_text = tok.decode(&out);
                         let tlp = if want_lp > 0 {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
@@ -1162,10 +1169,7 @@ impl ServerModel {
                         } else if let Some(t) = tlp {
                             all_lp.push(t);
                         }
-                        logits = match graph {
-                            Some(g) => gpu.forward_via_graph(g, t, state)?,
-                            None    => gpu.forward_token(t, state)?,
-                        };
+                        logits = if launched { gpu.read_logits()? } else { gpu.forward_token(t, state)? };
                     }
                     return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
                 }
@@ -1220,9 +1224,9 @@ impl ServerModel {
 }
 
 /// Decode-graph replay is on unless `REINSTINCT_NO_GRAPH` is set (the
-/// same switch `generate-text` honours). Per-kernel decode is ~20%
-/// slower on a 27B, so the server captures a graph per model on its
-/// first request.
+/// same switch `generate-text` honours). The graph is worth ~1.7 ms per
+/// token on a 27B (36.2 vs 37.9 ms); the launch/finish split around
+/// the host work in the decode loop is worth as much again.
 fn decode_graphs_enabled() -> bool {
     std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
 }

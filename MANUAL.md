@@ -1352,6 +1352,27 @@ forward-pass divergence to a specific layer.
 
 ## SERVE-MODE NOTES
 
+### Decode loop: what the host costs
+
+Per token the worker samples, re-decodes the text, streams the delta
+and launches the next step. Two things keep that off the GPU's
+critical path:
+
+- The next step is **launched before** the text decode and stream
+  write (`decode_launch` / `decode_finish`, `forward_via_graph_launch`
+  / `read_logits`), so the host work overlaps the GPU instead of
+  sitting between steps.
+- The sampler is cheap at a 248k vocab: greedy takes the argmax
+  straight after the penalties (top-k / top-p / min-p cannot move it),
+  and the sampled path runs top-p / min-p / softmax over the ≤ top-k
+  candidates found by a one-pass k-entry heap — 0.26 ms greedy /
+  0.62 ms at temperature 0.7, down from 1.7 / 2.2 ms for the
+  vocab-wide chain.
+
+Measured on Qwen3.8-27B Q4_K_XL through `/v1/chat/completions`: 36.0
+ms/token at temperature 0 or 0.7, the same as `generate-text`'s
+graph-replayed decode — earlier the server sat 1.8 ms/token behind it.
+
 The HTTP server is hardened for non-critical real-world load:
 
 - Single GPU worker thread, FIFO queue across all three ports (one

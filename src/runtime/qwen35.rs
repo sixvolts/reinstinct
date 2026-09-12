@@ -3497,7 +3497,8 @@ impl GpuQwen35 {
     /// or None to launch per kernel. Returns this stage's output handoff
     /// and, on the last stage, the logits.
     pub fn decode_stage(&self, token: u32, state: &mut Qwen35GpuState,
-                        graph: Option<&GraphExec>, input: Option<&StageOutput>)
+                        graph: Option<&GraphExec>, input: Option<&StageOutput>,
+                        want_logits: bool)
         -> Result<(StageOutput, Option<Vec<f32>>), String>
     {
         debug_assert_eq!(hip::Device::current()?, self.stage.dev);
@@ -3516,13 +3517,21 @@ impl GpuQwen35 {
         let done = Event::new()?;
         done.record(&self.stream)?;
         state.pos += 1;
-        let logits = if self.stage.is_last() {
-            self.stream.synchronize()?;
-            let mut out = vec![0.0f32; self.vocab];
-            self.logits.copy_to_host(&mut out)?;
-            Some(out)
+        let logits = if self.stage.is_last() && want_logits {
+            Some(self.read_logits()?)
         } else { None };
         Ok((StageOutput { act: self.hidden_a.raw_ptr(), dev: self.stage.dev, done }, logits))
+    }
+
+    /// Wait for this stage's stream and copy the logits back — the
+    /// deferred half of a `decode_stage(.., want_logits = false)`, so a
+    /// caller can do host work while the step runs.
+    pub fn read_logits(&self) -> Result<Vec<f32>, String> {
+        assert!(self.stage.is_last(), "read_logits: only the last stage has logits");
+        self.stream.synchronize()?;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
     }
 
     /// Wait for `prev` and peer-copy `count` floats from its activation

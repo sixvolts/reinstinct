@@ -321,18 +321,38 @@ impl Qwen35Pipeline {
     fn decode(&self, token: u32, state: &mut Qwen35PipelineState, graph: Option<&PipelineGraph>)
         -> Result<Vec<f32>, String>
     {
+        self.decode_launch(token, state, graph)?;
+        self.decode_finish()
+    }
+
+    /// Enqueue one decode step on every stage and return without
+    /// waiting; `decode_finish` collects the logits. Between the two the
+    /// host is free — a server uses the gap for sampling bookkeeping,
+    /// text decode and streaming, which otherwise sit serialized with
+    /// the GPU.
+    pub fn decode_launch(&self, token: u32, state: &mut Qwen35PipelineState,
+                         graph: Option<&PipelineGraph>) -> Result<(), String>
+    {
         self.check_state(state);
+        if let Some(g) = graph {
+            assert_eq!(g.execs.len(), self.stages.len(), "graph / stage count mismatch");
+        }
         let mut prev: Option<StageOutput> = None;
-        let mut logits = None;
         for (i, (stage, (dev, st))) in self.stages.iter().zip(state.stages.iter_mut()).enumerate() {
             set_dev(*dev)?;
             let g = graph.map(|g| &g.execs[i]);
-            let (out, lg) = stage.gpu.decode_stage(token, st, g, prev.as_ref())?;
+            let (out, _) = stage.gpu.decode_stage(token, st, g, prev.as_ref(), false)?;
             prev = Some(out);
-            logits = lg;
         }
         state.pos += 1;
-        logits.ok_or_else(|| "pipeline: last stage returned no logits".to_string())
+        Ok(())
+    }
+
+    /// Wait for the step `decode_launch` enqueued and return its logits.
+    pub fn decode_finish(&self) -> Result<Vec<f32>, String> {
+        let last = self.stages.last().expect("pipeline has stages");
+        set_dev(last.dev)?;
+        last.gpu.read_logits()
     }
 
     /// `REINSTINCT_MOE_PROFILE` buckets, concatenated across stages.

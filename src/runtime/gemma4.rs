@@ -2636,10 +2636,25 @@ impl GpuGemma4 {
     pub fn forward_via_graph(&self, exec: &GraphExec, token: u32, state: &mut Gemma4GpuState)
         -> Result<Vec<f32>, String>
     {
+        self.forward_via_graph_launch(exec, token, state)?;
+        self.read_logits()
+    }
+
+    /// Enqueue one graph-replayed decode step without waiting;
+    /// `read_logits` collects it. Lets a caller overlap host work with
+    /// the step.
+    pub fn forward_via_graph_launch(&self, exec: &GraphExec, token: u32,
+                                    state: &mut Gemma4GpuState) -> Result<(), String>
+    {
         self.set_inputs(token, state.pos)?;
         exec.launch(&self.stream)?;
-        self.stream.synchronize()?;
         state.pos += 1;
+        Ok(())
+    }
+
+    /// Wait for the stream and copy the logits back.
+    pub fn read_logits(&self) -> Result<Vec<f32>, String> {
+        self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)

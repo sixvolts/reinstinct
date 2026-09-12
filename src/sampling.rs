@@ -215,17 +215,39 @@ pub fn apply_repetition_penalty(logits: &mut [f32], history: &[u32],
 
 /// Replace logits NOT in the top-k with -inf so subsequent softmax drops them.
 /// In-place. `k == 0` or `k >= vocab` is a no-op.
+/// The k-th largest finite logit — the top-k cut line — or `None` when
+/// fewer than `k` finite logits exist (nothing to cut). One pass with a
+/// k-entry min-heap: almost every logit fails the `> heap.min` test on
+/// the way through, so at a 248k vocab this is ~0.3 ms against the
+/// ~1 ms of copying and `select_nth` over the whole vocab it replaces.
+pub fn top_k_threshold(logits: &[f32], k: usize) -> Option<f32> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    if k == 0 || k >= logits.len() { return None; }
+    // f32 is not Ord; order the bit patterns instead: flip the sign bit
+    // of positives and every bit of negatives, and integer order equals
+    // float order.
+    #[inline]
+    fn key(v: f32) -> u32 { let b = v.to_bits(); if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 } }
+    #[inline]
+    fn unkey(k: u32) -> f32 { f32::from_bits(if k & 0x8000_0000 != 0 { k & 0x7FFF_FFFF } else { !k }) }
+    let mut heap: BinaryHeap<Reverse<u32>> = BinaryHeap::with_capacity(k + 1);
+    for &v in logits {
+        if !v.is_finite() { continue; }
+        let kv = key(v);
+        if heap.len() < k {
+            heap.push(Reverse(kv));
+        } else if kv > heap.peek().unwrap().0 {
+            heap.pop();
+            heap.push(Reverse(kv));
+        }
+    }
+    if heap.len() < k { return None; }
+    Some(unkey(heap.peek().unwrap().0))
+}
+
 pub fn apply_top_k(logits: &mut [f32], k: usize) {
-    if k == 0 || k >= logits.len() { return; }
-    // Partial selection: find the k-th largest value, mask everything below.
-    let mut copy: Vec<f32> = logits.iter().copied()
-        .filter(|v| v.is_finite()).collect();
-    if copy.len() <= k { return; }
-    // nth-element ordering: kth from the top.
-    let kth_idx = copy.len() - k;
-    copy.select_nth_unstable_by(kth_idx, |a, b|
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = copy[kth_idx];
+    let Some(threshold) = top_k_threshold(logits, k) else { return };
     for v in logits.iter_mut() {
         if !v.is_finite() || *v < threshold { *v = f32::NEG_INFINITY; }
     }
@@ -408,7 +430,34 @@ pub fn sample_chain_lp(logits: &mut [f32], params: &mut SamplerParams,
         params.frequency_penalty, params.presence_penalty);
     apply_repetition_penalty(logits, history,
         params.repetition_window, params.repetition_penalty);
-    apply_top_k(logits, params.top_k);
+    // Greedy: top-k / top-p / min-p never move the argmax, so skip the
+    // three vocab-wide passes (1.7 ms at a 248k vocab) unless logprobs
+    // over the filtered distribution were asked for.
+    if params.temperature <= 0.0 && top_logprobs_n == 0 {
+        return finalize_lp(logits, argmax(logits), 0, 1e-3);
+    }
+    // Filters on a compact candidate set: after top-k only k logits
+    // survive, so top-p / min-p / softmax run over ~40 entries instead
+    // of the vocab. `logits` is only masked back when logprobs need the
+    // filtered distribution.
+    if let Some(threshold) = top_k_threshold(logits, params.top_k) {
+        let mut cand: Vec<(u32, f32)> = Vec::with_capacity(params.top_k + 8);
+        for (i, &v) in logits.iter().enumerate() {
+            if v.is_finite() && v >= threshold { cand.push((i as u32, v)); }
+        }
+        let mut cl: Vec<f32> = cand.iter().map(|c| c.1).collect();
+        apply_top_p(&mut cl, params.top_p);
+        apply_min_p(&mut cl, params.min_p);
+        let pick = sample_softmax_temp(&cl, params.temperature, rng) as usize;
+        let token = cand[pick].0;
+        if top_logprobs_n == 0 {
+            return SampleResult { token, logprob: None, top_logprobs: vec![] };
+        }
+        for v in logits.iter_mut() { *v = f32::NEG_INFINITY; }
+        for (k, &(i, _)) in cand.iter().enumerate() { logits[i as usize] = cl[k]; }
+        return finalize_lp(logits, token, top_logprobs_n, params.temperature.max(1e-3));
+    }
+    // top-k off (or fewer finite logits than k): the vocab-wide chain.
     apply_top_p(logits, params.top_p);
     apply_min_p(logits, params.min_p);
     let token = sample_softmax_temp(logits, params.temperature, rng);
@@ -778,4 +827,34 @@ mod tests {
             assert_eq!(sample_temp_topk(&logits, 0.01, 10, &mut rng), 7);
         }
     }
+    /// Cost of one sampling step at the 27B vocab (248320 logits) for
+    /// the chat defaults, with and without temperature 0. Run with
+    /// `--ignored --nocapture`. This is host time serialized with the
+    /// GPU in serve, so it comes straight off decode tok/s.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_sample_chain_27b_vocab() {
+        let vocab = 248_320usize;
+        let mut rng = Rng::new(7);
+        let base: Vec<f32> = (0..vocab).map(|i| ((i * 7919) % 1000) as f32 * 0.02 - 5.0).collect();
+        let history: Vec<u32> = (0..64).map(|i| (i * 31) as u32).collect();
+        let counts = vec![0u16; vocab];
+        for (label, temperature) in [("temp 0.7 (chat defaults)", 0.7f32), ("temp 0", 0.0f32)] {
+            let mut sp = SamplerParams::default();
+            sp.temperature = temperature; sp.top_p = 0.95; sp.min_p = 0.05;
+            sp.repetition_penalty = 1.1; sp.frequency_penalty = 0.1; sp.top_k = 40;
+            let iters = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut logits = base.clone();
+                let _ = sample_chain_lp(&mut logits, &mut sp, &history, &counts, &mut rng, 0);
+            }
+            let per = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters { let _ = base.clone(); }
+            let clone = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            eprintln!("sample_chain_lp {label}: {:.3} ms/step (clone alone {clone:.3} ms)", per - clone);
+        }
+    }
+
 }
