@@ -2125,6 +2125,85 @@ mod tests {
         eprintln!("(each cell: ms per launch, GB/s of repacked weight bytes)");
     }
 
+    /// The register-resident GDN recurrent step (v2) against the
+    /// original kernel on random q/k/v/state: same state update and
+    /// output to fp32 reduction-order tolerance, and the microbench of
+    /// both at the 27B's shape (48 heads x 128). Sources come from disk
+    /// (`REINSTINCT_MMQ_BENCH_SRC_DIR` or kernels/) so variants iterate
+    /// without a rebuild.
+    #[test]
+    fn gdn_recurrent_v2_matches_v1_and_bench() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
+            .unwrap_or_else(|e| panic!("{dir}/{name}.cpp: {e}"));
+        let (n_heads, n_k_heads, head_dim) = (48usize, 16usize, 128usize);
+        let mut s: u64 = 0x6D_0001;
+        let mut rnd = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((s >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let q: Vec<f32> = (0..n_k_heads * head_dim).map(|_| rnd() * 0.2).collect();
+        let k: Vec<f32> = (0..n_k_heads * head_dim).map(|_| rnd() * 0.2).collect();
+        let v: Vec<f32> = (0..n_heads * head_dim).map(|_| rnd()).collect();
+        let a: Vec<f32> = (0..n_heads).map(|_| rnd()).collect();
+        let b: Vec<f32> = (0..n_heads).map(|_| rnd()).collect();
+        let ssm_a: Vec<f32> = (0..n_heads).map(|_| -(rnd().abs() + 0.5)).collect();
+        let dt: Vec<f32> = (0..n_heads).map(|_| rnd()).collect();
+        let state0: Vec<f32> = (0..n_heads * head_dim * head_dim).map(|_| rnd()).collect();
+        let stream = hip::Stream::new().unwrap();
+        let dq = DeviceBuf::from_slice(&q).unwrap(); let dk = DeviceBuf::from_slice(&k).unwrap();
+        let dv = DeviceBuf::from_slice(&v).unwrap(); let da = DeviceBuf::from_slice(&a).unwrap();
+        let db = DeviceBuf::from_slice(&b).unwrap(); let dsa = DeviceBuf::from_slice(&ssm_a).unwrap();
+        let ddt = DeviceBuf::from_slice(&dt).unwrap();
+        let run = |name: &str, kname: &str, block: u32, grid_y: u32, smem: u32, iters: usize|
+            -> (Vec<f32>, Vec<f32>, f64)
+        {
+            let m = Module::load(&cache.compile(name, &read(name)).unwrap()).unwrap();
+            let f = m.function(kname).unwrap();
+            let dstate = DeviceBuf::from_slice(&state0).unwrap();
+            let dout: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
+            let launch = || {
+                let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut va = dv.raw_ptr();
+                let mut aa = da.raw_ptr(); let mut ba = db.raw_ptr(); let mut sa = dsa.raw_ptr();
+                let mut ta = ddt.raw_ptr(); let mut st = dstate.raw_ptr(); let mut oa = dout.raw_ptr();
+                let mut nh = n_heads as u32; let mut hd = head_dim as u32; let mut nkh = n_k_heads as u32;
+                let mut args: [*mut c_void; 12] = [
+                    &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                    &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+                    &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+                    &mut ta as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void,
+                    &mut oa as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void];
+                unsafe { f.launch((n_heads as u32, grid_y, 1), (block, 1, 1), smem, Some(&stream), &mut args).unwrap(); }
+            };
+            launch(); stream.synchronize().unwrap();
+            let mut st = vec![0.0f32; state0.len()]; dstate.copy_to_host(&mut st).unwrap();
+            let mut out = vec![0.0f32; n_heads * head_dim]; dout.copy_to_host(&mut out).unwrap();
+            // timing (state keeps evolving; fine for a bandwidth number)
+            let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+            e0.record(&stream).unwrap();
+            for _ in 0..iters { launch(); }
+            e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+            (st, out, hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / iters as f64)
+        };
+        let hd = head_dim as u32;
+        let (st1, out1, ms1) = run("gdn_recurrent_step_fused", "gdn_recurrent_step_fused_f32",
+                                   64, hd / 16, 2 * hd * 4, 50);
+        // REINSTINCT_GDN_GEOM=cols,groups matches a variant's #defines.
+        let (cols, groups) = std::env::var("REINSTINCT_GDN_GEOM").ok()
+            .map(|g| { let v: Vec<u32> = g.split(',').map(|x| x.parse().unwrap()).collect(); (v[0], v[1]) })
+            .unwrap_or((32, 8));
+        let (st2, out2, ms2) = run("gdn_recurrent_step_v2", "gdn_recurrent_step_v2_f32",
+                                   cols * groups, hd / cols, (2 * hd + groups * cols) * 4, 50);
+        let e_state = rel_l2(&st2, &st1);
+        let e_out = rel_l2(&out2, &out1);
+        let bytes = 2.0 * (n_heads * head_dim * head_dim * 4) as f64;
+        eprintln!("gdn recurrent: v1 {ms1:.4} ms ({:.0} GB/s r+w)  v2 {ms2:.4} ms ({:.0} GB/s)  \
+                   state rel_l2={e_state:.2e} out rel_l2={e_out:.2e}",
+                  bytes / (ms1 * 1e-3) / 1e9, bytes / (ms2 * 1e-3) / 1e9);
+        assert!(e_state < 1e-5 && e_out < 1e-4, "v2 diverges: state {e_state:.2e} out {e_out:.2e}");
+    }
+
     /// Wall-clock of every wide MMQ GEMM at the 27B's FFN shape
     /// (644 tokens x 5120 -> 17408), from HIP events over 20 launches.
     /// Run with `--ignored --nocapture`; the per-kernel ms and effective

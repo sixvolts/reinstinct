@@ -54,10 +54,7 @@ const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cp
 /// Max split-K splits — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
 const ADD_INPLACE_SOURCE:       &str = include_str!("../../kernels/add_inplace.cpp");
-const GDN_RECURRENT_STEP_FUSED_SOURCE: &str = include_str!("../../kernels/gdn_recurrent_step_fused.cpp");
-const CONV1D_STEP_SILU_SOURCE:      &str = include_str!("../../kernels/conv1d_step_silu.cpp");
-const L2NORM_QK_SOURCE:             &str = include_str!("../../kernels/l2norm_qk.cpp");
-const RMSNORM_GATED_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_gated_multihead.cpp");
+const GDN_RECURRENT_STEP_FUSED_SOURCE: &str = include_str!("../../kernels/gdn_recurrent_step_v2.cpp");
 // Batched variants — one launch covers all `n_rows` of a prefill,
 // internally iterating with the recurrent state threaded through.
 // Decode (n_rows=1) keeps using the single-row kernels above.
@@ -1171,9 +1168,6 @@ pub struct GpuQwen35 {
     /// f32 KV-cache write at the device-resident decode position.
     add_inplace_module:      Module,
     gdn_recurrent_step_fused_module: Module,
-    conv1d_step_silu_module:      Module,
-    l2norm_qk_module:             Module,
-    rmsnorm_gated_multihead_module: Module,
     // Batched (n_rows-collapsed) variants used by forward_tokens_batched
     // to replace the per-row launch loops.
     conv1d_step_silu_batched_module: Module,
@@ -1425,10 +1419,7 @@ impl GpuQwen35 {
         let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
-        let gdn_recurrent_step_fused_hsaco = cache.compile("gdn_recurrent_step_fused", GDN_RECURRENT_STEP_FUSED_SOURCE)?;
-        let conv1d_step_silu_hsaco       = cache.compile("conv1d_step_silu", CONV1D_STEP_SILU_SOURCE)?;
-        let l2norm_qk_hsaco              = cache.compile("l2norm_qk",        L2NORM_QK_SOURCE)?;
-        let rmsnorm_gated_multihead_hsaco = cache.compile("rmsnorm_gated_multihead", RMSNORM_GATED_MULTIHEAD_SOURCE)?;
+        let gdn_recurrent_step_fused_hsaco = cache.compile("gdn_recurrent_step_v2", GDN_RECURRENT_STEP_FUSED_SOURCE)?;
         let conv1d_step_silu_batched_hsaco = cache.compile(
             "conv1d_step_silu_batched", CONV1D_STEP_SILU_BATCHED_SOURCE)?;
         let l2norm_qk_batched_hsaco = cache.compile(
@@ -1522,9 +1513,6 @@ impl GpuQwen35 {
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
             gdn_recurrent_step_fused_module: Module::load(&gdn_recurrent_step_fused_hsaco)?,
-            conv1d_step_silu_module:      Module::load(&conv1d_step_silu_hsaco)?,
-            l2norm_qk_module:             Module::load(&l2norm_qk_hsaco)?,
-            rmsnorm_gated_multihead_module: Module::load(&rmsnorm_gated_multihead_hsaco)?,
             conv1d_step_silu_batched_module:
                 Module::load(&conv1d_step_silu_batched_hsaco)?,
             l2norm_qk_batched_module:
@@ -1975,8 +1963,9 @@ impl GpuQwen35 {
                              w: *mut c_void, n: u32, eps: f32) -> Result<(), String>
     {
         let f = self.fused_module.function("add_rmsnorm_q8_f32")?;
+        assert!(n % 1024 == 0 && n <= 8192, "add_rmsnorm_q8: n {n} must be a multiple of 1024, <= 8192");
         let block: u32 = 1024;
-        let smem = (n + block) * 4;
+        let smem = 0;
         let mut ha = hidden; let mut aa = add.unwrap_or(std::ptr::null_mut());
         let mut wa = w; let mut ya = self.normed.raw_ptr(); let mut oa = self.xq8.raw_ptr();
         let mut na = n; let mut ea = eps;
@@ -2372,49 +2361,7 @@ impl GpuQwen35 {
     }
 
 
-    fn launch_conv1d_step_silu(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
-                               y: *mut c_void, n_channels: u32, kernel_size: u32)
-        -> Result<(), String>
-    {
-        let f = self.conv1d_step_silu_module.function("conv1d_step_silu_f32")?;
-        let block: u32 = 256;
-        let grid = (n_channels + block - 1) / block;
-        let mut xa = x_new; let mut wa = w; let mut ha = hist; let mut ya = y;
-        let mut nc = n_channels; let mut ks = kernel_size;
-        let mut args: [*mut c_void; 6] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut wa as *mut _ as *mut c_void,
-            &mut ha as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-            &mut ks as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
-    }
 
-    fn launch_l2norm_qk(&self, q_in: *mut c_void, q_out: *mut c_void,
-                        k_in: *mut c_void, k_out: *mut c_void,
-                        n_heads: u32, head_dim: u32, eps: f32, q_scale: f32)
-        -> Result<(), String>
-    {
-        let f = self.l2norm_qk_module.function("l2norm_qk_f32")?;
-        let block: u32 = 128;
-        let mut qi = q_in; let mut qo = q_out; let mut ki = k_in; let mut ko = k_out;
-        let mut nh = n_heads; let mut hd = head_dim; let mut ea = eps; let mut sc = q_scale;
-        let mut args: [*mut c_void; 8] = [
-            &mut qi as *mut _ as *mut c_void,
-            &mut qo as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut ko as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ea as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
-        let smem = block * std::mem::size_of::<f32>() as u32;
-        // 2D grid: x = head index, y = side (0 = Q, 1 = K).
-        unsafe { f.launch((n_heads, 2, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn launch_gdn_recurrent_step_fused(&self,
@@ -2423,14 +2370,17 @@ impl GpuQwen35 {
         state: *mut c_void, out: *mut c_void,
         n_heads: u32, head_dim: u32, n_k_heads: u32) -> Result<(), String>
     {
-        let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_fused_f32")?;
-        // Four threads per value-dim column (split kk); grid.y splits
-        // head_dim into COLS-wide chunks (COLS = 16, the kernel #define).
-        // block = 4*COLS = 64 (one wavefront). LDS = q | k.
-        const COLS: u32 = 16;
-        let block: u32 = 4 * COLS;
+        let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_v2_f32")?;
+        // v2 (kernels/gdn_recurrent_step_v2.cpp): 32-column slabs x 8
+        // row groups, 256 threads, the state column held in registers
+        // between the decay and update passes. LDS = q | k | red[8][32].
+        const COLS: u32 = 32;
+        const GROUPS: u32 = 8;
+        assert!(head_dim % (COLS * GROUPS / 32) == 0 && head_dim <= 256,
+                "gdn_recurrent_step_v2: head_dim {head_dim} must be a multiple of 8, <= 256");
+        let block: u32 = COLS * GROUPS;
         let grid_y = (head_dim + COLS - 1) / COLS;
-        let smem = 2 * head_dim * std::mem::size_of::<f32>() as u32;
+        let smem = (2 * head_dim + GROUPS * COLS) * std::mem::size_of::<f32>() as u32;
         let mut qa = q; let mut ka = k; let mut va = v;
         let mut aa = a; let mut ba = b; let mut sma = ssm_a; let mut dta = dt_bias;
         let mut sa = state; let mut oa = out;
@@ -2452,26 +2402,6 @@ impl GpuQwen35 {
         unsafe { f.launch((n_heads, grid_y, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rmsnorm_gated_multihead(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
-                                      y: *mut c_void, n_heads: u32, head_dim: u32, eps: f32)
-        -> Result<(), String>
-    {
-        let f = self.rmsnorm_gated_multihead_module.function("rmsnorm_gated_multihead_f32")?;
-        let block: u32 = 128;
-        let mut xa = x; let mut za = z; let mut wa = w; let mut ya = y;
-        let mut nh = n_heads; let mut hd = head_dim; let mut ea = eps;
-        let mut args: [*mut c_void; 7] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut za as *mut _ as *mut c_void,
-            &mut wa as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ea as *mut _ as *mut c_void,
-        ];
-        let smem = block * std::mem::size_of::<f32>() as u32;
-        unsafe { f.launch((n_heads, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
-    }
 
     fn launch_add_inplace(&self, x: *mut c_void, y: *mut c_void, n: u32) -> Result<(), String> {
         let f = self.add_inplace_module.function("add_inplace_f32")?;
@@ -3482,7 +3412,6 @@ impl GpuQwen35 {
     {
         assert_eq!(state.block_states.len(), self.blocks.len());
         let h_dim     = self.hidden        as u32;
-        let conv_dim  = self.gdn_conv_dim  as u32;
         let n_heads   = self.gdn_n_heads   as u32;
         let n_k_heads = self.gdn_n_k_heads as u32;
         let head_dim  = self.gdn_head_dim  as u32;
@@ -3527,44 +3456,63 @@ impl GpuQwen35 {
                 }};
             }
 
-            // attn pre-norm (output_ptr = hidden_b serves as scratch)
-            traced!("attn_norm", self.launch_rmsnorm(self.hidden_a.raw_ptr(),
-                w.attn.attn_norm.raw_ptr(), self.hidden_b.raw_ptr(), h_dim, self.rms_eps));
-            traced!("matvec_attn_qkv", self.launch_matvec_dispatch(&w.attn.attn_qkv,
-                self.hidden_b.raw_ptr(), self.gdn_qkv.raw_ptr()));
-            traced!("matvec_attn_gate", self.launch_matvec_dispatch(&w.attn.attn_gate,
-                self.hidden_b.raw_ptr(), self.gdn_z.raw_ptr()));
-            traced!("matvec_ssm_alpha", self.launch_matvec_dispatch(&w.attn.ssm_alpha,
-                self.hidden_b.raw_ptr(), self.gdn_a.raw_ptr()));
-            traced!("matvec_ssm_beta", self.launch_matvec_dispatch(&w.attn.ssm_beta,
-                self.hidden_b.raw_ptr(), self.gdn_b.raw_ptr()));
-            traced!("conv1d_step_silu", self.launch_conv1d_step_silu(self.gdn_qkv.raw_ptr(),
-                w.attn.ssm_conv1d.raw_ptr(), lstate.conv_hist.raw_ptr(),
-                self.gdn_conv_out.raw_ptr(), conv_dim, self.gdn_conv_kernel as u32));
+            // The fused decode chain, one event pair per launch. The
+            // previous block's FFN output is not pending here: the
+            // untraced blocks above complete their residual add.
+            let normed = self.normed.raw_ptr();
+            traced!("add_rmsnorm_q8", self.launch_add_rmsnorm_q8(self.hidden_a.raw_ptr(), None,
+                w.attn.attn_norm.raw_ptr(), h_dim, self.rms_eps));
+            traced!("matvec_attn_qkv", self.launch_matvec_prequant(&w.attn.attn_qkv,
+                normed, self.gdn_qkv.raw_ptr()));
+            traced!("matvec_attn_gate", self.launch_matvec_prequant(&w.attn.attn_gate,
+                normed, self.gdn_z.raw_ptr()));
+            let (a_ptr, b_ptr) = match &w.attn.ssm_ab {
+                Some(ab) => {
+                    traced!("matvec_ssm_ab", self.launch_matvec_prequant(ab, normed, self.gdn_ab.raw_ptr()));
+                    let base = self.gdn_ab.raw_ptr() as *mut f32;
+                    (base as *mut c_void, unsafe { base.add(self.gdn_n_heads) } as *mut c_void)
+                }
+                None => {
+                    traced!("matvec_ssm_alpha", self.launch_matvec_prequant(&w.attn.ssm_alpha,
+                        normed, self.gdn_a.raw_ptr()));
+                    traced!("matvec_ssm_beta", self.launch_matvec_prequant(&w.attn.ssm_beta,
+                        normed, self.gdn_b.raw_ptr()));
+                    (self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr())
+                }
+            };
             let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
-            let q_in_ptr = unsafe { conv_out_ptr.add(0)                    } as *mut c_void;
-            let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_key_dim)     } as *mut c_void;
             let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_key_dim) } as *mut c_void;
-            traced!("l2norm_qk", self.launch_l2norm_qk(q_in_ptr, self.gdn_q.raw_ptr(),
-                k_in_ptr, self.gdn_k.raw_ptr(), n_k_heads, head_dim, 1e-6, q_scale));
+            traced!("conv1d_l2norm", self.launch_conv1d_l2norm(self.gdn_qkv.raw_ptr(),
+                w.attn.ssm_conv1d.raw_ptr(), lstate.conv_hist.raw_ptr(),
+                self.gdn_conv_out.raw_ptr(), self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), q_scale));
             traced!("recurrent_step_fused", self.launch_gdn_recurrent_step_fused(
-                self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr,
-                self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr(),
+                self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr, a_ptr, b_ptr,
                 w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
                 lstate.recurrent.raw_ptr(), self.gdn_core_out.raw_ptr(),
                 n_heads, head_dim, n_k_heads));
-            traced!("rmsnorm_gated", self.launch_rmsnorm_gated_multihead(
+            traced!("rmsnorm_gated_q8", self.launch_rmsnorm_gated_q8(
                 self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
-                w.attn.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr(),
-                n_heads, head_dim, self.rms_eps));
-            traced!("matvec_ssm_out", self.launch_matvec_dispatch(&w.attn.ssm_out,
+                w.attn.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr()));
+            traced!("matvec_ssm_out", self.launch_matvec_prequant(&w.attn.ssm_out,
                 self.gdn_core_out.raw_ptr(), self.hidden_b.raw_ptr()));
-            // Post-block residual + ffn (untraced)
-            self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
-            self.launch_rmsnorm(self.hidden_a.raw_ptr(), w.post_norm.raw_ptr(),
-                                self.hidden_b.raw_ptr(), h_dim, self.rms_eps)?;
-            self.step_ffn(self.hidden_b.raw_ptr(), self.hidden_b.raw_ptr(), &w.ffn)?;
-            self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
+            traced!("post_add_rmsnorm_q8", self.launch_add_rmsnorm_q8(self.hidden_a.raw_ptr(),
+                Some(self.hidden_b.raw_ptr()), w.post_norm.raw_ptr(), h_dim, self.rms_eps));
+            match &w.ffn {
+                BlockFfn::Dense(d) => {
+                    let f = self.ffn as u32;
+                    traced!("ffn_gate", self.launch_matvec_prequant(&d.gate, normed, self.ffn_a.raw_ptr()));
+                    traced!("ffn_up",   self.launch_matvec_prequant(&d.up,   normed, self.ffn_b.raw_ptr()));
+                    traced!("swiglu_q8", self.launch_swiglu_q8(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
+                        self.ffn_a.raw_ptr(), f));
+                    traced!("ffn_down", self.launch_matvec_prequant(&d.down, self.ffn_a.raw_ptr(),
+                        self.hidden_b.raw_ptr()));
+                }
+                BlockFfn::Moe(m) => {
+                    traced!("moe_ffn", self.step_moe_ffn(normed, self.hidden_b.raw_ptr(), m));
+                }
+            }
+            traced!("add_inplace", self.launch_add_inplace(self.hidden_a.raw_ptr(),
+                self.hidden_b.raw_ptr(), h_dim));
         }
 
         // Output norm + projection

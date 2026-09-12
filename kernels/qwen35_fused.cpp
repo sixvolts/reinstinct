@@ -52,9 +52,17 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 // hidden (+= add)  ->  y = rmsnorm(hidden) * w  ->  q8(y).
-// One workgroup; dynamic LDS = (n + blockDim.x) floats. `add` may be null.
-// Replaces add_inplace + rmsnorm + quantize_q8.
-extern "C" __global__
+// One workgroup of 1024 threads (16 waves — the vector's memory traffic
+// needs the parallelism; at 256 threads this was a 35 µs kernel).
+// Thread t holds elements t, t+1024, ... and their `w` in registers, so
+// 32-lane group j holds sub-blocks j, j+32, ... whole and quantises them
+// from registers: one global read of the vector and of w, no LDS
+// staging, and the sum of squares reduces with a DPP wave reduction
+// plus one LDS exchange instead of a ten-step barrier tree.
+// `add` may be null. Replaces add_inplace + rmsnorm + quantize_q8.
+#define ARQ_THREADS 1024
+#define ARQ_KMAX    8           // n <= 8192
+extern "C" __global__ __launch_bounds__(ARQ_THREADS)
 void add_rmsnorm_q8_f32(float*       __restrict__ hidden,
                         const float* __restrict__ add,
                         const float* __restrict__ w,
@@ -63,25 +71,38 @@ void add_rmsnorm_q8_f32(float*       __restrict__ hidden,
                         unsigned int n,
                         float        eps)
 {
-    extern __shared__ float smem[];
-    float* vals = smem;
-    float* red  = smem + n;
-    const int tid = threadIdx.x, bs = blockDim.x;
-    float sum = 0.0f;
-    for (int i = tid; i < (int)n; i += bs) {
-        float v = hidden[i];
-        if (add) { v += add[i]; hidden[i] = v; }
-        vals[i] = v;
-        sum += v * v;
-    }
-    const float rrms = rsqrtf(block_sum(sum, red) / (float)n + eps);
-    const unsigned int n_sub = n >> 5;
+    __shared__ float red[ARQ_THREADS / 64];
+    const int tid  = threadIdx.x;
     const int lane = tid & 31;
-    for (unsigned int sb = tid >> 5; sb < n_sub; sb += bs >> 5) {
-        const int idx = sb * 32 + lane;
-        const float v = vals[idx] * rrms * w[idx];
-        y[idx] = v;
-        q8_store_sub(out + sb, lane, v);
+    const int nk   = (int)n / ARQ_THREADS;          // elements per thread
+    float v[ARQ_KMAX], wv[ARQ_KMAX];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < ARQ_KMAX; k++) {
+        if (k < nk) {
+            const int i = k * ARQ_THREADS + tid;
+            float x = hidden[i];
+            wv[k] = w[i];
+            if (add) { x += add[i]; hidden[i] = x; }
+            v[k] = x;
+            sum += x * x;
+        }
+    }
+    sum = wave64_reduce_add_f32(sum);
+    if ((tid & 63) == 0) red[tid >> 6] = sum;
+    __syncthreads();
+    float tot = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < ARQ_THREADS / 64; i++) tot += red[i];
+    const float rrms = rsqrtf(tot / (float)n + eps);
+    #pragma unroll
+    for (int k = 0; k < ARQ_KMAX; k++) {
+        if (k < nk) {
+            const int i = k * ARQ_THREADS + tid;
+            const float o = v[k] * rrms * wv[k];
+            y[i] = o;
+            q8_store_sub(out + (i >> 5), lane, o);
+        }
     }
 }
 
