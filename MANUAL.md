@@ -65,11 +65,25 @@ The split is planned by weight bytes (equal bytes ≈ equal decode time
 per stage, embedding / head charged to their stages) or set with
 `--split <blocks,...>`. Each stage captures its own decode graph.
 
-This buys capacity, not speed: stages are sequential for one sequence,
-so decode is still one weight pass per token, now split across cards
-— `Qwen3.8-27B-UD-Q8_K_XL` (29 GB) runs at 16.0 tok/s across two
-MI50s, 95% of the two-card bandwidth roofline. Gemma 4 and the
-spec-decode paths (`mtp-gen`, `dflash-gen`) remain single-GPU.
+For decode this buys capacity, not speed: stages are sequential for
+one sequence, so it is still one weight pass per token, now split
+across cards — `Qwen3.8-27B-UD-Q8_K_XL` (29 GB) runs at 16.0 tok/s
+across two MI50s, 95% of the two-card bandwidth roofline.
+
+Prefill does use both cards at once: the prompt goes through in
+micro-batches (GPipe-style — at least four equal chunks of at most
+`REINSTINCT_PREFILL_CHUNK` = 256 tokens), and stage 0 starts chunk
+`k+1` the moment it has handed chunk `k` on, so with S stages and M
+chunks the cards are busy M/(M+S−1) of the pass. Nothing on the host
+waits between chunks; the cross-stage events and each stage's single
+stream order everything. Later chunks attend to earlier ones through
+the KV caches / GDN states exactly as a mid-sequence prefill does, and
+the result is bit-exact with the one-shot prefill. On the Q8_K_XL:
+pp644 2.09 → 1.47 s (438 tok/s, 1.42×), pp2044 7.59 → 4.37 s
+(468 tok/s, 1.74×). Chunks below ~128 tokens stop paying — the MMQ grid
+no longer fills 60 CUs — so the bubbles cannot be shrunk by making the
+end chunks small; longer prompts simply get more chunks. Gemma 4 and
+the spec-decode paths (`mtp-gen`, `dflash-gen`) remain single-GPU.
 
 ### Requirements
 
@@ -725,7 +739,8 @@ OpenAI-shaped error body on non-2xx:
 | `REINSTINCT_PREFILL` | `generate-text` + `--gpu`: run only the batched prefill on the prompt, print timing and top-10 logits, then exit (skips generation). Drops the per-call generation noise so a prefill-only bench is one-line. |
 | `REINSTINCT_PREFILL_TWICE` | Used with `REINSTINCT_PREFILL=1`. Two passes: first warms the pool + captures the graph, second is the captured measurement. Prints both timings. The captured number is what's fair to compare against `llama-bench pp512` (steady state). |
 | `REINSTINCT_PREFILL_THRICE` | (Gemma 4 only) As `_TWICE` but also runs a third pass to measure the cache-replay path that skips `end_capture + instantiate`. Reports `warmup → captured → replay → fresh`. |
-| `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown. Diagnostic; breaks graph capture. |
+| `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown (`=2` also prints every block by global index). Diagnostic; breaks graph capture. |
+| `REINSTINCT_PREFILL_CHUNK` | Multi-GPU pipeline: largest micro-batch (tokens) a prompt is prefilled in (default 256; rounded to 64). The prompt is cut into at least four equal chunks so the stages overlap; see *Multi-GPU*. |
 
 ### Disabling optimizations (A/B + diagnosis)
 
@@ -1076,7 +1091,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
 | qwen-3.8-27B           |          187       |     —       |    —     |        26.9       |      —     |    —     |
-| qwen-3.8-27B Q8_K_XL, 2×MI50 |    307       |     —       |    —     |        16.0       |      —     |    —     |
+| qwen-3.8-27B Q8_K_XL, 2×MI50 |    438       |     —       |    —     |        16.0       |      —     |    —     |
 | gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|

@@ -3901,7 +3901,7 @@ impl GpuQwen35 {
     {
         assert!(self.stage.is_first() && self.stage.is_last(),
                 "forward_tokens_batched drives a whole-model engine; pipeline stages use prefill_stage");
-        let (_act, _out, logits) = self.prefill_stage(tokens, state, None)?;
+        let (_act, _out, logits) = self.prefill_stage(tokens, state, None, true)?;
         Ok(logits.expect("last stage returns logits"))
     }
 
@@ -3909,11 +3909,13 @@ impl GpuQwen35 {
     /// first stage the rows are embedded here; otherwise they are
     /// peer-copied from `input` (the previous stage's `[n, hidden]`
     /// activation). The last stage also runs the output head on the last
-    /// row and returns its logits. The returned `PooledBuf` is the
-    /// activation the handoff points into — the caller keeps it alive
-    /// until the next stage has consumed it.
+    /// row and, when `want_logits`, syncs and returns them — a pipeline
+    /// prefilling in micro-batches asks only for the final chunk's, so
+    /// the host never blocks between chunks and the stages overlap. The
+    /// returned `PooledBuf` is the activation the handoff points into —
+    /// the caller keeps it alive until the next stage has consumed it.
     pub fn prefill_stage<'a>(&'a self, tokens: &[u32], state: &mut Qwen35GpuState,
-                             input: Option<&StageOutput>)
+                             input: Option<&StageOutput>, want_logits: bool)
         -> Result<(PooledBuf<'a, f32>, StageOutput, Option<Vec<f32>>), String>
     {
         assert!(!tokens.is_empty(), "prefill_stage needs ≥1 token");
@@ -3985,6 +3987,12 @@ impl GpuQwen35 {
             for &(k, ms) in &block_ms {
                 if k == 'F' { sf += ms; nf += 1; } else { sl += ms; nl += 1; }
             }
+            // REINSTINCT_PREFILL_TRACE=2: one line per block, global index.
+            if std::env::var("REINSTINCT_PREFILL_TRACE").ok().as_deref() == Some("2") {
+                for (i, &(k, ms)) in block_ms.iter().enumerate() {
+                    eprintln!("[prefill-trace]   blk {:>3} {k} {ms:>7.2} ms", self.stage.first_block + i);
+                }
+            }
             eprintln!("[prefill-trace] {} tokens × {} blocks  ({}F + {}L)",
                 n, block_ms.len(), nf, nl);
             eprintln!("[prefill-trace]   full-attn  {:>7.1} ms total  ({:>5.2} ms/block)",
@@ -4015,7 +4023,7 @@ impl GpuQwen35 {
         let done = Event::new()?;
         done.record(&self.stream)?;
         state.pos += n;
-        let logits = if self.stage.is_last() {
+        let logits = if self.stage.is_last() && want_logits {
             self.stream.synchronize()?;
             let mut out = vec![0.0f32; self.vocab];
             self.logits.copy_to_host(&mut out)?;

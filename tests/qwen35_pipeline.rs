@@ -9,12 +9,18 @@
 //! same-device copy, which still exercises every seam except PCIe).
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use reinstinct_engine::gguf::GgufFile;
 use reinstinct_engine::hip;
 use reinstinct_engine::model::qwen3_5::Qwen35Model;
 use reinstinct_engine::runtime::KernelCache;
 use reinstinct_engine::runtime::pipeline::Qwen35Pipeline;
+
+/// HIP graph capture in `Global` mode rejects "unsafe" API calls from
+/// *any* thread while a capture is open, so two tests capturing in the
+/// same process must not interleave. Serialise them.
+static GPU: Mutex<()> = Mutex::new(());
 
 fn fixture_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("REINSTINCT_GGUF_FIXTURE") {
@@ -27,6 +33,7 @@ fn fixture_path() -> Option<PathBuf> {
 
 #[test]
 fn two_stage_pipeline_matches_single_engine() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = fixture_path() else { eprintln!("skipping"); return; };
     let n_dev = match hip::device_count() { Ok(n) if n >= 1 => n, _ => { eprintln!("skip: no HIP"); return; } };
     let devices: Vec<i32> = if n_dev >= 2 { vec![0, 1] } else { vec![0, 0] };
@@ -87,6 +94,53 @@ fn two_stage_pipeline_matches_single_engine() {
     // Sequential (per-token) prefill and batched prefill use different
     // kernels, so compare by argmax rather than bits.
     assert_eq!(argmax(&lg), argmax(&ref_prefill));
+}
+
+/// Micro-batched prefill: a prompt long enough to split into several
+/// chunks must land on the same logits as the one-shot single engine.
+/// Later chunks attend to earlier ones through the KV cache with a
+/// different tiling of the same sums, so compare to a tolerance rather
+/// than bits, and require the same argmax through a few decode steps.
+#[test]
+fn micro_batched_prefill_matches_one_shot() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(p) = fixture_path() else { eprintln!("skipping"); return; };
+    let n_dev = match hip::device_count() { Ok(n) if n >= 1 => n, _ => { eprintln!("skip: no HIP"); return; } };
+    let devices: Vec<i32> = if n_dev >= 2 { vec![0, 1] } else { vec![0, 0] };
+
+    hip::Device::set(0).unwrap();
+    let g = GgufFile::open(&p).expect("open gguf");
+    let model = Qwen35Model::load(&g).expect("load model");
+    let cache = KernelCache::new().expect("kernel cache");
+    let max_seq = 512;
+    // 300 tokens -> chunks of 128, 128, 44.
+    let base: Vec<u32> = vec![151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 11, 323];
+    let prompt: Vec<u32> = (0..300).map(|i| base[i % base.len()] + (i as u32 % 7)).collect();
+
+    let single = Qwen35Pipeline::new(&model, &g, &cache, max_seq, &[0], None).expect("single");
+    let mut s1 = single.new_state(&model, max_seq).expect("state");
+    let ref_lg = single.forward_tokens_batched(&prompt, &mut s1).expect("prefill");
+
+    let pipe = Qwen35Pipeline::new(&model, &g, &cache, max_seq, &devices, None).expect("pipeline");
+    let mut s2 = pipe.new_state(&model, max_seq).expect("state");
+    let got = pipe.forward_tokens_batched(&prompt, &mut s2).expect("chunked prefill");
+    assert_eq!(s2.pos, prompt.len());
+    let scale = ref_lg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let diff = max_abs_diff(&got, &ref_lg);
+    eprintln!("chunked prefill: max |Δlogit| = {diff:.3e} (scale {scale:.2})");
+    assert!(diff <= 1e-3 * scale, "chunked prefill logits differ: {diff:.3e} vs scale {scale:.2}");
+    assert_eq!(argmax(&got), argmax(&ref_lg));
+
+    // The state left behind is a valid mid-sequence state.
+    let g1 = single.capture_forward_graph(&mut s1).expect("graph");
+    let g2 = pipe.capture_forward_graph(&mut s2).expect("graph");
+    let mut tok = argmax(&ref_lg);
+    for i in 0..4 {
+        let a = single.forward_token_via_graph(&g1, tok, &mut s1).expect("decode");
+        let b = pipe.forward_token_via_graph(&g2, tok, &mut s2).expect("decode");
+        assert_eq!(argmax(&a), argmax(&b), "decode step {i} diverged after chunked prefill");
+        tok = argmax(&a);
+    }
 }
 
 fn argmax(v: &[f32]) -> u32 {

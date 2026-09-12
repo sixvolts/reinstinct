@@ -210,22 +210,67 @@ impl Qwen35Pipeline {
         assert_eq!(state.stages.len(), self.stages.len(), "pipeline state / stage count mismatch");
     }
 
+    /// The micro-batch (chunk) sizes a prompt of `n` tokens is prefilled
+    /// in on a multi-stage pipeline, in tokens: at least four equal
+    /// chunks, none above `REINSTINCT_PREFILL_CHUNK` tokens (default
+    /// 256), all 64-multiples (the MMQ token tile) but the last.
+    ///
+    /// With S stages and M chunks the cards are busy M/(M+S-1) of the
+    /// pass, but the fill/drain chunks cannot be made cheap by making
+    /// them small: below ~128 tokens the MMQ grid (`out_dim/64` x 1
+    /// workgroups) no longer fills 60 CUs and a chunk costs nearly as
+    /// much as one twice its size — measured on the 27B at pp644, 64-token
+    /// end chunks came out slightly *slower* than four equal 192s. So:
+    /// equal chunks, and more of them only as the prompt grows.
+    fn prefill_chunks(&self, n: usize) -> Vec<usize> {
+        if self.stages.len() == 1 || n < 2 * 64 { return vec![n]; }
+        let max_chunk = std::env::var("REINSTINCT_PREFILL_CHUNK").ok()
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(256)
+            .div_ceil(64) * 64;
+        let chunk = n.div_ceil(4).div_ceil(64) * 64;
+        let chunk = chunk.clamp(64, max_chunk);
+        let mut chunks = Vec::with_capacity(n.div_ceil(chunk));
+        let mut left = n;
+        while left > 0 { let c = chunk.min(left); chunks.push(c); left -= c; }
+        chunks
+    }
+
     /// Batched prefill of `tokens`; returns the logits at the last position.
+    ///
+    /// On a multi-stage pipeline the prompt goes through in micro-batches
+    /// (GPipe-style, sizes from `prefill_chunks`): stage 0 starts chunk
+    /// `k+1` as soon as it has handed chunk `k` on, so the stages work
+    /// concurrently instead of one card idling while the other runs. Nothing on the host waits between
+    /// chunks — the cross-stage events order the copies, and each
+    /// stage's single stream orders its chunks — so the overlap falls out
+    /// of stream semantics. Later chunks attend to earlier ones through
+    /// the KV caches / GDN states the same way a mid-sequence prefill
+    /// does.
     pub fn forward_tokens_batched(&self, tokens: &[u32], state: &mut Qwen35PipelineState)
         -> Result<Vec<f32>, String>
     {
         self.check_state(state);
-        // Each stage's activation buffer must outlive the next stage's
-        // copy out of it; collect them and drop after the pass.
-        let mut held = Vec::with_capacity(self.stages.len());
-        let mut prev: Option<StageOutput> = None;
+        assert!(!tokens.is_empty(), "forward_tokens_batched needs ≥1 token");
+        let sizes = self.prefill_chunks(tokens.len());
+        let mut chunks: Vec<&[u32]> = Vec::with_capacity(sizes.len());
+        let mut at = 0;
+        for c in sizes { chunks.push(&tokens[at..at + c]); at += c; }
+        // Every stage-0 activation must outlive stage 1's copy out of
+        // it, and a chunk's buffers must not be recycled under the copy
+        // by the next chunk on the same stage: hold them all until the
+        // pass is done (n × hidden floats in total).
+        let mut held = Vec::with_capacity(chunks.len() * self.stages.len());
         let mut logits = None;
-        for (stage, (dev, st)) in self.stages.iter().zip(state.stages.iter_mut()) {
-            set_dev(*dev)?;
-            let (act, out, lg) = stage.gpu.prefill_stage(tokens, st, prev.as_ref())?;
-            held.push(act);
-            prev = Some(out);
-            logits = lg;
+        for (ci, ch) in chunks.iter().enumerate() {
+            let last_chunk = ci + 1 == chunks.len();
+            let mut prev: Option<StageOutput> = None;
+            for (stage, (dev, st)) in self.stages.iter().zip(state.stages.iter_mut()) {
+                set_dev(*dev)?;
+                let (act, out, lg) = stage.gpu.prefill_stage(ch, st, prev.as_ref(), last_chunk)?;
+                held.push(act);
+                prev = Some(out);
+                logits = lg;
+            }
         }
         state.pos += tokens.len();
         drop(held);
