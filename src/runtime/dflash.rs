@@ -268,17 +268,27 @@ impl GpuDFlash {
     /// absolute position `state.ctx_len`, which occupies block position 0;
     /// positions 1.. are `MASK` and are denoised.
     ///
-    /// Returns **all** `block_size` predictions. Position 0 is not a draft
+    /// `block` is how many positions to denoise, `2..=block_size`. The
+    /// checkpoint's `block_size` is a *training* width, not a structural
+    /// one: nothing in the weights is tied to it (RoPE is absolute, the
+    /// masks are computed, and no tensor is block-shaped), and the paper
+    /// states models trained at larger blocks generalise to smaller
+    /// inference-time blocks — offered precisely so block size can be cut
+    /// "under compute-bound settings", which is what an MI50 is at K=16.
+    /// The reference implementation likewise takes block_size per call.
+    ///
+    /// Returns **all** `block` predictions. Position 0 is not a draft
     /// — the anchor was visible there — but it is a useful self-check:
     /// a correctly wired drafter should reproduce the anchor almost
     /// always, so a mismatch points at the forward pass rather than at
     /// weak draft quality. Callers take `[1..]` as the actual proposal.
     pub fn draft_block(&self, state: &DFlashState, target: &GpuGemma4,
-                       anchor: u32, mask_token: u32) -> Result<Vec<u32>, String>
+                       anchor: u32, mask_token: u32, block: usize)
+        -> Result<Vec<u32>, String>
     {
         let cfg = &self.config;
         let h = cfg.hidden_size as usize;
-        let b = cfg.block_size as usize;
+        let b = block.clamp(2, cfg.block_size as usize);
         let q_dim = (cfg.n_heads * cfg.head_dim) as usize;
         let kv_dim = (cfg.n_kv_heads * cfg.head_dim) as usize;
         let ff = cfg.ffn_size as usize;
@@ -286,7 +296,10 @@ impl GpuDFlash {
 
         // [anchor, MASK × (b-1)], embedded from the TARGET's table with no
         // √hidden scale — the reference takes the raw embedding weight.
-        let mut ids = vec![mask_token; b];
+        // blk_tokens is sized for the checkpoint's full block; the upload
+        // has to match that length even when denoising fewer positions, so
+        // pad with MASK and let the embed read only the first `b`.
+        let mut ids = vec![mask_token; self.config.block_size as usize];
         ids[0] = anchor;
         self.blk_tokens.copy_from_host(&ids)?;
         target.launch_embed_batched(target.vocab_head(), self.blk_x.raw_ptr(),
@@ -353,8 +366,11 @@ impl GpuDFlash {
         // The hidden at block position j predicts the token AT j, so
         // positions 1..b-1 are the draft; position 0 is the anchor we
         // already had.
+        // Same story as blk_tokens: the readback must cover the whole
+        // buffer, so size it by the checkpoint's block and read the first
+        // `b` rows out of it.
         let vocab = target.vocab_size();
-        let mut logits = vec![0.0f32; b * vocab];
+        let mut logits = vec![0.0f32; self.config.block_size as usize * vocab];
         self.blk_logits.copy_to_host(&mut logits)?;
         let mut out = Vec::with_capacity(b);
         for j in 0..b {

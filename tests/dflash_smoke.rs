@@ -75,7 +75,7 @@ fn drafts_a_block_the_target_mostly_accepts() {
     assert_eq!(d_state.ctx_len, p);
 
     let mask = 4u32;   // Gemma 4 tokenizer mask_token_id
-    let preds = draft.draft_block(&d_state, &target, anchor, mask).expect("draft");
+    let preds = draft.draft_block(&d_state, &target, anchor, mask, draft.config.block_size as usize).expect("draft");
     let b = draft.config.block_size as usize;
     assert_eq!(preds.len(), b);
     // Block position 0 held the anchor unmasked. Its output is NOT a

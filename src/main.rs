@@ -128,6 +128,13 @@ enum Command {
         /// `tokenizer.ggml.mask_token_id` (4 on Gemma 4).
         #[arg(long)]
         mask_token: Option<u32>,
+        /// Positions the drafter denoises per round, 2..=block_size (16).
+        /// Unlike --verify-width this also shrinks the *draft*, which is
+        /// the point on compute-bound hardware: the checkpoint's 16 is a
+        /// training width and the paper documents smaller inference-time
+        /// blocks as a supported knob.
+        #[arg(long)]
+        block_size: Option<usize>,
         /// How many of the block's positions to verify, 2..=block_size.
         /// The drafter always denoises the full block in one pass — that
         /// cost is fixed — but verify cost is linear in width while
@@ -393,8 +400,8 @@ fn main() -> anyhow::Result<()> {
             qwen_mtp_probe_cli(&path, prompt, steps),
         Command::QwenVerifyCheck { path, prompt, k } =>
             qwen_verify_check_cli(&path, prompt, k),
-        Command::DflashGen { target, drafter, prompt, system, steps, mask_token, verify_width } =>
-            dflash_gen_cli(&target, &drafter, prompt, system, steps, mask_token, verify_width),
+        Command::DflashGen { target, drafter, prompt, system, steps, mask_token, block_size, verify_width } =>
+            dflash_gen_cli(&target, &drafter, prompt, system, steps, mask_token, block_size, verify_width),
         Command::QwenMtpGen { path, prompt, tokens, k } =>
             qwen_mtp_gen_cli(&path, prompt, tokens, k),
         Command::AlignCheck { target, drafter, prompt, system, steps } =>
@@ -2373,6 +2380,7 @@ use reinstinct_engine::sampling::argmax;
 fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
                   prompt_text: Option<String>, system: Option<String>,
                   steps: usize, mask_token: Option<u32>,
+                  block_size: Option<usize>,
                   verify_width: Option<usize>) -> anyhow::Result<()>
 {
     use reinstinct_engine::chat::{ChatMessage, Role, format_gemma4};
@@ -2431,9 +2439,10 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let taps: Vec<usize> = draft.target_layers().iter().map(|&l| l as usize).collect();
     gm.enable_target_tap(&taps, &mut t_state, max_seq).map_err(anyhow::Error::msg)?;
 
-    let vw = verify_width.unwrap_or(b).clamp(2, b);
+    let bs = block_size.unwrap_or(b).clamp(2, b);
+    let vw = verify_width.unwrap_or(bs).clamp(2, bs);
     println!("target  = {} ({} tok prompt)", target_path.display(), prompt.len());
-    println!("drafter = {}, block = {b}, verify width = {vw}, taps = {taps:?}",
+    println!("drafter = {}, block = {bs}/{b}, verify width = {vw}, taps = {taps:?}",
              drafter_path.display());
 
     let argmax = |v: &[f32]| -> u32 {
@@ -2462,7 +2471,7 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
     let (mut t_draft, mut t_verify, mut t_ctx) = (0.0f64, 0.0f64, 0.0f64);
     while out.len() < steps && !stopped {
         let td = std::time::Instant::now();
-        let preds = draft.draft_block(&d_state, &gm, anchor, mask)
+        let preds = draft.draft_block(&d_state, &gm, anchor, mask, bs)
             .map_err(anyhow::Error::msg)?;
         t_draft += td.elapsed().as_secs_f64();
         // Draft the whole block (one pass regardless), but only hand the
