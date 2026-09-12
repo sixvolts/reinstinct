@@ -94,18 +94,25 @@ pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8>
     assert_eq!(in_dim % BLOCK_SIZE, 0, "Q8_0 in_dim must be a multiple of 32");
     let n_blocks = in_dim / BLOCK_SIZE;
     let nsp      = repacked_n_sub_padded(in_dim);
-    let qs_len   = out_dim * nsp * 32;
+    let half_len = out_dim * nsp * 16;
     let d_len    = out_dim * nsp * 2;
-    let mut out  = vec![0u8; qs_len + d_len];
+    let mut out  = vec![0u8; 2 * half_len + d_len];
 
+    // Layout: lo plane (quants 0-15 of every sub-block, 16 B each), hi
+    // plane (quants 16-31), then the fp16 d plane. Splitting the 32
+    // quant bytes into two planes is what lets a wave's lanes — one
+    // sub-block each — read them with two fully contiguous 16-byte
+    // loads; one 32-byte block per lane made every load instruction
+    // half-use its cache lines and capped the Q8_0 matvec near 500 GB/s
+    // where the 16-byte-per-lane formats reach 700.
     for row in 0..out_dim {
         for blk in 0..n_blocks {
             let src = (row * n_blocks + blk) * BYTES_PER_BLOCK;
-            let dst_qs = (row * nsp + blk) * 32;
-            let dst_d  = qs_len + (row * nsp + blk) * 2;
+            let i   = row * nsp + blk;
             // on-disk block: u16 d (2 bytes) || i8 qs[32] (32 bytes)
-            out[dst_d ..dst_d  + 2 ].copy_from_slice(&bytes[src..src + 2]);
-            out[dst_qs..dst_qs + 32].copy_from_slice(&bytes[src + 2..src + 34]);
+            out[i * 16..i * 16 + 16].copy_from_slice(&bytes[src + 2..src + 18]);
+            out[half_len + i * 16..half_len + i * 16 + 16].copy_from_slice(&bytes[src + 18..src + 34]);
+            out[2 * half_len + i * 2..2 * half_len + i * 2 + 2].copy_from_slice(&bytes[src..src + 2]);
         }
     }
     out

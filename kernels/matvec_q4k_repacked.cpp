@@ -74,28 +74,34 @@ void mv_q4k_repacked(const uint8_t* __restrict__ wbase,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    // Rows are clamped instead of branched so the compiler issues every
+    // load of the trip (both rows' planes and the activation) before the
+    // first dot; a guarded row put an execz branch between the two rows'
+    // loads and a waitcnt right behind each. The clamped duplicate
+    // computes garbage that the masked store below drops.
+    const int rmax = (int)out_dim - 1;
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        uint4 q[ROWS]; uint16_t sm[ROWS]; uint32_t dd[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            q[r]  = nib[(size_t)row * nsp + sb];
+            sm[r] = smp[(size_t)row * nsp + sb];
+            dd[r] = ddp[(size_t)row * n_super + (sb >> 3)];
+        }
         const BlockQ8* xb   = xq + sb;
         const float    dx   = xb->d;
         const float    xsum = xb->xsum;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint16_t sm = smp[(size_t)row * nsp + sb];
-            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
             const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                               * (float)(sm & 0xFFu);
+                               * (float)(sm[r] & 0xFFu);
             const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                               * (float)(sm >> 8);
-
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                               * (float)(sm[r] >> 8);
+            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             int idot = 0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {

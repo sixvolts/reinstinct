@@ -51,8 +51,9 @@ void moe_matvec_q8_0_repacked_f32(const unsigned char* __restrict__ slab,
 
     const unsigned int n_sub = in_dim >> 5;
     const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
-    const int*      qs_int  = reinterpret_cast<const int*>(wbase);
-    const uint16_t* d_plane = reinterpret_cast<const uint16_t*>(
+    const uint4*    lo_plane = reinterpret_cast<const uint4*>(wbase);
+    const uint4*    hi_plane = reinterpret_cast<const uint4*>(wbase + (size_t)out_dim * nsp * 16);
+    const uint16_t* d_plane  = reinterpret_cast<const uint16_t*>(
         wbase + (size_t)out_dim * nsp * 32);
 
     float acc[ROWS];
@@ -68,13 +69,16 @@ void moe_matvec_q8_0_repacked_f32(const unsigned char* __restrict__ slab,
             const int row = row0 + r;
             if (row >= (int)out_dim) continue;
             const size_t   idx   = (size_t)row * nsp + sb;
-            const int*     w_int = qs_int + idx * 8;
+            const uint4    wl    = lo_plane[idx];
+            const uint4    wh    = hi_plane[idx];
             const uint16_t db    = d_plane[idx];
             const float    dw    = __half2float(*reinterpret_cast<const __half*>(&db));
+            const int w[8] = { (int)wl.x, (int)wl.y, (int)wl.z, (int)wl.w,
+                               (int)wh.x, (int)wh.y, (int)wh.z, (int)wh.w };
             int idot = 0;
             #pragma unroll
             for (int g = 0; g < 8; g++)
-                idot = __builtin_amdgcn_sdot4(w_int[g], xq32[g], idot, false);
+                idot = __builtin_amdgcn_sdot4(w[g], xq32[g], idot, false);
             acc[r] += dw * dx * (float)idot;
         }
     }
@@ -116,8 +120,9 @@ void moe_matvec_q8_0_repacked_down_f32(const unsigned char* __restrict__ slab,
     const unsigned int row   = blockIdx.x * rpb + r;
     const bool active = (r < rpb) && (row < out_dim);
 
-    const int*      qs_int  = reinterpret_cast<const int*>(wbase);
-    const uint16_t* d_plane = reinterpret_cast<const uint16_t*>(
+    const uint4*    lo_plane = reinterpret_cast<const uint4*>(wbase);
+    const uint4*    hi_plane = reinterpret_cast<const uint4*>(wbase + (size_t)out_dim * nsp * 16);
+    const uint16_t* d_plane  = reinterpret_cast<const uint16_t*>(
         wbase + (size_t)out_dim * nsp * 32);
 
     float contrib = 0.0f;
@@ -126,13 +131,16 @@ void moe_matvec_q8_0_repacked_down_f32(const unsigned char* __restrict__ slab,
         const float    dx   = xb->d;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
         const size_t   idx   = (size_t)row * nsp + sb;
-        const int*     w_int = qs_int + idx * 8;
+        const uint4    wl    = lo_plane[idx];
+        const uint4    wh    = hi_plane[idx];
         const uint16_t db    = d_plane[idx];
         const float    dw    = __half2float(*reinterpret_cast<const __half*>(&db));
+        const int w[8] = { (int)wl.x, (int)wl.y, (int)wl.z, (int)wl.w,
+                           (int)wh.x, (int)wh.y, (int)wh.z, (int)wh.w };
         int idot = 0;
         #pragma unroll
         for (int g = 0; g < 8; g++)
-            idot = __builtin_amdgcn_sdot4(w_int[g], xq32[g], idot, false);
+            idot = __builtin_amdgcn_sdot4(w[g], xq32[g], idot, false);
         contrib = dw * dx * (float)idot;
     }
     red[tid] = contrib;

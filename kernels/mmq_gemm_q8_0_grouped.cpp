@@ -55,7 +55,9 @@ void mmq_gemm_q8_0_grouped_f32(const unsigned char* __restrict__ slab,
 
     const unsigned int n_sub = in_dim >> 5;
     const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
-    const uint4*    qsp = reinterpret_cast<const uint4*>(wbase);
+    // Two-plane quant layout: quants 0-15 of every sub-block, then 16-31.
+    const uint4* qlo = reinterpret_cast<const uint4*>(wbase);
+    const uint4* qhi = reinterpret_cast<const uint4*>(wbase + (size_t)out_dim * nsp * 16);
     const uint16_t* dp  = reinterpret_cast<const uint16_t*>(
         wbase + (size_t)out_dim * nsp * 32);
 
@@ -76,8 +78,8 @@ void mmq_gemm_q8_0_grouped_f32(const unsigned char* __restrict__ slab,
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim && sb0 + (unsigned int)lk < n_sub) {
                 const unsigned int sb = sb0 + lk;
-                sW_lo[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2];
-                sW_hi[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2 + 1];
+                sW_lo[lr][lk] = qlo[(size_t)wrow * nsp + sb];
+                sW_hi[lr][lk] = qhi[(size_t)wrow * nsp + sb];
                 const uint16_t d_bits = dp[(size_t)wrow * nsp + sb];
                 sWd[lr][lk] = __half2float(*reinterpret_cast<const __half*>(&d_bits));
             } else {

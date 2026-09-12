@@ -45,8 +45,11 @@ void mv_q8_0_repacked(const unsigned char* __restrict__ slab,
     const unsigned int nsp = ((n_blocks & (n_blocks - 1u)) == 0u)
                              ? (n_blocks + 1u) : n_blocks;
 
-    const int*      qs_int = reinterpret_cast<const int*>(slab);
-    const uint16_t* d_plane = reinterpret_cast<const uint16_t*>(
+    // Two-plane quant layout (quant::q8_0::repack_for_matvec): quants
+    // 0-15 of every sub-block, then 16-31, then the fp16 scales.
+    const uint4*    lo_plane = reinterpret_cast<const uint4*>(slab);
+    const uint4*    hi_plane = reinterpret_cast<const uint4*>(slab + (size_t)out_dim * nsp * 16);
+    const uint16_t* d_plane  = reinterpret_cast<const uint16_t*>(
         slab + (size_t)out_dim * nsp * 32);
 
     const int row0 = blockIdx.x * ROWS;
@@ -56,25 +59,29 @@ void mv_q8_0_repacked(const unsigned char* __restrict__ slab,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    const int rmax = (int)out_dim - 1;   // clamped rows: see matvec_q4k_repacked.cpp
     for (int sb = lane; sb < (int)n_blocks; sb += 64) {
+        uint4 wlo[ROWS], whi[ROWS]; uint16_t db[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            const size_t idx = (size_t)row * nsp + sb;
+            wlo[r] = lo_plane[idx];
+            whi[r] = hi_plane[idx];
+            db[r]  = d_plane[idx];
+        }
         const BlockQ8* xb = xq + sb;
         const float dx   = xb->d;
         const int*  xq32 = reinterpret_cast<const int*>(xb->qs);
-
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-            // qs[row][sb] — 32 bytes = 8 int32, naturally aligned
-            const int*     w_int = qs_int + ((size_t)row * nsp + sb) * 8;
-            const uint16_t db    = d_plane[(size_t)row * nsp + sb];
-            const float    dw    = __half2float(*reinterpret_cast<const __half*>(&db));
-
+            const float dw = __half2float(*reinterpret_cast<const __half*>(&db[r]));
+            const int w[8] = { (int)wlo[r].x, (int)wlo[r].y, (int)wlo[r].z, (int)wlo[r].w,
+                               (int)whi[r].x, (int)whi[r].y, (int)whi[r].z, (int)whi[r].w };
             int idot = 0;
             #pragma unroll
-            for (int g = 0; g < 8; g++) {
-                idot = __builtin_amdgcn_sdot4(w_int[g], xq32[g], idot, false);
-            }
+            for (int g = 0; g < 8; g++)
+                idot = __builtin_amdgcn_sdot4(w[g], xq32[g], idot, false);
             acc[r] += dw * dx * (float)idot;
         }
     }

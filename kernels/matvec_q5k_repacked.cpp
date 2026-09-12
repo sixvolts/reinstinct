@@ -25,8 +25,12 @@ struct __attribute__((packed)) BlockQ8 {
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
 // Spread 4 bits (b0..b3) to bit 4 of bytes 0..3.
+// Bits 0..3 of h to bits 4, 12, 20, 28: one multiply by (2^4 + 2^11 +
+// 2^18 + 2^25) puts bit i at i+4, i+11, i+18, i+25; only the diagonal
+// lands on a target bit and no two terms share a bit, so the mask is
+// exact. Three ops instead of eleven.
 __device__ __forceinline__ uint32_t spread4(uint32_t h) {
-    return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
+    return ((h & 0xFu) * 0x02040810u) & 0x10101010u;
 }
 
 extern "C" __global__
@@ -56,36 +60,35 @@ void matvec_q5k_repacked_f32(const uint8_t* __restrict__ wbase,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    const int rmax = (int)out_dim - 1;   // clamped rows: see matvec_q4k_repacked.cpp
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        uint4 q[ROWS]; uint32_t qh[ROWS]; uint16_t sm[ROWS]; uint32_t dd[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            q[r]  = nib[(size_t)row * nsp + sb];
+            qh[r] = qhp[(size_t)row * nsp + sb];
+            sm[r] = smp[(size_t)row * nsp + sb];
+            dd[r] = ddp[(size_t)row * n_super + (sb >> 3)];
+        }
         const BlockQ8* xb   = xq + sb;
         const float    dx   = xb->d;
         const float    xsum = xb->xsum;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint32_t qh = qhp[(size_t)row * nsp + sb];
-            const uint16_t sm = smp[(size_t)row * nsp + sb];
-            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
             const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                               * (float)(sm & 0xFFu);
+                               * (float)(sm[r] & 0xFFu);
             const float deff = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                               * (float)(sm >> 8);
-
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                               * (float)(sm[r] >> 8);
+            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             int idot = 0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu)
-                    | spread4((qh >> (4 * (2 * j)))     & 0xFu);
-                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu)
-                    | spread4((qh >> (4 * (2 * j + 1))) & 0xFu);
+                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | spread4(qh[r] >> (8 * j));
+                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | spread4(qh[r] >> (8 * j + 4));
                 idot = __builtin_amdgcn_sdot4((int)lo, xq32[j],     idot, false);
                 idot = __builtin_amdgcn_sdot4((int)hi, xq32[j + 4], idot, false);
             }

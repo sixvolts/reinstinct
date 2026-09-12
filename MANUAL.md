@@ -1184,8 +1184,8 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
-| qwen-3.8-27B           |          255       |     —       |    —     |        26.9       |      —     |    —     |
-| qwen-3.8-27B Q8_K_XL, 2×MI50 |    438       |     —       |    —     |        16.0       |      —     |    —     |
+| qwen-3.8-27B           |          255       |     —       |    —     |        32.2       |      —     |    —     |
+| qwen-3.8-27B Q8_K_XL, 2×MI50 |    419       |     —       |    —     |        20.3       |      —     |    —     |
 | gemma4-31B             |          217       |    172      |  **+26%**|        27.5       |     21.0   |  **+31%**|
 | gemma4-31B QAT (Q4_0)  |          265       |     —       |    —     |         —         |      —     |    —     |
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
@@ -1262,6 +1262,19 @@ straight-line implementation:
 Prefill is mostly HBM-bound on the MoE grouped GEMM (47% of GPU time
 on qwen 35B-MoE). Key changes:
 
+- Decode matvecs: one lane per 32-weight sub-block, two rows per wave,
+  four waves per workgroup. The rows are clamped rather than branched
+  so every load of a trip (both rows' planes and the activation) is in
+  flight before the first `v_dot4`; a guarded row put an `execz`
+  branch between the rows' loads and a `waitcnt` behind each, which
+  held Q5_K at 540 GB/s and Q6_K at 590 against Q4_0's 690 (now 700 /
+  690). Q5_K/Q6_K spread their high bits with a multiply instead of
+  bit-by-bit shifts. Q8_0's repacked layout is two 16-byte planes
+  (quants 0-15 of every sub-block, then 16-31): one 32-byte block per
+  lane made every load instruction half-use its cache lines and capped
+  Q8_0 at ~500 GB/s; the planes take it to 750. The kernel-read
+  ceiling on an MI50 is ~830 GB/s (`hip-info`), ~720 at the size of one
+  projection. `bench_matvec_repacked_kernels --ignored` measures them.
 - 2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS / IQ3_S).
   Every format expands its weight tile to int8 at LDS-load time — one
   unpack per thread per tile — so the inner loop is the same 8-sdot4

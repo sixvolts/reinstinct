@@ -28,9 +28,13 @@ static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
 // Spread four 2-bit fields (weight b at bits 2b..2b+1) to bits 4..5 of
 // bytes 0..3 — the position the 6-bit quant's high pair occupies.
+// Four 2-bit fields of h (bits 0-1, 2-3, 4-5, 6-7) to bits 4-5, 12-13,
+// 20-21, 28-29. Two multiplies, one per pair of fields, so no two
+// partial products share a bit (a single multiply would carry between
+// fields 3 and 0 at bit 12).
 __device__ __forceinline__ uint32_t spread2(uint32_t h) {
-    return ((h & 0x03u) << 4) | ((h & 0x0Cu) << 10)
-         | ((h & 0x30u) << 16) | ((h & 0xC0u) << 22);
+    return (((h & 0x33u) * 0x00010010u) & 0x00300030u)
+         | ((((h >> 2) & 0x33u) * 0x01001000u) & 0x30003000u);
 }
 
 extern "C" __global__
@@ -60,42 +64,41 @@ void matvec_q6k_repacked_f32(const uint8_t* __restrict__ wbase,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    const int rmax = (int)out_dim - 1;   // clamped rows: see matvec_q4k_repacked.cpp
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        uint4 q[ROWS]; uint32_t h2lo[ROWS], h2hi[ROWS]; uint16_t sm[ROWS], db[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            const size_t idx = (size_t)row * nsp + sb;
+            q[r]    = nib[idx];
+            h2lo[r] = h2p[idx * 2];
+            h2hi[r] = h2p[idx * 2 + 1];
+            sm[r]   = smp[idx];
+            db[r]   = ddp[(size_t)row * n_super + (sb >> 3)];
+        }
         const BlockQ8* xb   = xq + sb;
         const float    dx   = xb->d;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
-        // Activation half-sums for the symmetric −32 fold.
         int xis0 = 0, xis1 = 0;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             xis0 = __builtin_amdgcn_sdot4(xq32[j],     0x01010101, xis0, false);
             xis1 = __builtin_amdgcn_sdot4(xq32[j + 4], 0x01010101, xis1, false);
         }
-
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-
-            const size_t idx = (size_t)row * nsp + sb;
-            const uint4    q    = nib[idx];
-            const uint32_t h2lo = h2p[idx * 2];       // groups 0..3
-            const uint32_t h2hi = h2p[idx * 2 + 1];   // groups 4..7
-            const uint16_t sm     = smp[idx];
-            const uint16_t d_bits = ddp[(size_t)row * n_super + (sb >> 3)];
-            const float d = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
-            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
-
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const float d = __half2float(*reinterpret_cast<const __half*>(&db[r]));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm[r] & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm[r] >> 8);
+            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             int idot0 = 0, idot1 = 0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                const uint32_t ge = 2 * j;            // low-nibble group
-                const uint32_t go = 2 * j + 1;        // high-nibble group
-                const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
-                const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
+                // low nibbles of word j = group 2j, high = group 2j+1;
+                // byte g of the plane holds group g's fields.
+                const uint32_t he = ((2 * j < 4 ? h2lo[r] : h2hi[r]) >> (8 * ((2 * j) & 3))) & 0xFFu;
+                const uint32_t ho = ((2 * j + 1 < 4 ? h2lo[r] : h2hi[r]) >> (8 * ((2 * j + 1) & 3))) & 0xFFu;
                 const uint32_t q6lo = ( qa[j]       & 0x0F0F0F0Fu) | spread2(he);
                 const uint32_t q6hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | spread2(ho);
                 idot0 = __builtin_amdgcn_sdot4((int)q6lo, xq32[j],     idot0, false);

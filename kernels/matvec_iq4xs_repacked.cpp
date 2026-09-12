@@ -80,21 +80,22 @@ void mv_iq4xs_repacked(const uint8_t* __restrict__ wbase,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    const int rmax = (int)out_dim - 1;   // clamped rows: see matvec_q4k_repacked.cpp
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        uint4 q[ROWS]; uint16_t db[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            q[r]  = nib[(size_t)row * nsp + sb];
+            db[r] = dp[(size_t)row * nsp + sb];
+        }
         const BlockQ8* xb   = xq + sb;
         const float    dx   = xb->d;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint16_t db = dp[(size_t)row * nsp + sb];
-            const float    dw = __half2float(*reinterpret_cast<const __half*>(&db));
-
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const float    dw = __half2float(*reinterpret_cast<const __half*>(&db[r]));
+            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             int idot = 0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {

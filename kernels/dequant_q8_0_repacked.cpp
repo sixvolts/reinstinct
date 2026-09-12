@@ -39,7 +39,9 @@ void dequant_q8_0_repacked_f16(const unsigned char* __restrict__ slab,
         slab + (size_t)out_dim * nsp * 32);
 
     const size_t pidx = (size_t)row * nsp + blk;
-    const int8_t   q = qs_plane[pidx * 32 + i];
+    // Two-plane quant layout: quants 0-15 of every sub-block, then 16-31.
+    const size_t   half = (size_t)out_dim * nsp * 16;
+    const int8_t   q = (i < 16) ? qs_plane[pidx * 16 + i] : qs_plane[half + pidx * 16 + (i - 16)];
     const uint16_t db = d_plane[pidx];
     const float    d  = __half2float(*reinterpret_cast<const __half*>(&db));
 
