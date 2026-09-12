@@ -1843,6 +1843,104 @@ mod tests {
             "mmq gemm iq3s rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
+    /// Wall-clock of every wide MMQ GEMM at the 27B's FFN shape
+    /// (644 tokens x 5120 -> 17408), from HIP events over 20 launches.
+    /// Run with `--ignored --nocapture`; the per-kernel ms and effective
+    /// int8 TOPS are what to compare when touching the MMQ inner loops.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_mmq_wide_kernels() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (p_rows, in_dim, out_dim) = (644usize, 5120usize, 17408usize);
+        let mut s: u64 = 0xB3AC_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        // Random block bytes with tame fp16 scales at the right offsets.
+        let synth = |bs: usize, bpb: usize, d_off: usize, dmin: bool, rng: &mut dyn FnMut() -> u8| -> Vec<u8> {
+            let n_blocks = out_dim * (in_dim / bs);
+            let mut w = vec![0u8; n_blocks * bpb];
+            for b in &mut w { *b = rng(); }
+            for blk in 0..n_blocks {
+                let off = blk * bpb;
+                let d = ((blk % 23) as f32 + 1.0) * 0.001;
+                w[off + d_off..off + d_off + 2].copy_from_slice(
+                    &crate::quant::half::f32_to_f16(d).to_le_bytes());
+                if dmin {
+                    w[off + 2..off + 4].copy_from_slice(
+                        &crate::quant::half::f32_to_f16(d * 0.5).to_le_bytes());
+                }
+            }
+            w
+        };
+        use crate::quant::{q4_0, q4_k, q5_k, q6_k, q8_0, iq4_xs};
+        let cases: Vec<(&str, &str, &str, Vec<u8>)> = vec![
+            ("q4_0", "mmq_gemm_q4_0_repacked", "mmq_gemm_q4_0_repacked_f32",
+             q4_0::repack_for_matvec(&synth(32, q4_0::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
+            ("q4_k", "mmq_gemm_q4k_repacked", "mmq_gemm_q4k_repacked_f32",
+             q4_k::repack_for_matvec(&synth(256, q4_k::BYTES_PER_BLOCK, 0, true, &mut rng_u8), in_dim, out_dim)),
+            ("q5_k", "mmq_gemm_q5k_repacked", "mmq_gemm_q5k_repacked_f32",
+             q5_k::repack_for_matvec(&synth(256, q5_k::BYTES_PER_BLOCK, 0, true, &mut rng_u8), in_dim, out_dim)),
+            ("q6_k", "mmq_gemm_q6k_repacked", "mmq_gemm_q6k_repacked_f32",
+             q6_k::repack_for_matvec(&synth(256, q6_k::BYTES_PER_BLOCK, 208, false, &mut rng_u8), in_dim, out_dim)),
+            ("q8_0", "mmq_gemm_q8_0_repacked", "mmq_gemm_q8_0_repacked_f32",
+             q8_0::repack_for_matvec(&synth(32, q8_0::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
+            ("iq4xs", "mmq_gemm_iq4xs_repacked", "mmq_gemm_iq4xs_repacked_f32",
+             iq4_xs::repack_for_matvec(&synth(256, iq4_xs::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
+        ];
+        // Sources are read from disk at run time (from `kernels/`, or
+        // `REINSTINCT_MMQ_BENCH_SRC_DIR`) so a kernel edit re-benches
+        // without rebuilding the test binary.
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
+            .unwrap_or_else(|e| panic!("{dir}/{name}.cpp: {e}"));
+        let srcs: std::collections::HashMap<&str, String> = cases.iter()
+            .map(|(_, name, _, _)| (*name, read(name))).collect();
+
+        let x = mmq_test_x(p_rows, in_dim);
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
+        let dxq: DeviceBuf<u8> = DeviceBuf::new(p_rows * (in_dim / 32) * 40).unwrap();
+        let dy: DeviceBuf<f32> = DeviceBuf::new(p_rows * out_dim).unwrap();
+        let stream = hip::Stream::new().unwrap();
+        let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut ind = in_dim as u32;
+        let mut qargs: [*mut c_void; 3] = [
+            &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut ind as *mut _ as *mut c_void];
+        unsafe { qf.launch((((in_dim as u32) + 255) / 256, p_rows as u32, 1), (256, 1, 1),
+                           0, Some(&stream), &mut qargs).unwrap(); }
+        let macs = p_rows as f64 * in_dim as f64 * out_dim as f64;
+        for (label, name, kname, packed) in &cases {
+            let gmod = Module::load(&cache.compile(name, &srcs[name]).unwrap()).unwrap();
+            let gf = gmod.function(kname).unwrap();
+            let dw: DeviceBuf<u8> = DeviceBuf::from_slice(packed).unwrap();
+            let launch = |stream: &hip::Stream| {
+                let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
+                let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut pa = p_rows as u32;
+                let mut gargs: [*mut c_void; 6] = [
+                    &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
+                    &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                    &mut oa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void];
+                unsafe { gf.launch(((out_dim as u32 + 63) / 64, (p_rows as u32 + 63) / 64, 1),
+                                   (256, 1, 1), 0, Some(stream), &mut gargs).unwrap(); }
+            };
+            launch(&stream); launch(&stream);
+            stream.synchronize().unwrap();
+            let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+            e0.record(&stream).unwrap();
+            let iters = 20;
+            for _ in 0..iters { launch(&stream); }
+            e1.record(&stream).unwrap();
+            e1.synchronize().unwrap();
+            let ms = hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / iters as f64;
+            eprintln!("mmq {label:<6} {p_rows}x{in_dim}->{out_dim}: {ms:7.3} ms  {:5.1} TOPS",
+                      2.0 * macs / (ms * 1e-3) / 1e12);
+        }
+    }
+
     /// Q4_0 across all three paths it can take — repacked matvec
     /// (decode), on-disk dp4a matvec (a Q4_0 token_embd doubling as the
     /// tied LM head, which cannot be repacked), and the MMQ GEMM

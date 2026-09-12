@@ -1174,9 +1174,10 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
-| qwen-3.8-27B           |          187       |     —       |    —     |        26.9       |      —     |    —     |
+| qwen-3.8-27B           |          255       |     —       |    —     |        26.9       |      —     |    —     |
 | qwen-3.8-27B Q8_K_XL, 2×MI50 |    438       |     —       |    —     |        16.0       |      —     |    —     |
-| gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
+| gemma4-31B             |          217       |    172      |  **+26%**|        27.5       |     21.0   |  **+31%**|
+| gemma4-31B QAT (Q4_0)  |          265       |     —       |    —     |         —         |      —     |    —     |
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|
 | gemma4-26B-MoE         |          768       |    621      |  **+24%**|        86.5       |     85.5   |   **+1%**|
@@ -1250,7 +1251,13 @@ straight-line implementation:
 Prefill is mostly HBM-bound on the MoE grouped GEMM (47% of GPU time
 on qwen 35B-MoE). Key changes:
 
-- 2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0). No dequant-to-fp16
+- 2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS / IQ3_S).
+  Every format expands its weight tile to int8 at LDS-load time — one
+  unpack per thread per tile — so the inner loop is the same 8-sdot4
+  dot for all of them; unpacking inside the loop had spilled registers
+  and left Q5_K at 9 and Q6_K at 6 TOPS against Q8_0's 20 at the 27B
+  FFN shape (now 15 / 14; `bench_mmq_wide_kernels --ignored` measures
+  it). No dequant-to-fp16
   scratch. BM = 64, BK = 4, occupancy 2. sX tile padded `[BN][BK+1]`
   to break a 4-way LDS bank conflict on `xq32` reads (-3% to -10%
   across MoE variants).

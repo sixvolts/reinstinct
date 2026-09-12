@@ -52,6 +52,14 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
+// The weight tile is expanded to int8 at LDS-load time — two uint4 per
+// 32-weight sub-block (weights 0-15, then 16-31) in the order the
+// activation's dp4a groups use — so the inner loop is the plain int8
+// dot of the Q8_0 kernel. Unpacking there instead cost TM*TN*BK*8
+// unpacks per tile against one per thread here, and the register
+// pressure of the packed form spilled (5-49 VGPRs across the K-quants;
+// Q6_K ran at 5.7 TOPS against Q8_0's 19.7 at the 27B FFN shape).
+
 template<int TM, int TN, int BK, int TXG, int THREADS>
 __device__ __forceinline__
 void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
@@ -76,7 +84,8 @@ void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
     const uint32_t* ddp = reinterpret_cast<const uint32_t*>(   // v2: d|dmin per superblock
         wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 2);
 
-    __shared__ uint4   sW[BM][BK];       // packed nibbles
+    __shared__ uint4   sW_lo[BM][BK];    // int8 weights 0-15 (nibbles expanded)
+    __shared__ uint4   sW_hi[BM][BK];    // int8 weights 16-31
     __shared__ float2  sWs[BM][BK];      // (dsc, deff) — formed from the v2 scales
     __shared__ BlockQ8 sX[BN][BK + 1];       // int8 acts
 
@@ -93,7 +102,11 @@ void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim) {
                 const unsigned int sb = sb0 + lk;
-                sW[lr][lk] = nib[(size_t)wrow * nsp + sb];
+                const uint4 q = nib[(size_t)wrow * nsp + sb];
+                const uint32_t M = 0x0F0F0F0Fu;
+                sW_lo[lr][lk] = make_uint4(q.x & M, q.y & M, q.z & M, q.w & M);
+                sW_hi[lr][lk] = make_uint4((q.x >> 4) & M, (q.y >> 4) & M,
+                                           (q.z >> 4) & M, (q.w >> 4) & M);
                 const uint16_t sm = smp[(size_t)wrow * nsp + sb];
                 const uint32_t dd = ddp[(size_t)wrow * n_super + (sb >> 3)];
                 const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
@@ -121,11 +134,12 @@ void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk++) {
-            uint4 wq[TM];
+            uint4 wlo[TM], whi[TM];
             float dsc[TM], deff[TM];
             #pragma unroll
             for (int r = 0; r < TM; r++) {
-                wq[r] = sW[ty + r * TYG][kk];
+                wlo[r] = sW_lo[ty + r * TYG][kk];
+                whi[r] = sW_hi[ty + r * TYG][kk];
                 const float2 s = sWs[ty + r * TYG][kk];
                 dsc[r]  = s.x;
                 deff[r] = s.y;
@@ -138,15 +152,12 @@ void mmq_q4k_impl(const unsigned char* __restrict__ wbase,
                 const float    xsum = xb->xsum;
                 #pragma unroll
                 for (int r = 0; r < TM; r++) {
-                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
+                    const int wa[8] = { (int)wlo[r].x, (int)wlo[r].y, (int)wlo[r].z, (int)wlo[r].w,
+                                        (int)whi[r].x, (int)whi[r].y, (int)whi[r].z, (int)whi[r].w };
                     int idot = 0;
                     #pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        idot = __builtin_amdgcn_sdot4(
-                            (int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot, false);
-                        idot = __builtin_amdgcn_sdot4(
-                            (int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot, false);
-                    }
+                    for (int j = 0; j < 8; j++)
+                        idot = __builtin_amdgcn_sdot4(wa[j], xq32[j], idot, false);
                     acc[r][n] += dsc[r] * dx * (float)idot - deff[r] * xsum;
                 }
             }

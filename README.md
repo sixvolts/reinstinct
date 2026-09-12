@@ -47,12 +47,13 @@ reinstinct wins **10 of 10** tested configurations.
 | Gemma 4 E4B | **1070** | 1070 | par |
 | Qwen 3.5 27B | **210** | 187 | **+12%** |
 | Qwen 3.6 27B | **211** | 187 | **+13%** |
-| Gemma 4 31B Dense | **177** | 172 | **+3%** |
+| Gemma 4 31B Dense | **217** | 172 | **+26%** |
 | Qwen 3.5 35B-A3B MoE | **820** | 803 | **+2%** |
 | Qwen 3.6 35B-A3B MoE | **809** | 802 | **+1%** |
 | Gemma 4 26B-A4B MoE | **768** | 621 | **+24%** |
 
-2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS) drives the dense
+2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS — every
+format expanded to int8 at tile load, one inner loop) drives the dense
 prefill wins; a grouped-expert GEMM that gathers tokens by router
 choice drives the MoE wins.
 

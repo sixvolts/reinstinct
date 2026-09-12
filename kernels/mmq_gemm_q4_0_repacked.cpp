@@ -59,6 +59,19 @@ struct __attribute__((packed)) BlockQ8 {
 };
 static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
 
+// The weight tile is expanded to int8 at LDS-load time — two uint4 per
+// 32-weight sub-block (weights 0-15, then 16-31) in the order the
+// activation's dp4a groups use — so the inner loop is the plain int8
+// dot of the Q8_0 kernel. Unpacking there instead cost TM*TN*BK*8
+// unpacks per tile against one per thread here, and the register
+// pressure of the packed form spilled (5-49 VGPRs across the K-quants;
+// Q6_K ran at 5.7 TOPS against Q8_0's 19.7 at the 27B FFN shape).
+// Bytewise `v - 8` on four nibbles without inter-byte borrow (set bit 7,
+// subtract, clear bit 7) — the signed int8 Q4_0 weight sdot4 wants.
+__device__ __forceinline__ uint32_t sub8(uint32_t v) {
+    return ((v | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+}
+
 template<int TM, int TN, int BK, int TXG, int THREADS>
 __device__ __forceinline__
 void mmq_q4_0_impl(const unsigned char* __restrict__ wbase,
@@ -80,7 +93,8 @@ void mmq_q4_0_impl(const unsigned char* __restrict__ wbase,
     const uint16_t* dp  = reinterpret_cast<const uint16_t*>(
         wbase + (size_t)out_dim * nsp * 16);
 
-    __shared__ uint4   sW[BM][BK];       // packed nibbles
+    __shared__ uint4   sW_lo[BM][BK];    // int8 (nibble - 8) for weights 0-15
+    __shared__ uint4   sW_hi[BM][BK];    // int8 (nibble - 8) for weights 16-31
     __shared__ float   sWd[BM][BK];      // per-block fp16 scale, widened
     __shared__ BlockQ8 sX[BN][BK + 1];   // int8 acts
 
@@ -97,7 +111,13 @@ void mmq_q4_0_impl(const unsigned char* __restrict__ wbase,
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim) {
                 const unsigned int sb = sb0 + lk;
-                sW[lr][lk] = nib[(size_t)wrow * nsp + sb];
+                // The -8 offset is folded in bytewise here (sub8), so the
+                // loop needs no quantised-activation-sum term.
+                const uint4 q = nib[(size_t)wrow * nsp + sb];
+                const uint32_t M = 0x0F0F0F0Fu;
+                sW_lo[lr][lk] = make_uint4(sub8(q.x & M), sub8(q.y & M), sub8(q.z & M), sub8(q.w & M));
+                sW_hi[lr][lk] = make_uint4(sub8((q.x >> 4) & M), sub8((q.y >> 4) & M),
+                                           sub8((q.z >> 4) & M), sub8((q.w >> 4) & M));
                 const uint16_t db = dp[(size_t)wrow * nsp + sb];
                 sWd[lr][lk] = __half2float(*reinterpret_cast<const __half*>(&db));
             } else {
@@ -118,34 +138,28 @@ void mmq_q4_0_impl(const unsigned char* __restrict__ wbase,
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk++) {
-            uint4 wq[TM];
+            uint4 wlo[TM], whi[TM];
             float dw[TM];
             #pragma unroll
             for (int r = 0; r < TM; r++) {
-                wq[r] = sW[ty + r * TYG][kk];
-                dw[r] = sWd[ty + r * TYG][kk];
+                wlo[r] = sW_lo[ty + r * TYG][kk];
+                whi[r] = sW_hi[ty + r * TYG][kk];
+                dw[r]  = sWd[ty + r * TYG][kk];
             }
             #pragma unroll
             for (int n = 0; n < TN; n++) {
                 const BlockQ8* xb   = &sX[tx + n * TXG][kk];
                 const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
                 const float    dx   = xb->d;
-                int xqsum = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; g++)
-                    xqsum = __builtin_amdgcn_sdot4(0x01010101, xq32[g], xqsum, false);
                 #pragma unroll
                 for (int r = 0; r < TM; r++) {
-                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
+                    const int wa[8] = { (int)wlo[r].x, (int)wlo[r].y, (int)wlo[r].z, (int)wlo[r].w,
+                                        (int)whi[r].x, (int)whi[r].y, (int)whi[r].z, (int)whi[r].w };
                     int idot = 0;
                     #pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        idot = __builtin_amdgcn_sdot4(
-                            (int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot, false);
-                        idot = __builtin_amdgcn_sdot4(
-                            (int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot, false);
-                    }
-                    acc[r][n] += dw[r] * dx * (float)(idot - 8 * xqsum);
+                    for (int j = 0; j < 8; j++)
+                        idot = __builtin_amdgcn_sdot4(wa[j], xq32[j], idot, false);
+                    acc[r][n] += dw[r] * dx * (float)idot;
                 }
             }
         }
