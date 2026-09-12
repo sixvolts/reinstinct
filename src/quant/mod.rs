@@ -4,7 +4,10 @@
 //! HIP kernels in `kernels/dequant_*.hip`.
 
 pub mod half;
+pub mod iq3_s;
+pub mod iq4_nl;
 pub mod iq4_xs;
+pub mod q3_k;
 pub mod q4_0;
 pub mod q4_k;
 pub mod q5_k;
@@ -77,6 +80,9 @@ pub fn dequantize_to_f32(
         GgmlType::Q6_K   => q6_k::dequantize_to_f32(bytes, out),
         GgmlType::Q8_0   => q8_0::dequantize_to_f32(bytes, out),
         GgmlType::IQ4_XS => iq4_xs::dequantize_to_f32(bytes, out),
+        GgmlType::IQ4_NL => iq4_nl::dequantize_to_f32(bytes, out),
+        GgmlType::IQ3_S  => iq3_s::dequantize_to_f32(bytes, out),
+        GgmlType::Q3_K   => q3_k::dequantize_to_f32(bytes, out),
         // Recognized but no oracle: surface the tensor name so the caller knows what's missing.
         ty => return Err(GgufError::UnsupportedGgmlTypeFor { name: info.name.clone(), ty }),
     }

@@ -37,6 +37,29 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Quantize f32 values to Q8_0 blocks — ggml's `quantize_row_q8_0`:
+/// per 32-block, `d = max|x| / 127`, `q = round(x / d)`. This is the
+/// requantization path for source formats with no exact Q8_0 relabelling
+/// (Q3_K's 16-weight sub-blocks straddle Q8_0's 32). `vals.len()` must be
+/// a multiple of 32.
+pub fn quantize_from_f32(vals: &[f32]) -> Vec<u8> {
+    use crate::quant::half::f32_to_f16;
+    assert_eq!(vals.len() % BLOCK_SIZE, 0, "Q8_0 quantize: len must be a multiple of 32");
+    let n_blocks = vals.len() / BLOCK_SIZE;
+    let mut out = vec![0u8; n_blocks * BYTES_PER_BLOCK];
+    let dst: &mut [BlockQ8_0] = bytemuck::cast_slice_mut(&mut out);
+    for (blk, o) in vals.chunks_exact(BLOCK_SIZE).zip(dst.iter_mut()) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        o.d = f32_to_f16(d);
+        for (i, v) in blk.iter().enumerate() {
+            o.qs[i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    out
+}
+
 /// Padded sub-block count per repacked row. Mirrors the same trick the
 /// Q4/5/6_K repacks use: when `in_dim/32` is a power of two every row
 /// aliases onto the same HBM channel, costing ~3× on matvec. One

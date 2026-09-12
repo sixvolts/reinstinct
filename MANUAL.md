@@ -863,6 +863,7 @@ Tested GGUF files. Tested decode + prefill on real prompts at P≈504.
 | `Qwen3.5-4B-UD-Q4_K_XL.gguf`                  | qwen35      | Hybrid Gated-DeltaNet + GQA, all dense layers.                |
 | `Qwen3.5-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Hybrid GDN + GQA, 64 layers (L,L,L,F pattern: 48 GDN + 16 attn). |
 | `Qwen3.6-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.5-27B, retuned weights.                        |
+| `Qwen3.8-27B-UD-Q4_K_XL.gguf`                 | qwen35      | Same arch as 3.6-27B (config identical field for field), retuned weights, ships the `nextn` MTP head (block 65). Thinks by default: emits a `<think>` block before answering. |
 | `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | MoE, 256 experts top-8, hybrid GDN.                           |
 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`             | qwen35moe   | Same arch as 3.5-35B-MoE.                                     |
 
@@ -892,10 +893,24 @@ real histogram.
 
 Weight dtypes with a full kernel set (repacked matvec, batched matvec,
 MMQ GEMM, embed lookup): `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`.
-`IQ4_XS` has no kernels of its own — it is transcoded to `Q8_0` at load
-(near-exact; the codebook fits int8), costing 4.25→8.5 bpw on the few
-tensors that use it. `F16`/`F32` matmul tensors go through the
-`gemm_f16_rows` fallback.
+
+Four more parse and load by **transcoding to `Q8_0` at load time**, so
+they run on the Q8_0 kernels rather than needing their own:
+
+| on disk  | how                                   | exact?            | bpw       |
+|----------|---------------------------------------|-------------------|-----------|
+| `IQ4_XS` | codebook relabel                      | yes (scale→fp16)  | 4.25→8.5  |
+| `IQ4_NL` | codebook relabel                      | yes, bit for bit  | 4.5→8.5   |
+| `IQ3_S`  | grid+sign relabel                     | yes (scale→fp16)  | 3.44→8.5  |
+| `Q3_K`   | dequantize → requantize per 32-block  | no; ≤0.6 Q8 step  | 3.44→8.5  |
+
+The price is VRAM and bandwidth on those tensors, and it is not small on
+files that lean on them. `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with
+2.9 GB of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`; on device that
+is ~19.8 GB, +21%, and decode lands 21% below 3.6-27B (22.6 vs 28.5 tok/s)
+— the whole gap is transcode bytes. A native repacked `IQ4_XS` kernel is
+the follow-up that would recover most of it. `F16`/`F32` matmul tensors go
+through the `gemm_f16_rows` fallback.
 
 ---
 
@@ -1023,6 +1038,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
+| qwen-3.8-27B           |          192       |     —       |    —     |        22.6       |      —     |    —     |
 | gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|

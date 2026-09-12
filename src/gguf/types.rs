@@ -29,6 +29,7 @@ pub enum GgmlType {
     Q6_K    = 14,
     Q8_K    = 15,
     IQ4_NL  = 20,
+    IQ3_S   = 21,
     IQ4_XS  = 23,
     BF16    = 30,
 }
@@ -51,6 +52,7 @@ impl GgmlType {
             14 => Ok(Self::Q6_K),
             15 => Ok(Self::Q8_K),
             20 => Ok(Self::IQ4_NL),
+            21 => Ok(Self::IQ3_S),
             23 => Ok(Self::IQ4_XS),
             30 => Ok(Self::BF16),
             _  => Err(GgufError::UnknownGgmlType(v)),
@@ -64,7 +66,7 @@ impl GgmlType {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1
                 | Self::Q8_0 | Self::Q8_1 | Self::IQ4_NL => 32,
             Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K
-                | Self::Q6_K | Self::Q8_K | Self::IQ4_XS => 256,
+                | Self::Q6_K | Self::Q8_K | Self::IQ4_XS | Self::IQ3_S => 256,
         }
     }
 
@@ -88,6 +90,7 @@ impl GgmlType {
             Self::Q8_K    => 292,  // fp32 d + 256 int8 + 16 int16 bsums
             Self::IQ4_NL  => 18,   // fp16 d + 16 nibbles indexing 16-entry LUT
             Self::IQ4_XS  => 136,  // fp16 d + u16 scales_h + 4 scales_l + 128 nibbles
+            Self::IQ3_S   => 110,  // fp16 d + 64 qs + 8 qh + 32 signs + 4 scales
         }
     }
 

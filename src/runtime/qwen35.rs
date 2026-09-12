@@ -247,6 +247,31 @@ impl GpuMatvecTensor {
                 Some((crate::quant::q8_0::repack_for_matvec(
                     &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
             }
+            // Same treatment for the other codebook formats Unsloth's
+            // UD-XL files reach for — both relabel onto Q8_0 exactly.
+            GgmlType::IQ4_NL => {
+                let q8 = crate::quant::iq4_nl::transcode_to_q8_0(
+                    bytes, in_dim as usize * out_dim as usize);
+                Some((crate::quant::q8_0::repack_for_matvec(
+                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
+            }
+            GgmlType::IQ3_S => {
+                let q8 = crate::quant::iq3_s::transcode_to_q8_0(
+                    bytes, in_dim as usize * out_dim as usize);
+                Some((crate::quant::q8_0::repack_for_matvec(
+                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
+            }
+            // Q3_K has no exact relabelling (16-weight sub-blocks straddle
+            // Q8_0's 32), so dequantize and requantize. 8 bits per 32 on a
+            // 3-bit source loses nothing measurable; see quant/q3_k.rs.
+            GgmlType::Q3_K => {
+                let n = in_dim as usize * out_dim as usize;
+                let mut f = vec![0.0f32; n];
+                crate::quant::q3_k::dequantize_to_f32(bytes, &mut f);
+                let q8 = crate::quant::q8_0::quantize_from_f32(&f);
+                Some((crate::quant::q8_0::repack_for_matvec(
+                    &q8, in_dim as usize, out_dim as usize), GgmlType::Q8_0))
+            }
             _ => None,
         };
         match packed {
