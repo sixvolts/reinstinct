@@ -256,15 +256,39 @@ global load. Every fix for that either lengthens the contiguous run (which
 needs a bigger BK, which costs LDS, which costs occupancy) or prefetches
 (which costs LDS, same problem).
 
-The way out is a prefetch that does **not** live in LDS: stage the next
-chunk's weights in *registers* while computing the current one. TM=1 means
-a thread owns exactly one weight row, so its share of a chunk is 4 uint4 —
-16 VGPRs, against the 188 of headroom below the 3-wave cliff. That keeps
-LDS at 4.7 KB and occupancy at 3. It is the one untried idea with the
-right shape, and it is where the next attempt should start.
+**Register prefetch — tried, does not pay.** The idea was a prefetch that
+does not live in LDS: stage the next chunk's weights in registers (TM=1,
+so one uint4 + one float2 per thread) and write them to the single LDS
+buffer after the compute. Measured:
 
-If it lands, verify(16) goes to roughly the 91 ms floor: a round becomes
-~120 ms for 5.25 tokens, or **~44 tok/s against the 26.2 baseline (1.7x)**.
+| Variant | VGPRs | verify(16) |
+|---|---:|---:|
+| baseline, no prefetch | 68 | **166 ms** |
+| prefetch, full unroll | 229 | 235 ms |
+| prefetch, weights only | 229 | 219 ms |
+| prefetch + `launch_bounds(64,3)` | 84 | 1243 ms (spills) |
+| prefetch + `#pragma unroll 1` on kk | 48 | 177 ms |
+| prefetch + `#pragma unroll 2` on kk | 58 | 176 ms |
+| prefetch + `asm volatile` barrier per kk | 228 | 220 ms |
+
+The staging itself is ~6 VGPRs. The jump to 229 is the scheduler: once
+there are loads in flight to hide, it hoists every kk iteration's LDS
+reads of the unrolled compute to the top for ILP — 16 BlockQ8 x 10 dwords
+— and occupancy collapses to 1 wave/SIMD. Limiting the unroll stops that
+(48 VGPRs) but forfeits the ILP the compute needs, and lands worse than
+having no prefetch at all. A compiler barrier does not prevent the hoist.
+
+So there is no configuration of this kernel structure where hiding the
+weight-load latency in software beats hiding it with occupancy, and
+occupancy is VGPR-capped at 3. The remaining gap to the ~91 ms floor
+needs a different structure — most likely a tiled weight layout that
+turns each chunk's 16 scattered 64-byte segments into one contiguous
+1 KB read, which the decode matvec cannot share and the 31B has no VRAM to
+duplicate. On this hardware, 166 ms is the practical floor for verify(16).
+
+The lever that *did* move throughput past parity was not a kernel at
+all: `--block-size` (26.3 -> 28.7 tok/s), because the MI50's free-token
+budget is ~6 and the checkpoint's 16 sits past it.
 
 ### Risks
 
