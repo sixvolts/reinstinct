@@ -674,6 +674,11 @@ enum ServerModel {
     Qwen {
         gpu: crate::runtime::pipeline::Qwen35Pipeline,
         state: crate::runtime::pipeline::Qwen35PipelineState,
+        /// Decode body captured into a HIP graph (per stage), replayed
+        /// once per token. Captured lazily on the first request, after
+        /// the first prefill has warmed the buffer pools (hipMalloc is
+        /// forbidden during capture). `None` under `REINSTINCT_NO_GRAPH`.
+        graph: Option<crate::runtime::pipeline::PipelineGraph>,
         tok: crate::tokenizer::Tokenizer,
         eos: u32,
         max_seq: usize,
@@ -682,6 +687,9 @@ enum ServerModel {
     Gemma {
         gpu: crate::runtime::gemma4::GpuGemma4,
         state: crate::runtime::gemma4::Gemma4GpuState,
+        /// Same as Qwen's; also `None` when capture is unsupported
+        /// (SuperQuant KV), which falls back to per-kernel decode.
+        graph: Option<crate::hip::GraphExec>,
         tok: crate::tokenizer::GemmaTokenizer,
         eos: u32,
         bos: u32,
@@ -860,7 +868,7 @@ impl ServerModel {
                 for _ in 0..5 { verify_graphs.push(None); }
                 Some(GemmaDrafter { runtime: dr, verify_graphs })
             } else { None };
-            Ok(ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, name, drafter,
+            Ok(ServerModel::Gemma { gpu, state, graph: None, tok, eos, bos, max_seq, name, drafter,
                                     prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS) })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
@@ -881,7 +889,7 @@ impl ServerModel {
                 warn!("--big-drafter ignored on qwen35 target \
                        (no supported drafter; see gemma4-mtp memory file)");
             }
-            Ok(ServerModel::Qwen { gpu, state, tok, eos, max_seq, name })
+            Ok(ServerModel::Qwen { gpu, state, graph: None, tok, eos, max_seq, name })
         }
     }
 
@@ -917,7 +925,7 @@ impl ServerModel {
             .map(|d| std::time::Instant::now() + d);
 
         match self {
-            ServerModel::Qwen { gpu, state, tok, eos, max_seq, .. } => {
+            ServerModel::Qwen { gpu, state, graph, tok, eos, max_seq, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => tok.encode(text),
                     PromptInput::Chat(msgs) => {
@@ -941,6 +949,10 @@ impl ServerModel {
                 } else {
                     gpu.forward_tokens(&prompt, state)?
                 };
+                if graph.is_none() && decode_graphs_enabled() {
+                    *graph = Some(gpu.capture_forward_graph(state)?);
+                    info!("captured decode graph ({} stage(s))", gpu.n_stages());
+                }
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                     || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
@@ -980,11 +992,14 @@ impl ServerModel {
                     } else if let Some(t) = tlp {
                         all_lp.push(t);
                     }
-                    logits = gpu.forward_token(t, state)?;
+                    logits = match graph {
+                        Some(g) => gpu.forward_token_via_graph(g, t, state)?,
+                        None    => gpu.forward_token(t, state)?,
+                    };
                 }
                 Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
-            ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
+            ServerModel::Gemma { gpu, state, graph, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => {
                         let mut p = vec![*bos];
@@ -1065,6 +1080,12 @@ impl ServerModel {
                             Err(e) => warn!("prefix-cache snapshot failed: {e}"),
                         }
                     }
+                    if graph.is_none() && decode_graphs_enabled() && !state.is_superquant() {
+                        match gpu.capture_forward_graph(state) {
+                            Ok(g) => { *graph = Some(g); info!("captured decode graph"); }
+                            Err(e) => warn!("decode graph capture failed, staying per-kernel: {e}"),
+                        }
+                    }
                     let vocab = logits.len();
                     let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                         || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
@@ -1097,7 +1118,10 @@ impl ServerModel {
                         } else if let Some(t) = tlp {
                             all_lp.push(t);
                         }
-                        logits = gpu.forward_token(t, state)?;
+                        logits = match graph {
+                            Some(g) => gpu.forward_via_graph(g, t, state)?,
+                            None    => gpu.forward_token(t, state)?,
+                        };
                     }
                     return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
                 }
@@ -1149,6 +1173,14 @@ impl ServerModel {
             }
         }
     }
+}
+
+/// Decode-graph replay is on unless `REINSTINCT_NO_GRAPH` is set (the
+/// same switch `generate-text` honours). Per-kernel decode is ~20%
+/// slower on a 27B, so the server captures a graph per model on its
+/// first request.
+fn decode_graphs_enabled() -> bool {
+    std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
 }
 
 // --- the GPU worker ----------------------------------------------------
