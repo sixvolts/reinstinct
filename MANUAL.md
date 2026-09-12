@@ -901,23 +901,29 @@ select per four nibbles, no memory lookup. In the MMQ GEMM the codebook
 is applied once at tile-load time, so the inner loop is the plain int8
 dot; it lands within 1.5% of the Q8_0 MMQ at half the weight bytes.
 
-Three more parse and load by **transcoding to `Q8_0` at load time**, so
-they run on the Q8_0 kernels rather than needing their own:
+Three more formats Unsloth's UD-XL files reach for load by **relabelling
+onto one of those layouts at load time** — no requantization, and no
+bytes wider than they need to be:
 
-| on disk  | how                                   | exact?            | bpw       |
-|----------|---------------------------------------|-------------------|-----------|
-| `IQ4_NL` | codebook relabel                      | yes, bit for bit  | 4.5→8.5   |
-| `IQ3_S`  | grid+sign relabel                     | yes (scale→fp16)  | 3.44→8.5  |
-| `Q3_K`   | dequantize → requantize per 32-block  | no; ≤0.6 Q8 step  | 3.44→8.5  |
+| on disk  | becomes                          | how                                      | exact?           | bpw        |
+|----------|----------------------------------|------------------------------------------|------------------|------------|
+| `IQ4_NL` | `IQ4_XS` repacked                | nibbles verbatim, `d` is the sub-scale   | bit for bit      | 4.5→4.5    |
+| `IQ3_S`  | `IQ4_XS` layout, `IQ3_S` codebook | odd −15..15 → nibble `(v+15)/2`          | yes (scale→fp16) | 3.44→4.5   |
+| `Q3_K`   | `Q6_K`                           | `q6 = q3 + 28`, `sc6 = sc3 − 32`, same `d` | bit for bit    | 3.44→6.56  |
 
-The price is VRAM and bandwidth on those tensors, which is why `IQ4_XS`
-got native kernels: `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with
-2.9 GB of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`. With `IQ4_XS`
-transcoded it sat at ~19.8 GB on device (+21%) and decoded 21% below the
-architecturally identical 3.6-27B (22.6 vs 28.5 tok/s) — the whole gap
-was transcode bytes. Native `IQ4_XS` brings it to 18.4 GiB peak and
-26.4 tok/s; the remaining ~7% is the ~0.4 GB that still transcodes plus
-the retuned weights' own dtype mix. `F16`/`F32` matmul tensors go
+`IQ3_S` is the only one with its own modules: the IQ4_XS kernel sources
+have their codebook words `#ifndef`-guarded, and `quant::iq3_s::
+kernel_source` compiles them a second time with `{−15,−13,…,15}`. All
+three used to transcode to `Q8_0` (8.5 bpw, and lossy for `Q3_K`).
+
+Why it matters: `Qwen3.8-27B-UD-Q4_K_XL` is 16.4 GB on disk with 2.9 GB
+of `IQ4_XS` plus ~0.4 GB of `IQ4_NL`/`Q3_K`/`IQ3_S`. With everything
+transcoded to `Q8_0` it sat at ~19.8 GB on device (+21%) and decoded 21%
+below the architecturally identical 3.6-27B (22.6 vs 28.5 tok/s) — the
+whole gap was transcode bytes. Native `IQ4_XS` brought it to 18.4 GiB
+peak / 26.4 tok/s, and relabelling the last three to 17.6 GiB / 26.9
+tok/s; the remaining ~6% to 3.6-27B is the retuned weights' own dtype
+mix (more Q5_K/Q6_K). `F16`/`F32` matmul tensors go
 through the `gemm_f16_rows` fallback.
 
 ---
@@ -1046,7 +1052,7 @@ thermally-stable run; see `README.md` for the headline summary.
 | qwen-3.5-27B           |          210       |    187      |  **+12%**|        28.1       |     23.4   |  **+20%**|
 | qwen-3.6-27B           |          211       |    187      |  **+13%**|        28.5       |     23.2   |  **+23%**|
 | qwen-3.6-27B-MTP       |          —         |    —        |    —     |        28.4       |     23.2   |  **+22%**|
-| qwen-3.8-27B           |          189       |     —       |    —     |        26.4       |      —     |    —     |
+| qwen-3.8-27B           |          187       |     —       |    —     |        26.9       |      —     |    —     |
 | gemma4-31B             |          177       |    172      |   **+3%**|        27.5       |     21.0   |  **+31%**|
 | qwen-3.5-35B-MoE       |          820       |    803      |   **+2%**|       101.3       |     78.3   |  **+29%**|
 | qwen-3.6-35B-MoE       |          809       |    802      |   **+1%**|        93.5       |     77.1   |  **+21%**|

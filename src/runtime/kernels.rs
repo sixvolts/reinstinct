@@ -1889,6 +1889,69 @@ mod tests {
             "mmq gemm iq4xs rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
     }
 
+    /// IQ3_S through the same kernels with its codebook substituted: the
+    /// codebook words `kernel_source` emits are the one new thing, and
+    /// they only get checked against real weights here.
+    #[test]
+    fn iq3s_kernels_match_dequant_path() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::iq3_s::{BLOCK_SIZE, BYTES_PER_BLOCK, kernel_source};
+        use crate::quant::half::f32_to_f16;
+
+        let in_dim = 2048usize;
+        let out_dim = 384usize;
+        let total_blocks = out_dim * (in_dim / BLOCK_SIZE);
+        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
+        let mut s: u64 = 0x1A35_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for blk in 0..total_blocks {
+            let off = blk * BYTES_PER_BLOCK;
+            let d = ((blk % 23) as f32 + 1.0) * 0.002;   // d >= 0 as on disk
+            w_bytes[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+            for i in 2..BYTES_PER_BLOCK { w_bytes[off + i] = rng_u8(); }
+        }
+        let mut xs: u64 = 0x9876_FACE;
+        let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                             ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+
+        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
+        crate::quant::iq3_s::dequantize_to_f32(&w_bytes, &mut w_fp32);
+        let mut cpu = vec![0.0f32; out_dim];
+        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
+
+        let packed = crate::quant::iq3_s::repack_for_matvec(&w_bytes, in_dim, out_dim);
+        let gpu = run_repacked_matvec(&cache, "matvec_iq3s_repacked",
+            &kernel_source(MATVEC_IQ4XS_REPACKED_SRC),
+            "matvec_iq4xs_repacked_f32", &packed, &x, in_dim, out_dim).expect("iq3s repacked");
+        let e = rel_l2(&gpu, &cpu);
+        eprintln!("matvec_iq3s_repacked {out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "iq3s repacked rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+
+        let p_rows = 24usize;
+        let xm = mmq_test_x(p_rows, in_dim);
+        let mut cpu_m = vec![0.0f32; p_rows * out_dim];
+        for pr in 0..p_rows {
+            let mut row = vec![0.0f32; out_dim];
+            crate::cpu::ops::matvec(&xm[pr * in_dim..(pr + 1) * in_dim], &w_fp32,
+                                    in_dim, out_dim, &mut row);
+            cpu_m[pr * out_dim..(pr + 1) * out_dim].copy_from_slice(&row);
+        }
+        let gpu = run_mmq_gemm(&cache, "mmq_gemm_iq3s_repacked",
+            &kernel_source(MMQ_GEMM_IQ4XS_REPACKED_SRC),
+            "mmq_gemm_iq4xs_repacked_f32", &packed, &xm, p_rows, in_dim, out_dim)
+            .expect("mmq gemm iq3s");
+        let e = rel_l2(&gpu, &cpu_m);
+        eprintln!("mmq_gemm_iq3s_repacked {p_rows}x{out_dim}x{in_dim}: rel_l2={e:.3e}");
+        assert!(e < DP4A_REL_L2_MAX,
+            "mmq gemm iq3s rel_l2 {e:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+    }
+
     /// Q4_0 across all three paths it can take — repacked matvec
     /// (decode), on-disk dp4a matvec (a Q4_0 token_embd doubling as the
     /// tied LM head, which cannot be repacked), and the MMQ GEMM

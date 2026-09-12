@@ -47,10 +47,15 @@
 // IQ4_NL / IQ4_XS codebook — the 16 int8 values a nibble indexes, packed
 // four per 32-bit word (little-endian): entries 0-3, 4-7, 8-11, 12-15.
 //   {-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113}
+// Overridable: IQ3_S repacks into this same layout with the codebook
+// {-15,-13,...,15} and compiles this source with the four words
+// predefined (quant::iq3_s::kernel_source).
+#ifndef IQ4NL_KV_0_3
 #define IQ4NL_KV_0_3   0xbfad9881u
 #define IQ4NL_KV_4_7   0xf6eaddcfu
 #define IQ4NL_KV_8_11  0x26190d01u
 #define IQ4NL_KV_12_15 0x71594535u
+#endif
 
 // Map 4 nibbles (one per byte of `n4`, masked to 0x0F0F0F0F) to 4 int8
 // codebook values packed for sdot4 — in registers, via v_perm_b32.

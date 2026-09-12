@@ -10,10 +10,13 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-__constant__ int8_t IQ4NL_KV[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10,
-       1,   13,  25,  38,  53,  69,  89, 113,
-};
+// Overridable — IQ3_S compiles this source with its own table
+// (quant::iq3_s::kernel_source).
+#ifndef IQ4NL_KV_TABLE
+#define IQ4NL_KV_TABLE { -127, -104, -83, -65, -49, -35, -22, -10, \
+                            1,   13,  25,  38,  53,  69,  89, 113 }
+#endif
+__constant__ int8_t IQ4NL_KV[16] = IQ4NL_KV_TABLE;
 
 extern "C" __global__
 void dequant_iq4xs_repacked_f16(const unsigned char* __restrict__ slab,

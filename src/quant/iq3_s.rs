@@ -11,10 +11,13 @@
 //! bytes in 1..15, and the sign bits flip them. Per 32-weight sub-block
 //! `db = d * (1 + 2 * scale4)`, so `w = db * ±grid_byte`.
 //!
-//! That last line is why this transcodes to Q8_0 exactly: a sub-block is
-//! 32 weights sharing one scale, each a signed value in -15..15 — which is
-//! a Q8_0 block term for term, with `d = db` and `q = ±grid_byte`. Only
-//! `db` moves, by one fp16 rounding. See [`transcode_to_q8_0`].
+//! That last line is what makes it repackable at 4.5 bpw: a sub-block is
+//! 32 weights sharing one scale, each an odd value in -15..15 — sixteen
+//! possible values, i.e. a nibble through the codebook
+//! `{-15,-13,...,13,15}` (`KVALUES_IQ3S`, `v = 2n - 15`). So it takes the
+//! repacked IQ4_XS layout (nibble plane + fp16 scale per 32) and the
+//! IQ4_XS kernels compiled with this codebook in place of IQ4_NL's
+//! (`kernel_source`). Only `db` moves, by one fp16 rounding.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -158,26 +161,58 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Transcode IQ3_S bytes into the equivalent Q8_0 bytes — a relabelling,
-/// not a requantization. Each 32-weight sub-block already IS a Q8_0
-/// block: one scale, 32 signed small ints. Only the scale is rounded, to
-/// fp16, ~2⁻¹¹ relative. Costs 3.44 → 8.5 bpw on the tensors involved,
-/// and buys the full repacked-int8 kernel set (matvec, batched, MMQ).
-pub fn transcode_to_q8_0(bytes: &[u8], n_weights: usize) -> Vec<u8> {
+/// The sixteen values an IQ3_S weight can take, indexed by the repacked
+/// nibble: `KVALUES_IQ3S[n] = 2n - 15`.
+pub const KVALUES_IQ3S: [i8; 16] =
+    [-15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15];
+
+/// The IQ4_XS kernel sources with the codebook swapped for
+/// [`KVALUES_IQ3S`]. The kernels read it as four little-endian words of
+/// four int8 (the `v_perm_b32` lookup) and, in the dequant kernel, as a
+/// brace-initialised table; both are `#ifndef`-guarded so predefining
+/// them here is all it takes.
+pub fn kernel_source(iq4xs_source: &str) -> String {
+    let word = |i: usize| -> u32 {
+        u32::from_le_bytes([KVALUES_IQ3S[i] as u8, KVALUES_IQ3S[i + 1] as u8,
+                            KVALUES_IQ3S[i + 2] as u8, KVALUES_IQ3S[i + 3] as u8])
+    };
+    let table: Vec<String> = KVALUES_IQ3S.iter().map(|v| v.to_string()).collect();
+    format!("#define IQ4NL_KV_0_3   {:#010x}u\n#define IQ4NL_KV_4_7   {:#010x}u\n\
+             #define IQ4NL_KV_8_11  {:#010x}u\n#define IQ4NL_KV_12_15 {:#010x}u\n\
+             #define IQ4NL_KV_TABLE {{ {} }}\n{}",
+            word(0), word(4), word(8), word(12), table.join(", "), iq4xs_source)
+}
+
+/// Repack an IQ3_S matvec weight `[out_dim, in_dim]` into the repacked
+/// IQ4_XS layout (`iq4_xs::repack_for_matvec`): per 32-weight sub-block
+/// 16 nibble bytes (weight `k` low, `k+16` high, nibble `(v + 15) / 2`)
+/// and one fp16 `db`. 3.44 bpw on disk becomes 4.5 on device, against
+/// 8.5 for the Q8_0 relabel this replaces. Consumed by the IQ4_XS
+/// kernels built from [`kernel_source`]; tagged `GgmlType::IQ3_S`.
+pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8> {
     use crate::quant::half::f32_to_f16;
-    use crate::quant::q8_0::{BlockQ8_0, BYTES_PER_BLOCK as Q8_BYTES};
-    assert_eq!(n_weights % BLOCK_SIZE, 0);
-    let n_blocks = n_weights / BLOCK_SIZE;
-    assert!(bytes.len() >= n_blocks * BYTES_PER_BLOCK);
+    use crate::quant::iq4_xs::repacked_n_sub_padded;
+    assert_eq!(in_dim % BLOCK_SIZE, 0, "IQ3_S in_dim must be a multiple of 256");
+    let n_blocks = in_dim / BLOCK_SIZE;
+    let nsp      = repacked_n_sub_padded(in_dim);
+    let nib_len  = out_dim * nsp * 16;
+    let mut out  = vec![0u8; nib_len + out_dim * nsp * 2];
     let blocks: &[BlockIQ3_S] =
-        bytemuck::cast_slice(&bytes[..n_blocks * BYTES_PER_BLOCK]);
-    let mut out = vec![0u8; n_weights / 32 * Q8_BYTES];
-    let dst: &mut [BlockQ8_0] = bytemuck::cast_slice_mut(&mut out);
-    for (bi, b) in blocks.iter().enumerate() {
-        for (s, (db, vals)) in sub_blocks(b).iter().enumerate() {
-            let o = &mut dst[bi * 8 + s];
-            o.d = f32_to_f16(*db);   // db >= 0 by construction: d*(1+2*s4) with d>=0
-            o.qs = *vals;
+        bytemuck::cast_slice(&bytes[..out_dim * n_blocks * BYTES_PER_BLOCK]);
+    for row in 0..out_dim {
+        for blk in 0..n_blocks {
+            let b = &blocks[row * n_blocks + blk];
+            for (s, (db, vals)) in sub_blocks(b).iter().enumerate() {
+                let sb = blk * 8 + s;
+                let dst_nib = (row * nsp + sb) * 16;
+                for k in 0..16 {
+                    let lo = ((vals[k] as i32 + 15) / 2) as u8;
+                    let hi = ((vals[k + 16] as i32 + 15) / 2) as u8;
+                    out[dst_nib + k] = lo | (hi << 4);
+                }
+                let dst_d = nib_len + (row * nsp + sb) * 2;
+                out[dst_d..dst_d + 2].copy_from_slice(&f32_to_f16(*db).to_le_bytes());
+            }
         }
     }
     out
@@ -188,29 +223,53 @@ mod tests {
     use super::*;
     use crate::quant::half::f32_to_f16;
 
+    /// Reading the repacked planes back through the kernels' index
+    /// arithmetic (nibble `k` low / `k+16` high, `KVALUES_IQ3S`, fp16
+    /// scale) must reproduce the direct dequant to the fp16 rounding of
+    /// `db`. Also pins the codebook words `kernel_source` emits.
     #[test]
-    fn transcode_matches_direct_dequant() {
-        const N: usize = 48;
+    fn repack_matches_direct_dequant() {
+        use crate::quant::iq4_xs::repacked_n_sub_padded;
+        let in_dim = 512usize;    // 16 sub-blocks -> pow2 -> nsp = 17
+        let out_dim = 3usize;
+        let n_blocks = in_dim / BLOCK_SIZE;
+        let nsp = repacked_n_sub_padded(in_dim);
         let mut seed: u64 = 0x1A35_0000;
         let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                            (seed >> 56) as u8 };
-        let mut bytes = vec![0u8; N * BYTES_PER_BLOCK];
-        for b in 0..N {
+        let mut bytes = vec![0u8; out_dim * n_blocks * BYTES_PER_BLOCK];
+        for b in 0..out_dim * n_blocks {
             let off = b * BYTES_PER_BLOCK;
             let d = 10f32.powi(b as i32 % 4 - 2) * (1.0 + b as f32 / 48.0);
             bytes[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
             for i in 2..BYTES_PER_BLOCK { bytes[off + i] = rng(); }
         }
-        let n = N * BLOCK_SIZE;
-        let mut direct = vec![0.0f32; n];
+        let mut direct = vec![0.0f32; out_dim * in_dim];
         dequantize_to_f32(&bytes, &mut direct);
-        let q8 = transcode_to_q8_0(&bytes, n);
-        let mut via = vec![0.0f32; n];
-        crate::quant::q8_0::dequantize_to_f32(&q8, &mut via);
+
+        let packed = repack_for_matvec(&bytes, in_dim, out_dim);
+        let nib_len = out_dim * nsp * 16;
         let mut max_rel = 0.0f32;
-        for (a, b) in direct.iter().zip(&via) {
-            max_rel = max_rel.max((a - b).abs() / a.abs().max(1e-30));
+        for row in 0..out_dim {
+            for sb in 0..in_dim / 32 {
+                let nib = &packed[(row * nsp + sb) * 16..][..16];
+                let d_off = nib_len + (row * nsp + sb) * 2;
+                let db = f16_to_f32(u16::from_le_bytes([packed[d_off], packed[d_off + 1]]));
+                for k in 0..16 {
+                    let lo = db * KVALUES_IQ3S[(nib[k] & 0x0F) as usize] as f32;
+                    let hi = db * KVALUES_IQ3S[(nib[k] >> 4) as usize] as f32;
+                    let a = direct[row * in_dim + sb * 32 + k];
+                    let b = direct[row * in_dim + sb * 32 + k + 16];
+                    max_rel = max_rel.max((lo - a).abs() / a.abs().max(1e-30));
+                    max_rel = max_rel.max((hi - b).abs() / b.abs().max(1e-30));
+                }
+            }
         }
-        assert!(max_rel < 5e-4, "iq3_s transcode max_rel {max_rel:.3e}");
+        assert!(max_rel < 5e-4, "iq3_s repack max_rel {max_rel:.3e}");
+
+        let src = kernel_source("");
+        assert!(src.contains("#define IQ4NL_KV_0_3   0xf7f5f3f1u"), "{src}");
+        assert!(src.contains("#define IQ4NL_KV_12_15 0x0f0d0b09u"), "{src}");
+        assert!(src.contains("IQ4NL_KV_TABLE { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 }"), "{src}");
     }
 }

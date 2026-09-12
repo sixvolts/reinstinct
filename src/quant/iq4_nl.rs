@@ -6,9 +6,11 @@
 //!
 //! `w = d * KVALUES[nibble]`; byte `k` holds weight `k` (low) and `k+16`
 //! (high). It is IQ4_XS without the per-sub-block 6-bit scale — the same
-//! codebook, one fp16 scale per 32 — so, like IQ4_XS, it maps onto Q8_0
-//! exactly: `d` stays `d`, `q` becomes the codebook value (which spans
-//! -127..113 and fits int8). Nothing is even rounded here.
+//! codebook, one fp16 scale per 32. That makes it a *subset* of the
+//! repacked IQ4_XS layout (`iq4_xs::repack_for_matvec`: a nibble plane
+//! and one fp16 scale per 32-weight sub-block): the nibbles copy across
+//! verbatim and `d` is the sub-block scale as-is. Nothing is rounded, and
+//! the tensor runs on the IQ4_XS kernels tagged as `IQ4_XS`.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -42,22 +44,26 @@ pub fn dequantize_to_f32(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Transcode IQ4_NL bytes into the equivalent Q8_0 bytes. Bit-exact: the
-/// scale is copied and the codebook values already are int8.
-pub fn transcode_to_q8_0(bytes: &[u8], n_weights: usize) -> Vec<u8> {
-    use crate::quant::q8_0::{BlockQ8_0, BYTES_PER_BLOCK as Q8_BYTES};
-    assert_eq!(n_weights % BLOCK_SIZE, 0);
-    let n_blocks = n_weights / BLOCK_SIZE;
-    assert!(bytes.len() >= n_blocks * BYTES_PER_BLOCK);
+/// Repack an IQ4_NL matvec weight `[out_dim, in_dim]` into the repacked
+/// IQ4_XS layout, bit for bit: the 16 nibble bytes per block copy across
+/// and `d` is the per-sub-block fp16 scale. The result is consumed by the
+/// IQ4_XS kernels, so callers tag it `GgmlType::IQ4_XS`.
+pub fn repack_for_matvec(bytes: &[u8], in_dim: usize, out_dim: usize) -> Vec<u8> {
+    use crate::quant::iq4_xs::repacked_n_sub_padded;
+    assert_eq!(in_dim % BLOCK_SIZE, 0, "IQ4_NL in_dim must be a multiple of 32");
+    let n_sub   = in_dim / BLOCK_SIZE;
+    let nsp     = repacked_n_sub_padded(in_dim);
+    let nib_len = out_dim * nsp * 16;
+    let mut out = vec![0u8; nib_len + out_dim * nsp * 2];
     let blocks: &[BlockIQ4_NL] =
-        bytemuck::cast_slice(&bytes[..n_blocks * BYTES_PER_BLOCK]);
-    let mut out = vec![0u8; n_blocks * Q8_BYTES];
-    let dst: &mut [BlockQ8_0] = bytemuck::cast_slice_mut(&mut out);
-    for (b, o) in blocks.iter().zip(dst.iter_mut()) {
-        o.d = b.d;
-        for k in 0..16 {
-            o.qs[k]      = KVALUES_IQ4NL[(b.qs[k] & 0x0F) as usize];
-            o.qs[k + 16] = KVALUES_IQ4NL[(b.qs[k] >> 4)   as usize];
+        bytemuck::cast_slice(&bytes[..out_dim * n_sub * BYTES_PER_BLOCK]);
+    for row in 0..out_dim {
+        for sb in 0..n_sub {
+            let b = &blocks[row * n_sub + sb];
+            let dst_nib = (row * nsp + sb) * 16;
+            out[dst_nib..dst_nib + 16].copy_from_slice(&b.qs);
+            let dst_d = nib_len + (row * nsp + sb) * 2;
+            out[dst_d..dst_d + 2].copy_from_slice(&b.d.to_le_bytes());
         }
     }
     out
@@ -68,24 +74,45 @@ mod tests {
     use super::*;
     use crate::quant::half::f32_to_f16;
 
+    /// Reading the repacked planes back through the IQ4_XS kernels' index
+    /// arithmetic (nibble `k` low / `k+16` high, codebook, fp16 scale)
+    /// must reproduce the direct dequant exactly — nothing is rounded.
     #[test]
-    fn transcode_is_bit_exact_against_dequant() {
-        const N: usize = 64;
+    fn repack_is_bit_exact_against_dequant() {
+        use crate::quant::iq4_xs::repacked_n_sub_padded;
+        let in_dim = 128usize;     // 4 sub-blocks -> pow2 -> nsp = 5
+        let out_dim = 3usize;
+        let n_sub = in_dim / BLOCK_SIZE;
+        let nsp = repacked_n_sub_padded(in_dim);
+        assert_eq!(nsp, 5);
         let mut seed: u64 = 0x1A4A_1000;
         let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                            (seed >> 56) as u8 };
-        let mut bytes = vec![0u8; N * BYTES_PER_BLOCK];
-        for b in 0..N {
+        let mut bytes = vec![0u8; out_dim * n_sub * BYTES_PER_BLOCK];
+        for b in 0..out_dim * n_sub {
             let off = b * BYTES_PER_BLOCK;
             bytes[off..off + 2].copy_from_slice(
-                &f32_to_f16(0.01 * (b as f32 - 30.0)).to_le_bytes());
+                &f32_to_f16(0.01 * (b as f32 - 5.0)).to_le_bytes());
             for i in 2..BYTES_PER_BLOCK { bytes[off + i] = rng(); }
         }
-        let n = N * BLOCK_SIZE;
-        let mut direct = vec![0.0f32; n];
+        let mut direct = vec![0.0f32; out_dim * in_dim];
         dequantize_to_f32(&bytes, &mut direct);
-        let mut via = vec![0.0f32; n];
-        crate::quant::q8_0::dequantize_to_f32(&transcode_to_q8_0(&bytes, n), &mut via);
-        assert_eq!(direct, via, "iq4_nl -> q8_0 must be bit-exact");
+
+        let packed = repack_for_matvec(&bytes, in_dim, out_dim);
+        let nib_len = out_dim * nsp * 16;
+        assert_eq!(packed.len(), nib_len + out_dim * nsp * 2);
+        for row in 0..out_dim {
+            for sb in 0..n_sub {
+                let nib = &packed[(row * nsp + sb) * 16..][..16];
+                let d_off = nib_len + (row * nsp + sb) * 2;
+                let d = f16_to_f32(u16::from_le_bytes([packed[d_off], packed[d_off + 1]]));
+                for k in 0..16 {
+                    let lo = d * KVALUES_IQ4NL[(nib[k] & 0x0F) as usize] as f32;
+                    let hi = d * KVALUES_IQ4NL[(nib[k] >> 4) as usize] as f32;
+                    assert_eq!(lo, direct[row * in_dim + sb * 32 + k]);
+                    assert_eq!(hi, direct[row * in_dim + sb * 32 + k + 16]);
+                }
+            }
+        }
     }
 }

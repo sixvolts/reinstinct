@@ -9,13 +9,15 @@
 //! 16 sub-blocks of 16 weights. Per-weight: `w = d * (sc - 32) * (q3 - 4)`
 //! with `q3` in 0..7 and `sc` in 0..63.
 //!
-//! Unlike IQ3_S / IQ4_NL there is no exact Q8_0 transcode: a Q8_0 block is
-//! 32 weights under one scale, and a Q3_K block pairs two 16-weight
-//! sub-blocks with independent scales. The loader dequantizes and
-//! requantizes to Q8_0 instead (`q8_0::quantize_from_f32`). That is not
-//! exact, but requantizing a 3-bit source at 8 bits per 32-block loses
-//! nothing measurable: the Q8_0 step is <=1/254 of the block's peak, far
-//! inside the source's own quantization error.
+//! A Q3_K block relabels **exactly** onto a Q6_K block: both are 256
+//! weights in sixteen 16-weight sub-blocks with a signed integer scale
+//! per sub-block and one fp16 `d`. Q6_K is `w = d * sc6 * (q6 - 32)` with
+//! `sc6` int8 and `q6` in 0..63, so `sc6 = sc - 32` (range -32..31) and
+//! `q6 = q3 + 28` (range 28..35) reproduce every weight term for term —
+//! the same three factors, in the same order, so it is bit-exact. The
+//! loader does that (`transcode_to_q6_k`) and hands the result to the
+//! Q6_K repack + kernels: 6.56 bpw on device instead of the 8.5 of a Q8_0
+//! requantization, and no rounding at all.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -54,6 +56,65 @@ fn unpack_scales(scales: &[u8; 12]) -> [i8; 16] {
     for (i, w) in aux.iter().enumerate() {
         for (j, b) in w.to_le_bytes().iter().enumerate() {
             out[i * 4 + j] = *b as i8;
+        }
+    }
+    out
+}
+
+/// The 256 3-bit quants of a block in weight order, each in 0..7 (the
+/// stored value; the weight is `d * (sc - 32) * (q3 - 4)`). Same walk as
+/// `dequantize_to_f32`, without the scale.
+fn unpack_quants(b: &BlockQ3_K) -> [u8; 256] {
+    let mut q = [0u8; 256];
+    let mut y = 0usize;
+    let mut m: u8 = 1;
+    for n in (0..BLOCK_SIZE).step_by(128) {
+        let qs = &b.qs[n / 4..n / 4 + 32];
+        let mut shift = 0u32;
+        for _ in 0..4 {
+            for l in 0..32 {
+                let lo = (qs[l] >> shift) & 3;
+                let hi = if b.hmask[l] & m != 0 { 4 } else { 0 };
+                q[y] = lo | hi;
+                y += 1;
+            }
+            shift += 2;
+            m <<= 1;
+        }
+    }
+    q
+}
+
+/// Relabel Q3_K bytes as the equivalent Q6_K bytes — exact, see the
+/// module doc. Sub-block `i` (weights `16i..16i+16`) takes scale
+/// `sc[i] - 32` in both formats; the quants are packed into Q6_K's
+/// `ql`/`qh` split the way `q6_k::dequantize_to_f32` reads them.
+pub fn transcode_to_q6_k(bytes: &[u8], n_weights: usize) -> Vec<u8> {
+    use crate::quant::q6_k::{BlockQ6_K, BYTES_PER_BLOCK as Q6_BYTES};
+    assert_eq!(n_weights % BLOCK_SIZE, 0);
+    let n_blocks = n_weights / BLOCK_SIZE;
+    assert!(bytes.len() >= n_blocks * BYTES_PER_BLOCK);
+    let blocks: &[BlockQ3_K] =
+        bytemuck::cast_slice(&bytes[..n_blocks * BYTES_PER_BLOCK]);
+    let mut out = vec![0u8; n_blocks * Q6_BYTES];
+    let dst: &mut [BlockQ6_K] = bytemuck::cast_slice_mut(&mut out);
+    for (b, o) in blocks.iter().zip(dst.iter_mut()) {
+        o.d = b.d;
+        for (i, sc) in unpack_scales(&b.scales).iter().enumerate() {
+            o.scales[i] = (*sc as i32 - 32) as i8;
+        }
+        let q3 = unpack_quants(b);
+        for chunk in 0..2 {
+            let (ql_off, qh_off, y_off) = (chunk * 64, chunk * 32, chunk * 128);
+            for l in 0..32 {
+                let q1 = q3[y_off + l]      + 28;
+                let q2 = q3[y_off + l + 32] + 28;
+                let q3_ = q3[y_off + l + 64] + 28;
+                let q4 = q3[y_off + l + 96] + 28;
+                o.ql[ql_off + l]      = (q1 & 0x0F) | ((q3_ & 0x0F) << 4);
+                o.ql[ql_off + l + 32] = (q2 & 0x0F) | ((q4 & 0x0F) << 4);
+                o.qh[qh_off + l] = (q1 >> 4) | ((q2 >> 4) << 2) | ((q3_ >> 4) << 4) | ((q4 >> 4) << 6);
+            }
         }
     }
     out
@@ -126,9 +187,10 @@ mod tests {
         assert!(out.iter().all(|v| *v == 0.0));
     }
 
-    /// Requantizing to Q8_0 must stay inside the source's own precision.
+    /// The Q6_K relabel must reproduce the direct dequant bit for bit —
+    /// same `d`, same integer scale and quant, same operation order.
     #[test]
-    fn requantize_to_q8_0_is_within_source_error() {
+    fn transcode_to_q6_k_is_bit_exact() {
         const N: usize = 32;
         let mut seed: u64 = 0x0A3E_0000;
         let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -143,19 +205,9 @@ mod tests {
         let n = N * BLOCK_SIZE;
         let mut direct = vec![0.0f32; n];
         dequantize_to_f32(&bytes, &mut direct);
-        let q8 = crate::quant::q8_0::quantize_from_f32(&direct);
+        let q6 = transcode_to_q6_k(&bytes, n);
         let mut via = vec![0.0f32; n];
-        crate::quant::q8_0::dequantize_to_f32(&q8, &mut via);
-        // Per 32-block the Q8_0 step is peak/127. Rounding contributes
-        // half a step; the scale being stored as fp16 adds up to
-        // 127 * 2^-11 ~ 0.06 of a step on the largest |q|. Bound at 0.6.
-        for (blk, (a, b)) in direct.chunks(32).zip(via.chunks(32)).enumerate() {
-            let peak = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let step = peak / 127.0;
-            for (x, y) in a.iter().zip(b) {
-                assert!((x - y).abs() <= step * 0.6 + 1e-7,
-                    "block {blk}: |{x} - {y}| exceeds 0.6 of a Q8_0 step ({step})");
-            }
-        }
+        crate::quant::q6_k::dequantize_to_f32(&q6, &mut via);
+        assert_eq!(direct, via, "q3_k -> q6_k must be bit-exact");
     }
 }
