@@ -190,7 +190,6 @@ pub struct PrefillGemm {
     deq_q5k:   Module,
     deq_q6k:   Module,
     deq_q8_0:  Module,
-    deq_iq4xs: Module,
     deq_q4_0:  Module,
     deq_q4_0_repacked: Module,
     deq_iq4xs_repacked: Module,
@@ -235,8 +234,6 @@ impl PrefillGemm {
                            include_str!("../../kernels/dequant_q6_k_f16.cpp"))?)?,
             deq_q8_0:  Module::load(&cache.compile("dequant_q8_0_f16",
                            include_str!("../../kernels/dequant_q8_0_f16.cpp"))?)?,
-            deq_iq4xs: Module::load(&cache.compile("dequant_iq4_xs_f16",
-                           include_str!("../../kernels/dequant_iq4_xs_f16.cpp"))?)?,
             deq_q4_0:  Module::load(&cache.compile("dequant_q4_0_f16",
                            include_str!("../../kernels/dequant_q4_0_f16.cpp"))?)?,
             deq_q4_0_repacked: Module::load(&cache.compile("dequant_q4_0_repacked_f16",
@@ -294,7 +291,6 @@ impl PrefillGemm {
             GgmlType::Q5_K   => (&self.deq_q5k,   "dequant_q5_k_f16",   256, 256),
             GgmlType::Q6_K   => (&self.deq_q6k,   "dequant_q6_k_f16",   256, 256),
             GgmlType::Q8_0   => (&self.deq_q8_0,  "dequant_q8_0_f16",    32,  32),
-            GgmlType::IQ4_XS => (&self.deq_iq4xs, "dequant_iq4_xs_f16", 256, 256),
             o => return Err(format!("PrefillGemm: unsupported weight dtype {o:?}")),
         })
     }

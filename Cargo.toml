@@ -10,7 +10,7 @@ license = "Apache-2.0"
 memmap2 = "0.9"
 # Safe casting between byte slices and POD block structs
 bytemuck = { version = "1.20", features = ["derive"] }
-# Runtime dlopen of libamdhip64.so / librocblas.so
+# Runtime dlopen of libamdhip64.so
 libloading = "0.8"
 # Library error types
 thiserror = "2.0"

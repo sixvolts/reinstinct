@@ -303,7 +303,7 @@ pub struct MoeBlock {
 }
 
 /// Per-prefill-call scratch for the grouped-expert GEMM MoE path
-/// (`REINSTINCT_MOE_GROUPED`). Mirrors qwen35's `MoeRuntime` sort fields.
+/// (default; `REINSTINCT_MOE_NO_GROUPED` opts out). Mirrors qwen35's `MoeRuntime` sort fields.
 /// Pooled so the first prefill at each P warms the allocator and
 /// subsequent prefills capture the kernel chain into a HIP graph
 /// (hipMalloc is forbidden inside `Graph::begin_capture`).
@@ -867,7 +867,7 @@ pub struct GpuGemma4 {
     m_moe_geglu:   Module,
     m_moe_geglu_q8: Module,
     m_moe_combine: Module,
-    /// Grouped-expert GEMM modules (MoE prefill, `REINSTINCT_MOE_GROUPED`).
+    /// Grouped-expert GEMM modules (MoE prefill; `REINSTINCT_MOE_NO_GROUPED` opts out).
     m_expert_sort: Module,
     m_grouped_q6k: Module,
     m_grouped_q8_0: Module,
@@ -2718,7 +2718,7 @@ impl GpuGemma4 {
         let pf_act      = self.pool_f32.take(cw * nu_a * ff_a)?;
         let pf_dn       = self.pool_f32.take(cw * nu_a * h)?;
         let pf_xq8_e    = self.pool_u8.take(cw * nu_a * (ff_a / 32) * 40)?;
-        // Grouped-expert GEMM scratch (REINSTINCT_MOE_GROUPED path).
+        // Grouped-expert GEMM scratch (grouped MoE prefill path).
         let gs = MoeGroupedScratch {
             count:  self.pool_i32.take(ne_a)?,
             cursor: self.pool_i32.take(ne_a)?,

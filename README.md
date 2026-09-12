@@ -52,7 +52,7 @@ reinstinct wins **10 of 10** tested configurations.
 | Qwen 3.6 35B-A3B MoE | **809** | 802 | **+1%** |
 | Gemma 4 26B-A4B MoE | **768** | 621 | **+24%** |
 
-2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0) drives the dense
+2D-tiled int8 MMQ GEMM (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS) drives the dense
 prefill wins; a grouped-expert GEMM that gathers tokens by router
 choice drives the MoE wins.
 
@@ -98,6 +98,9 @@ the drafter is likely to land.
 - **Q8 KV cache**: INT8 key/value cache with dp4a FlashAttention (default)
 - **SuperQuant tiered KV cache**: Opt-in 2-tier (int8 + turbo3) cache that extends context capacity ~1.7× vs int8 / ~3.3× vs fp16. Capacity feature, not a perf feature — trade ~30% decode tok/s for room to attend over longer contexts. Gemma 4 only today; see [docs/SUPERQUANT.md](docs/SUPERQUANT.md).
 - **MTP speculative decoding**: Multi-Token Prediction with per-request control
+- **DFlash block-diffusion drafting**: Gemma 4 31B with its DFlash drafter, runtime-sized blocks (`dflash-gen`)
+- **Multi-GPU pipeline parallelism**: split a dense Qwen 3.x model's layers across cards (`--gpus 0,1`) — Qwen3.8-27B at Q8 on two MI50s at 95% of the two-card bandwidth roofline; prefill micro-batched so both cards work at once
+- **Every Unsloth UD-XL tensor type loads at its real size**: IQ4_XS native kernels (v_perm codebook), IQ4_NL / IQ3_S / Q3_K relabelled onto layouts with kernels, BF16 requantized to Q8_0 — nothing widens to F32
 - **OpenAI-compatible serve endpoint**: /v1/chat/completions with streaming, logprobs, prefix cache
 - **HIP graph capture**: Entire decode step as a single GPU submission
 - **Fused kernels**: RMSNorm+projection, RoPE+KV write, SwiGLU, dequant+GEMV, attention

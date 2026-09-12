@@ -152,12 +152,14 @@ about GPU execution; `serve/` knows nothing about kernels.
 also tried in fallback order). All HIP calls go through `libloading::Library`
 symbol lookups. The binary itself depends only on system glibc and Rust's
 runtime. This was a deliberate choice: ROCm versioning is a moving
-target, and a build that links rocBLAS against ROCm 6.4 won't run on a
-machine with ROCm 7.2 installed. The dlopen route makes one binary work
-across ROCm 5.7 / 6.x / 7.x.
+target, and a build that links against ROCm 6.4 won't run on a machine
+with ROCm 7.2 installed. The dlopen route makes one binary work across
+ROCm 5.7 / 6.x / 7.x.
 
-`rocBLAS` is also dlopened lazily — only the prefill HGEMM path
-imports it.
+There is no rocBLAS dependency at all any more: ROCm 7.x distro builds
+ship no gfx906 Tensile kernels and abort on handle creation, so the
+fp16 GEMM fallback is the engine's own `gemm_f16_rows` kernel and every
+quantized GEMM is the hand-written MMQ path.
 
 ### Kernel build pipeline
 

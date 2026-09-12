@@ -4,7 +4,6 @@
 //! ROCm 5.7 / 6.x / 7.x runtime that exposes `libamdhip64.so`.
 
 pub mod sys;
-pub mod rocblas;
 
 use std::ffi::{CString, c_char, c_void};
 use std::marker::PhantomData;
@@ -56,6 +55,22 @@ pub fn mem_info() -> Result<(usize, usize)> {
     let (mut free, mut total) = (0usize, 0usize);
     unsafe { ck(api, (api.mem_get_info)(&mut free, &mut total), "hipMemGetInfo")?; }
     Ok((free, total))
+}
+
+/// Stream-ordered copy of `bytes` from `src` on device `src_dev` to `dst`
+/// on device `dst_dev` — the direct PCIe/xGMI path when peer access is
+/// enabled between the two, a host bounce otherwise. Asynchronous on
+/// `stream`, which must belong to one of the two devices. Raw pointers
+/// because the producer of a pipeline handoff only publishes its
+/// activation's address, not a `DeviceBuf`.
+pub unsafe fn memcpy_peer_async(dst: *mut c_void, dst_dev: HipDevice,
+                                src: *const c_void, src_dev: HipDevice,
+                                bytes: usize, stream: &Stream) -> Result<()> {
+    let api = hip().map_err(|s| s.to_string())?;
+    unsafe {
+        ck(api, (api.memcpy_peer_async)(dst, dst_dev, src, src_dev, bytes, stream.raw),
+           "hipMemcpyPeerAsync")
+    }
 }
 
 /// RAII handle to a HIP device. Setting it switches the runtime's active
@@ -212,26 +227,6 @@ impl<T: Copy> DeviceBuf<T> {
                                         count * std::mem::size_of::<T>(),
                                         HipMemcpyKind::DeviceToDevice, stream.raw),
                "hipMemcpyAsync D2D range")
-        }
-    }
-
-    /// Stream-ordered copy of `count` elements from `src`, which lives on
-    /// device `src_dev`, into the start of `self` on device `dst_dev`.
-    /// The direct PCIe/xGMI path when peer access is enabled between the
-    /// two, a host bounce otherwise — either way asynchronous on `stream`,
-    /// which must belong to one of the two devices.
-    pub fn copy_from_peer_async(&self, dst_dev: HipDevice, src: &DeviceBuf<T>,
-                                src_dev: HipDevice, count: usize, stream: &Stream)
-        -> Result<()>
-    {
-        assert!(count <= src.len && count <= self.len,
-                "copy_from_peer_async: count {count} exceeds src {} / dst {}", src.len, self.len);
-        let api = hip().map_err(|s| s.to_string())?;
-        unsafe {
-            ck(api, (api.memcpy_peer_async)(self.ptr as *mut c_void, dst_dev,
-                                            src.ptr as *const c_void, src_dev,
-                                            count * std::mem::size_of::<T>(), stream.raw),
-               "hipMemcpyPeerAsync")
         }
     }
 

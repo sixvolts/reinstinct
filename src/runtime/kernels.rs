@@ -29,8 +29,6 @@ const MATVEC_Q6_K_KERNEL: &str = "matvec_q6_k_f32";
 const MATVEC_Q5_K_SOURCE: &str = include_str!("../../kernels/matvec_q5_k.cpp");
 const MATVEC_Q5_K_KERNEL: &str = "matvec_q5_k_f32";
 
-const MATVEC_IQ4_XS_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs.cpp");
-const MATVEC_IQ4_XS_KERNEL: &str = "matvec_iq4_xs_f32";
 
 const QUANTIZE_Q8_SOURCE:   &str = include_str!("../../kernels/quantize_q8.cpp");
 // Q4_0 kernel sources. The runtime compiles these from gemma4.rs /
@@ -619,52 +617,6 @@ pub fn swiglu_mul_f32(cache: &KernelCache, gate: &[f32], up: &[f32]) -> Result<V
     hip::Device(0).synchronize()?;
 
     let mut out = vec![0.0f32; n];
-    dy.copy_to_host(&mut out)?;
-    Ok(out)
-}
-
-/// Fused IQ4_XS dequant + GEMV. 136 bytes per super-block; quants are
-/// 4-bit indices into a fixed 16-entry non-uniform codebook
-/// (KVALUES_IQ4NL), with per-sub-block 6-bit scale.
-pub fn matvec_iq4_xs_f32(cache: &KernelCache, w_bytes: &[u8], x: &[f32],
-                         in_dim: usize, out_dim: usize) -> Result<Vec<f32>, String>
-{
-    use crate::quant::iq4_xs::{BLOCK_SIZE, BYTES_PER_BLOCK};
-    assert_eq!(in_dim % BLOCK_SIZE, 0, "in_dim must be a multiple of {}", BLOCK_SIZE);
-    let n_blocks = in_dim / BLOCK_SIZE;
-    let expect_bytes = out_dim * n_blocks * BYTES_PER_BLOCK;
-    assert_eq!(w_bytes.len(), expect_bytes,
-        "w_bytes len {} != expected {} ({}*{}*{})",
-        w_bytes.len(), expect_bytes, out_dim, n_blocks, BYTES_PER_BLOCK);
-    assert_eq!(x.len(), in_dim);
-
-    let hsaco = cache.compile("matvec_iq4_xs", MATVEC_IQ4_XS_SOURCE)?;
-    let module = Module::load(&hsaco)?;
-    let f = module.function(MATVEC_IQ4_XS_KERNEL)?;
-
-    let dw: DeviceBuf<u8>  = DeviceBuf::from_slice(w_bytes)?;
-    let dx: DeviceBuf<f32> = DeviceBuf::from_slice(x)?;
-    let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim)?;
-
-    let block: u32 = 256;
-    let grid: u32 = out_dim as u32;
-    let mut w_ptr = dw.raw_ptr();
-    let mut x_ptr = dx.raw_ptr();
-    let mut y_ptr = dy.raw_ptr();
-    let mut in_arg = in_dim as u32;
-    let mut out_arg = out_dim as u32;
-    let mut args: [*mut c_void; 5] = [
-        &mut w_ptr   as *mut _ as *mut c_void,
-        &mut x_ptr   as *mut _ as *mut c_void,
-        &mut y_ptr   as *mut _ as *mut c_void,
-        &mut in_arg  as *mut _ as *mut c_void,
-        &mut out_arg as *mut _ as *mut c_void,
-    ];
-    let smem_bytes = block * std::mem::size_of::<f32>() as u32;
-    unsafe { f.launch((grid, 1, 1), (block, 1, 1), smem_bytes, None, &mut args)?; }
-    hip::Device(0).synchronize()?;
-
-    let mut out = vec![0.0f32; out_dim];
     dy.copy_to_host(&mut out)?;
     Ok(out)
 }
@@ -1524,62 +1476,6 @@ mod tests {
             assert!(d < 1e-5 || r < 1e-5,
                 "swiglu[{i}]: gpu {} cpu {} diff {d:.3e}", gpu[i], cpu[i]);
         }
-    }
-
-    #[test]
-    fn matvec_iq4_xs_matches_dequant_path() {
-        let Some(cache) = skip_if_no_gpu() else { return };
-        use crate::quant::iq4_xs::{BLOCK_SIZE, BYTES_PER_BLOCK};
-        use crate::quant::half::f32_to_f16;
-
-        let in_dim = 2048usize;
-        let out_dim = 384usize;
-        let n_blocks_per_row = in_dim / BLOCK_SIZE;
-        let total_blocks = out_dim * n_blocks_per_row;
-        let mut w_bytes = vec![0u8; total_blocks * BYTES_PER_BLOCK];
-
-        let mut s: u64 = 0xBEAD_F00D_C0DE;
-        let mut rng_u8 = || -> u8 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (s >> 56) as u8
-        };
-
-        for blk in 0..total_blocks {
-            let off = blk * BYTES_PER_BLOCK;
-            let d = ((blk % 23) as f32 - 11.0) * 0.005;
-            w_bytes[off..off+2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
-            // scales_h: u16 — random
-            w_bytes[off+2] = rng_u8();
-            w_bytes[off+3] = rng_u8();
-            // scales_l: 4 bytes
-            for i in 0..4   { w_bytes[off + 4 + i] = rng_u8(); }
-            // qs: 128 bytes of nibble pairs
-            for i in 0..128 { w_bytes[off + 8 + i] = rng_u8(); }
-        }
-
-        let mut x_seed: u64 = 0x9876_FACE;
-        let mut x_rng = || { x_seed = x_seed.wrapping_mul(6364136223846793005)
-                                            .wrapping_add(1442695040888963407);
-                             ((x_seed >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
-        let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
-
-        let mut w_fp32 = vec![0.0f32; out_dim * in_dim];
-        crate::quant::iq4_xs::dequantize_to_f32(&w_bytes, &mut w_fp32);
-        let mut cpu = vec![0.0f32; out_dim];
-        crate::cpu::ops::matvec(&x, &w_fp32, in_dim, out_dim, &mut cpu);
-
-        let gpu = matvec_iq4_xs_f32(&cache, &w_bytes, &x, in_dim, out_dim).expect("gpu iq4_xs matvec");
-
-        let mut max_abs = 0.0_f32;
-        let mut max_rel = 0.0_f32;
-        for j in 0..out_dim {
-            let d = (gpu[j] - cpu[j]).abs();
-            let r = d / cpu[j].abs().max(1e-8);
-            if d > max_abs { max_abs = d; }
-            if r > max_rel { max_rel = r; }
-        }
-        eprintln!("matvec_iq4_xs {out_dim}x{in_dim}: max_abs={max_abs:.3e} max_rel={max_rel:.3e}");
-        assert!(max_rel < 5e-4, "matvec_iq4_xs max_rel {max_rel:.3e} exceeds 5e-4");
     }
 
     #[test]
@@ -2929,25 +2825,7 @@ rel_l2 {e:.3e} too large");
             check_bulk_dequant(&cache, "dequant_q8_0_f16",
                 include_str!("../../kernels/dequant_q8_0_f16.cpp"), "dequant_q8_0_f16",
                 &w, 32, 32, &cpu);
-        }
-        // IQ4_XS — 256 w / 136 B.
-        {
-            let n_blocks = 64;
-            let bpb = crate::quant::iq4_xs::BYTES_PER_BLOCK;
-            let mut w = vec![0u8; n_blocks * bpb];
-            for b in w.iter_mut() { *b = rng_u8(); }
-            for blk in 0..n_blocks {
-                let off = blk * bpb;
-                w[off..off+2].copy_from_slice(
-                    &crate::quant::half::f32_to_f16(0.005).to_le_bytes());
-            }
-            let mut cpu = vec![0.0f32; n_blocks * 256];
-            crate::quant::iq4_xs::dequantize_to_f32(&w, &mut cpu);
-            check_bulk_dequant(&cache, "dequant_iq4_xs_f16",
-                include_str!("../../kernels/dequant_iq4_xs_f16.cpp"), "dequant_iq4_xs_f16",
-                &w, 256, 256, &cpu);
-        }
-    }
+        }    }
 
     #[test]
     fn rmsnorm_handles_unit_weight() {

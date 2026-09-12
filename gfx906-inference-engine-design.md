@@ -1,3 +1,9 @@
+> **Historical design document.** The original plan for the engine;
+> several choices here were later reversed (rocBLAS for the prefill GEMM
+> — removed when ROCm 7.x dropped gfx906 kernels; single-GPU by
+> construction — now pipelined). `docs/ARCHITECTURE.md` describes what
+> was actually built.
+
 # Custom HIP Inference Engine for AMD MI50/MI60 (gfx906)
 ## Design and Feasibility Reference
 

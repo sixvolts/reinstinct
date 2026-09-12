@@ -16,6 +16,7 @@ pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod dflash;
 pub mod spec_decode;
+#[cfg(test)]
 pub mod smoke;
 pub mod kv_turbo3;
 pub mod kv_superquant;

@@ -1,3 +1,9 @@
+> **Historical.** This is the June 2026 snapshot written for moving the
+> project off its original machine. It predates the rocBLAS removal, the
+> DFlash port, native IQ/Q3_K loading and multi-GPU pipelining; the
+> current state is in `MANUAL.md` (commands, models, performance) and
+> `docs/`. Kept for the trace-dataset provenance in the rsync notes.
+
 # Handoff — reinstinct (2026-06-09)
 
 Snapshot for moving the project to another machine. Picks up after commit `1afa1a9`.

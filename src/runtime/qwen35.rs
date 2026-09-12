@@ -86,7 +86,6 @@ const DEQUANT_Q4_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q4_k_
 const DEQUANT_Q5_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q5_k_f16.cpp");
 const DEQUANT_Q6_K_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q6_k_f16.cpp");
 const DEQUANT_Q8_0_F16_SOURCE:  &str = include_str!("../../kernels/dequant_q8_0_f16.cpp");
-const DEQUANT_IQ4_XS_F16_SOURCE:&str = include_str!("../../kernels/dequant_iq4_xs_f16.cpp");
 const DEQUANT_Q4_0_REPACKED_F16_SOURCE: &str =
     include_str!("../../kernels/dequant_q4_0_repacked_f16.cpp");
 const DEQUANT_IQ4XS_REPACKED_F16_SOURCE: &str =
@@ -155,8 +154,6 @@ const MATVEC_Q4_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q4_
 const MATVEC_Q5_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q5_k_wave64.cpp");
 const MATVEC_Q6_K_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q6_k_wave64.cpp");
 const MATVEC_Q8_0_WAVE64_SOURCE:   &str = include_str!("../../kernels/matvec_q8_0_wave64.cpp");
-const MATVEC_IQ4_XS_WAVE64_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs_wave64.cpp");
-const MATVEC_IQ4_XS_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_iq4_xs_dp4a.cpp");
 const MATVEC_F16_WAVE64_SOURCE:    &str = include_str!("../../kernels/matvec_f16_wave64.cpp");
 
 /// A weight tensor used as the W matrix in a `y = W·x` matvec, resident on
@@ -1157,8 +1154,6 @@ pub struct GpuQwen35 {
     matvec_q5_k_wave64_module:   Module,
     matvec_q6_k_wave64_module:   Module,
     matvec_q8_0_wave64_module:   Module,
-    matvec_iq4_xs_wave64_module: Module,
-    matvec_iq4_xs_dp4a_module: Module,
     matvec_f16_wave64_module:    Module,
 
     // int8 dp4a matvec: quantize the activation once, then v_dot4_i32_i8.
@@ -1197,7 +1192,6 @@ pub struct GpuQwen35 {
     dequant_q5_k_module:   Module,
     dequant_q6_k_module:   Module,
     dequant_q8_0_module:   Module,
-    dequant_iq4_xs_module: Module,
     dequant_q4k_repacked_module: Module,
     dequant_q4_0_repacked_module: Module,
     dequant_iq4xs_repacked_module: Module,
@@ -1404,8 +1398,6 @@ impl GpuQwen35 {
         let matvec_q5_k_wave64_hsaco   = cache.compile("matvec_q5_k_wave64",   MATVEC_Q5_K_WAVE64_SOURCE)?;
         let matvec_q6_k_wave64_hsaco   = cache.compile("matvec_q6_k_wave64",   MATVEC_Q6_K_WAVE64_SOURCE)?;
         let matvec_q8_0_wave64_hsaco   = cache.compile("matvec_q8_0_wave64",   MATVEC_Q8_0_WAVE64_SOURCE)?;
-        let matvec_iq4_xs_wave64_hsaco = cache.compile("matvec_iq4_xs_wave64", MATVEC_IQ4_XS_WAVE64_SOURCE)?;
-        let matvec_iq4_xs_dp4a_hsaco = cache.compile("matvec_iq4_xs_dp4a", MATVEC_IQ4_XS_DP4A_SOURCE)?;
         let matvec_f16_wave64_hsaco    = cache.compile("matvec_f16_wave64",    MATVEC_F16_WAVE64_SOURCE)?;
         let quantize_q8_hsaco      = cache.compile("quantize_q8",      QUANTIZE_Q8_SOURCE)?;
         let matvec_q4_k_dp4a_hsaco = cache.compile("matvec_q4_k_dp4a", MATVEC_Q4_K_DP4A_SOURCE)?;
@@ -1504,7 +1496,6 @@ impl GpuQwen35 {
             dequant_q5_k_module:      Module::load(&cache.compile("dequant_q5_k_f16", DEQUANT_Q5_K_F16_SOURCE)?)?,
             dequant_q6_k_module:      Module::load(&cache.compile("dequant_q6_k_f16", DEQUANT_Q6_K_F16_SOURCE)?)?,
             dequant_q8_0_module:      Module::load(&cache.compile("dequant_q8_0_f16", DEQUANT_Q8_0_F16_SOURCE)?)?,
-            dequant_iq4_xs_module:    Module::load(&cache.compile("dequant_iq4_xs_f16", DEQUANT_IQ4_XS_F16_SOURCE)?)?,
             dequant_q4k_repacked_module: Module::load(&cache.compile(
                 "dequant_q4k_repacked_f16", DEQUANT_Q4K_REPACKED_F16_SOURCE)?)?,
             dequant_q4_0_repacked_module: Module::load(&cache.compile(
@@ -1534,8 +1525,6 @@ impl GpuQwen35 {
             matvec_q5_k_wave64_module:   Module::load(&matvec_q5_k_wave64_hsaco)?,
             matvec_q6_k_wave64_module:   Module::load(&matvec_q6_k_wave64_hsaco)?,
             matvec_q8_0_wave64_module:   Module::load(&matvec_q8_0_wave64_hsaco)?,
-            matvec_iq4_xs_wave64_module: Module::load(&matvec_iq4_xs_wave64_hsaco)?,
-            matvec_iq4_xs_dp4a_module: Module::load(&matvec_iq4_xs_dp4a_hsaco)?,
             matvec_f16_wave64_module:    Module::load(&matvec_f16_wave64_hsaco)?,
             quantize_q8_module:      Module::load(&quantize_q8_hsaco)?,
             matvec_q4_k_dp4a_module: Module::load(&matvec_q4_k_dp4a_hsaco)?,
@@ -2002,18 +1991,17 @@ impl GpuQwen35 {
 
         let dp4a = self.dp4a_enabled
             && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
-                               | GgmlType::Q6_K | GgmlType::Q8_0
-                               | GgmlType::IQ4_XS);
+                               | GgmlType::Q6_K | GgmlType::Q8_0);
         if dp4a {
             self.launch_quantize_q8(x, in_d)?;
             // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
-            // others: 64-thread, 2 rows per wavefront. IQ4_XS shares the
-            // 64-thread/1-row layout of matvec_iq4_xs_wave64_f32.
+            // others: 64-thread, 2 rows per wavefront. These are the
+            // on-disk-layout kernels; only `token_embd` (which doubles as
+            // the tied output projection) still reaches them.
             let (module, kname, rows, block) = match w.dtype {
                 GgmlType::Q4_K   => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
                 GgmlType::Q5_K   => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
                 GgmlType::Q6_K   => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
-                GgmlType::IQ4_XS => (&self.matvec_iq4_xs_dp4a_module, "matvec_iq4_xs_dp4a_f32", 1u32, 64),
                 _                => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
             };
             let f = module.function(kname)?;
@@ -2043,8 +2031,6 @@ impl GpuQwen35 {
                                     "matvec_q5_k_wave64_f32", wp, x, y, in_d, out_d),
             GgmlType::Q6_K   => self.launch_matvec_wave64(&self.matvec_q6_k_wave64_module,
                                     "matvec_q6_k_wave64_f32", wp, x, y, in_d, out_d),
-            GgmlType::IQ4_XS => self.launch_matvec_wave64(&self.matvec_iq4_xs_wave64_module,
-                                    "matvec_iq4_xs_wave64_f32", wp, x, y, in_d, out_d),
             // F16 weights are the tiny GDN projections (ssm_alpha/beta,
             // out_dim = n_v_heads). wave64's one-wavefront-per-row leaves
             // the GPU starved at that size; the block-256 kernel gives 4×
@@ -2058,7 +2044,8 @@ impl GpuQwen35 {
             other => Err(format!(
                 "qwen35 matvec: no kernel for {other:?} (weight shape [{in_d}×{out_d}]). \
                  Likely a UD-mix dtype on a matmul tensor. \
-                 Supported: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS (dp4a).")),
+                 Supported: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0 (on-disk layout); \
+                 every repacked dtype via the repacked kernels.")),
         }
     }
 
@@ -3524,12 +3511,9 @@ impl GpuQwen35 {
         -> Result<(), String>
     {
         self.stream.wait_event(&prev.done)?;
-        let api = hip::sys::hip().map_err(|s| s.to_string())?;
-        let e = unsafe { (api.memcpy_peer_async)(
-            dst, self.stage.dev, prev.act as *const c_void, prev.dev,
-            count * std::mem::size_of::<f32>(), self.stream.raw()) };
-        if e.is_ok() { Ok(()) } else {
-            Err(format!("hipMemcpyPeerAsync (stage handoff): {}", api.err_str(e)))
+        unsafe {
+            hip::memcpy_peer_async(dst, self.stage.dev, prev.act as *const c_void, prev.dev,
+                                   count * std::mem::size_of::<f32>(), &self.stream)
         }
     }
 
@@ -3655,7 +3639,6 @@ impl GpuQwen35 {
             GgmlType::Q5_K   => (&self.dequant_q5_k_module,   "dequant_q5_k_f16",   256, 256),
             GgmlType::Q6_K   => (&self.dequant_q6_k_module,   "dequant_q6_k_f16",   256, 256),
             GgmlType::Q8_0   => (&self.dequant_q8_0_module,   "dequant_q8_0_f16",    32,  32),
-            GgmlType::IQ4_XS => (&self.dequant_iq4_xs_module, "dequant_iq4_xs_f16", 256, 256),
             other => return Err(format!("dequant_weight: unsupported {other:?}")),
         };
         let n_blocks = (n / wpb) as u32;

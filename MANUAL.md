@@ -306,6 +306,29 @@ batched K-token verify forward) produces the same per-position argmax
 as decoding those K tokens one at a time. Use this to validate the
 batched-verify path before enabling `qwen-mtp-gen`.
 
+### dflash-gen
+
+```
+reinstinct-engine dflash-gen <TARGET> <DRAFTER>
+                  [--prompt <TEXT> | --system <TEXT> --prompt <TEXT>]
+                  [-n <STEPS>] [--mask-token <ID>] [--block-size <N>]
+                  [--verify-width <N>]
+```
+
+Block-diffusion speculative decoding against a Gemma 4 31B target with
+its DFlash drafter (`gemma4-31b-it-dflash-*.gguf`). Each round the
+drafter denoises a block of masked positions in one pass, conditioned
+on hidden states tapped from six target layers; the target verifies
+the block in one batched forward. See `docs/DFLASH_PORT.md` for the
+port and the measured results.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-n`, `--steps <N>` | 64 | Tokens to generate. |
+| `--mask-token <ID>` | GGUF `tokenizer.ggml.mask_token_id` (4) | Mask token the drafter denoises. |
+| `--block-size <N>` | 16 (checkpoint) | Positions the drafter denoises per round, 2..=16. Shrinks the draft as well as the verify; smaller blocks win on compute-bound MI50 (4 measured best). |
+| `--verify-width <N>` | block size | How many of the block's positions the target verifies, 2..=block size. Verify cost is linear in width; acceptance saturates well below 16. |
+
 ### qwen-mtp-gen
 
 ```
@@ -321,6 +344,32 @@ against a plain single-token-decode baseline.
 speculative batching — measured ~0.58× best vs plain decode. Useful for
 correctness comparison and as a reference for porting MTP to other
 backends; not recommended for production throughput.
+
+### align-check
+
+```
+reinstinct-engine align-check <TARGET> <DRAFTER> [--prompt <TEXT>] [--system <TEXT>] [-n <STEPS>]
+```
+
+K=1 acceptance ceiling between any two Gemma 4 models: greedy-decode
+`<TARGET>` for `-n` steps and report how often `<DRAFTER>`'s argmax at
+each position agrees. The upper bound on what speculative decoding can
+accept with that pair, independent of the drafting mechanics.
+
+### dump-traces
+
+```
+reinstinct-engine dump-traces <TARGET> --prompts <JSONL> --out <FILE>
+                  [-n <STEPS>] [--skip <N>] [--limit <N>]
+```
+
+EAGLE-style drafter training data: for each `{"prompt", "seq_id"}` line
+in the JSONL, chat-template and prefill the prompt on the Gemma 4
+target, greedy-decode `-n` tokens, and append `(prev_tok, label_tok,
+hidden_b[H] fp16)` per step — the target's post-output-norm hidden state
+and the next-token label. Resume-safe: completed `seq_id`s in `--out`
+are skipped; `--skip` adds a manual offset and `--limit` caps prompts
+per run (0 = no cap).
 
 ### superquant-bench
 
@@ -750,14 +799,23 @@ serve mode. The serve startup logs WARN if any of them are active.
 
 | Variable | Effect |
 |---|---|
-| `REINSTINCT_NO_GRAPH` | Disable HIP-graph capture/replay for the `gemma4` decode; run per-kernel instead. Required for `REINSTINCT_DECODE_DEBUG`. |
+| `REINSTINCT_NO_GRAPH` | Disable HIP-graph capture/replay for decode (`generate-text` and `serve`, both runtimes); run per-kernel instead. Required for `REINSTINCT_DECODE_DEBUG`. |
 | `REINSTINCT_PREFILL_NO_GRAPH` | Same, for the prefill path (both qwen35 and gemma4). |
 | `REINSTINCT_GEMMA_NO_DP4A` | Force the f32/wave64 matvec instead of the int8 `v_dot4_i32_i8` dp4a path on gemma4. Big perf hit; precision check only. |
-| `REINSTINCT_NO_DP4A_Q4` / `_Q5` / `_Q6` / `_Q8` | Disable the dp4a path for one quant type. |
+| `REINSTINCT_NO_DP4A_Q4_0` / `_Q4` / `_Q5` / `_Q6` / `_Q8` | gemma4 only: disable the dp4a path for one quant type (Q4_0 / Q4_K / Q5_K / Q6_K / Q8_0). |
 | `REINSTINCT_GDN_NO_LDS128` | qwen35 only: opt out of the LDS-resident-state GDN recurrent kernel (head_dim=128 fast path). Falls back to the general HBM-state kernel. |
 | `REINSTINCT_OLD_ATTN` | gemma4 only: legacy single-block attention kernel instead of the split-K FlashDecoding path. |
 | `REINSTINCT_MOE_NO_GROUPED` | Opt out of the grouped-expert MMQ GEMM. Falls back to per-token expert matvecs (~2× slower MoE prefill). |
 | `REINSTINCT_MOE_PROFILE` | Per-stage decode timer (sync-per-lap). Disables graph capture as a side effect — big perf hit. |
+
+### Speculative-decode knobs (Gemma 4 MTP)
+
+| Variable | Effect |
+|---|---|
+| `REINSTINCT_MTP_MIN_ALPHA` | Adaptive-K: turn MTP off for the rest of the request once the rolling accept rate falls below this. `serve` defaults to 0.55; `mtp-gen` to 0 (disabled, for measurement parity). |
+| `REINSTINCT_MTP_WINDOW` | Rounds in the rolling accept-rate window above (default 8). |
+| `REINSTINCT_DRAFTER_P_MIN` | `mtp-gen`: drafter confidence floor — stop drafting a round early once the drafter's top-1 probability drops below it (default 0 = draft the full K). |
+| `REINSTINCT_DRAFTER_NO_BONUS` | Measurement only: on a full accept, do **not** take the target's K+1-th logit as a free bonus token (the literature's plain "advance by K"). |
 
 ### SuperQuant tiered KV cache (opt-in, Gemma 4 live)
 
@@ -1151,9 +1209,9 @@ straight-line implementation:
   K-quant uses a 256-thread / 8-row workgroup (ROWS=2 × 4 waves). A
   ROWS=1 K-quant variant exists for research but isn't dispatched —
   measured tradeoff space favours the default at production shapes.
-  IQ4_XS got the same dp4a treatment (previously fell through to a
-  fp32 wave64 fallback that cost 12% of decode GPU time on qwen 27B;
-  now ~4%).
+  IQ4_XS now repacks into the Q4_0 layout and runs the Q4_0-derived
+  kernels with an in-register codebook (`v_perm_b32`); the earlier
+  on-disk-layout IQ4_XS kernels are gone.
 - int8 KV cache with per-head scale; dp4a Q·Kᵀ, dequant-V P·V.
 - `rmsnorm + add_residual` fused on Gemma 4. Per-layer output scale
   folded into the final fused `rmsnorm_add_scale`. The router weight

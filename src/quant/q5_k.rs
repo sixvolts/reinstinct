@@ -197,8 +197,9 @@ mod tests {
         q4_bytes[0..2].copy_from_slice(&f32_to_f16(2.0).to_le_bytes());
         q4_bytes[2..4].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
         for j in 0..4 {
-            q4_bytes[4 + j]  = (3 & 0x3F) | (((3 >> 4) & 0x3) << 6);
-            q4_bytes[8 + j]  = (4 & 0x3F) | (((4 >> 4) & 0x3) << 6);
+            // 6-bit scale 3 / min 4: low six bits only, high-bit field 0.
+            q4_bytes[4 + j]  = 3;
+            q4_bytes[8 + j]  = 4;
             q4_bytes[12 + j] = (3 & 0x0F) | ((4 & 0x0F) << 4);
         }
         for i in 0..128 {
