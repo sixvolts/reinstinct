@@ -113,3 +113,64 @@ void matvec_q8_0_repacked_r1_f32(const unsigned char* __restrict__ slab,
 {
     mv_q8_0_repacked<1>(slab, xq, y, in_dim, out_dim);
 }
+
+// Split-K variant for tiny out_dim (the GDN ssm_alpha|beta projection is
+// [5120 -> 96]): grid.y splits the sub-blocks into `n_split` ranges so
+// there are n_split x as many waves in flight, each writing a partial
+// row sum into y[blockIdx.y * out_dim + row]; the consumer adds the
+// partials. With 48 workgroups of 2.5 trips this projection was a 16 µs
+// kernel for half a megabyte — pure latency.
+extern "C" __global__
+void matvec_q8_0_repacked_splitk_f32(const unsigned char* __restrict__ slab,
+                                     const BlockQ8*   __restrict__ xq,
+                                     float*           __restrict__ y,
+                                     unsigned int in_dim,
+                                     unsigned int out_dim,
+                                     unsigned int n_split)
+{
+    const unsigned int n_blocks = in_dim >> 5;
+    const unsigned int nsp = ((n_blocks & (n_blocks - 1u)) == 0u)
+                             ? (n_blocks + 1u) : n_blocks;
+    const uint4*    lo_plane = reinterpret_cast<const uint4*>(slab);
+    const uint4*    hi_plane = reinterpret_cast<const uint4*>(slab + (size_t)out_dim * nsp * 16);
+    const uint16_t* d_plane  = reinterpret_cast<const uint16_t*>(
+        slab + (size_t)out_dim * nsp * 32);
+    const unsigned int chunk = (n_blocks + n_split - 1) / n_split;
+    const unsigned int sb_lo = blockIdx.y * chunk;
+    const unsigned int sb_hi = min(sb_lo + chunk, n_blocks);
+    const int row0 = blockIdx.x * 2;
+    const int lane = threadIdx.x;
+    const int rmax = (int)out_dim - 1;
+    float acc[2] = { 0.0f, 0.0f };
+    for (unsigned int sb = sb_lo + lane; sb < sb_hi; sb += 64) {
+        uint4 wlo[2], whi[2]; uint16_t db[2];
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int row = min(row0 + r, rmax);
+            const size_t idx = (size_t)row * nsp + sb;
+            wlo[r] = lo_plane[idx];
+            whi[r] = hi_plane[idx];
+            db[r]  = d_plane[idx];
+        }
+        const BlockQ8* xb = xq + sb;
+        const float dx   = xb->d;
+        const int*  xq32 = reinterpret_cast<const int*>(xb->qs);
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const float dw = __half2float(*reinterpret_cast<const __half*>(&db[r]));
+            const int w[8] = { (int)wlo[r].x, (int)wlo[r].y, (int)wlo[r].z, (int)wlo[r].w,
+                               (int)whi[r].x, (int)whi[r].y, (int)whi[r].z, (int)whi[r].w };
+            int idot = 0;
+            #pragma unroll
+            for (int g = 0; g < 8; g++)
+                idot = __builtin_amdgcn_sdot4(w[g], xq32[g], idot, false);
+            acc[r] += dw * dx * (float)idot;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        float a = wave64_reduce_add_f32(acc[r]);
+        if (lane == 0 && (row0 + r) < (int)out_dim)
+            y[(size_t)blockIdx.y * out_dim + row0 + r] = a;
+    }
+}

@@ -2167,13 +2167,16 @@ mod tests {
                 let mut aa = da.raw_ptr(); let mut ba = db.raw_ptr(); let mut sa = dsa.raw_ptr();
                 let mut ta = ddt.raw_ptr(); let mut st = dstate.raw_ptr(); let mut oa = dout.raw_ptr();
                 let mut nh = n_heads as u32; let mut hd = head_dim as u32; let mut nkh = n_k_heads as u32;
-                let mut args: [*mut c_void; 12] = [
+                let mut np = 1u32; let mut ps = 0u32;
+                let mut args: [*mut c_void; 14] = [
                     &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
                     &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
                     &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
                     &mut ta as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void,
                     &mut oa as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void];
+                    &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void,
+                    &mut np as *mut _ as *mut c_void, &mut ps as *mut _ as *mut c_void];
+                // v1 reads 12 of them; the extra two are harmless trailing args.
                 unsafe { f.launch((n_heads as u32, grid_y, 1), (block, 1, 1), smem, Some(&stream), &mut args).unwrap(); }
             };
             launch(); stream.synchronize().unwrap();

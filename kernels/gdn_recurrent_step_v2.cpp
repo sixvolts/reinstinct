@@ -36,7 +36,9 @@ void gdn_recurrent_step_v2_f32(const float* __restrict__ q_in,    // [n_k_heads,
                                float*       __restrict__ out,     // [n_heads, head_dim]
                                unsigned int n_heads,
                                unsigned int head_dim,
-                               unsigned int n_k_heads)
+                               unsigned int n_k_heads,
+                               unsigned int n_part,      // a_in/b_in are n_part partial sums,
+                               unsigned int part_stride) // part p at + p*part_stride
 {
     extern __shared__ float lds[];                  // q | k (head_dim each) | red[GROUPS][COLS]
     const int h   = blockIdx.x;
@@ -52,8 +54,13 @@ void gdn_recurrent_step_v2_f32(const float* __restrict__ q_in,    // [n_k_heads,
         q_lds[i] = q_in[(size_t)kh * head_dim + i];
         k_lds[i] = k_in[(size_t)kh * head_dim + i];
     }
-    const float dec = __expf(ssm_a[h] * softplus_stable_r(a_in[h] + dt_bias[h]));
-    const float bet = 1.0f / (1.0f + __expf(-b_in[h]));
+    float a_h = 0.0f, b_h = 0.0f;
+    for (unsigned int p = 0; p < n_part; p++) {
+        a_h += a_in[(size_t)p * part_stride + h];
+        b_h += b_in[(size_t)p * part_stride + h];
+    }
+    const float dec = __expf(ssm_a[h] * softplus_stable_r(a_h + dt_bias[h]));
+    const float bet = 1.0f / (1.0f + __expf(-b_h));
     const bool active = vv < head_dim;
     const float vval = active ? v_in[(size_t)h * head_dim + vv] : 0.0f;
     const int R   = (int)head_dim / GROUPS;

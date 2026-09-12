@@ -1336,30 +1336,31 @@ fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow
     println!("  output_norm     {norm:>8.3} ms ({:>4.1}%)", pct(norm));
     println!("  output_proj     {proj:>8.3} ms ({:>4.1}%)", pct(proj));
 
-    // Per-kernel breakdown for one GDN block (block 0). Pick an L block.
-    let lin_idx = m.block_kinds.iter()
-        .position(|k| matches!(k, BlockKind::LinearAttention))
-        .ok_or_else(|| anyhow::anyhow!("no L block"))?;
-    state.reset().map_err(anyhow::Error::msg)?;
-    let trace_iters_gdn = 5usize;
-    let mut sum_kernels: std::collections::BTreeMap<&'static str, f32> =
-        std::collections::BTreeMap::new();
-    let mut order: Vec<&'static str> = Vec::new();
-    for it in 0..trace_iters_gdn {
-        let (_logits, ks) = gpu.forward_token_traced_gdn(token, &mut state, lin_idx)
-            .map_err(anyhow::Error::msg)?;
-        if it == 0 { for (n, _) in &ks { order.push(n); } }
-        for (n, ms) in ks { *sum_kernels.entry(n).or_insert(0.0) += ms; }
+    // Per-kernel breakdown of one block of each kind: the first GDN
+    // block and the first full-attention block.
+    for (kind, label) in [(BlockKind::LinearAttention, "GDN"), (BlockKind::FullAttention, "full-attention")] {
+        let Some(idx) = m.block_kinds.iter().position(|k| *k == kind) else { continue };
         state.reset().map_err(anyhow::Error::msg)?;
+        let trace_iters_blk = 5usize;
+        let mut sum_kernels: std::collections::BTreeMap<&'static str, f32> =
+            std::collections::BTreeMap::new();
+        let mut order: Vec<&'static str> = Vec::new();
+        for it in 0..trace_iters_blk {
+            let (_logits, ks) = gpu.forward_token_traced_block(token, &mut state, idx)
+                .map_err(anyhow::Error::msg)?;
+            if it == 0 { for (n, _) in &ks { order.push(n); } }
+            for (n, ms) in ks { *sum_kernels.entry(n).or_insert(0.0) += ms; }
+            state.reset().map_err(anyhow::Error::msg)?;
+        }
+        let total_blk: f32 = sum_kernels.values().sum::<f32>() / trace_iters_blk as f32;
+        println!("\n--- one {label} block kernel breakdown ({trace_iters_blk} iters, ms each) ---");
+        println!("  block index = {idx}");
+        for n in &order {
+            let avg = sum_kernels[n] / trace_iters_blk as f32;
+            println!("  {n:<22} {avg:>7.4} ms ({:>4.1}%)", 100.0 * avg / total_blk);
+        }
+        println!("  {:<22} {total_blk:>7.4} ms (sum of kernels in one block)", "TOTAL");
     }
-    let total_gdn: f32 = sum_kernels.values().sum::<f32>() / trace_iters_gdn as f32;
-    println!("\n--- one GDN block kernel breakdown ({} iters, ms each) ---", trace_iters_gdn);
-    println!("  block index = {lin_idx} (L)");
-    for n in &order {
-        let avg = sum_kernels[n] / trace_iters_gdn as f32;
-        println!("  {n:<22} {avg:>7.4} ms ({:>4.1}%)", 100.0 * avg / total_gdn);
-    }
-    println!("  {:<22} {total_gdn:>7.4} ms (sum of GDN kernels in one block)", "TOTAL");
 
     // HIP graph capture: capture the full forward chain once at pos=0
     // for this token, then time hipGraphLaunch + sync + D2H per call.

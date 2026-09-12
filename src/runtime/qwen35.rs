@@ -121,6 +121,8 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Must match the BN
 /// the grouped-GEMM kernel is compiled with (mmq_gemm_q4k_grouped.cpp).
 const MOE_GEMM_BN: u32 = 16;
+/// Split-K partials for the GDN alpha|beta projection (`gdn_ab_project`).
+const AB_SPLIT: u32 = 4;
 const MATVEC_Q4_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q4_k_dp4a.cpp");
 const MATVEC_Q5_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q5_k_dp4a.cpp");
 const MATVEC_Q6_K_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q6_k_dp4a.cpp");
@@ -1215,6 +1217,9 @@ pub struct GpuQwen35 {
     /// [2 * gdn_n_heads]: the ssm_alpha | ssm_beta projections in one
     /// launch when the two share a dtype (`GpuLinAttnWeights::ssm_ab`).
     gdn_ab:  DeviceBuf<f32>,
+    /// [AB_SPLIT][2 * gdn_n_heads]: split-K partials of the same when
+    /// the weight is repacked Q8_0; the recurrent kernel sums them.
+    gdn_ab_part: DeviceBuf<f32>,
     matvec_q5k_repacked_module: Module,
     matvec_q6k_repacked_module: Module,
     /// K=2..4 batched K-quant matvec — the spec-decode verify path.
@@ -1576,6 +1581,7 @@ impl GpuQwen35 {
             fused_module: Module::load(&cache.compile("qwen35_fused", QWEN35_FUSED_SOURCE)?)?,
             normed:  DeviceBuf::new(hidden.max(ffn))?,
             gdn_ab:  DeviceBuf::new(2 * gdn_n_heads)?,
+            gdn_ab_part: DeviceBuf::new(AB_SPLIT as usize * 2 * gdn_n_heads)?,
             matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
             matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
             matvec_q4k_batched_module: Module::load(&matvec_q4k_batched_hsaco)?,
@@ -2364,11 +2370,57 @@ impl GpuQwen35 {
 
 
     #[allow(clippy::too_many_arguments)]
+    /// The ssm_alpha | ssm_beta projection of `normed` (already in
+    /// `self.xq8`). Returns `(a_ptr, b_ptr, n_part, part_stride)` for the
+    /// recurrent kernel: a fused [hidden, 2*n_heads] weight goes through
+    /// one launch — split-K with AB_SPLIT partials when it is repacked
+    /// Q8_0, whose 96-row matvec is otherwise pure latency — and the
+    /// unfused pair through two.
+    fn gdn_ab_project(&self, w: &GpuLinAttnWeights, normed: *mut c_void)
+        -> Result<(*mut c_void, *mut c_void, u32, u32), String>
+    {
+        let nh = self.gdn_n_heads;
+        match &w.ssm_ab {
+            Some(ab) if ab.repacked && ab.dtype == GgmlType::Q8_0 && self.dp4a_enabled => {
+                self.launch_matvec_q8_0_splitk(ab, self.gdn_ab_part.raw_ptr(), AB_SPLIT)?;
+                let base = self.gdn_ab_part.raw_ptr() as *mut f32;
+                Ok((base as *mut c_void, unsafe { base.add(nh) } as *mut c_void, AB_SPLIT, 2 * nh as u32))
+            }
+            Some(ab) => {
+                self.launch_matvec_prequant(ab, normed, self.gdn_ab.raw_ptr())?;
+                let base = self.gdn_ab.raw_ptr() as *mut f32;
+                Ok((base as *mut c_void, unsafe { base.add(nh) } as *mut c_void, 1, 0))
+            }
+            None => {
+                self.launch_matvec_prequant(&w.ssm_alpha, normed, self.gdn_a.raw_ptr())?;
+                self.launch_matvec_prequant(&w.ssm_beta,  normed, self.gdn_b.raw_ptr())?;
+                Ok((self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr(), 1, 0))
+            }
+        }
+    }
+
+    /// Repacked-Q8_0 matvec on `self.xq8` writing `n_split` partial row
+    /// sums to `y[split * out_dim + row]`.
+    fn launch_matvec_q8_0_splitk(&self, w: &GpuMatvecTensor, y: *mut c_void, n_split: u32)
+        -> Result<(), String>
+    {
+        let f = self.matvec_q8_0_repacked_module.function("matvec_q8_0_repacked_splitk_f32")?;
+        let mut wa = w.data.raw_ptr(); let mut xa = self.xq8.raw_ptr(); let mut ya = y;
+        let mut ia = w.in_dim; let mut oa = w.out_dim; let mut ns = n_split;
+        let mut args: [*mut c_void; 6] = [
+            &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+        unsafe { f.launch(((w.out_dim + 1) / 2, n_split, 1), (64, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn launch_gdn_recurrent_step_fused(&self,
         q: *mut c_void, k: *mut c_void, v: *mut c_void,
         a: *mut c_void, b: *mut c_void, ssm_a: *mut c_void, dt_bias: *mut c_void,
         state: *mut c_void, out: *mut c_void,
-        n_heads: u32, head_dim: u32, n_k_heads: u32) -> Result<(), String>
+        n_heads: u32, head_dim: u32, n_k_heads: u32,
+        n_part: u32, part_stride: u32) -> Result<(), String>
     {
         let f = self.gdn_recurrent_step_fused_module.function("gdn_recurrent_step_v2_f32")?;
         // v2 (kernels/gdn_recurrent_step_v2.cpp): 32-column slabs x 8
@@ -2385,7 +2437,8 @@ impl GpuQwen35 {
         let mut aa = a; let mut ba = b; let mut sma = ssm_a; let mut dta = dt_bias;
         let mut sa = state; let mut oa = out;
         let mut nh = n_heads; let mut hd = head_dim; let mut nkh = n_k_heads;
-        let mut args: [*mut c_void; 12] = [
+        let mut np = n_part; let mut ps = part_stride;
+        let mut args: [*mut c_void; 14] = [
             &mut qa  as *mut _ as *mut c_void,
             &mut ka  as *mut _ as *mut c_void,
             &mut va  as *mut _ as *mut c_void,
@@ -2398,6 +2451,8 @@ impl GpuQwen35 {
             &mut nh  as *mut _ as *mut c_void,
             &mut hd  as *mut _ as *mut c_void,
             &mut nkh as *mut _ as *mut c_void,
+            &mut np  as *mut _ as *mut c_void,
+            &mut ps  as *mut _ as *mut c_void,
         ];
         unsafe { f.launch((n_heads, grid_y, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
@@ -3406,8 +3461,8 @@ impl GpuQwen35 {
     /// chosen linear-attention block is bracketed with HIP events.
     /// Returns (logits, list of (name, ms) pairs) for the block at
     /// `traced_block_idx`. Other blocks run normally.
-    pub fn forward_token_traced_gdn(&self, token: u32, state: &mut Qwen35GpuState,
-                                    traced_block_idx: usize)
+    pub fn forward_token_traced_block(&self, token: u32, state: &mut Qwen35GpuState,
+                                      traced_block_idx: usize)
         -> Result<(Vec<f32>, Vec<(&'static str, f32)>), String>
     {
         assert_eq!(state.block_states.len(), self.blocks.len());
@@ -3421,8 +3476,8 @@ impl GpuQwen35 {
         self.set_pos(state.pos)?;
         self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
 
-        // Walk blocks, but for `traced_block_idx` (which must be a Linear
-        // block) we expand the chain manually with events between kernels.
+        // Walk blocks, but for `traced_block_idx` we expand the block's
+        // decode chain manually with events between kernels.
         let mut traced_events: Vec<(&'static str, Event, Event)> = Vec::new();
         for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
             if i != traced_block_idx {
@@ -3440,12 +3495,6 @@ impl GpuQwen35 {
                 continue;
             }
 
-            // Traced block — must be Linear.
-            let (w, lstate) = match (block, st) {
-                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => (w, s),
-                _ => return Err("traced block must be LinearAttention".into()),
-            };
-
             // Helper: wrap a closure in HIP events and append to the trace.
             macro_rules! traced {
                 ($name:expr, $body:expr) => {{
@@ -3460,26 +3509,39 @@ impl GpuQwen35 {
             // previous block's FFN output is not pending here: the
             // untraced blocks above complete their residual add.
             let normed = self.normed.raw_ptr();
+            let (post_norm, ffn) = match (block, st) {
+                (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
+                    assert!(kv.len < kv.max_seq, "KV cache full");
+                    let q_dim = self.q_dim() as u32;
+                    let scaling = (self.head_dim as f32).powf(-0.5);
+                    traced!("add_rmsnorm_q8", self.launch_add_rmsnorm_q8(self.hidden_a.raw_ptr(), None,
+                        w.attn.attn_norm.raw_ptr(), h_dim, self.rms_eps));
+                    traced!("matvec_attn_q", self.launch_matvec_prequant(&w.attn.attn_q, normed, self.q_raw.raw_ptr()));
+                    traced!("matvec_attn_k", self.launch_matvec_prequant(&w.attn.attn_k, normed, self.k_raw.raw_ptr()));
+                    traced!("matvec_attn_v", self.launch_matvec_prequant(&w.attn.attn_v, normed, self.v_raw.raw_ptr()));
+                    traced!("q_split_norm_rope", self.launch_q_split_norm_rope(self.q_raw.raw_ptr(),
+                        self.q_buf.raw_ptr(), self.gate_buf.raw_ptr(), w.attn.attn_q_norm.raw_ptr()));
+                    traced!("k_norm_rope_kv_write", self.launch_k_norm_rope_kv_write(self.k_raw.raw_ptr(),
+                        self.v_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr()));
+                    traced!("attn_step", self.launch_attn_step(self.q_buf.raw_ptr(), kv.k.raw_ptr(),
+                        kv.v.raw_ptr(), self.attn_concat.raw_ptr(), scaling));
+                    traced!("sigmoid_mul_q8", self.launch_sigmoid_mul_q8(self.attn_concat.raw_ptr(),
+                        self.gate_buf.raw_ptr(), q_dim));
+                    traced!("matvec_attn_output", self.launch_matvec_prequant(&w.attn.attn_output,
+                        self.attn_concat.raw_ptr(), self.hidden_b.raw_ptr()));
+                    kv.len += 1;
+                    (&w.post_norm, &w.ffn)
+                }
+                (GpuBlock::Linear(w), GpuBlockState::Linear(lstate)) => {
             traced!("add_rmsnorm_q8", self.launch_add_rmsnorm_q8(self.hidden_a.raw_ptr(), None,
                 w.attn.attn_norm.raw_ptr(), h_dim, self.rms_eps));
             traced!("matvec_attn_qkv", self.launch_matvec_prequant(&w.attn.attn_qkv,
                 normed, self.gdn_qkv.raw_ptr()));
             traced!("matvec_attn_gate", self.launch_matvec_prequant(&w.attn.attn_gate,
                 normed, self.gdn_z.raw_ptr()));
-            let (a_ptr, b_ptr) = match &w.attn.ssm_ab {
-                Some(ab) => {
-                    traced!("matvec_ssm_ab", self.launch_matvec_prequant(ab, normed, self.gdn_ab.raw_ptr()));
-                    let base = self.gdn_ab.raw_ptr() as *mut f32;
-                    (base as *mut c_void, unsafe { base.add(self.gdn_n_heads) } as *mut c_void)
-                }
-                None => {
-                    traced!("matvec_ssm_alpha", self.launch_matvec_prequant(&w.attn.ssm_alpha,
-                        normed, self.gdn_a.raw_ptr()));
-                    traced!("matvec_ssm_beta", self.launch_matvec_prequant(&w.attn.ssm_beta,
-                        normed, self.gdn_b.raw_ptr()));
-                    (self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr())
-                }
-            };
+            let mut ab = (std::ptr::null_mut(), std::ptr::null_mut(), 0u32, 0u32);
+            traced!("matvec_ssm_ab", (|| { ab = self.gdn_ab_project(&w.attn, normed)?; Ok::<(), String>(()) })());
+            let (a_ptr, b_ptr, n_part, part_stride) = ab;
             let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
             let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_key_dim) } as *mut c_void;
             traced!("conv1d_l2norm", self.launch_conv1d_l2norm(self.gdn_qkv.raw_ptr(),
@@ -3489,15 +3551,19 @@ impl GpuQwen35 {
                 self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr, a_ptr, b_ptr,
                 w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
                 lstate.recurrent.raw_ptr(), self.gdn_core_out.raw_ptr(),
-                n_heads, head_dim, n_k_heads));
+                n_heads, head_dim, n_k_heads, n_part, part_stride));
             traced!("rmsnorm_gated_q8", self.launch_rmsnorm_gated_q8(
                 self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
                 w.attn.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr()));
             traced!("matvec_ssm_out", self.launch_matvec_prequant(&w.attn.ssm_out,
                 self.gdn_core_out.raw_ptr(), self.hidden_b.raw_ptr()));
+                    (&w.post_norm, &w.ffn)
+                }
+                _ => return Err("block kind mismatch".into()),
+            };
             traced!("post_add_rmsnorm_q8", self.launch_add_rmsnorm_q8(self.hidden_a.raw_ptr(),
-                Some(self.hidden_b.raw_ptr()), w.post_norm.raw_ptr(), h_dim, self.rms_eps));
-            match &w.ffn {
+                Some(self.hidden_b.raw_ptr()), post_norm.raw_ptr(), h_dim, self.rms_eps));
+            match ffn {
                 BlockFfn::Dense(d) => {
                     let f = self.ffn as u32;
                     traced!("ffn_gate", self.launch_matvec_prequant(&d.gate, normed, self.ffn_a.raw_ptr()));
@@ -4524,18 +4590,7 @@ impl GpuQwen35 {
         //    launch when they share a dtype.
         self.launch_matvec_prequant(&weights.attn_qkv,  normed, self.gdn_qkv.raw_ptr())?;
         self.launch_matvec_prequant(&weights.attn_gate, normed, self.gdn_z.raw_ptr())?;
-        let (a_ptr, b_ptr) = match &weights.ssm_ab {
-            Some(ab) => {
-                self.launch_matvec_prequant(ab, normed, self.gdn_ab.raw_ptr())?;
-                let base = self.gdn_ab.raw_ptr() as *mut f32;
-                (base as *mut c_void, unsafe { base.add(self.gdn_n_heads) } as *mut c_void)
-            }
-            None => {
-                self.launch_matvec_prequant(&weights.ssm_alpha, normed, self.gdn_a.raw_ptr())?;
-                self.launch_matvec_prequant(&weights.ssm_beta,  normed, self.gdn_b.raw_ptr())?;
-                (self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr())
-            }
-        };
+        let (a_ptr, b_ptr, n_part, part_stride) = self.gdn_ab_project(weights, normed)?;
 
         // 3) Causal Conv1D + SiLU over [Q | K | V], with the per-head
         //    L2 norms of Q (scale 1/√head_dim) and K fused; V stays in
@@ -4553,7 +4608,7 @@ impl GpuQwen35 {
                                              weights.ssm_a.raw_ptr(), weights.ssm_dt_bias.raw_ptr(),
                                              state.recurrent.raw_ptr(),
                                              self.gdn_core_out.raw_ptr(),
-                                             n_heads, head_dim, n_k_heads)?;
+                                             n_heads, head_dim, n_k_heads, n_part, part_stride)?;
 
         // 5) Per-head gated RMSNorm (core_out *= w * silu(z)), quantised
         //    for the out projection.
