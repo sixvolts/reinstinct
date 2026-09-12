@@ -2017,6 +2017,114 @@ mod tests {
         }
     }
 
+    /// Decode-side matvec bandwidth per dtype at the 27B's projection
+    /// shapes: bytes of the repacked weight streamed per launch, timed
+    /// with HIP events over 50 launches. Run with `--ignored --nocapture`.
+    /// The ceiling to compare against is hip-info's kernel-read figure
+    /// (~830 GB/s on an MI50).
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_matvec_repacked_kernels() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::{q4_0, q4_k, q5_k, q6_k, q8_0, iq4_xs};
+        let shapes: [(usize, usize); 6] = [(5120, 17408), (17408, 5120), (5120, 8192),
+                                           (8192, 5120), (5120, 16384), (5120, 1024)];
+        let mut s: u64 = 0x3A7C_0001;
+        let mut rng_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let stream = hip::Stream::new().unwrap();
+        // (label, compile name, source, kernel, rows per workgroup, block)
+        // (label, kernel file stem, kernel, rows per workgroup, block).
+        // Sources are read from disk (`kernels/`, or
+        // `REINSTINCT_MMQ_BENCH_SRC_DIR`) so a kernel edit re-benches
+        // without rebuilding the test binary.
+        let kinds: [(&str, &str, &str, u32, u32); 6] = [
+            ("q4_0",  "matvec_q4_0_repacked",  "matvec_q4_0_repacked_f32",  8, 256),
+            ("q4_k",  "matvec_q4k_repacked",   "matvec_q4k_repacked_f32",   8, 256),
+            ("q5_k",  "matvec_q5k_repacked",   "matvec_q5k_repacked_f32",   8, 256),
+            ("q6_k",  "matvec_q6k_repacked",   "matvec_q6k_repacked_f32",   8, 256),
+            ("q8_0",  "matvec_q8_0_repacked",  "matvec_q8_0_repacked_f32",  2, 64),
+            ("iq4xs", "matvec_iq4xs_repacked", "matvec_iq4xs_repacked_f32", 8, 256),
+        ];
+        // REINSTINCT_MV_BENCH_Q8_GEOM=rows,block overrides the Q8_0 launch
+        // geometry for kernel-mapping experiments.
+        let mut kinds = kinds;
+        if let Ok(g) = std::env::var("REINSTINCT_MV_BENCH_Q8_GEOM") {
+            let v: Vec<u32> = g.split(',').map(|x| x.parse().unwrap()).collect();
+            kinds[4].3 = v[0]; kinds[4].4 = v[1];
+        }
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let mods: Vec<Module> = kinds.iter().map(|k| {
+            let src = std::fs::read_to_string(format!("{dir}/{}.cpp", k.1))
+                .unwrap_or_else(|e| panic!("{dir}/{}.cpp: {e}", k.1));
+            Module::load(&cache.compile(k.1, &src).unwrap()).unwrap()
+        }).collect();
+        eprintln!("{:<14} {}", "in x out", kinds.iter().map(|k| format!("{:>12}", k.0)).collect::<String>());
+        for &(in_dim, out_dim) in &shapes {
+            let x: Vec<f32> = (0..in_dim).map(|i| ((i * 37) % 101) as f32 * 0.01 - 0.5).collect();
+            let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
+            let dxq: DeviceBuf<u8> = DeviceBuf::new((in_dim / 32) * 40).unwrap();
+            let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim).unwrap();
+            let mut xp = dx.raw_ptr(); let mut qp = dxq.raw_ptr(); let mut ind = in_dim as u32;
+            let mut qargs: [*mut c_void; 3] = [
+                &mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+                &mut ind as *mut _ as *mut c_void];
+            unsafe { qf.launch((((in_dim as u32) + 255) / 256, 1, 1), (256, 1, 1), 0, Some(&stream), &mut qargs).unwrap(); }
+            let mut line = format!("{:<14}", format!("{in_dim}x{out_dim}"));
+            for (ki, k) in kinds.iter().enumerate() {
+                let (bs, bpb, d_off): (usize, usize, usize) = match k.0 {
+                    "q4_0" => (32, q4_0::BYTES_PER_BLOCK, 0), "q4_k" => (256, q4_k::BYTES_PER_BLOCK, 0),
+                    "q5_k" => (256, q5_k::BYTES_PER_BLOCK, 0), "q6_k" => (256, q6_k::BYTES_PER_BLOCK, 208),
+                    "q8_0" => (32, q8_0::BYTES_PER_BLOCK, 0), _ => (256, iq4_xs::BYTES_PER_BLOCK, 0),
+                };
+                let n_blocks = out_dim * (in_dim / bs);
+                let mut w = vec![0u8; n_blocks * bpb];
+                for b in &mut w { *b = rng_u8(); }
+                for blk in 0..n_blocks {
+                    let off = blk * bpb;
+                    w[off + d_off..off + d_off + 2].copy_from_slice(
+                        &crate::quant::half::f32_to_f16(0.001).to_le_bytes());
+                }
+                let packed = match k.0 {
+                    "q4_0" => q4_0::repack_for_matvec(&w, in_dim, out_dim),
+                    "q4_k" => q4_k::repack_for_matvec(&w, in_dim, out_dim),
+                    "q5_k" => q5_k::repack_for_matvec(&w, in_dim, out_dim),
+                    "q6_k" => q6_k::repack_for_matvec(&w, in_dim, out_dim),
+                    "q8_0" => q8_0::repack_for_matvec(&w, in_dim, out_dim),
+                    _      => iq4_xs::repack_for_matvec(&w, in_dim, out_dim),
+                };
+                let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
+                let f = mods[ki].function(k.2).unwrap();
+                let grid = (out_dim as u32 + k.3 - 1) / k.3;
+                let launch = |stream: &hip::Stream| {
+                    let mut wp = dw.raw_ptr(); let mut qp2 = dxq.raw_ptr(); let mut yp = dy.raw_ptr();
+                    let mut ia = in_dim as u32; let mut oa = out_dim as u32;
+                    let mut args: [*mut c_void; 5] = [
+                        &mut wp as *mut _ as *mut c_void, &mut qp2 as *mut _ as *mut c_void,
+                        &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                        &mut oa as *mut _ as *mut c_void];
+                    unsafe { f.launch((grid, 1, 1), (k.4, 1, 1), 0, Some(stream), &mut args).unwrap(); }
+                };
+                launch(&stream); launch(&stream); stream.synchronize().unwrap();
+                let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+                e0.record(&stream).unwrap();
+                let iters = 50;
+                for _ in 0..iters { launch(&stream); }
+                e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+                let ms = hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / iters as f64;
+                let gbs = packed.len() as f64 / (ms * 1e-3) / 1e9;
+                line.push_str(&format!("{:>7.3}ms {:>3.0}", ms, gbs));
+            }
+            eprintln!("{line}");
+        }
+        eprintln!("(each cell: ms per launch, GB/s of repacked weight bytes)");
+    }
+
     /// Wall-clock of every wide MMQ GEMM at the 27B's FFN shape
     /// (644 tokens x 5120 -> 17408), from HIP events over 20 launches.
     /// Run with `--ignored --nocapture`; the per-kernel ms and effective

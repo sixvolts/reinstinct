@@ -48,8 +48,6 @@ const SWIGLU_SOURCE:            &str = include_str!("../../kernels/swiglu.cpp");
 const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multihead.cpp");
 const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.cpp");
 const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.cpp");
-const ROPE_SOURCE:              &str = include_str!("../../kernels/rope.cpp");
-const KV_WRITE_F32_SOURCE:      &str = include_str!("../../kernels/kv_write_f32.cpp");
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_PARTIAL_F32_SOURCE:  &str = include_str!("../../kernels/attn_partial_f32.cpp");
 const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cpp");
@@ -133,6 +131,7 @@ const MATVEC_Q8_0_DP4A_SOURCE: &str = include_str!("../../kernels/matvec_q8_0_dp
 const MATVEC_Q4K_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4k_repacked.cpp");
 const MATVEC_Q4_0_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_q4_0_repacked.cpp");
 const MATVEC_IQ4XS_REPACKED_SOURCE: &str = include_str!("../../kernels/matvec_iq4xs_repacked.cpp");
+const QWEN35_FUSED_SOURCE: &str = include_str!("../../kernels/qwen35_fused.cpp");
 // IQ3_S = the IQ4_XS kernels with its codebook (quant::iq3_s::kernel_source).
 const MMQ_GEMM_Q4K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
 const MMQ_GEMM_Q5K_SOURCE: &str = include_str!("../../kernels/mmq_gemm_q5k_repacked.cpp");
@@ -226,11 +225,19 @@ impl GpuMatvecTensor {
         if shape.len() != 2 {
             return Err(format!("tensor {name}: expected 2D, got {shape:?}"));
         }
-        let in_dim  = shape[0] as u32;
-        let out_dim = shape[1] as u32;
+        Self::from_bytes_matvec(bytes, info.ggml_type, shape[0] as u32, shape[1] as u32)
+    }
+
+    /// `from_gguf_matvec` on raw row-major GGUF tensor bytes — also how
+    /// two same-dtype `[in, out]` tensors are fused into one `[in, 2*out]`
+    /// weight (their bytes simply concatenated, rows being independent
+    /// in every block format).
+    pub fn from_bytes_matvec(bytes: &[u8], ggml_type: GgmlType, in_dim: u32, out_dim: u32)
+        -> Result<Self, String>
+    {
         // `(bytes, dtype)` — dtype can differ from the on-disk type when a
         // format without a repacked kernel is widened on the way in.
-        let packed = match info.ggml_type {
+        let packed = match ggml_type {
             GgmlType::Q4_0 => Some((crate::quant::q4_0::repack_for_matvec(
                 bytes, in_dim as usize, out_dim as usize), GgmlType::Q4_0)),
             GgmlType::Q4_K => Some((crate::quant::q4_k::repack_for_matvec(
@@ -291,9 +298,16 @@ impl GpuMatvecTensor {
                 in_dim, out_dim,
                 repacked: true,
             }),
+            None if ggml_type == GgmlType::BF16 => {
+                let u16s: &[u16] = bytemuck::cast_slice(bytes);
+                let f32s: Vec<f32> = u16s.iter().map(|&b| crate::quant::half::bf16_to_f32(b)).collect();
+                let raw: &[u8] = bytemuck::cast_slice(&f32s);
+                Ok(Self { data: DeviceBuf::from_slice(raw)?, dtype: GgmlType::F32,
+                          in_dim, out_dim, repacked: false })
+            }
             None => Ok(Self {
                 data: DeviceBuf::from_slice(bytes)?,
-                dtype: info.ggml_type,
+                dtype: ggml_type,
                 in_dim, out_dim,
                 repacked: false,
             }),
@@ -739,6 +753,10 @@ pub struct GpuLinAttnWeights {
     pub attn_gate:   GpuMatvecTensor,   // [hidden, value_dim]
     pub ssm_alpha:   GpuMatvecTensor,   // [hidden, n_heads]
     pub ssm_beta:    GpuMatvecTensor,   // [hidden, n_heads]
+    /// `ssm_alpha | ssm_beta` as one `[hidden, 2*n_heads]` weight, when
+    /// the two share a dtype — one launch instead of two for a pair of
+    /// 48-row projections whose cost is all dispatch.
+    pub ssm_ab:      Option<GpuMatvecTensor>,
     pub ssm_a:       DeviceBuf<f32>,    // [n_heads]   (already -exp(A_log))
     pub ssm_dt_bias: DeviceBuf<f32>,    // [n_heads]
     pub ssm_conv1d:  DeviceBuf<f32>,    // [conv_dim, kernel]
@@ -751,12 +769,29 @@ impl GpuLinAttnWeights {
         let pre = format!("blk.{layer}.");
         let mv = |n: &str| if repack { GpuMatvecTensor::from_gguf_matvec(gguf, n) }
                            else      { GpuMatvecTensor::from_gguf(gguf, n) };
+        let ssm_ab = {
+            let (na, nb) = (format!("{pre}ssm_alpha.weight"), format!("{pre}ssm_beta.weight"));
+            match (gguf.tensor(&na), gguf.tensor(&nb)) {
+                (Some(ia), Some(ib)) if repack && ia.ggml_type == ib.ggml_type
+                    && ia.shape() == ib.shape() && ia.shape().len() == 2 =>
+                {
+                    let (a, b) = (gguf.tensor_data(&na).map_err(|e| e.to_string())?.unwrap_or(&[]),
+                                  gguf.tensor_data(&nb).map_err(|e| e.to_string())?.unwrap_or(&[]));
+                    let mut ab = Vec::with_capacity(a.len() + b.len());
+                    ab.extend_from_slice(a); ab.extend_from_slice(b);
+                    Some(GpuMatvecTensor::from_bytes_matvec(&ab, ia.ggml_type,
+                        ia.shape()[0] as u32, 2 * ia.shape()[1] as u32)?)
+                }
+                _ => None,
+            }
+        };
         Ok(Self {
             attn_norm:   load_fp32_tensor(gguf, &format!("{pre}attn_norm.weight"))?,
             attn_qkv:    mv(&format!("{pre}attn_qkv.weight"))?,
             attn_gate:   mv(&format!("{pre}attn_gate.weight"))?,
             ssm_alpha:   mv(&format!("{pre}ssm_alpha.weight"))?,
             ssm_beta:    mv(&format!("{pre}ssm_beta.weight"))?,
+            ssm_ab,
             ssm_a:       load_fp32_tensor(gguf, &format!("{pre}ssm_a"))?,
             ssm_dt_bias: load_fp32_tensor(gguf, &format!("{pre}ssm_dt.bias"))?,
             ssm_conv1d:  load_fp32_tensor(gguf, &format!("{pre}ssm_conv1d.weight"))?,
@@ -1087,7 +1122,6 @@ pub struct GpuQwen35 {
     gate_buf:    DeviceBuf<f32>,   // [q_dim]
     k_raw:       DeviceBuf<f32>,   // [kv_dim]
     v_raw:       DeviceBuf<f32>,   // [kv_dim]
-    k_norm:      DeviceBuf<f32>,   // [kv_dim]
     attn_concat: DeviceBuf<f32>,   // [q_dim]
     logits:      DeviceBuf<f32>,   // [vocab]
 
@@ -1130,13 +1164,11 @@ pub struct GpuQwen35 {
     rmsnorm_multihead_module: Module,
     split_q_gate_module:     Module,
     sigmoid_mul_module:      Module,
-    rope_module:             Module,
     attn_step_module:        Module,
     /// Split-K decode attention (FlashDecoding) — partial + merge.
     attn_partial_module:     Module,
     attn_merge_module:       Module,
     /// f32 KV-cache write at the device-resident decode position.
-    kv_write_module:         Module,
     add_inplace_module:      Module,
     gdn_recurrent_step_fused_module: Module,
     conv1d_step_silu_module:      Module,
@@ -1180,6 +1212,15 @@ pub struct GpuQwen35 {
     matvec_q4_0_repacked_module: Module,
     matvec_iq4xs_repacked_module: Module,
     matvec_iq3s_repacked_module: Module,
+    /// Fused norm/quantize/elementwise kernels of the decode step
+    /// (kernels/qwen35_fused.cpp).
+    fused_module: Module,
+    /// fp32 output of the fused norms — the matvec input for weights
+    /// that cannot take the int8 activation (F16, dp4a off).
+    normed:  DeviceBuf<f32>,   // [max(hidden, ffn)]
+    /// [2 * gdn_n_heads]: the ssm_alpha | ssm_beta projections in one
+    /// launch when the two share a dtype (`GpuLinAttnWeights::ssm_ab`).
+    gdn_ab:  DeviceBuf<f32>,
     matvec_q5k_repacked_module: Module,
     matvec_q6k_repacked_module: Module,
     /// K=2..4 batched K-quant matvec — the spec-decode verify path.
@@ -1341,7 +1382,6 @@ impl GpuQwen35 {
         let gate_buf    = DeviceBuf::new(q_dim)?;
         let k_raw       = DeviceBuf::new(kv_dim)?;
         let v_raw       = DeviceBuf::new(kv_dim)?;
-        let k_norm      = DeviceBuf::new(kv_dim)?;
         let attn_concat = DeviceBuf::new(q_dim)?;
         let logits      = DeviceBuf::new(vocab)?;
         let attn_o_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize * head_dim)?;
@@ -1381,11 +1421,9 @@ impl GpuQwen35 {
         let rmsnorm_multihead_hsaco = cache.compile("rmsnorm_multihead", RMSNORM_MULTIHEAD_SOURCE)?;
         let split_q_gate_hsaco      = cache.compile("split_q_gate",      SPLIT_Q_GATE_SOURCE)?;
         let sigmoid_mul_hsaco       = cache.compile("sigmoid_mul",       SIGMOID_MUL_SOURCE)?;
-        let rope_hsaco              = cache.compile("rope",              ROPE_SOURCE)?;
         let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
         let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
-        let kv_write_hsaco          = cache.compile("kv_write_f32",      KV_WRITE_F32_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
         let gdn_recurrent_step_fused_hsaco = cache.compile("gdn_recurrent_step_fused", GDN_RECURRENT_STEP_FUSED_SOURCE)?;
         let conv1d_step_silu_hsaco       = cache.compile("conv1d_step_silu", CONV1D_STEP_SILU_SOURCE)?;
@@ -1467,7 +1505,7 @@ impl GpuQwen35 {
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
             pool_f32, pool_u8, pool_u16, prefill_warm_p, ffn_a, ffn_b,
-            q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
+            q_raw, q_buf, gate_buf, k_raw, v_raw, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
             moe_prof_on, prof_mark, prof_buckets,
             rope_cos, rope_sin,
@@ -1479,11 +1517,9 @@ impl GpuQwen35 {
             rmsnorm_multihead_module: Module::load(&rmsnorm_multihead_hsaco)?,
             split_q_gate_module:      Module::load(&split_q_gate_hsaco)?,
             sigmoid_mul_module:       Module::load(&sigmoid_mul_hsaco)?,
-            rope_module:              Module::load(&rope_hsaco)?,
             attn_step_module:         Module::load(&attn_step_hsaco)?,
             attn_partial_module:      Module::load(&attn_partial_hsaco)?,
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
-            kv_write_module:          Module::load(&kv_write_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
             gdn_recurrent_step_fused_module: Module::load(&gdn_recurrent_step_fused_hsaco)?,
             conv1d_step_silu_module:      Module::load(&conv1d_step_silu_hsaco)?,
@@ -1549,6 +1585,9 @@ impl GpuQwen35 {
             matvec_q4_0_repacked_module: Module::load(&matvec_q4_0_repacked_hsaco)?,
             matvec_iq4xs_repacked_module: Module::load(&matvec_iq4xs_repacked_hsaco)?,
             matvec_iq3s_repacked_module: Module::load(&matvec_iq3s_repacked_hsaco)?,
+            fused_module: Module::load(&cache.compile("qwen35_fused", QWEN35_FUSED_SOURCE)?)?,
+            normed:  DeviceBuf::new(hidden.max(ffn))?,
+            gdn_ab:  DeviceBuf::new(2 * gdn_n_heads)?,
             matvec_q5k_repacked_module: Module::load(&matvec_q5k_repacked_hsaco)?,
             matvec_q6k_repacked_module: Module::load(&matvec_q6k_repacked_hsaco)?,
             matvec_q4k_batched_module: Module::load(&matvec_q4k_batched_hsaco)?,
@@ -1927,6 +1966,146 @@ impl GpuQwen35 {
                           0, Some(&self.stream), &mut args) }
     }
 
+
+    // ===== Fused decode-step launchers (kernels/qwen35_fused.cpp) ==========
+
+    /// `hidden (+= add)`, then `normed = rmsnorm(hidden) * w` as fp32 and
+    /// as BlockQ8 in `self.xq8`. One workgroup.
+    fn launch_add_rmsnorm_q8(&self, hidden: *mut c_void, add: Option<*mut c_void>,
+                             w: *mut c_void, n: u32, eps: f32) -> Result<(), String>
+    {
+        let f = self.fused_module.function("add_rmsnorm_q8_f32")?;
+        let block: u32 = 1024;
+        let smem = (n + block) * 4;
+        let mut ha = hidden; let mut aa = add.unwrap_or(std::ptr::null_mut());
+        let mut wa = w; let mut ya = self.normed.raw_ptr(); let mut oa = self.xq8.raw_ptr();
+        let mut na = n; let mut ea = eps;
+        let mut args: [*mut c_void; 7] = [
+            &mut ha as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut ea as *mut _ as *mut c_void];
+        unsafe { f.launch((1, 1, 1), (block, 1, 1), smem, Some(&self.stream), &mut args) }
+    }
+
+    /// `out = silu(gate) * up`, fp32 plus BlockQ8 in `self.xq8`.
+    fn launch_swiglu_q8(&self, gate: *mut c_void, up: *mut c_void, out: *mut c_void, n: u32)
+        -> Result<(), String>
+    {
+        let f = self.fused_module.function("swiglu_q8_f32")?;
+        let mut ga = gate; let mut ua = up; let mut oa = out; let mut qa = self.xq8.raw_ptr();
+        let mut na = n;
+        let mut args: [*mut c_void; 5] = [
+            &mut ga as *mut _ as *mut c_void, &mut ua as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut qa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void];
+        unsafe { f.launch(((n + 255) / 256, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// `x *= sigmoid(gate)` in place, plus BlockQ8 in `self.xq8`.
+    fn launch_sigmoid_mul_q8(&self, x: *mut c_void, gate: *mut c_void, n: u32) -> Result<(), String> {
+        let f = self.fused_module.function("sigmoid_mul_q8_f32")?;
+        let mut xa = x; let mut ga = gate; let mut qa = self.xq8.raw_ptr(); let mut na = n;
+        let mut args: [*mut c_void; 4] = [
+            &mut xa as *mut _ as *mut c_void, &mut ga as *mut _ as *mut c_void,
+            &mut qa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
+        unsafe { f.launch(((n + 255) / 256, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// GDN conv1d + SiLU with the Q/K per-head L2 norms fused; V lands in
+    /// `conv_out`'s V region.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_conv1d_l2norm(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
+                            conv_out: *mut c_void, q_out: *mut c_void, k_out: *mut c_void,
+                            q_scale: f32) -> Result<(), String>
+    {
+        let f = self.fused_module.function("conv1d_l2norm_f32")?;
+        let (nkh, nh, hd) = (self.gdn_n_k_heads as u32, self.gdn_n_heads as u32, self.gdn_head_dim as u32);
+        let mut xa = x_new; let mut wa = w; let mut ha = hist; let mut ca = conv_out;
+        let mut qa = q_out; let mut ka = k_out;
+        let mut nkh_a = nkh; let mut hd_a = hd; let mut kd = self.gdn_key_dim as u32;
+        let mut ks = self.gdn_conv_kernel as u32; let mut eps = 1e-6f32; let mut qs = q_scale;
+        let mut args: [*mut c_void; 12] = [
+            &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ha as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut nkh_a as *mut _ as *mut c_void, &mut hd_a as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void, &mut ks as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void, &mut qs as *mut _ as *mut c_void];
+        unsafe { f.launch((2 * nkh + nh, 1, 1), (hd, 1, 1), hd * 4, Some(&self.stream), &mut args) }
+    }
+
+    /// GDN per-head gated RMSNorm, fp32 plus BlockQ8 in `self.xq8`.
+    fn launch_rmsnorm_gated_q8(&self, x: *mut c_void, z: *mut c_void, w: *mut c_void,
+                               y: *mut c_void) -> Result<(), String>
+    {
+        let f = self.fused_module.function("rmsnorm_gated_q8_f32")?;
+        let (nh, hd) = (self.gdn_n_heads as u32, self.gdn_head_dim as u32);
+        let mut xa = x; let mut za = z; let mut wa = w; let mut ya = y; let mut qa = self.xq8.raw_ptr();
+        let mut nh_a = nh; let mut hd_a = hd; let mut eps = self.rms_eps;
+        let mut args: [*mut c_void; 8] = [
+            &mut xa as *mut _ as *mut c_void, &mut za as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
+            &mut qa as *mut _ as *mut c_void, &mut nh_a as *mut _ as *mut c_void,
+            &mut hd_a as *mut _ as *mut c_void, &mut eps as *mut _ as *mut c_void];
+        unsafe { f.launch((nh, 1, 1), (hd, 1, 1), hd * 4, Some(&self.stream), &mut args) }
+    }
+
+    /// Full attention Q side: split [Q | gate], RMSNorm + RoPE Q.
+    fn launch_q_split_norm_rope(&self, q_raw: *mut c_void, q_out: *mut c_void, gate_out: *mut c_void,
+                                w: *mut c_void) -> Result<(), String>
+    {
+        let f = self.fused_module.function("q_split_norm_rope_f32")?;
+        let hd = self.head_dim as u32;
+        let mut qr = q_raw; let mut qo = q_out; let mut go = gate_out; let mut wa = w;
+        let mut ca = self.rope_cos.raw_ptr(); let mut sa = self.rope_sin.raw_ptr();
+        let mut pa = self.d_pos.raw_ptr(); let mut hd_a = hd; let mut rd = self.rotary_dim as u32;
+        let mut eps = self.rms_eps;
+        let mut args: [*mut c_void; 10] = [
+            &mut qr as *mut _ as *mut c_void, &mut qo as *mut _ as *mut c_void,
+            &mut go as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void, &mut hd_a as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void, &mut eps as *mut _ as *mut c_void];
+        unsafe { f.launch((self.n_heads as u32, 1, 1), (hd, 1, 1), 2 * hd * 4,
+                          Some(&self.stream), &mut args) }
+    }
+
+    /// Full attention K/V side: RMSNorm + RoPE K into the K cache row at
+    /// `d_pos`, V into the V cache row.
+    fn launch_k_norm_rope_kv_write(&self, k_raw: *mut c_void, v_raw: *mut c_void, w: *mut c_void,
+                                   k_cache: *mut c_void, v_cache: *mut c_void) -> Result<(), String>
+    {
+        let f = self.fused_module.function("k_norm_rope_kv_write_f32")?;
+        let (nkv, hd) = (self.n_kv_heads as u32, self.head_dim as u32);
+        let mut ka = k_raw; let mut va = v_raw; let mut wa = w;
+        let mut ca = self.rope_cos.raw_ptr(); let mut sa = self.rope_sin.raw_ptr();
+        let mut pa = self.d_pos.raw_ptr(); let mut kc = k_cache; let mut vc = v_cache;
+        let mut nkv_a = nkv; let mut hd_a = hd; let mut rd = self.rotary_dim as u32;
+        let mut eps = self.rms_eps;
+        let mut args: [*mut c_void; 12] = [
+            &mut ka as *mut _ as *mut c_void, &mut va as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void, &mut vc as *mut _ as *mut c_void,
+            &mut nkv_a as *mut _ as *mut c_void, &mut hd_a as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void, &mut eps as *mut _ as *mut c_void];
+        unsafe { f.launch((2 * nkv, 1, 1), (hd, 1, 1), 2 * hd * 4, Some(&self.stream), &mut args) }
+    }
+
+    /// Matvec whose input is already in `self.xq8` (from a fused norm /
+    /// activation kernel) — skips the quantize launch for repacked dp4a
+    /// weights; anything else takes the plain dispatch on the fp32 copy.
+    fn launch_matvec_prequant(&self, w: &GpuMatvecTensor, x_f32: *mut c_void, y: *mut c_void)
+        -> Result<(), String>
+    {
+        if w.repacked && self.dp4a_enabled {
+            self.launch_matvec_repacked_xq8(w, y)
+        } else {
+            self.launch_matvec_dispatch(w, x_f32, y)
+        }
+    }
+
     /// Dispatch a matvec to the right kernel based on the weight's on-disk
     /// dtype. Output `y` always lands as fp32. K-quants and Q8_0 take the
     /// int8 dp4a path (quantize the activation, then v_dot4_i32_i8 — far
@@ -1959,6 +2138,37 @@ impl GpuQwen35 {
                 return r;
             }
             self.launch_quantize_q8(x, in_d)?;
+            return self.launch_matvec_repacked_xq8(w, y);
+        }
+
+        let dp4a = self.dp4a_enabled
+            && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
+                               | GgmlType::Q6_K | GgmlType::Q8_0);
+        if dp4a {
+            self.launch_quantize_q8(x, in_d)?;
+            // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
+            // others: 64-thread, 2 rows per wavefront. These are the
+            // on-disk-layout kernels; only `token_embd` (which doubles as
+            // the tied output projection) still reaches them.
+            let (module, kname, rows, block) = match w.dtype {
+                GgmlType::Q4_K   => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
+                GgmlType::Q5_K   => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                GgmlType::Q6_K   => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
+                _                => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
+            };
+            let f = module.function(kname)?;
+            let grid = (out_d + rows - 1) / rows;
+            return self.launch_matvec_q_kernel_xq8(&f, wp, y, in_d, out_d, grid, block);
+        }
+        self.launch_matvec_f32_fallback(w, x, y)
+    }
+
+    /// The repacked int8 matvec on whatever `self.xq8` holds.
+    fn launch_matvec_repacked_xq8(&self, w: &GpuMatvecTensor, y: *mut c_void) -> Result<(), String> {
+        let in_d  = w.in_dim;
+        let out_d = w.out_dim;
+        let wp    = w.data.raw_ptr();
+        {
             // K-quants: 256-thread / 8-row workgroup. Q8_0 uses the
             // dp4a 64-thread / 2-row footprint on the new two-plane
             // layout (alignment win, not occupancy).
@@ -1998,39 +2208,37 @@ impl GpuQwen35 {
                 &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
                 &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
                 &mut oa as *mut _ as *mut c_void];
-            return unsafe {
+            unsafe {
                 f.launch((grid, 1, 1), (kblock, 1, 1), 0, Some(&self.stream), &mut args)
-            };
+            }
         }
+    }
 
-        let dp4a = self.dp4a_enabled
-            && matches!(w.dtype, GgmlType::Q4_K | GgmlType::Q5_K
-                               | GgmlType::Q6_K | GgmlType::Q8_0);
-        if dp4a {
-            self.launch_quantize_q8(x, in_d)?;
-            // Q4_K: 256-thread workgroup (4 independent wavefronts, 8 rows);
-            // others: 64-thread, 2 rows per wavefront. These are the
-            // on-disk-layout kernels; only `token_embd` (which doubles as
-            // the tied output projection) still reaches them.
-            let (module, kname, rows, block) = match w.dtype {
-                GgmlType::Q4_K   => (&self.matvec_q4_k_dp4a_module, "matvec_q4_k_dp4a_f32", 8u32, 256u32),
-                GgmlType::Q5_K   => (&self.matvec_q5_k_dp4a_module, "matvec_q5_k_dp4a_f32", DP4A_ROWBLOCK, 64),
-                GgmlType::Q6_K   => (&self.matvec_q6_k_dp4a_module, "matvec_q6_k_dp4a_f32", DP4A_ROWBLOCK, 64),
-                _                => (&self.matvec_q8_0_dp4a_module, "matvec_q8_0_dp4a_f32", DP4A_ROWBLOCK, 64),
-            };
-            let f = module.function(kname)?;
-            let grid = (out_d + rows - 1) / rows;
+    /// Launch an on-disk-layout dp4a matvec kernel on `self.xq8`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_matvec_q_kernel_xq8(&self, f: &crate::hip::Function<'_>, wp: *mut c_void, y: *mut c_void,
+                                  in_d: u32, out_d: u32, grid: u32, block: u32) -> Result<(), String>
+    {
+        {
             let mut wa = wp; let mut xa = self.xq8.raw_ptr(); let mut ya = y;
             let mut ia = in_d; let mut oa = out_d;
             let mut args: [*mut c_void; 5] = [
                 &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
                 &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
                 &mut oa as *mut _ as *mut c_void];
-            return unsafe {
+            unsafe {
                 f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args)
-            };
+            }
         }
+    }
 
+    /// The fp32 / f16 matvecs for weights without an int8 path.
+    fn launch_matvec_f32_fallback(&self, w: &GpuMatvecTensor, x: *mut c_void, y: *mut c_void)
+        -> Result<(), String>
+    {
+        let in_d  = w.in_dim;
+        let out_d = w.out_dim;
+        let wp    = w.data.raw_ptr();
         match w.dtype {
             // 256-thread/block fp32 — the wave64 alternative starves the
             // GPU on small `out_dim` matvecs (qwen GDN's ssm_alpha/beta
@@ -2132,29 +2340,6 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
-    fn launch_rope(&self, x: *mut c_void, n_heads: u32) -> Result<(), String> {
-        let f = self.rope_module.function("rope_apply_f32")?;
-        let half = (self.rotary_dim / 2) as u32;
-        let block: u32 = 64;
-        let grid_x = (half + block - 1) / block;
-        let mut xa = x;
-        let mut ca = self.rope_cos.raw_ptr();
-        let mut sa = self.rope_sin.raw_ptr();
-        let mut hd = self.head_dim   as u32;
-        let mut rd = self.rotary_dim as u32;
-        let mut nh = n_heads;
-        let mut p  = self.d_pos.raw_ptr();
-        let mut args: [*mut c_void; 7] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut ca as *mut _ as *mut c_void,
-            &mut sa as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut rd as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut p  as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
-    }
 
     /// Stage the decode position into the device-resident `d_pos`.
     fn set_pos(&self, pos: usize) -> Result<(), String> {
@@ -2186,22 +2371,6 @@ impl GpuQwen35 {
         self.prof_buckets.borrow().iter().map(|(l, t)| (*l, t * 1e3)).collect()
     }
 
-    /// Write a K/V row into the cache at the device-resident position
-    /// `d_pos` — a graph-capturable replacement for the host-offset
-    /// memcpy.
-    fn launch_kv_write(&self, src: *mut c_void, cache: *mut c_void, kv_dim: u32)
-        -> Result<(), String>
-    {
-        let f = self.kv_write_module.function("kv_write_f32")?;
-        let block: u32 = 256;
-        let grid = (kv_dim + block - 1) / block;
-        let mut sa = src; let mut ca = cache;
-        let mut pp = self.d_pos.raw_ptr(); let mut kd = kv_dim;
-        let mut args: [*mut c_void; 4] = [
-            &mut sa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
-        unsafe { f.launch((grid,1,1),(block,1,1), 0, Some(&self.stream), &mut args) }
-    }
 
     fn launch_conv1d_step_silu(&self, x_new: *mut c_void, w: *mut c_void, hist: *mut c_void,
                                y: *mut c_void, n_channels: u32, kernel_size: u32)
@@ -2406,8 +2575,10 @@ impl GpuQwen35 {
     /// attention sub-layer output (post-projection, pre-residual) to
     /// `output_ptr`. `input_ptr` is read-only here — must NOT alias
     /// `output_ptr`. No H2D/D2H/sync.
+    /// `pending_add`: a residual still to be added into `input_ptr`
+    /// (the previous sub-layer's output) — folded into the first norm.
     fn step_full_attention(&self,
-        input_ptr: *mut c_void, output_ptr: *mut c_void,
+        input_ptr: *mut c_void, pending_add: Option<*mut c_void>, output_ptr: *mut c_void,
         weights: &GpuFullAttnWeights, kv_cache: &mut GpuKvCache,
     ) -> Result<(), String>
     {
@@ -2415,53 +2586,48 @@ impl GpuQwen35 {
         let h_dim  = self.hidden as u32;
         let q_dim  = self.q_dim()  as u32;
         let scaling = (self.head_dim as f32).powf(-0.5);
+        let normed = self.normed.raw_ptr();
 
-        // normed → output_ptr (output_ptr serves dual duty: normed first,
-        //                      then final attn output overwrites it)
-        self.launch_rmsnorm(input_ptr, weights.attn_norm.raw_ptr(),
-                            output_ptr, h_dim, self.rms_eps)?;
-        self.launch_matvec_dispatch(&weights.attn_q, output_ptr, self.q_raw.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.attn_k, output_ptr, self.k_raw.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.attn_v, output_ptr, self.v_raw.raw_ptr())?;
-        self.launch_split_q_gate(self.q_raw.raw_ptr(), self.q_buf.raw_ptr(),
-                                 self.gate_buf.raw_ptr(),
-                                 self.n_heads as u32, self.head_dim as u32)?;
-        self.launch_rmsnorm_multihead(self.q_buf.raw_ptr(), weights.attn_q_norm.raw_ptr(),
-                                      self.q_buf.raw_ptr(),
-                                      self.n_heads as u32, self.head_dim as u32, self.rms_eps)?;
-        self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32)?;
-        self.launch_rmsnorm_multihead(self.k_raw.raw_ptr(), weights.attn_k_norm.raw_ptr(),
-                                      self.k_norm.raw_ptr(),
-                                      self.n_kv_heads as u32, self.head_dim as u32, self.rms_eps)?;
-        self.launch_rope(self.k_norm.raw_ptr(), self.n_kv_heads as u32)?;
-        // Append this token's K/V into the cache at the device-resident
-        // position — a kernel (not a host-offset memcpy) so the forward
-        // is graph-capturable.
-        let kv_dim = kv_cache.kv_dim as u32;
-        self.launch_kv_write(self.k_norm.raw_ptr(), kv_cache.k.raw_ptr(), kv_dim)?;
-        self.launch_kv_write(self.v_raw.raw_ptr(),  kv_cache.v.raw_ptr(), kv_dim)?;
+        // input (+= pending); normed = rmsnorm(input, attn_norm) as fp32
+        // and as the int8 activation the projections read.
+        self.launch_add_rmsnorm_q8(input_ptr, pending_add, weights.attn_norm.raw_ptr(),
+                                   h_dim, self.rms_eps)?;
+        self.launch_matvec_prequant(&weights.attn_q, normed, self.q_raw.raw_ptr())?;
+        self.launch_matvec_prequant(&weights.attn_k, normed, self.k_raw.raw_ptr())?;
+        self.launch_matvec_prequant(&weights.attn_v, normed, self.v_raw.raw_ptr())?;
+        // Q: split [Q | gate], per-head RMSNorm, RoPE — one launch.
+        self.launch_q_split_norm_rope(self.q_raw.raw_ptr(), self.q_buf.raw_ptr(),
+                                      self.gate_buf.raw_ptr(), weights.attn_q_norm.raw_ptr())?;
+        // K: per-head RMSNorm + RoPE straight into the cache row at the
+        // device-resident position; V copied alongside. A kernel (not a
+        // host-offset memcpy) so the forward is graph-capturable.
+        self.launch_k_norm_rope_kv_write(self.k_raw.raw_ptr(), self.v_raw.raw_ptr(),
+                                         weights.attn_k_norm.raw_ptr(),
+                                         kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr())?;
         self.launch_attn_step(self.q_buf.raw_ptr(),
                               kv_cache.k.raw_ptr(), kv_cache.v.raw_ptr(),
                               self.attn_concat.raw_ptr(), scaling)?;
-        self.launch_sigmoid_mul(self.attn_concat.raw_ptr(), self.gate_buf.raw_ptr(), q_dim)?;
-        self.launch_matvec_dispatch(&weights.attn_output, self.attn_concat.raw_ptr(), output_ptr)?;
+        self.launch_sigmoid_mul_q8(self.attn_concat.raw_ptr(), self.gate_buf.raw_ptr(), q_dim)?;
+        self.launch_matvec_prequant(&weights.attn_output, self.attn_concat.raw_ptr(), output_ptr)?;
         kv_cache.len += 1;
         Ok(())
     }
 
     /// Device-pointer FFN step. `input_ptr == output_ptr` is allowed
     /// (gate/up matvecs run before down writes back). No H2D/D2H/sync.
+    /// `prequant`: `self.xq8` already holds the quantised `input_ptr`
+    /// (a fused norm wrote it), so gate/up skip their quantize.
     fn step_swiglu_ffn(&self,
         input_ptr: *mut c_void, output_ptr: *mut c_void,
-        weights: &GpuFfnWeights,
+        weights: &GpuFfnWeights, prequant: bool,
     ) -> Result<(), String>
     {
         let f = self.ffn as u32;
-        self.launch_matvec_dispatch(&weights.gate, input_ptr, self.ffn_a.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.up,   input_ptr, self.ffn_b.raw_ptr())?;
-        self.launch_swiglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
-                           self.ffn_a.raw_ptr(), f)?;
-        self.launch_matvec_dispatch(&weights.down, self.ffn_a.raw_ptr(), output_ptr)?;
+        if !prequant { self.launch_quantize_q8(input_ptr, self.hidden as u32)?; }
+        self.launch_matvec_prequant(&weights.gate, input_ptr, self.ffn_a.raw_ptr())?;
+        self.launch_matvec_prequant(&weights.up,   input_ptr, self.ffn_b.raw_ptr())?;
+        self.launch_swiglu_q8(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(), self.ffn_a.raw_ptr(), f)?;
+        self.launch_matvec_prequant(&weights.down, self.ffn_a.raw_ptr(), output_ptr)?;
         Ok(())
     }
 
@@ -2471,7 +2637,7 @@ impl GpuQwen35 {
         -> Result<(), String>
     {
         match ffn {
-            BlockFfn::Dense(d) => self.step_swiglu_ffn(input_ptr, output_ptr, d),
+            BlockFfn::Dense(d) => self.step_swiglu_ffn(input_ptr, output_ptr, d, false),
             BlockFfn::Moe(m)   => self.step_moe_ffn(input_ptr, output_ptr, m),
         }
     }
@@ -2978,13 +3144,30 @@ impl GpuQwen35 {
         weights: &GpuFullAttnBlock, kv_cache: &mut GpuKvCache,
     ) -> Result<(), String>
     {
+        self.step_full_attention_block_pending(hidden_io, false, scratch, weights, kv_cache)?;
+        self.launch_add_inplace(hidden_io, scratch, self.hidden as u32)
+    }
+
+    /// One full-attention block with the residual joins folded into the
+    /// norms: `pending` says `scratch` still holds the previous block's
+    /// FFN output to add into `hidden_io` first, and on return `scratch`
+    /// holds this block's FFN output, NOT yet added — the next block's
+    /// first norm (or the caller's final `add_inplace`) does that.
+    fn step_full_attention_block_pending(&self,
+        hidden_io: *mut c_void, pending: bool, scratch: *mut c_void,
+        weights: &GpuFullAttnBlock, kv_cache: &mut GpuKvCache,
+    ) -> Result<(), String>
+    {
         let h = self.hidden as u32;
-        self.step_full_attention(hidden_io, scratch, &weights.attn, kv_cache)?;
-        self.launch_add_inplace(hidden_io, scratch, h)?;
-        self.launch_rmsnorm(hidden_io, weights.post_norm.raw_ptr(), scratch, h, self.rms_eps)?;
-        self.step_ffn(scratch, scratch, &weights.ffn)?;
-        self.launch_add_inplace(hidden_io, scratch, h)?;
-        Ok(())
+        let pending_add = if pending { Some(scratch) } else { None };
+        self.step_full_attention(hidden_io, pending_add, scratch, &weights.attn, kv_cache)?;
+        // hidden += attn; normed = post_norm(hidden) (fp32 + int8) for the FFN.
+        self.launch_add_rmsnorm_q8(hidden_io, Some(scratch), weights.post_norm.raw_ptr(), h,
+                                   self.rms_eps)?;
+        match &weights.ffn {
+            BlockFfn::Dense(d) => self.step_swiglu_ffn(self.normed.raw_ptr(), scratch, d, true),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m),
+        }
     }
 
     /// On-device "linear (GDN) transformer block" composer.
@@ -2993,13 +3176,25 @@ impl GpuQwen35 {
         weights: &GpuLinAttnBlock, state: &mut GpuLinAttnState,
     ) -> Result<(), String>
     {
+        self.step_linear_attention_block_pending(hidden_io, false, scratch, weights, state)?;
+        self.launch_add_inplace(hidden_io, scratch, self.hidden as u32)
+    }
+
+    /// GDN counterpart of `step_full_attention_block_pending`.
+    fn step_linear_attention_block_pending(&self,
+        hidden_io: *mut c_void, pending: bool, scratch: *mut c_void,
+        weights: &GpuLinAttnBlock, state: &mut GpuLinAttnState,
+    ) -> Result<(), String>
+    {
         let h = self.hidden as u32;
-        self.step_linear_attention(hidden_io, scratch, &weights.attn, state)?;
-        self.launch_add_inplace(hidden_io, scratch, h)?;
-        self.launch_rmsnorm(hidden_io, weights.post_norm.raw_ptr(), scratch, h, self.rms_eps)?;
-        self.step_ffn(scratch, scratch, &weights.ffn)?;
-        self.launch_add_inplace(hidden_io, scratch, h)?;
-        Ok(())
+        let pending_add = if pending { Some(scratch) } else { None };
+        self.step_linear_attention(hidden_io, pending_add, scratch, &weights.attn, state)?;
+        self.launch_add_rmsnorm_q8(hidden_io, Some(scratch), weights.post_norm.raw_ptr(), h,
+                                   self.rms_eps)?;
+        match &weights.ffn {
+            BlockFfn::Dense(d) => self.step_swiglu_ffn(self.normed.raw_ptr(), scratch, d, true),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m),
+        }
     }
 
     /// MTP-head draft forward — predicts the token *after* `embed_next`
@@ -3460,18 +3655,27 @@ impl GpuQwen35 {
     /// runs separately, just before this.
     fn enqueue_decode_body(&self, state: &mut Qwen35GpuState) -> Result<(), String> {
         assert_eq!(state.block_states.len(), self.blocks.len());
+        // Each block leaves its FFN output in hidden_b un-added; the next
+        // block's first norm adds it (one launch instead of two), and the
+        // last one is added here.
+        let mut pending = false;
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
-                    self.step_full_attention_block_dev(
-                        self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, kv)?;
+                    self.step_full_attention_block_pending(
+                        self.hidden_a.raw_ptr(), pending, self.hidden_b.raw_ptr(), w, kv)?;
                 }
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
-                    self.step_linear_attention_block_dev(
-                        self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), w, s)?;
+                    self.step_linear_attention_block_pending(
+                        self.hidden_a.raw_ptr(), pending, self.hidden_b.raw_ptr(), w, s)?;
                 }
                 _ => return Err("block kind mismatch between weights and state".into()),
             }
+            pending = true;
+        }
+        if pending {
+            self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+                                    self.hidden as u32)?;
         }
         if self.stage.is_last() {
             self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm().raw_ptr(),
@@ -4325,7 +4529,7 @@ impl GpuQwen35 {
         self.set_pos(kv_cache.len)?;
 
         // Sub-layer 1: attention with pre-norm + residual.
-        self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+        self.step_full_attention(self.hidden_a.raw_ptr(), None, self.hidden_b.raw_ptr(),
                                  &weights.attn, kv_cache)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
 
@@ -4349,63 +4553,67 @@ impl GpuQwen35 {
     /// `cpu::qwen3_5::linear_attention_step`. Reads `input_ptr` (preserved),
     /// writes the post-projection output to `output_ptr`. Updates the
     /// recurrent + conv state in `state`.
+    /// `pending_add`: a residual still to be added into `input_ptr`
+    /// (the previous sub-layer's output) — folded into the first norm.
     fn step_linear_attention(&self,
-        input_ptr: *mut c_void, output_ptr: *mut c_void,
+        input_ptr: *mut c_void, pending_add: Option<*mut c_void>, output_ptr: *mut c_void,
         weights: &GpuLinAttnWeights, state: &mut GpuLinAttnState,
     ) -> Result<(), String>
     {
         let h_dim     = self.hidden        as u32;
-        let conv_dim  = self.gdn_conv_dim  as u32;
         let n_heads   = self.gdn_n_heads   as u32;     // value heads
         let n_k_heads = self.gdn_n_k_heads as u32;     // key/query heads
         let head_dim  = self.gdn_head_dim  as u32;
         let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
+        let normed    = self.normed.raw_ptr();
 
-        // 1) normed = rmsnorm(input, attn_norm) → output_ptr (used as scratch)
-        self.launch_rmsnorm(input_ptr, weights.attn_norm.raw_ptr(),
-                            output_ptr, h_dim, self.rms_eps)?;
+        // 1) input (+= pending); normed = rmsnorm(input, attn_norm) as
+        //    fp32 and as the int8 activation the projections read.
+        self.launch_add_rmsnorm_q8(input_ptr, pending_add, weights.attn_norm.raw_ptr(),
+                                   h_dim, self.rms_eps)?;
 
-        // 2) Four projections off normed.
-        self.launch_matvec_dispatch(&weights.attn_qkv,  output_ptr, self.gdn_qkv.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.attn_gate, output_ptr, self.gdn_z.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.ssm_alpha, output_ptr, self.gdn_a.raw_ptr())?;
-        self.launch_matvec_dispatch(&weights.ssm_beta,  output_ptr, self.gdn_b.raw_ptr())?;
+        // 2) Projections off normed: qkv, gate, and alpha|beta in one
+        //    launch when they share a dtype.
+        self.launch_matvec_prequant(&weights.attn_qkv,  normed, self.gdn_qkv.raw_ptr())?;
+        self.launch_matvec_prequant(&weights.attn_gate, normed, self.gdn_z.raw_ptr())?;
+        let (a_ptr, b_ptr) = match &weights.ssm_ab {
+            Some(ab) => {
+                self.launch_matvec_prequant(ab, normed, self.gdn_ab.raw_ptr())?;
+                let base = self.gdn_ab.raw_ptr() as *mut f32;
+                (base as *mut c_void, unsafe { base.add(self.gdn_n_heads) } as *mut c_void)
+            }
+            None => {
+                self.launch_matvec_prequant(&weights.ssm_alpha, normed, self.gdn_a.raw_ptr())?;
+                self.launch_matvec_prequant(&weights.ssm_beta,  normed, self.gdn_b.raw_ptr())?;
+                (self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr())
+            }
+        };
 
-        // 3) Causal Conv1D with SiLU fused into the output write.
-        self.launch_conv1d_step_silu(self.gdn_qkv.raw_ptr(), weights.ssm_conv1d.raw_ptr(),
-                                     state.conv_hist.raw_ptr(), self.gdn_conv_out.raw_ptr(),
-                                     conv_dim, self.gdn_conv_kernel as u32)?;
-
-        // 4) conv_out is laid out [Q | K | V]: Q/K are key_dim wide
-        //    (n_k_heads heads), V is value_dim wide (n_heads heads).
+        // 3) Causal Conv1D + SiLU over [Q | K | V], with the per-head
+        //    L2 norms of Q (scale 1/√head_dim) and K fused; V stays in
+        //    conv_out's V region.
         let conv_out_ptr = self.gdn_conv_out.raw_ptr() as *mut f32;
-        let q_in_ptr = unsafe { conv_out_ptr.add(0)                    } as *mut c_void;
-        let k_in_ptr = unsafe { conv_out_ptr.add(self.gdn_key_dim)     } as *mut c_void;
         let v_in_ptr = unsafe { conv_out_ptr.add(2 * self.gdn_key_dim) } as *mut c_void;
+        self.launch_conv1d_l2norm(self.gdn_qkv.raw_ptr(), weights.ssm_conv1d.raw_ptr(),
+                                  state.conv_hist.raw_ptr(), self.gdn_conv_out.raw_ptr(),
+                                  self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), q_scale)?;
 
-        // 5) Per-head L2-norm of Q (scale 1/√head_dim) and K (scale 1) —
-        //    n_k_heads heads each.
-        self.launch_l2norm_qk(q_in_ptr, self.gdn_q.raw_ptr(),
-                              k_in_ptr, self.gdn_k.raw_ptr(),
-                              n_k_heads, head_dim, 1e-6, q_scale)?;
-
-        // 6+7) Recurrent gated delta-rule update — decay/beta computed
-        //      inside the kernel from a/b/ssm_a/dt_bias.
+        // 4) Recurrent gated delta-rule update — decay/beta computed
+        //    inside the kernel from a/b/ssm_a/dt_bias.
         self.launch_gdn_recurrent_step_fused(self.gdn_q.raw_ptr(), self.gdn_k.raw_ptr(), v_in_ptr,
-                                             self.gdn_a.raw_ptr(), self.gdn_b.raw_ptr(),
+                                             a_ptr, b_ptr,
                                              weights.ssm_a.raw_ptr(), weights.ssm_dt_bias.raw_ptr(),
                                              state.recurrent.raw_ptr(),
                                              self.gdn_core_out.raw_ptr(),
                                              n_heads, head_dim, n_k_heads)?;
 
-        // 8) Per-head gated RMSNorm: core_out *= w * silu(z), in place.
-        self.launch_rmsnorm_gated_multihead(self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
-                                             weights.ssm_norm.raw_ptr(),
-                                             self.gdn_core_out.raw_ptr(),
-                                             n_heads, head_dim, self.rms_eps)?;
+        // 5) Per-head gated RMSNorm (core_out *= w * silu(z)), quantised
+        //    for the out projection.
+        self.launch_rmsnorm_gated_q8(self.gdn_core_out.raw_ptr(), self.gdn_z.raw_ptr(),
+                                     weights.ssm_norm.raw_ptr(), self.gdn_core_out.raw_ptr())?;
 
-        // 9) Project back to hidden.
-        self.launch_matvec_dispatch(&weights.ssm_out, self.gdn_core_out.raw_ptr(), output_ptr)?;
+        // 6) Project back to hidden.
+        self.launch_matvec_prequant(&weights.ssm_out, self.gdn_core_out.raw_ptr(), output_ptr)?;
         Ok(())
     }
 
@@ -4419,7 +4627,7 @@ impl GpuQwen35 {
     {
         assert_eq!(input.len(), self.hidden);
         self.hidden_a.copy_from_host(input)?;
-        self.step_linear_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+        self.step_linear_attention(self.hidden_a.raw_ptr(), None, self.hidden_b.raw_ptr(),
                                     weights, state)?;
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
@@ -4440,7 +4648,7 @@ impl GpuQwen35 {
         let h_dim = self.hidden as u32;
 
         self.hidden_a.copy_from_host(input)?;
-        self.step_linear_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+        self.step_linear_attention(self.hidden_a.raw_ptr(), None, self.hidden_b.raw_ptr(),
                                     &weights.attn, state)?;
         self.launch_add_inplace(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), h_dim)?;
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), weights.post_norm.raw_ptr(),
@@ -4480,7 +4688,7 @@ impl GpuQwen35 {
         // write + attention kernels see the right slot. Without this
         // they read pos=0 every call.
         self.set_pos(kv_cache.len)?;
-        self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
+        self.step_full_attention(self.hidden_a.raw_ptr(), None, self.hidden_b.raw_ptr(),
                                  weights, kv_cache)?;
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
@@ -4502,7 +4710,7 @@ impl GpuQwen35 {
     {
         assert_eq!(input.len(), self.hidden, "input must be hidden-sized");
         self.hidden_a.copy_from_host(input)?;
-        self.step_swiglu_ffn(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), weights)?;
+        self.step_swiglu_ffn(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(), weights, false)?;
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.hidden];
         self.hidden_b.copy_to_host(&mut out)?;
