@@ -51,6 +51,7 @@ const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.c
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_PARTIAL_F32_SOURCE:  &str = include_str!("../../kernels/attn_partial_f32.cpp");
 const ATTN_DECODE_GQA_SOURCE:   &str = include_str!("../../kernels/attn_decode_gqa_f32.cpp");
+const ATTN_PREFILL_TILED_SOURCE: &str = include_str!("../../kernels/attn_prefill_tiled_f32.cpp");
 const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
@@ -1188,6 +1189,10 @@ pub struct GpuQwen35 {
     /// case decode uses attn_partial_f32.
     attn_gqa_module:         Option<Module>,
     attn_gh:                 u32,
+    /// Tiled prefill attention (kernels/attn_prefill_tiled_f32.cpp),
+    /// specialised on head_dim; `None` (REINSTINCT_PREFILL_ATTN=flash or
+    /// an unsupported head_dim) keeps attn_prefill_flash_f32.
+    attn_prefill_tiled_module: Option<Module>,
     attn_merge_module:       Module,
     /// f32 KV-cache write at the device-resident decode position.
     add_inplace_module:      Module,
@@ -1457,6 +1462,12 @@ impl GpuQwen35 {
         let attn_gh = if attn_g % attn_gh == 0 { attn_gh } else { attn_g.min(8) };
         let gqa_ok = matches!(head_dim, 16 | 32 | 64 | 128 | 256)
             && std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true);
+        let tiled_ok = head_dim % 64 == 0 && head_dim <= 256
+            && std::env::var("REINSTINCT_PREFILL_ATTN").map(|v| v != "flash").unwrap_or(true);
+        let attn_prefill_tiled_hsaco = if tiled_ok {
+            Some(cache.compile(&format!("attn_prefill_tiled_hd{head_dim}"),
+                &format!("#define HD {head_dim}\n{ATTN_PREFILL_TILED_SOURCE}"))?)
+        } else { None };
         let attn_gqa_hsaco = if gqa_ok {
             Some(cache.compile(&format!("attn_decode_gqa_hd{head_dim}_gh{attn_gh}"),
                 &format!("#define HD {head_dim}\n#define GH {attn_gh}\n{ATTN_DECODE_GQA_SOURCE}"))?)
@@ -1566,6 +1577,7 @@ impl GpuQwen35 {
             attn_partial_module:      Module::load(&attn_partial_hsaco)?,
             attn_gqa_module:          attn_gqa_hsaco.as_ref().map(|h| Module::load(h)).transpose()?,
             attn_gh,
+            attn_prefill_tiled_module: attn_prefill_tiled_hsaco.as_ref().map(|h| Module::load(h)).transpose()?,
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
             gdn_recurrent_step_fused_module: Module::load(&gdn_recurrent_step_fused_hsaco)?,
@@ -4188,10 +4200,13 @@ impl GpuQwen35 {
     {
         const BQ: u32 = 8;
         const BK: u32 = 8;
-        let f = self.attn_step_batched_module.function("attn_prefill_flash_f32")?;
-        let block: u32 = 64 * BQ;
         let head_dim = self.head_dim as u32;
-        let smem = 2 * BK * head_dim * 4;
+        // Tiled kernel: 32 queries per 256-thread workgroup, static LDS.
+        let (f, block, smem, rows_per_wg) = match &self.attn_prefill_tiled_module {
+            Some(m) => (m.function("attn_prefill_tiled_f32")?, 256u32, 0u32, 32u32),
+            None => (self.attn_step_batched_module.function("attn_prefill_flash_f32")?,
+                     64 * BQ, 2 * BK * head_dim * 4, BQ),
+        };
         let mut qa = q; let mut ka = k_cache; let mut va = v_cache; let mut oa = out;
         let mut nh = self.n_heads as u32;
         let mut nkv = self.n_kv_heads as u32;
@@ -4213,7 +4228,7 @@ impl GpuQwen35 {
             &mut nr as *mut _ as *mut c_void,
             &mut bp as *mut _ as *mut c_void,
         ];
-        unsafe { f.launch((self.n_heads as u32, (n_rows + BQ - 1) / BQ, 1),
+        unsafe { f.launch((self.n_heads as u32, (n_rows + rows_per_wg - 1) / rows_per_wg, 1),
                           (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
