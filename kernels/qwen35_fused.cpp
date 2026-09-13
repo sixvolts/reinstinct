@@ -38,16 +38,17 @@ __device__ __forceinline__ void q8_store_sub(BlockQ8* __restrict__ out, int lane
 
 // Block-wide sum of `v` (block = blockDim.x threads, `red` has blockDim.x
 // floats). Returns the total to every thread.
+// One DPP reduction per wave, one LDS exchange, one barrier — not the
+// log2(bs)-barrier tree these latency-bound single-token kernels used
+// to pay. `red` needs blockDim.x/64 floats (blockDim.x a multiple of 64).
 __device__ __forceinline__ float block_sum(float v, float* red) {
-    const int tid = threadIdx.x, bs = blockDim.x;
-    red[tid] = v;
+    const int tid = threadIdx.x, nw = blockDim.x >> 6;
+    v = wave64_reduce_add_f32(v);
+    if ((tid & 63) == 0) red[tid >> 6] = v;
     __syncthreads();
-    for (int s = bs / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] += red[tid + s];
-        __syncthreads();
-    }
-    const float t = red[0];
-    __syncthreads();
+    float t = 0.0f;
+    for (int i = 0; i < nw; i++) t += red[i];
+    __syncthreads();                                // red may be reused by the caller
     return t;
 }
 
@@ -75,15 +76,26 @@ void add_rmsnorm_q8_f32(float*       __restrict__ hidden,
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
     const int nk   = (int)n / ARQ_THREADS;          // elements per thread
-    float v[ARQ_KMAX], wv[ARQ_KMAX];
+    // All loads first (rows past nk re-read the last row: cache hits,
+    // never used), then a scheduling fence: otherwise the compiler
+    // issues load, wait, fma per row and this single-workgroup kernel is
+    // one memory latency per row instead of one in total.
+    float v[ARQ_KMAX], wv[ARQ_KMAX], av[ARQ_KMAX];
+    #pragma unroll
+    for (int k = 0; k < ARQ_KMAX; k++) {
+        const int i = min(k, nk - 1) * ARQ_THREADS + tid;
+        v[k]  = hidden[i];
+        wv[k] = w[i];
+        av[k] = add ? add[i] : 0.0f;
+    }
+    __builtin_amdgcn_sched_barrier(0);
     float sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < ARQ_KMAX; k++) {
         if (k < nk) {
             const int i = k * ARQ_THREADS + tid;
-            float x = hidden[i];
-            wv[k] = w[i];
-            if (add) { x += add[i]; hidden[i] = x; }
+            const float x = v[k] + av[k];
+            if (add) hidden[i] = x;
             v[k] = x;
             sum += x * x;
         }

@@ -126,6 +126,26 @@ the difference between "the golden test passed" and "it never ran".
 The `tests/golden` fixtures are checked in; `tests/golden/build.sh`
 regenerates the llama.cpp reference logits.
 
+`REINSTINCT_GGUF_FIXTURE` can point the real-block oracle tests at a
+bigger model (e.g. the 27B, whose block 0 takes the split-K alpha|beta
+path that the 0.8B never does). Mind host RAM: the 27B linear-attention
+oracle peaks at ~19 GB, the full-attention one at >30 GB (OOM-killed on
+a 30 GB box), and the tests load the model into anonymous memory — run
+them alone, never alongside another test process on the same host.
+
+Kernel micro-benchmarks are `#[ignore]` tests run with
+`cargo test --release --lib <name> -- --ignored --nocapture`; they read
+`kernels/` from disk (`REINSTINCT_MMQ_BENCH_SRC_DIR` points them at a
+variant directory) so a kernel edit re-benches without a rebuild:
+
+| Bench | What | Knobs |
+|---|---|---|
+| `bench_matvec_repacked_kernels` | decode matvec GB/s per dtype at the 27B's projection shapes | `REINSTINCT_MV_BENCH_SHAPES="in x out,..."`, `_R1=1` (one-row-per-wave entries), `_SEG=1`, `_Q8_GEOM=rows,block` |
+| `bench_matvec_stream_overlap` | two independent matvecs on one stream vs fork/join on two, direct and in a graph (negative result: ≤2%, nothing in a graph) | — |
+| `bench_mmq_wide_kernels` | prefill MMQ GEMM per dtype | — |
+| `bench_attn_decode` | split-K decode attention, old per-query-head kernel vs the GQA kernel, at 32 / 512 / 2048 / 8192 tokens on a cold KV cache, with a correctness check between them | `REINSTINCT_ATTN_GEOM=heads,kv,head_dim` (default 24,4,256 = the 27B), `REINSTINCT_ATTN_SPLITS`, `REINSTINCT_ATTN_DEFS="#define UNR 2\n"` |
+| `gdn_recurrent_v2_matches_v1_and_bench` (not ignored) | GDN recurrent step v1 vs v2 on a cold state | `REINSTINCT_GDN_GEOM=cols,groups` |
+
 ## COMMANDS
 
 ### inspect
@@ -636,7 +656,13 @@ reinstinct-engine gpu-bench <PATH> [-n <N>] [-t <ID>]
 ```
 
 Time GPU `forward_token` over `--iters` iterations (default 20) and
-compare against the CPU baseline.
+compare against the CPU baseline. Also prints a per-stage breakdown
+and a per-kernel trace of one block of each kind (the first GDN block
+and the first full-attention block, hipEvent-timed; the
+`(event overhead)` row is an empty event pair — subtract it from every
+kernel to get the in-graph cost). Note the bench decodes at position
+0..iters, so the attention rows show the short-context floor only;
+`bench_attn_decode` (below) covers long contexts.
 
 ---
 
@@ -829,8 +855,9 @@ serve mode. The serve startup logs WARN if any of them are active.
 | `REINSTINCT_PREFILL_NO_GRAPH` | Same, for the prefill path (both qwen35 and gemma4). |
 | `REINSTINCT_GEMMA_NO_DP4A` | Force the f32/wave64 matvec instead of the int8 `v_dot4_i32_i8` dp4a path on gemma4. Big perf hit; precision check only. |
 | `REINSTINCT_NO_DP4A_Q4_0` / `_Q4` / `_Q5` / `_Q6` / `_Q8` | gemma4 only: disable the dp4a path for one quant type (Q4_0 / Q4_K / Q5_K / Q6_K / Q8_0). |
-| `REINSTINCT_GDN_NO_LDS128` | qwen35 only: opt out of the LDS-resident-state GDN recurrent kernel (head_dim=128 fast path). Falls back to the general HBM-state kernel. |
-| `REINSTINCT_OLD_ATTN` | gemma4 only: legacy single-block attention kernel instead of the split-K FlashDecoding path. |
+| `REINSTINCT_GDN_NO_LDS128` | qwen35 only: opt out of the LDS-resident-state variant of the *prefill* (batched) GDN recurrent kernel (head_dim=128). Falls back to the general HBM-state kernel. |
+| `REINSTINCT_OLD_ATTN` | Legacy single-block decode attention kernel instead of the split-K FlashDecoding path (both runtimes). |
+| `REINSTINCT_ATTN=partial` | qwen35 only: the per-query-head split-K kernel (`attn_partial_f32`) instead of the GQA flash-decoding kernel. A/B only — 8× slower at 8K context. |
 | `REINSTINCT_MOE_NO_GROUPED` | Opt out of the grouped-expert MMQ GEMM. Falls back to per-token expert matvecs (~2× slower MoE prefill). |
 | `REINSTINCT_MOE_PROFILE` | Per-stage decode timer (sync-per-lap). Disables graph capture as a side effect — big perf hit. |
 
@@ -1297,10 +1324,30 @@ on qwen 35B-MoE). Key changes:
   scatter back. Per-tile BN = 16 for qwen MoE's Q4_K/Q5_K (~16
   tokens/expert avg → 0 padding waste); BN = 32 for gemma 26B-MoE's
   Q6_K/Q8_0 (~32 tokens/expert avg).
-- GDN recurrent kernel (qwen35 hybrid): LDS-resident state slice with
-  +1-stride pad to eliminate a 64-way bank conflict; per-thread
-  decayed-state in a 32-float register array; per-row `a`/`b` scalars
-  preloaded to LDS. 3.84× speedup over the baseline (8.57 → 2.23 ms).
+- GDN recurrent kernel (qwen35 hybrid, `gdn_recurrent_step_v2.cpp`):
+  one workgroup per (head, 32-column slab), 4 row groups of 32 rows,
+  the state column register-resident between the decay and update
+  passes (read once, written once). Compiled specialised on head_dim.
+  The state loads are issued as one batch before anything that waits
+  on memory — the compiler otherwise pairs each load with its FMA and
+  the kernel runs at one row in flight per wave. 22 µs per block on
+  the 27B cold (the v1 kernel: 47 µs). Its alpha|beta projection is a
+  split-K Q8_0 matvec whose partials the kernel sums (96 rows over
+  5120 was pure launch latency otherwise).
+- Decode attention (qwen35, `attn_decode_gqa_f32.cpp`): GQA
+  flash-decoding. One workgroup per (kv head, group of ≤6 query heads,
+  split): K/V rows read once per group as float4s, query slices in
+  registers, scores reduced across the row's lanes with DPP
+  (`row_bcast` for the cross-row steps — no LDS in the reduction),
+  online softmax per 256-token tile so any context fits a fixed LDS
+  footprint; partial (m, l, o) into the same buffers the merge kernel
+  reads. The per-query-head kernel it replaces read the shared KV head
+  once per query head with scalar loads: 1.2 ms per block at 8K on
+  the 27B, now 0.17 (56 → 390 GB/s); decode at a 4K prompt 37.5 →
+  29.2 ms/token. The split count is fixed per model at capture
+  (max_seq/256, ≤16); 30 splits is 15% faster at 8K but slower below
+  2K from the merge cost. Gemma's int8-KV attention
+  (`attn_partial_q8`) still has the old structure.
 - HIP graph capture + per-(state, P) `GraphExec` cache on Gemma 4
   prefill — skips end_capture + instantiate on subsequent same-shape
   prefills.

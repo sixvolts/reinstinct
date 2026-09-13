@@ -50,6 +50,7 @@ const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.
 const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.cpp");
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_PARTIAL_F32_SOURCE:  &str = include_str!("../../kernels/attn_partial_f32.cpp");
+const ATTN_DECODE_GQA_SOURCE:   &str = include_str!("../../kernels/attn_decode_gqa_f32.cpp");
 const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
@@ -1169,6 +1170,12 @@ pub struct GpuQwen35 {
     attn_step_module:        Module,
     /// Split-K decode attention (FlashDecoding) — partial + merge.
     attn_partial_module:     Module,
+    /// GQA flash-decoding kernel (kernels/attn_decode_gqa_f32.cpp),
+    /// compiled specialised on head_dim and `attn_gh` query heads per
+    /// workgroup; `None` when head_dim is not one it supports, in which
+    /// case decode uses attn_partial_f32.
+    attn_gqa_module:         Option<Module>,
+    attn_gh:                 u32,
     attn_merge_module:       Module,
     /// f32 KV-cache write at the device-resident decode position.
     add_inplace_module:      Module,
@@ -1425,6 +1432,21 @@ impl GpuQwen35 {
         let sigmoid_mul_hsaco       = cache.compile("sigmoid_mul",       SIGMOID_MUL_SOURCE)?;
         let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
         let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
+        // GQA decode attention: GH query heads of one kv head per
+        // workgroup — the largest divisor of the group size up to 6 (the
+        // register budget at two waves per SIMD), so the 27B's 6-head
+        // groups take one workgroup and the 0.8B's 4-head groups too.
+        // REINSTINCT_ATTN=partial keeps the per-query-head kernel for A/B.
+        let attn_g = (n_heads / n_kv_heads.max(1)).max(1) as u32;
+        let attn_gh = (1..=6u32).rev().find(|d| attn_g % d == 0).unwrap_or(1).max(
+            if attn_g <= 8 { attn_g } else { 1 });
+        let attn_gh = if attn_g % attn_gh == 0 { attn_gh } else { attn_g.min(8) };
+        let gqa_ok = matches!(head_dim, 16 | 32 | 64 | 128 | 256)
+            && std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true);
+        let attn_gqa_hsaco = if gqa_ok {
+            Some(cache.compile(&format!("attn_decode_gqa_hd{head_dim}_gh{attn_gh}"),
+                &format!("#define HD {head_dim}\n#define GH {attn_gh}\n{ATTN_DECODE_GQA_SOURCE}"))?)
+        } else { None };
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
         let add_inplace_hsaco       = cache.compile("add_inplace",       ADD_INPLACE_SOURCE)?;
         // Specialised on head_dim: the recurrent step's row loops unroll
@@ -1523,6 +1545,8 @@ impl GpuQwen35 {
             sigmoid_mul_module:       Module::load(&sigmoid_mul_hsaco)?,
             attn_step_module:         Module::load(&attn_step_hsaco)?,
             attn_partial_module:      Module::load(&attn_partial_hsaco)?,
+            attn_gqa_module:          attn_gqa_hsaco.as_ref().map(|h| Module::load(h)).transpose()?,
+            attn_gh,
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
             add_inplace_module:       Module::load(&add_inplace_hsaco)?,
             gdn_recurrent_step_fused_module: Module::load(&gdn_recurrent_step_fused_hsaco)?,
@@ -2521,22 +2545,39 @@ impl GpuQwen35 {
         // LDS: qf[head_dim f32] | scores[chunk_max f32] | tmp[block f32]
         let smem = (head_dim + chunk_max + block) * 4;
 
-        let fp = self.attn_partial_module.function("attn_partial_f32")?;
         let mut qa=q; let mut ka=k_cache; let mut va=v_cache;
         let mut op=self.attn_o_partial.raw_ptr();
         let mut mp=self.attn_m_partial.raw_ptr();
         let mut lp=self.attn_l_partial.raw_ptr();
         let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
         let mut sc=scaling; let mut ns=n_splits;
-        let mut pargs: [*mut c_void; 12] = [
-            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
-            &mut va as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
-            &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
-        unsafe {
-            fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
+        if let Some(m) = &self.attn_gqa_module {
+            // One workgroup per (kv head, group of attn_gh query heads,
+            // split); static LDS; same partial buffers as the merge reads.
+            let fg = m.function("attn_decode_gqa_f32")?;
+            let groups = (n_heads / n_kv + self.attn_gh - 1) / self.attn_gh;
+            let mut gargs: [*mut c_void; 11] = [
+                &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                &mut va as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+                &mut ns as *mut _ as *mut c_void];
+            unsafe {
+                fg.launch((n_kv * groups, n_splits, 1), (block,1,1), 0, Some(&self.stream), &mut gargs)?;
+            }
+        } else {
+            let fp = self.attn_partial_module.function("attn_partial_f32")?;
+            let mut pargs: [*mut c_void; 12] = [
+                &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                &mut va as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+            unsafe {
+                fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
+            }
         }
 
         let fm = self.attn_merge_module.function("attn_merge_f32")?;
@@ -3520,6 +3561,9 @@ impl GpuQwen35 {
             // previous block's FFN output is not pending here: the
             // untraced blocks above complete their residual add.
             let normed = self.normed.raw_ptr();
+            // Calibration: an empty event pair measures the per-row
+            // overhead of the trace itself (event record + dispatch gap).
+            traced!("(event overhead)", Ok::<(), String>(()));
             let (post_norm, ffn) = match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
                     assert!(kv.len < kv.max_seq, "KV cache full");
