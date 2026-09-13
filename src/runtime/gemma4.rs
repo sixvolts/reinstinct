@@ -84,6 +84,7 @@ const MATVEC_Q8_0_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q8_0_r
 // Prefill kernel sources.
 const ROPE_PREFILL_SRC:      &str = include_str!("../../kernels/rope_prefill.cpp");
 const ATTN_PREFILL_SRC:      &str = include_str!("../../kernels/attn_prefill_flash.cpp");
+const ATTN_PREFILL_TILED_SRC: &str = include_str!("../../kernels/attn_prefill_tiled_f32.cpp");
 const PERMUTE_PLE_SRC:       &str = include_str!("../../kernels/permute_ple.cpp");
 const KV_QUANT_PREFILL_SRC:  &str = include_str!("../../kernels/kv_quant_prefill.cpp");
 const ROPE_BATCHED_SRC:      &str = include_str!("../../kernels/rope_batched.cpp");
@@ -767,6 +768,9 @@ pub struct GpuGemma4 {
     /// one module per (head_dim, query heads per group) the model's
     /// layers need; empty under REINSTINCT_ATTN=partial.
     m_attn_gqa_q8:  std::collections::HashMap<(u32, u32), Module>,
+    /// Tiled prefill attention (attn_prefill_tiled_f32.cpp) per head_dim
+    /// of the layers; empty under REINSTINCT_PREFILL_ATTN=flash.
+    m_attn_prefill_tiled: std::collections::HashMap<u32, Module>,
     /// SuperQuant 2-tier attention (opt-in). Always loaded so opt-in
     /// at state construction time doesn't need to recompile.
     m_attn_superquant: Module,
@@ -1002,6 +1006,17 @@ impl GpuGemma4 {
         // (the 31B's sliding layers are 32/16/256 -> 2, its global
         // layers 32/4/512 -> 4 with two groups). head_dim must be a
         // multiple of 64 up to 512; other shapes keep attn_partial_q8.
+        let mut attn_prefill_tiled_modules: std::collections::HashMap<u32, Module> =
+            std::collections::HashMap::new();
+        if std::env::var("REINSTINCT_PREFILL_ATTN").map(|v| v != "flash").unwrap_or(true) {
+            for b in &blocks {
+                let hd = b.head_dim as u32;
+                if !matches!(hd, 128 | 256 | 512) || attn_prefill_tiled_modules.contains_key(&hd) { continue; }
+                let m = ld(&format!("attn_prefill_tiled_hd{hd}"),
+                           &format!("#define HD {hd}\n{ATTN_PREFILL_TILED_SRC}"))?;
+                attn_prefill_tiled_modules.insert(hd, m);
+            }
+        }
         let mut attn_gqa_q8_modules: std::collections::HashMap<(u32, u32), Module> =
             std::collections::HashMap::new();
         if std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true) {
@@ -1094,6 +1109,7 @@ impl GpuGemma4 {
             m_attn_win:   ld("attn_step_window", ATTN_WINDOW_SRC)?,
             m_attn_partial: ld("attn_partial_q8", ATTN_PARTIAL_Q8_SRC)?,
             m_attn_gqa_q8:  attn_gqa_q8_modules,
+            m_attn_prefill_tiled: attn_prefill_tiled_modules,
             m_attn_superquant: ld("attn_partial_superquant", ATTN_PARTIAL_SQ_SRC)?,
             m_attn_superquant_rs: ld("attn_partial_superquant_rs", ATTN_PARTIAL_SQRS_SRC)?,
             m_attn_superquant_wp: ld("attn_partial_superquant_wp", ATTN_PARTIAL_SQWP_SRC)?,
@@ -3741,9 +3757,12 @@ impl GpuGemma4 {
         // #define BQ / BK.
         const BQ: u32 = 8;
         const BK: u32 = 8;
-        let f = m.function("attn_prefill_flash_f32")?;
-        let block: u32 = 64 * BQ;
-        let smem = 2 * BK * head_dim * 4;
+        // The tiled kernel (32 queries per 256-thread workgroup, static
+        // LDS, sliding window supported) when compiled for this head_dim.
+        let (f, block, smem, rows_per_wg) = match self.m_attn_prefill_tiled.get(&head_dim) {
+            Some(mt) => (mt.function("attn_prefill_tiled_f32")?, 256u32, 0u32, 32u32),
+            None => (m.function("attn_prefill_flash_f32")?, 64 * BQ, 2 * BK * head_dim * 4, BQ),
+        };
         let mut qa=q; let mut ka=k; let mut va=v; let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
         let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=0u32;
@@ -3754,7 +3773,7 @@ impl GpuGemma4 {
             &mut hd as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void, &mut pr as *mut _ as *mut c_void,
             &mut bp as *mut _ as *mut c_void];
-        unsafe { f.launch((self.n_heads as u32, (p as u32 + BQ - 1) / BQ, 1),
+        unsafe { f.launch((self.n_heads as u32, (p as u32 + rows_per_wg - 1) / rows_per_wg, 1),
                           (block,1,1), smem, Some(&self.stream), &mut args) }
     }
 

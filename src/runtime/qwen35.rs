@@ -1462,7 +1462,7 @@ impl GpuQwen35 {
         let attn_gh = if attn_g % attn_gh == 0 { attn_gh } else { attn_g.min(8) };
         let gqa_ok = matches!(head_dim, 16 | 32 | 64 | 128 | 256)
             && std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true);
-        let tiled_ok = head_dim % 64 == 0 && head_dim <= 256
+        let tiled_ok = matches!(head_dim, 128 | 256 | 512)
             && std::env::var("REINSTINCT_PREFILL_ATTN").map(|v| v != "flash").unwrap_or(true);
         let attn_prefill_tiled_hsaco = if tiled_ok {
             Some(cache.compile(&format!("attn_prefill_tiled_hd{head_dim}"),

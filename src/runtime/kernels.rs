@@ -2604,9 +2604,12 @@ mod tests {
     #[ignore = "benchmark — run explicitly with --ignored"]
     fn bench_attn_prefill() {
         let Some(cache) = skip_if_no_gpu() else { return };
-        let (n_heads, n_kv, head_dim) = std::env::var("REINSTINCT_ATTN_GEOM").ok()
-            .map(|g| { let v: Vec<usize> = g.split(',').map(|x| x.parse().unwrap()).collect(); (v[0], v[1], v[2]) })
-            .unwrap_or((24, 4, 256));
+        // The 27B (24/4/256, causal) and Gemma 31B's sliding (32/16/256,
+        // window 1024) and global (32/4/512) layers.
+        let geoms: Vec<(usize, usize, usize, u32)> = match std::env::var("REINSTINCT_ATTN_GEOM").ok() {
+            Some(g) => { let v: Vec<usize> = g.split(',').map(|x| x.parse().unwrap()).collect(); vec![(v[0], v[1], v[2], v[3] as u32)] }
+            None => vec![(24, 4, 256, 0), (32, 16, 256, 1024), (32, 4, 512, 0)],
+        };
         let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
         let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
@@ -2614,10 +2617,12 @@ mod tests {
         let mf = Module::load(&cache.compile("attn_prefill_flash", &read("attn_prefill_flash")).unwrap()).unwrap();
         let ff = mf.function("attn_prefill_flash_f32").unwrap();
         let defs = std::env::var("REINSTINCT_ATTN_DEFS").unwrap_or_default().replace("\\n", "\n");
+        let stream = hip::Stream::new().unwrap();
+        for (n_heads, n_kv, head_dim, window) in geoms {
         let tsrc = format!("#define HD {head_dim}\n{defs}{}", read("attn_prefill_tiled_f32"));
         let mt = Module::load(&cache.compile(&format!("attn_prefill_tiled_bench_hd{head_dim}_{}", defs.len()), &tsrc).unwrap()).unwrap();
         let ft = mt.function("attn_prefill_tiled_f32").unwrap();
-        let stream = hip::Stream::new().unwrap();
+        eprintln!("geometry {n_heads}/{n_kv}/{head_dim} window {window}");
         let max_seq = 4096usize;
         let mut sd: u64 = 0x9F11_0001;
         let mut rnd = || { sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -2634,7 +2639,7 @@ mod tests {
         for &(base_pos, n_rows) in &[(0usize, 512usize), (0, 2048), (0, 3968), (2048, 512), (0, 1000)] {
             let launch = |f: &hip::Function<'_>, out: &DeviceBuf<f32>, grid: (u32, u32, u32), block: u32, smem: u32, st: &hip::Stream| {
                 let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut va = dv.raw_ptr(); let mut oa = out.raw_ptr();
-                let mut nh = n_heads as u32; let mut nkv = n_kv as u32; let mut hd = head_dim as u32; let mut wn = 0u32;
+                let mut nh = n_heads as u32; let mut nkv = n_kv as u32; let mut hd = head_dim as u32; let mut wn = window;
                 let mut sc = scaling; let mut nr = n_rows as u32; let mut bp = base_pos as u32;
                 let mut args: [*mut c_void; 11] = [
                     &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
@@ -2664,11 +2669,13 @@ mod tests {
             };
             let ms1 = time(&flash, 3); let ms2 = time(&tiled, 5);
             let kv_len = (base_pos + n_rows) as f64;
-            let pairs = n_rows as f64 * (kv_len - n_rows as f64 / 2.0);   // causal (q, k) pairs per head
+            let mut pairs = n_rows as f64 * (kv_len - n_rows as f64 / 2.0);   // causal (q, k) pairs per head
+            if window > 0 { pairs = pairs.min(n_rows as f64 * window as f64); }
             let flops = 2.0 * 2.0 * pairs * head_dim as f64 * n_heads as f64;
-            eprintln!("prefill attn base {base_pos:>4} rows {n_rows:>4}: flash {ms1:.3} ms ({:.2} TFLOPS)  tiled {ms2:.3} ms ({:.2} TFLOPS)  rel_l2 {err:.2e}",
+            eprintln!("  base {base_pos:>4} rows {n_rows:>4}: flash {ms1:.3} ms ({:.2} TFLOPS)  tiled {ms2:.3} ms ({:.2} TFLOPS)  rel_l2 {err:.2e}",
                       flops / (ms1 * 1e-3) / 1e12, flops / (ms2 * 1e-3) / 1e12);
             assert!(err < 2e-3, "tiled prefill attention diverges: rel_l2 {err:.2e}");
+        }
         }
     }
 
