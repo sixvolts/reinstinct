@@ -118,6 +118,7 @@ impl KernelCache {
     fn shared_headers() -> &'static [(&'static str, &'static str)] {
         const HEADERS: &[(&str, &str)] = &[
             ("gfx906_dpp.h", include_str!("../../kernels/gfx906_dpp.h")),
+            ("attn_gqa_common.h", include_str!("../../kernels/attn_gqa_common.h")),
         ];
         HEADERS
     }

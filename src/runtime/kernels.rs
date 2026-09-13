@@ -2457,6 +2457,144 @@ mod tests {
         assert!(e_state < 1e-4 && e_out < 1e-3, "v2 diverges");
     }
 
+    /// Gemma's int8-KV split-K decode attention: attn_partial_q8 vs the
+    /// GQA kernel at the 31B's two layer geometries (sliding-window
+    /// layers 32/16/256 with window 1024, global layers 32/4/512) over a
+    /// range of context lengths, with a correctness check between them.
+    /// `--ignored --nocapture`; REINSTINCT_ATTN_GEOM=heads,kv,head_dim,window.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_attn_decode_q8() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let geoms: Vec<(usize, usize, usize, u32)> = match std::env::var("REINSTINCT_ATTN_GEOM").ok() {
+            Some(g) => { let v: Vec<usize> = g.split(',').map(|x| x.parse().unwrap()).collect(); vec![(v[0], v[1], v[2], v[3] as u32)] }
+            None => vec![(32, 16, 256, 1024), (32, 4, 512, 0)],
+        };
+        let max_seq = 8192usize;
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
+            .unwrap_or_else(|e| panic!("{dir}/{name}.cpp: {e}"));
+        let mp = Module::load(&cache.compile("attn_partial_q8", &read("attn_partial_q8")).unwrap()).unwrap();
+        let mm = Module::load(&cache.compile("attn_merge", &read("attn_merge")).unwrap()).unwrap();
+        let fp = mp.function("attn_partial_q8_f32").unwrap();
+        let fm = mm.function("attn_merge_f32").unwrap();
+        let stream = hip::Stream::new().unwrap();
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let flush_n = 16usize << 20;
+        let flush: DeviceBuf<f32> = DeviceBuf::new(flush_n).unwrap();
+        let flush_q: DeviceBuf<u8> = DeviceBuf::new((flush_n / 32) * 40).unwrap();
+        let flush_l2 = |st: &hip::Stream| {
+            let mut xp = flush.raw_ptr(); let mut qp = flush_q.raw_ptr(); let mut n = flush_n as u32;
+            let mut a: [*mut c_void; 3] = [&mut xp as *mut _ as *mut c_void,
+                &mut qp as *mut _ as *mut c_void, &mut n as *mut _ as *mut c_void];
+            unsafe { qf.launch(((flush_n as u32) / 256, 1, 1), (256, 1, 1), 0, Some(st), &mut a).unwrap(); }
+        };
+        for (n_heads, n_kv, head_dim, window) in geoms {
+            let g = (n_heads / n_kv) as u32;
+            let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
+            let defs = std::env::var("REINSTINCT_ATTN_DEFS").unwrap_or_default().replace("\\n", "\n");
+            let gsrc = format!("#define HD {head_dim}\n#define GH {gh}\n{defs}{}", read("attn_decode_gqa_q8"));
+            let mg = Module::load(&cache.compile(&format!("attn_decode_gqa_q8_bench_hd{head_dim}_gh{gh}_{}", defs.len()), &gsrc).unwrap()).unwrap();
+            let fg = mg.function("attn_decode_gqa_q8_f32").unwrap();
+            let mut sd: u64 = 0x0A8E_0001 ^ head_dim as u64;
+            let mut rnd = || { sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                               ((sd >> 40) as f32 / (1u64 << 24) as f32) - 0.5 };
+            let kv_dim = n_kv * head_dim;
+            let kc: Vec<i8> = (0..max_seq * kv_dim).map(|_| (rnd() * 254.0) as i8).collect();
+            let vc: Vec<i8> = (0..max_seq * kv_dim).map(|_| (rnd() * 254.0) as i8).collect();
+            let ksc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.02 + rnd().abs() * 0.02).collect();
+            let vsc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.02 + rnd().abs() * 0.02).collect();
+            let q: Vec<f32> = (0..n_heads * head_dim).map(|_| rnd() * 4.0).collect();
+            let dk = DeviceBuf::from_slice(&kc).unwrap(); let dv = DeviceBuf::from_slice(&vc).unwrap();
+            let dks = DeviceBuf::from_slice(&ksc).unwrap(); let dvs = DeviceBuf::from_slice(&vsc).unwrap();
+            let dq = DeviceBuf::from_slice(&q).unwrap();
+            let n_splits = std::env::var("REINSTINCT_ATTN_SPLITS").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(((max_seq as u32 + 255) / 256).clamp(1, 16));
+            let win_max = if window > 0 { window.min(max_seq as u32) } else { max_seq as u32 };
+            let chunk_max = (win_max + n_splits - 1) / n_splits;
+            let block = 256u32;
+            let smem = head_dim as u32 + (chunk_max + block) * 4;
+            let dop: DeviceBuf<f32> = DeviceBuf::new(n_heads * n_splits as usize * head_dim).unwrap();
+            let dmp: DeviceBuf<f32> = DeviceBuf::new(n_heads * n_splits as usize).unwrap();
+            let dlp: DeviceBuf<f32> = DeviceBuf::new(n_heads * n_splits as usize).unwrap();
+            let dout: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
+            let dout2: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
+            let dpos: DeviceBuf<u32> = DeviceBuf::new(1).unwrap();
+            eprintln!("geometry {n_heads}/{n_kv}/{head_dim} window {window} (GH {gh}, n_splits {n_splits})");
+            for &pos in &[31u32, 511, 2047, 8191] {
+                dpos.copy_from_host(&[pos]).unwrap();
+                let merge = |st: &hip::Stream, out: &DeviceBuf<f32>| {
+                    let mut op2 = dop.raw_ptr(); let mut mp2 = dmp.raw_ptr(); let mut lp2 = dlp.raw_ptr();
+                    let mut oa = out.raw_ptr(); let mut hd2 = head_dim as u32; let mut ns2 = n_splits;
+                    let mut margs: [*mut c_void; 6] = [
+                        &mut op2 as *mut _ as *mut c_void, &mut mp2 as *mut _ as *mut c_void,
+                        &mut lp2 as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                        &mut hd2 as *mut _ as *mut c_void, &mut ns2 as *mut _ as *mut c_void];
+                    unsafe { fm.launch((n_heads as u32, 1, 1), (block, 1, 1), 0, Some(st), &mut margs).unwrap(); }
+                };
+                let launch_old = |st: &hip::Stream| {
+                    let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut ksa = dks.raw_ptr();
+                    let mut va = dv.raw_ptr(); let mut vsa = dvs.raw_ptr();
+                    let mut op = dop.raw_ptr(); let mut mpp = dmp.raw_ptr(); let mut lp = dlp.raw_ptr();
+                    let mut nh = n_heads as u32; let mut nkv = n_kv as u32; let mut hd = head_dim as u32;
+                    let mut pp = dpos.raw_ptr(); let mut wn = window; let mut sc = 1.0f32; let mut ns = n_splits;
+                    let mut pargs: [*mut c_void; 15] = [
+                        &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                        &mut ksa as *mut _ as *mut c_void, &mut va as *mut _ as *mut c_void,
+                        &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                        &mut mpp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                        &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                        &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+                        &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void];
+                    unsafe { fp.launch((n_heads as u32, n_splits, 1), (block, 1, 1), smem, Some(st), &mut pargs).unwrap(); }
+                    merge(st, &dout);
+                };
+                let launch_gqa = |st: &hip::Stream| {
+                    let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut ksa = dks.raw_ptr();
+                    let mut va = dv.raw_ptr(); let mut vsa = dvs.raw_ptr();
+                    let mut op = dop.raw_ptr(); let mut mpp = dmp.raw_ptr(); let mut lp = dlp.raw_ptr();
+                    let mut nh = n_heads as u32; let mut nkv = n_kv as u32;
+                    let mut pp = dpos.raw_ptr(); let mut wn = window; let mut sc = 1.0f32; let mut ns = n_splits;
+                    let mut pargs: [*mut c_void; 14] = [
+                        &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                        &mut ksa as *mut _ as *mut c_void, &mut va as *mut _ as *mut c_void,
+                        &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                        &mut mpp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                        &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                        &mut pp as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+                        &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+                    let groups = (g + gh - 1) / gh;
+                    unsafe { fg.launch((n_kv as u32 * groups, n_splits, 1), (block, 1, 1), 0, Some(st), &mut pargs).unwrap(); }
+                    merge(st, &dout2);
+                };
+                launch_old(&stream); launch_gqa(&stream); stream.synchronize().unwrap();
+                let mut o1 = vec![0.0f32; n_heads * head_dim]; dout.copy_to_host(&mut o1).unwrap();
+                let mut o2 = vec![0.0f32; n_heads * head_dim]; dout2.copy_to_host(&mut o2).unwrap();
+                let err = rel_l2(&o2, &o1);
+                let time = |body: &dyn Fn(&hip::Stream)| -> f64 {
+                    let iters = 20; let mut total = 0.0f64;
+                    for _ in 0..iters {
+                        flush_l2(&stream);
+                        let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+                        e0.record(&stream).unwrap(); body(&stream);
+                        e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+                        total += hip::Event::elapsed_time(&e0, &e1).unwrap() as f64;
+                    }
+                    total / iters as f64
+                };
+                let ms = time(&launch_old); let ms2 = time(&launch_gqa);
+                let attended = if window > 0 { (pos + 1).min(window) } else { pos + 1 } as f64;
+                let bytes = 2.0 * attended * kv_dim as f64;
+                eprintln!("  len {:>5}: old {:.4} ms ({:>4.0} GB/s)  gqa {:.4} ms ({:>4.0} GB/s)  rel_l2 {err:.2e}",
+                          pos + 1, ms, bytes / (ms * 1e-3) / 1e9, ms2, bytes / (ms2 * 1e-3) / 1e9);
+                assert!(err < 1e-4, "gqa q8 attention diverges: rel_l2 {err:.2e}");
+            }
+        }
+    }
+
     /// The register-resident GDN recurrent step (v2) against the
     /// original kernel on random q/k/v/state: same state update and
     /// output to fp32 reduction-order tolerance, and the microbench of

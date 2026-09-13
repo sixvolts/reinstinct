@@ -49,6 +49,7 @@ const LOGIT_SOFTCAP_SRC:     &str = include_str!("../../kernels/logit_softcap.cp
 const SCALE_INPLACE_SRC:     &str = include_str!("../../kernels/scale_inplace.cpp");
 const ATTN_WINDOW_SRC:       &str = include_str!("../../kernels/attn_step_q8.cpp");
 const ATTN_PARTIAL_Q8_SRC:   &str = include_str!("../../kernels/attn_partial_q8.cpp");
+const ATTN_DECODE_GQA_Q8_SRC: &str = include_str!("../../kernels/attn_decode_gqa_q8.cpp");
 const ATTN_PARTIAL_SQ_SRC:   &str = include_str!("../../kernels/attn_partial_superquant.cpp");
 const ATTN_PARTIAL_SQRS_SRC: &str = include_str!("../../kernels/attn_partial_superquant_rs.cpp");
 const ATTN_PARTIAL_SQWP_SRC: &str = include_str!("../../kernels/attn_partial_superquant_wp.cpp");
@@ -762,6 +763,10 @@ pub struct GpuGemma4 {
     m_attn_win:  Module,
     /// Split-K decode attention (partial + merge) — see attn_partial_q8.cpp.
     m_attn_partial: Module,
+    /// GQA flash-decoding over the int8 cache (attn_decode_gqa_q8.cpp),
+    /// one module per (head_dim, query heads per group) the model's
+    /// layers need; empty under REINSTINCT_ATTN=partial.
+    m_attn_gqa_q8:  std::collections::HashMap<(u32, u32), Module>,
     /// SuperQuant 2-tier attention (opt-in). Always loaded so opt-in
     /// at state construction time doesn't need to recompile.
     m_attn_superquant: Module,
@@ -992,6 +997,25 @@ impl GpuGemma4 {
 
         let ones = DeviceBuf::from_slice(&vec![1.0f32; hd_max])?;
 
+        // GQA decode attention, compiled per distinct (head_dim, GH) of
+        // the layers: GH = the largest divisor of the group size up to 4
+        // (the 31B's sliding layers are 32/16/256 -> 2, its global
+        // layers 32/4/512 -> 4 with two groups). head_dim must be a
+        // multiple of 64 up to 512; other shapes keep attn_partial_q8.
+        let mut attn_gqa_q8_modules: std::collections::HashMap<(u32, u32), Module> =
+            std::collections::HashMap::new();
+        if std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true) {
+            for b in &blocks {
+                let (hd, nkv) = (b.head_dim as u32, b.n_kv.max(1) as u32);
+                let g = (n_heads as u32 / nkv).max(1);
+                let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
+                if hd % 64 != 0 || hd > 512 || attn_gqa_q8_modules.contains_key(&(hd, gh)) { continue; }
+                let m = ld(&format!("attn_decode_gqa_q8_hd{hd}_gh{gh}"),
+                           &format!("#define HD {hd}\n#define GH {gh}\n{ATTN_DECODE_GQA_Q8_SRC}"))?;
+                attn_gqa_q8_modules.insert((hd, gh), m);
+            }
+        }
+
         // Scratch for the quantized activation: one BlockQ8 (40 bytes)
         // per 32 input elements, sized to the widest matvec.
         let max_in_dim = blocks.iter()
@@ -1069,6 +1093,7 @@ impl GpuGemma4 {
             m_scale:      ld("scale_inplace", SCALE_INPLACE_SRC)?,
             m_attn_win:   ld("attn_step_window", ATTN_WINDOW_SRC)?,
             m_attn_partial: ld("attn_partial_q8", ATTN_PARTIAL_Q8_SRC)?,
+            m_attn_gqa_q8:  attn_gqa_q8_modules,
             m_attn_superquant: ld("attn_partial_superquant", ATTN_PARTIAL_SQ_SRC)?,
             m_attn_superquant_rs: ld("attn_partial_superquant_rs", ATTN_PARTIAL_SQRS_SRC)?,
             m_attn_superquant_wp: ld("attn_partial_superquant_wp", ATTN_PARTIAL_SQWP_SRC)?,
@@ -2374,29 +2399,56 @@ impl GpuGemma4 {
         // LDS: qi[head_dim i8] | scores[chunk_max f32] | tmp[block f32]
         let smem = head_dim + (chunk_max + block) * 4;
 
-        // --- partial: grid (n_heads, n_splits) ---
-        let fp = self.m_attn_partial.function("attn_partial_q8_f32")?;
-        let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
-        let mut op=self.attn_o_partial.raw_ptr();
-        let mut mp=self.attn_m_partial.raw_ptr();
-        let mut lp=self.attn_l_partial.raw_ptr();
-        let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
-        let mut ns=n_splits;
-        let mut pargs: [*mut c_void; 15] = [
-            &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
-            &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
-            &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
-            &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
-            &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
-            &mut ns as *mut _ as *mut c_void];
-        unsafe {
-            fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
-        }
+        let g = n_heads / n_kv.max(1);
+        let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
+        if let Some(m) = self.m_attn_gqa_q8.get(&(head_dim, gh)) {
+            // GQA flash-decoding: one workgroup per (kv head, group of gh
+            // query heads, split); static LDS; same partial buffers.
+            let fg = m.function("attn_decode_gqa_q8_f32")?;
+            let groups = (g + gh - 1) / gh;
+            let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
+            let mut op=self.attn_o_partial.raw_ptr();
+            let mut mp=self.attn_m_partial.raw_ptr();
+            let mut lp=self.attn_l_partial.raw_ptr();
+            let mut nh=n_heads; let mut nkv=n_kv;
+            let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
+            let mut ns=n_splits;
+            let mut gargs: [*mut c_void; 14] = [
+                &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
+                &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
+                &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut tl as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+            unsafe {
+                fg.launch((n_kv * groups, n_splits, 1), (block,1,1), 0, Some(&self.stream), &mut gargs)?;
+            }
+        } else {
+            // --- partial: grid (n_heads, n_splits) ---
+            let fp = self.m_attn_partial.function("attn_partial_q8_f32")?;
+            let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
+            let mut op=self.attn_o_partial.raw_ptr();
+            let mut mp=self.attn_m_partial.raw_ptr();
+            let mut lp=self.attn_l_partial.raw_ptr();
+            let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
+            let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
+            let mut ns=n_splits;
+            let mut pargs: [*mut c_void; 15] = [
+                &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
+                &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
+                &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
+                &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+                &mut ns as *mut _ as *mut c_void];
+            unsafe {
+                fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
+            }
 
-        // --- merge: grid (n_heads) ---
+            // --- merge: grid (n_heads) ---
+        }
         let fm = self.m_attn_merge.function("attn_merge_f32")?;
         let mut op2=self.attn_o_partial.raw_ptr();
         let mut mp2=self.attn_m_partial.raw_ptr();

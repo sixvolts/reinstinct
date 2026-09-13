@@ -23,6 +23,7 @@
 // prepended by the launcher (HD in {64, 128, 256}; GH <= 8).
 #include <hip/hip_runtime.h>
 #include "gfx906_dpp.h"
+#include "attn_gqa_common.h"
 
 #ifndef HD
 #define HD 128
@@ -48,44 +49,8 @@ static_assert(TILE == BS, "the exp pass maps one thread to one tile token");
 static_assert(TILE % (TPB * UNR) == 0, "tile must be a whole number of unrolled block steps");
 static_assert(GH >= 1 && GH <= 8, "GH <= 8");
 
-// Sum each of the GH values across the LPT lanes of its token row. All
-// DPP, no LDS, through the compiler's DPP builtin so it owns the
-// read-after-write hazards and the schedule (inline asm hid the hazard
-// and broke under register pressure): the cross-row steps use
-// row_bcast:15 / row_bcast:31 (GFX9) instead of an LDS swizzle and its
-// wait — with two waves per SIMD that wait, 192 times per wave and
-// tile, was the whole kernel. The sum is valid in the segment's last
-// lane (dl == LPT-1); for LPT <= 16 in every lane of the row.
-#define DPP_QP_XOR1   0xB1     // quad_perm:[1,0,3,2]
-#define DPP_QP_XOR2   0x4E     // quad_perm:[2,3,0,1]
-#define DPP_ROW_SHL4  0x104
-#define DPP_ROW_SHR4  0x114
-#define DPP_ROW_ROR8  0x128
-#define DPP_ROW_BCAST15 0x142
-#define DPP_ROW_BCAST31 0x143
-template <int CTRL, int ROW_MASK, int BANK_MASK>
-__device__ __forceinline__ float dpp_f32(float old, float src) {
-    return __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(old), __float_as_int(src),
-                                                      CTRL, ROW_MASK, BANK_MASK, false));
-}
-__device__ __forceinline__ void seg_sum_multi(float (&x)[GH]) {
-    #pragma unroll
-    for (int g = 0; g < GH; g++) {
-        float v = x[g];
-        if (LPT > 1) v += dpp_f32<DPP_QP_XOR1, 0xf, 0xf>(0.0f, v);
-        if (LPT > 2) v += dpp_f32<DPP_QP_XOR2, 0xf, 0xf>(0.0f, v);
-        if (LPT > 4) {
-            float t = dpp_f32<DPP_ROW_SHL4, 0xf, 0x5>(0.0f, v);   // banks 0,2 take lane+4
-            t = dpp_f32<DPP_ROW_SHR4, 0xf, 0xa>(t, v);            // banks 1,3 take lane-4
-            v += t;
-        }
-        if (LPT > 8)  v += dpp_f32<DPP_ROW_ROR8, 0xf, 0xf>(0.0f, v);
-        if (LPT > 16) v += dpp_f32<DPP_ROW_BCAST15, 0xa, 0xf>(0.0f, v);   // rows 1,3 += lane 15 of rows 0,2
-        if (LPT > 32) v += dpp_f32<DPP_ROW_BCAST31, 0xc, 0xf>(0.0f, v);   // rows 2,3 += lane 31
-        x[g] = v;
-    }
-}
-
+// Segment reductions: attn_gqa_common.h (all-DPP, row_bcast for the
+// cross-row steps; result valid in the segment's last lane).
 // Combine across the TPW token slots of a wave (lane bits above LPT).
 __device__ __forceinline__ float slot_sum(float x) {
     for (int o = LPT; o < 64; o <<= 1) x += __shfl_xor(x, o);
@@ -111,7 +76,7 @@ void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
 {
     __shared__ float s_p[GH][TILE];        // tile probabilities
     __shared__ float s_red[NW][GH];        // per-wave max / sum exchange
-    __shared__ float s_acc[NW][GH][HD];    // per-wave output partials (end)
+    __shared__ float s_x[GH][HD];          // cross-wave combine exchange (end)
 
     const int G     = (int)(n_heads / n_kv_heads);
     const int kvh   = blockIdx.x % n_kv_heads;
@@ -185,7 +150,7 @@ void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
                 #pragma unroll
                 for (int g = 0; g < GH; g++)
                     x[g] = qr[g].x * kk[u].x + qr[g].y * kk[u].y + qr[g].z * kk[u].z + qr[g].w * kk[u].w;
-                seg_sum_multi(x);
+                seg_sum_multi<GH, LPT>(x);
                 #pragma unroll
                 for (int g = 0; g < GH; g++) {
                     if (live) {
@@ -261,22 +226,33 @@ void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
         __syncthreads();                                   // s_p / s_red reuse next tile
     }
 
-    // ---- combine token slots, then waves; write the partials ----
+    // ---- combine token slots, then waves (one exchange buffer, wave 0
+    // accumulates), write the partials ----
     #pragma unroll
     for (int g = 0; g < GH; g++) {
         acc[g].x = slot_sum(acc[g].x); acc[g].y = slot_sum(acc[g].y);
         acc[g].z = slot_sum(acc[g].z); acc[g].w = slot_sum(acc[g].w);
-        if (tl == 0) *reinterpret_cast<float4*>(&s_acc[wave][g][dl * 4]) = acc[g];
     }
-    __syncthreads();
-    for (int idx = tid; idx < GH * HD; idx += BS) {
-        const int g = idx / HD, d = idx % HD;
-        if (g < gh_n) {
-            float v = 0.0f;
+    for (int w = 1; w < NW; w++) {
+        if (wave == w && tl == 0) {
             #pragma unroll
-            for (int w = 0; w < NW; w++) v += s_acc[w][g][d];
-            o_partial[((size_t)(h0 + g) * n_splits + sp) * HD + d] = v;
+            for (int g = 0; g < GH; g++) *reinterpret_cast<float4*>(&s_x[g][dl * 4]) = acc[g];
         }
+        __syncthreads();
+        if (wave == 0 && tl == 0) {
+            #pragma unroll
+            for (int g = 0; g < GH; g++) {
+                const float4 t = *reinterpret_cast<const float4*>(&s_x[g][dl * 4]);
+                acc[g].x += t.x; acc[g].y += t.y; acc[g].z += t.z; acc[g].w += t.w;
+            }
+        }
+        __syncthreads();
+    }
+    if (wave == 0 && tl == 0) {
+        #pragma unroll
+        for (int g = 0; g < GH; g++)
+            if (g < gh_n)
+                *reinterpret_cast<float4*>(o_partial + ((size_t)(h0 + g) * n_splits + sp) * HD + dl * 4) = acc[g];
     }
     if (tid == 0) {
         #pragma unroll
