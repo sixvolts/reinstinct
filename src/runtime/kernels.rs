@@ -2374,6 +2374,89 @@ mod tests {
         }
     }
 
+    /// The batched (prefill) GDN recurrent step at the 27B's shape over
+    /// 512 rows: us per row is the number that matters (48 layers x
+    /// n_rows of it per prefill). Runs the LDS-resident kernel from disk
+    /// (`REINSTINCT_MMQ_BENCH_SRC_DIR` for variants) and checks it against
+    /// the general kernel. `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored"]
+    fn bench_gdn_batched_recurrent() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (n_heads, n_k_heads, head_dim) = (48usize, 16usize, 128usize);
+        let n_rows: usize = std::env::var("REINSTINCT_GDN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
+            .unwrap_or_else(|e| panic!("{dir}/{name}.cpp: {e}"));
+        let mut sd: u64 = 0x6D11_0001;
+        let mut rnd = || { sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((sd >> 40) as f32 / (1u64 << 24) as f32) - 0.5 };
+        let kdim = n_k_heads * head_dim; let vdim = n_heads * head_dim;
+        let q: Vec<f32> = (0..n_rows * kdim).map(|_| rnd() * 0.2).collect();
+        let k: Vec<f32> = (0..n_rows * kdim).map(|_| rnd() * 0.2).collect();
+        let v: Vec<f32> = (0..n_rows * vdim).map(|_| rnd()).collect();
+        let a: Vec<f32> = (0..n_rows * n_heads).map(|_| rnd()).collect();
+        let b: Vec<f32> = (0..n_rows * n_heads).map(|_| rnd()).collect();
+        let ssm_a: Vec<f32> = (0..n_heads).map(|_| -0.5 - rnd().abs()).collect();
+        let dt: Vec<f32> = (0..n_heads).map(|_| rnd()).collect();
+        let state0: Vec<f32> = (0..n_heads * head_dim * head_dim).map(|_| rnd() * 0.1).collect();
+        let (dq, dk, dv) = (DeviceBuf::from_slice(&q).unwrap(), DeviceBuf::from_slice(&k).unwrap(), DeviceBuf::from_slice(&v).unwrap());
+        let (da, db) = (DeviceBuf::from_slice(&a).unwrap(), DeviceBuf::from_slice(&b).unwrap());
+        let (dsa, ddt) = (DeviceBuf::from_slice(&ssm_a).unwrap(), DeviceBuf::from_slice(&dt).unwrap());
+        let stream = hip::Stream::new().unwrap();
+        let run = |name: &str, kname: &str, block: u32, grid_y: u32, smem: u32, iters: usize| -> (Vec<f32>, Vec<f32>, f64) {
+            let src = format!("#define GDN_HEAD_DIM {head_dim}\n{}", read(name));
+            let m = Module::load(&cache.compile(&format!("{name}_bench"), &src).unwrap()).unwrap();
+            let f = m.function(kname).unwrap();
+            let dstate = DeviceBuf::from_slice(&state0).unwrap();
+            let dout: DeviceBuf<f32> = DeviceBuf::new(n_rows * vdim).unwrap();
+            let launch = || {
+                let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut va = dv.raw_ptr();
+                let mut aa = da.raw_ptr(); let mut ba = db.raw_ptr(); let mut sa = dsa.raw_ptr();
+                let mut ta = ddt.raw_ptr(); let mut st = dstate.raw_ptr(); let mut oa = dout.raw_ptr();
+                let mut nh = n_heads as u32; let mut hd = head_dim as u32; let mut nkh = n_k_heads as u32;
+                let mut nr = n_rows as u32; let mut qrs = kdim as u32; let mut vrs = vdim as u32;
+                let mut abs_ = n_heads as u32; let mut ors = vdim as u32;
+                let mut args: [*mut c_void; 17] = [
+                    &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+                    &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+                    &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+                    &mut ta as *mut _ as *mut c_void, &mut st as *mut _ as *mut c_void,
+                    &mut oa as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void,
+                    &mut nr as *mut _ as *mut c_void, &mut qrs as *mut _ as *mut c_void,
+                    &mut vrs as *mut _ as *mut c_void, &mut abs_ as *mut _ as *mut c_void,
+                    &mut ors as *mut _ as *mut c_void];
+                unsafe { f.launch((n_heads as u32, grid_y, 1), (block, 1, 1), smem, Some(&stream), &mut args).unwrap(); }
+            };
+            launch(); stream.synchronize().unwrap();
+            let mut st = vec![0.0f32; state0.len()]; dstate.copy_to_host(&mut st).unwrap();
+            let mut out = vec![0.0f32; n_rows * vdim]; dout.copy_to_host(&mut out).unwrap();
+            let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+            e0.record(&stream).unwrap();
+            for _ in 0..iters { launch(); }
+            e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+            (st, out, hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / iters as f64)
+        };
+        let hd = head_dim as u32;
+        let (st1, out1, ms1) = run("gdn_recurrent_step_fused_batched", "gdn_recurrent_step_fused_batched_f32",
+                                   64, hd / 16, 2 * hd * 4, 3);
+        let smem = (16 * (hd + 1) + 2 * hd + 2 * n_rows as u32) * 4;
+        let (st2, out2, ms2) = run("gdn_recurrent_step_fused_batched_lds128", "gdn_recurrent_step_fused_batched_lds128_f32",
+                                   64, hd / 16, smem, 5);
+        let e_state = rel_l2(&st2, &st1); let e_out = rel_l2(&out2, &out1);
+        eprintln!("gdn batched recurrent, {n_rows} rows: general {ms1:.2} ms ({:.1} us/row)  lds128 {ms2:.2} ms ({:.1} us/row)  state rel_l2={e_state:.2e} out rel_l2={e_out:.2e}",
+                  ms1 * 1e3 / n_rows as f64, ms2 * 1e3 / n_rows as f64);
+        assert!(e_state < 1e-4 && e_out < 1e-3, "lds128 diverges");
+        let (st3, out3, ms3) = run("gdn_recurrent_batched_v2", "gdn_recurrent_batched_v2_f32",
+                                   64, hd / 16, 0, 5);
+        let e_state = rel_l2(&st3, &st1); let e_out = rel_l2(&out3, &out1);
+        eprintln!("gdn batched recurrent v2: {ms3:.2} ms ({:.1} us/row)  state rel_l2={e_state:.2e} out rel_l2={e_out:.2e}",
+                  ms3 * 1e3 / n_rows as f64);
+        assert!(e_state < 1e-4 && e_out < 1e-3, "v2 diverges");
+    }
+
     /// The register-resident GDN recurrent step (v2) against the
     /// original kernel on random q/k/v/state: same state update and
     /// output to fp32 reduction-order tolerance, and the microbench of

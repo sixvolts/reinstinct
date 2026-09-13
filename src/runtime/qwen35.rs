@@ -65,6 +65,8 @@ const L2NORM_QK_BATCHED_SOURCE: &str =
     include_str!("../../kernels/l2norm_qk_batched.cpp");
 const GDN_RECURRENT_STEP_FUSED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/gdn_recurrent_step_fused_batched.cpp");
+const GDN_RECURRENT_BATCHED_V2_SOURCE: &str =
+    include_str!("../../kernels/gdn_recurrent_batched_v2.cpp");
 const GDN_RECURRENT_STEP_FUSED_BATCHED_LDS128_SOURCE: &str =
     include_str!("../../kernels/gdn_recurrent_step_fused_batched_lds128.cpp");
 const RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE: &str =
@@ -122,6 +124,16 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Must match the BN
 /// the grouped-GEMM kernel is compiled with (mmq_gemm_q4k_grouped.cpp).
 const MOE_GEMM_BN: u32 = 16;
+/// Per-kernel prefill timing (`REINSTINCT_PREFILL_TRACE=3`): name ->
+/// (total ms, launches). Filled by `GpuQwen35::ptrace`, printed and
+/// cleared at the end of `prefill_stage`.
+static PREFILL_PTRACE: std::sync::Mutex<std::collections::BTreeMap<&'static str, (f64, u32)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+fn prefill_ptrace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REINSTINCT_PREFILL_TRACE").ok().as_deref() == Some("3"))
+}
+
 /// Split-K partials for the GDN alpha|beta projection (`gdn_ab_project`).
 const AB_SPLIT: u32 = 4;
 /// GDN recurrent step geometry: 32-column slabs x 4 row groups.
@@ -1189,6 +1201,8 @@ pub struct GpuQwen35 {
     /// Stages the 8 KB per-WG state slice into LDS once per call so the
     /// per-row state ops are LDS-fast instead of HBM-latency-bound.
     gdn_recurrent_step_fused_batched_lds128_module: Module,
+    /// `gdn_recurrent_batched_v2.cpp` when head_dim is a multiple of 64.
+    gdn_recurrent_batched_v2_module: Option<Module>,
     rmsnorm_gated_multihead_batched_module: Module,
 
     matvec_f16_module:     Module,
@@ -1464,6 +1478,11 @@ impl GpuQwen35 {
         let gdn_recurrent_step_fused_batched_lds128_hsaco = cache.compile(
             "gdn_recurrent_step_fused_batched_lds128",
             GDN_RECURRENT_STEP_FUSED_BATCHED_LDS128_SOURCE)?;
+        // Prefill recurrence v2, specialised on head_dim (multiples of 64).
+        let gdn_recurrent_batched_v2_hsaco = if gdn_head_dim % 64 == 0 && gdn_head_dim <= 256 {
+            Some(cache.compile(&format!("gdn_recurrent_batched_v2_hd{gdn_head_dim}"),
+                &format!("#define GDN_HEAD_DIM {gdn_head_dim}\n{GDN_RECURRENT_BATCHED_V2_SOURCE}"))?)
+        } else { None };
         let rmsnorm_gated_multihead_batched_hsaco = cache.compile(
             "rmsnorm_gated_multihead_batched", RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
@@ -1558,6 +1577,7 @@ impl GpuQwen35 {
                 Module::load(&gdn_recurrent_step_fused_batched_hsaco)?,
             gdn_recurrent_step_fused_batched_lds128_module:
                 Module::load(&gdn_recurrent_step_fused_batched_lds128_hsaco)?,
+            gdn_recurrent_batched_v2_module: gdn_recurrent_batched_v2_hsaco.as_ref().map(|h| Module::load(h)).transpose()?,
             rmsnorm_gated_multihead_batched_module:
                 Module::load(&rmsnorm_gated_multihead_batched_hsaco)?,
             matvec_f16_module:    Module::load(&matvec_f16_hsaco)?,
@@ -1895,7 +1915,11 @@ impl GpuQwen35 {
         let block: u32 = 64;
         let use_lds128 = head_dim == 128
             && std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none();
-        let f = if use_lds128 {
+        let v2 = if std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none() {
+            self.gdn_recurrent_batched_v2_module.as_ref() } else { None };
+        let f = if let Some(m) = v2 {
+            m.function("gdn_recurrent_batched_v2_f32")?
+        } else if use_lds128 {
             self.gdn_recurrent_step_fused_batched_lds128_module
                 .function("gdn_recurrent_step_fused_batched_lds128_f32")?
         } else {
@@ -1907,7 +1931,9 @@ impl GpuQwen35 {
         // q_lds + k_lds + a_lds + b_lds); general needs 2·HEAD_DIM
         // (just q_lds + k_lds).
         let state_stride = head_dim + 1;
-        let smem = if use_lds128 {
+        let smem = if v2.is_some() {
+            0                                   // static LDS: COLS*HD + 2*HD floats
+        } else if use_lds128 {
             (COLS * state_stride + 2 * head_dim + 2 * n_rows) * 4
         } else {
             2 * head_dim * 4
@@ -4139,6 +4165,22 @@ impl GpuQwen35 {
     /// Batched causal attention for the qwen full-attention prefill —
     /// the flash-attention kernel (full causal, window 0). BQ=8 queries
     /// per workgroup, BK=8-key LDS tiles; must match the kernel #defines.
+    /// Time one prefill launch (or group of launches) under
+    /// `REINSTINCT_PREFILL_TRACE=3`: syncs before and after, so only for
+    /// diagnosis. A no-op wrapper otherwise.
+    fn ptrace<F: FnOnce() -> Result<(), String>>(&self, name: &'static str, f: F) -> Result<(), String> {
+        if !prefill_ptrace_enabled() { return f(); }
+        self.stream.synchronize()?;
+        let t = std::time::Instant::now();
+        f()?;
+        self.stream.synchronize()?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let mut m = PREFILL_PTRACE.lock().unwrap();
+        let e = m.entry(name).or_insert((0.0, 0));
+        e.0 += ms; e.1 += 1;
+        Ok(())
+    }
+
     fn launch_attn_step_batched(&self, q: *mut c_void, k_cache: *mut c_void,
                                 v_cache: *mut c_void, out: *mut c_void,
                                 base_pos: u32, n_rows: u32, scaling: f32)
@@ -4285,6 +4327,18 @@ impl GpuQwen35 {
                 sf, if nf > 0 { sf / nf as f64 } else { 0.0 });
             eprintln!("[prefill-trace]   GDN linear {:>7.1} ms total  ({:>5.2} ms/block)",
                 sl, if nl > 0 { sl / nl as f64 } else { 0.0 });
+            if prefill_ptrace_enabled() {
+                let mut m = PREFILL_PTRACE.lock().unwrap();
+                let mut rows: Vec<_> = m.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+                rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let tot: f64 = rows.iter().map(|r| r.1).sum();
+                eprintln!("[prefill-trace]   per kernel (synced; {tot:.0} ms total):");
+                for (k, ms, c) in rows {
+                    eprintln!("[prefill-trace]     {k:<22} {ms:>8.1} ms  {c:>4} launches  {:>7.3} ms each",
+                              ms / c as f64);
+                }
+                m.clear();
+            }
         }
 
         // 3) Output norm + projection on the LAST row only — last stage.
@@ -4397,55 +4451,55 @@ impl GpuQwen35 {
         assert!(base_pos + n <= kv.max_seq, "KV cache overflow in batched prefill");
 
         // pre-norm → bnorm  (n independent rmsnorms via the multihead kernel)
-        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
-                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.ptrace("F.rmsnorm", || self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps))?;
 
         // QKV projections, batched.
         let q_raw = self.pool_f32.take(n * 2 * q_dim)?;
         let k_raw = self.pool_f32.take(n * kv_dim)?;
         let v_raw = self.pool_f32.take(n * kv_dim)?;
-        self.bmm(&w.attn.attn_q, bnorm.raw_ptr(), n, q_raw.raw_ptr())?;
-        self.bmm(&w.attn.attn_k, bnorm.raw_ptr(), n, k_raw.raw_ptr())?;
-        self.bmm(&w.attn.attn_v, bnorm.raw_ptr(), n, v_raw.raw_ptr())?;
+        self.ptrace("F.bmm_q", || self.bmm(&w.attn.attn_q, bnorm.raw_ptr(), n, q_raw.raw_ptr()))?;
+        self.ptrace("F.bmm_k", || self.bmm(&w.attn.attn_k, bnorm.raw_ptr(), n, k_raw.raw_ptr()))?;
+        self.ptrace("F.bmm_v", || self.bmm(&w.attn.attn_v, bnorm.raw_ptr(), n, v_raw.raw_ptr()))?;
 
         // split q_raw → q, gate. The split kernel walks n_heads*head_dim
         // elements; passing n*n_heads covers all rows.
         let q_buf = self.pool_f32.take(n * q_dim)?;
         let gate  = self.pool_f32.take(n * q_dim)?;
-        self.launch_split_q_gate(q_raw.raw_ptr(), q_buf.raw_ptr(), gate.raw_ptr(),
-                                 (n * self.n_heads) as u32, self.head_dim as u32)?;
+        self.ptrace("F.split_q_gate", || self.launch_split_q_gate(q_raw.raw_ptr(), q_buf.raw_ptr(), gate.raw_ptr(),
+                                 (n * self.n_heads) as u32, self.head_dim as u32))?;
         // per-head Q-norm (n*n_heads independent heads).
-        self.launch_rmsnorm_multihead(q_buf.raw_ptr(), w.attn.attn_q_norm.raw_ptr(),
+        self.ptrace("F.q_norm", || self.launch_rmsnorm_multihead(q_buf.raw_ptr(), w.attn.attn_q_norm.raw_ptr(),
                                       q_buf.raw_ptr(),
                                       (n * self.n_heads) as u32, self.head_dim as u32,
-                                      self.rms_eps)?;
-        self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
+                                      self.rms_eps))?;
+        self.ptrace("F.rope_q", || self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32))?;
         // per-kv-head K-norm.
         let k_norm = self.pool_f32.take(n * kv_dim)?;
-        self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
+        self.ptrace("F.k_norm", || self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
                                       k_norm.raw_ptr(),
                                       (n * self.n_kv_heads) as u32, self.head_dim as u32,
-                                      self.rms_eps)?;
-        self.launch_rope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, base_pos as u32)?;
+                                      self.rms_eps))?;
+        self.ptrace("F.rope_k", || self.launch_rope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, base_pos as u32))?;
 
         // Push all N (k, v) into the cache at slots [base_pos, base_pos+n).
-        kv.k.copy_from_device_at_async(&k_norm, base_pos * kv_dim, &self.stream)?;
-        kv.v.copy_from_device_at_async(&v_raw,  base_pos * kv_dim, &self.stream)?;
+        self.ptrace("F.kv_copy_k", || kv.k.copy_from_device_at_async(&k_norm, base_pos * kv_dim, &self.stream))?;
+        self.ptrace("F.kv_copy_v", || kv.v.copy_from_device_at_async(&v_raw,  base_pos * kv_dim, &self.stream))?;
 
         // Batched causal attention → attn_concat.
         let attn = self.pool_f32.take(n * q_dim)?;
-        self.launch_attn_step_batched(q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
-                                      attn.raw_ptr(), base_pos as u32, n as u32, scaling)?;
+        self.ptrace("F.attn_flash", || self.launch_attn_step_batched(q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
+                                      attn.raw_ptr(), base_pos as u32, n as u32, scaling))?;
         // output gate + projection.
-        self.launch_sigmoid_mul(attn.raw_ptr(), gate.raw_ptr(), (n * q_dim) as u32)?;
-        self.bmm(&w.attn.attn_output, attn.raw_ptr(), n, bb.raw_ptr())?;
-        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+        self.ptrace("F.sigmoid_mul", || self.launch_sigmoid_mul(attn.raw_ptr(), gate.raw_ptr(), (n * q_dim) as u32))?;
+        self.ptrace("F.bmm_out", || self.bmm(&w.attn.attn_output, attn.raw_ptr(), n, bb.raw_ptr()))?;
+        self.ptrace("F.add", || self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32))?;
 
         // FFN sub-layer.
-        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
-                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.ptrace("F.post_rmsnorm", || self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps))?;
         self.batched_ffn(bnorm, bb, &w.ffn, n)?;
-        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+        self.ptrace("F.add", || self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32))?;
 
         kv.len += n;
         Ok(())
@@ -4460,10 +4514,10 @@ impl GpuQwen35 {
                 let f = self.ffn;
                 let gate = self.pool_f32.take(n * f)?;
                 let up   = self.pool_f32.take(n * f)?;
-                self.bmm(&d.gate, input.raw_ptr(), n, gate.raw_ptr())?;
-                self.bmm(&d.up,   input.raw_ptr(), n, up.raw_ptr())?;
-                self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
-                self.bmm(&d.down, gate.raw_ptr(), n, out_bb.raw_ptr())?;
+                self.ptrace("ffn.bmm_gate", || self.bmm(&d.gate, input.raw_ptr(), n, gate.raw_ptr()))?;
+                self.ptrace("ffn.bmm_up",   || self.bmm(&d.up,   input.raw_ptr(), n, up.raw_ptr()))?;
+                self.ptrace("ffn.swiglu",   || self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32))?;
+                self.ptrace("ffn.bmm_down", || self.bmm(&d.down, gate.raw_ptr(), n, out_bb.raw_ptr()))?;
             }
             BlockFfn::Moe(m) => {
                 // Prefill MoE: process the rows in MOE_PREFILL_CHUNK-sized
@@ -4501,26 +4555,26 @@ impl GpuQwen35 {
         let q_scale = (self.gdn_head_dim as f32).powf(-0.5);
 
         // pre-norm.
-        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
-                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.ptrace("L.rmsnorm", || self.launch_rmsnorm_multihead(ba.raw_ptr(), w.attn.attn_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps))?;
 
         // Four projections, batched.
         let qkv = self.pool_f32.take(n * cdim)?;
         let z   = self.pool_f32.take(n * vdim)?;
         let a   = self.pool_f32.take(n * self.gdn_n_heads)?;
         let b   = self.pool_f32.take(n * self.gdn_n_heads)?;
-        self.bmm(&w.attn.attn_qkv,  bnorm.raw_ptr(), n, qkv.raw_ptr())?;
-        self.bmm(&w.attn.attn_gate, bnorm.raw_ptr(), n, z.raw_ptr())?;
-        self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr())?;
-        self.bmm(&w.attn.ssm_beta,  bnorm.raw_ptr(), n, b.raw_ptr())?;
+        self.ptrace("L.bmm_qkv", || self.bmm(&w.attn.attn_qkv,  bnorm.raw_ptr(), n, qkv.raw_ptr()))?;
+        self.ptrace("L.bmm_gate", || self.bmm(&w.attn.attn_gate, bnorm.raw_ptr(), n, z.raw_ptr()))?;
+        self.ptrace("L.bmm_alpha", || self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr()))?;
+        self.ptrace("L.bmm_beta", || self.bmm(&w.attn.ssm_beta,  bnorm.raw_ptr(), n, b.raw_ptr()))?;
 
         // conv1d + SiLU, batched: one launch over all n rows (the kernel
         // threads the conv history through the rows internally).
         let conv_out = self.pool_f32.take(n * cdim)?;
-        self.launch_conv1d_step_silu_batched(
+        self.ptrace("L.conv1d", || self.launch_conv1d_step_silu_batched(
             qkv.raw_ptr(), w.attn.ssm_conv1d.raw_ptr(),
             st.conv_hist.raw_ptr(), conv_out.raw_ptr(),
-            cdim as u32, self.gdn_conv_kernel as u32, n as u32)?;
+            cdim as u32, self.gdn_conv_kernel as u32, n as u32))?;
 
         // L2-norm Q/K → q_all/k_all [n, kdim]. The conv output is
         // [n, cdim] with layout (q | k | v) per row; the batched kernel
@@ -4529,21 +4583,21 @@ impl GpuQwen35 {
         let k_all = self.pool_f32.take(n * kdim)?;
         let conv_q_ptr = conv_out.raw_ptr();
         let conv_k_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(kdim) } as *mut c_void;
-        self.launch_l2norm_qk_batched(
+        self.ptrace("L.l2norm_qk", || self.launch_l2norm_qk_batched(
             conv_q_ptr, q_all.raw_ptr(),
             conv_k_ptr, k_all.raw_ptr(),
             nkh, hd, 1e-6, q_scale, n as u32,
             cdim as u32,   // q_in_row_stride  — q half of conv_out, stride cdim
             kdim as u32,   // q_out_row_stride — q_all is dense [n, kdim]
             cdim as u32,   // k_in_row_stride
-            kdim as u32)?; // k_out_row_stride
+            kdim as u32))?; // k_out_row_stride
 
         // Recurrent step + decay/beta — single launch over all n rows;
         // the kernel loops internally with state threaded through.
         // v_in points at the v half of conv_out (offset 2*kdim per row).
         let core = self.pool_f32.take(n * vdim)?;
         let conv_v_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(2 * kdim) } as *mut c_void;
-        self.launch_gdn_recurrent_step_fused_batched(
+        self.ptrace("L.recurrent", || self.launch_gdn_recurrent_step_fused_batched(
             q_all.raw_ptr(), k_all.raw_ptr(), conv_v_ptr,
             a.raw_ptr(), b.raw_ptr(),
             w.attn.ssm_a.raw_ptr(), w.attn.ssm_dt_bias.raw_ptr(),
@@ -4552,23 +4606,23 @@ impl GpuQwen35 {
             kdim as u32,                                // qk_row_stride
             cdim as u32,                                // v_row_stride (conv layout)
             self.gdn_n_heads as u32,                    // ab_row_stride
-            vdim as u32)?;                              // out_row_stride
+            vdim as u32))?;                              // out_row_stride
 
         // Gated RMSNorm with z = attn_gate output (already [n, vdim]).
-        self.launch_rmsnorm_gated_multihead_batched(
+        self.ptrace("L.gated_norm", || self.launch_rmsnorm_gated_multihead_batched(
             core.raw_ptr(), z.raw_ptr(), w.attn.ssm_norm.raw_ptr(),
             core.raw_ptr(), nh, hd, self.rms_eps,
-            n as u32, vdim as u32)?;
+            n as u32, vdim as u32))?;
 
         // ssm_out projection, batched.
-        self.bmm(&w.attn.ssm_out, core.raw_ptr(), n, bb.raw_ptr())?;
-        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+        self.ptrace("L.bmm_ssm_out", || self.bmm(&w.attn.ssm_out, core.raw_ptr(), n, bb.raw_ptr()))?;
+        self.ptrace("L.add", || self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32))?;
 
         // FFN sub-layer.
-        self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
-                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
+        self.ptrace("L.post_rmsnorm", || self.launch_rmsnorm_multihead(ba.raw_ptr(), w.post_norm.raw_ptr(),
+                                      bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps))?;
         self.batched_ffn(bnorm, bb, &w.ffn, n)?;
-        self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32)?;
+        self.ptrace("L.add", || self.launch_add_inplace(ba.raw_ptr(), bb.raw_ptr(), (n * h) as u32))?;
         Ok(())
     }
 
