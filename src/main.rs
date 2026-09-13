@@ -886,16 +886,19 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             return Ok(());
         }
 
-        // Prefill the prompt in one batched pass (rocBLAS GEMM); fall
-        // back to the sequential path for a single-token prompt.
+        // Prefill the prompt in one batched pass; fall back to the
+        // sequential (decode-path) forward for a single-token prompt, or
+        // for any prompt under REINSTINCT_PREFILL_SEQ=1 (diagnostic:
+        // isolates the batched prefill kernels from the decode kernels).
+        let seq_prefill = std::env::var_os("REINSTINCT_PREFILL_SEQ").is_some();
         let t_pre = std::time::Instant::now();
-        let mut logits = if prompt.len() > 1 {
+        let mut logits = if prompt.len() > 1 && !seq_prefill {
             gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
         } else {
             gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
         };
-        println!("prefill       = {:.3} s ({} tokens, batched)",
-            t_pre.elapsed().as_secs_f32(), prompt.len());
+        println!("prefill       = {:.3} s ({} tokens, {})",
+            t_pre.elapsed().as_secs_f32(), prompt.len(), if seq_prefill { "sequential" } else { "batched" });
         // Capture the decode forward into a parametric HIP graph — the
         // graph reads `d_pos`, so one capture replays for every step,
         // eliding the per-kernel launch overhead. `REINSTINCT_NO_GRAPH`
@@ -1139,11 +1142,21 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
         };
         // Prefill the prompt in one batched pass — this populates every
         // layer's KV cache, so decode continues straight from position P.
+        // REINSTINCT_PREFILL_SEQ=1 (diagnostic): feed the prompt through
+        // the decode forward one token at a time instead.
+        let seq_prefill = std::env::var_os("REINSTINCT_PREFILL_SEQ").is_some();
         let t_prefill = std::time::Instant::now();
-        let mut lg = gm.prefill_forward(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        let mut lg = if seq_prefill {
+            let mut lg = Vec::new();
+            for &t in &prompt { lg = gm.forward_token(t, &mut state).map_err(anyhow::Error::msg)?; }
+            lg
+        } else {
+            gm.prefill_forward(&prompt, &mut state).map_err(anyhow::Error::msg)?
+        };
         let pf = t_prefill.elapsed().as_secs_f64();
-        println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token)",
-                 pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64);
+        println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token{})",
+                 pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64,
+                 if seq_prefill { ", sequential" } else { "" });
         // SuperQuant: prefill went through the int8 cache (existing
         // batched kernels). Migrate the populated int8 contents into
         // the SuperQuant tiers so the decode-time attention reads from
@@ -1179,7 +1192,10 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
             }
             println!("  {:<16} {tot:8.1} ms", "TOTAL");
         }
-        // One traced forward for a per-block timing breakdown.
+        // One traced forward for a per-block timing breakdown. It re-feeds
+        // the last token, so it is skipped under REINSTINCT_DECODE_DEBUG
+        // (whose dumps must be of the real forward).
+        if std::env::var_os("REINSTINCT_DECODE_DEBUG").is_none() {
         let probe = *all.last().unwrap();
         let (tlg, e_ms, blk_ms, o_ms) =
             gm.forward_token_timed(probe, &mut state).map_err(anyhow::Error::msg)?;
@@ -1202,6 +1218,7 @@ fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
                  if fln>0 {fl/fln as f32} else {0.0});
         println!("  output_proj     {o_ms:>8.3} ms");
         let _ = tlg;
+        }
         logits = lg;
     } else {
         let g_owned = GgufFile::open(path)?;

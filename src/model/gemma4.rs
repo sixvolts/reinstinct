@@ -24,6 +24,7 @@
 
 use thiserror::Error;
 
+use crate::gguf::GgmlType;
 use crate::gguf::{GgufFile, MetaValue};
 
 const ARCH: &str = "gemma4";
@@ -44,6 +45,9 @@ pub enum Gemma4Error {
 
     #[error("missing required tensor: {0}")]
     MissingTensor(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 type Result<T> = std::result::Result<T, Gemma4Error>;
@@ -83,6 +87,10 @@ pub struct Gemma4Config {
     pub rope_freq_base_swa: f32,
     pub rope_dim_full: u32,
     pub rope_dim_swa: u32,
+    /// `rope_freqs.weight` — per-pair RoPE frequency divisors for the
+    /// global-attention layers (llama.cpp's `freq_factors`; `None` when
+    /// the file has none). See `RopeCache::with_freq_factors`.
+    pub rope_freqs: Option<Vec<f32>>,
 
     /// Final-logit soft-cap value (`logits = cap·tanh(logits/cap)`).
     pub final_logit_softcapping: f32,
@@ -135,18 +143,35 @@ impl Gemma4Config {
         let sliding_window = require_u32(gguf, "gemma4.attention.sliding_window")?;
         let rope_freq_base     = require_f32(gguf, "gemma4.rope.freq_base")?;
         let rope_freq_base_swa = require_f32(gguf, "gemma4.rope.freq_base_swa")?;
-        let mut rope_dim_full  = require_u32(gguf, "gemma4.rope.dimension_count")?;
+        let rope_dim_full  = require_u32(gguf, "gemma4.rope.dimension_count")?;
         let rope_dim_swa   = require_u32(gguf, "gemma4.rope.dimension_count_swa")?;
-        // Gemma 4 full attention has HF partial_rotary_factor=0.25 on
-        // head_dim=512 ⇒ rotate first 128 dims. GGUF stores
-        // dimension_count=512 (= head_dim) and leaves it implicit; bake
-        // 128 in so our half-split kernel rotates the right slice.
-        // Empirically the converted GGUF weights match the Llama-style
-        // pairing (i, i+rotary/2) — not HF's (i, i+head_dim/2). Switching
-        // to HF "proportional" cos/sin made K=2 accept drop 27%→17%.
-        if rope_dim_full == head_dim_full && head_dim_full == 512 {
-            rope_dim_full = 128;
-        }
+        // Gemma 4's global-attention layers rotate the full 512-wide head
+        // (NEOX pairs (i, i+256)) with the frequency-factor table the
+        // file ships as `rope_freqs.weight`: 64 ones then 1e30s, so only
+        // the first 64 pairs turn (HF partial_rotary_factor = 0.25) and
+        // the frequencies are base^(-2i/512). An earlier reading of that
+        // as "rotate the first 128 dims as a 128-wide RoPE" paired the
+        // wrong dims at 4x the frequency; the error grew with position
+        // and broke the 31B past a few hundred tokens.
+        let rope_freqs = match gguf.tensor_data("rope_freqs.weight") {
+            Ok(Some(bytes)) => {
+                let info = gguf.tensor("rope_freqs.weight").expect("rope_freqs info");
+                if info.ggml_type != GgmlType::F32 {
+                    return Err(Gemma4Error::Other(format!(
+                        "rope_freqs.weight is {:?}, expected F32", info.ggml_type)));
+                }
+                let n = bytes.len() / 4;
+                let v: Vec<f32> = (0..n).map(|i| f32::from_le_bytes(
+                    [bytes[4*i], bytes[4*i+1], bytes[4*i+2], bytes[4*i+3]])).collect();
+                if v.len() != rope_dim_full as usize / 2 {
+                    return Err(Gemma4Error::Other(format!(
+                        "rope_freqs.weight has {} entries, expected rope_dim_full/2 = {}",
+                        v.len(), rope_dim_full / 2)));
+                }
+                Some(v)
+            }
+            _ => None,
+        };
         let final_logit_softcapping = require_f32(gguf, "gemma4.final_logit_softcapping")?;
         let eos_token_id   = require_u32(gguf, "tokenizer.ggml.eos_token_id")?;
 
@@ -196,7 +221,7 @@ impl Gemma4Config {
             block_count, hidden_size, ffn_size, ffn_sizes, vocab_size, context_length,
             rms_norm_eps, eos_token_id,
             n_heads, head_dim_full, head_dim_swa, sliding_window,
-            rope_freq_base, rope_freq_base_swa, rope_dim_full, rope_dim_swa,
+            rope_freq_base, rope_freq_base_swa, rope_dim_full, rope_dim_swa, rope_freqs,
             final_logit_softcapping, tied_embeddings,
             kv_heads, attn_kinds,
             expert_count, expert_used_count, expert_ff_size,

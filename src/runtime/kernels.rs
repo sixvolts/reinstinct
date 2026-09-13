@@ -2679,6 +2679,83 @@ mod tests {
         }
     }
 
+    /// Gemma's Q5_K token table through the embed_lookup_q5_k kernel
+    /// against the CPU dequant, for the token ids in
+    /// REINSTINCT_EMBED_IDS (comma list; default a spread of ids incl.
+    /// the top of the vocab). `--ignored --nocapture` with the Gemma fixture.
+    #[test]
+    #[ignore = "needs the Gemma fixture"]
+    fn gemma_embed_lookup_q5k_matches_cpu() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let Some(path) = crate::test_support::gemma_fixture() else { eprintln!("no gemma fixture"); return };
+        let g = crate::gguf::GgufFile::open(&path).unwrap();
+        let info = g.tensor("token_embd.weight").unwrap().clone();
+        assert_eq!(info.ggml_type, crate::gguf::GgmlType::Q5_K, "token_embd is {:?}", info.ggml_type);
+        let hidden = info.shape()[0] as usize; let vocab = info.shape()[1] as usize;
+        let bytes = g.tensor_data("token_embd.weight").unwrap().unwrap();
+        let bpr = (hidden / 256) * crate::quant::q5_k::BYTES_PER_BLOCK;
+        let ids: Vec<u32> = std::env::var("REINSTINCT_EMBED_IDS").ok()
+            .map(|v| v.split(',').map(|x| x.trim().parse().unwrap()).collect())
+            .unwrap_or_else(|| (0..64u32).map(|i| (i as u64 * (vocab as u64 - 1) / 63) as u32).collect());
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/embed_lookup_q5_k.cpp")).unwrap();
+        let m = Module::load(&cache.compile("embed_lookup_q5_k", &src).unwrap()).unwrap();
+        let f = m.function("embed_lookup_q5_k_batched_f32").unwrap();
+        let stream = hip::Stream::new().unwrap();
+        let dtab: DeviceBuf<u8> = DeviceBuf::from_slice(&bytes[..vocab * bpr]).unwrap();
+        let dids: DeviceBuf<u32> = DeviceBuf::from_slice(&ids).unwrap();
+        let dout: DeviceBuf<f32> = DeviceBuf::new(ids.len() * hidden).unwrap();
+        let mut ta = dtab.raw_ptr(); let mut oa = dout.raw_ptr(); let mut ia = dids.raw_ptr(); let mut hd = hidden as u32;
+        let mut args: [*mut c_void; 4] = [&mut ta as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                                          &mut ia as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void];
+        unsafe { f.launch(((hidden / 256) as u32, ids.len() as u32, 1), (256, 1, 1), 0, Some(&stream), &mut args).unwrap(); }
+        stream.synchronize().unwrap();
+        let mut out = vec![0.0f32; ids.len() * hidden]; dout.copy_to_host(&mut out).unwrap();
+        let mut worst = (0.0f32, 0u32);
+        for (r, &id) in ids.iter().enumerate() {
+            let mut cpu = vec![0.0f32; hidden];
+            crate::quant::q5_k::dequantize_to_f32(&bytes[id as usize * bpr..(id as usize + 1) * bpr], &mut cpu);
+            let e = rel_l2(&out[r * hidden..(r + 1) * hidden], &cpu);
+            if e > worst.0 { worst = (e, id); }
+        }
+        eprintln!("embed_lookup_q5_k over {} ids: worst rel_l2 {:.2e} at id {}", ids.len(), worst.0, worst.1);
+        assert!(worst.0 < 1e-5, "embedding row mismatch: rel_l2 {:.2e} at id {}", worst.0, worst.1);
+    }
+
+    /// The decode RoPE kernel (rope_dpos.cpp) with a RopeCache table:
+    /// position 0 must be the identity and position p must match the
+    /// CPU rotation.
+    #[test]
+    fn rope_dpos_matches_cpu_at_positions() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let (n_heads, hd) = (4usize, 256usize);
+        let rc = crate::cpu::rope::RopeCache::new(hd, 16, 10000.0);
+        let mut cos = vec![0.0f32; 16 * hd]; let mut sin = vec![0.0f32; 16 * hd];
+        for pos in 0..16 { let (c, s) = rc.get(pos); cos[pos*hd..(pos+1)*hd].copy_from_slice(c); sin[pos*hd..(pos+1)*hd].copy_from_slice(s); }
+        let dcos = DeviceBuf::from_slice(&cos).unwrap(); let dsin = DeviceBuf::from_slice(&sin).unwrap();
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/rope_dpos.cpp")).unwrap();
+        let m = Module::load(&cache.compile("rope", &src).unwrap()).unwrap();
+        let f = m.function("rope_apply_f32").unwrap();
+        let stream = hip::Stream::new().unwrap();
+        let x: Vec<f32> = (0..n_heads * hd).map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0).collect();
+        for pos in [0usize, 1, 3] {
+            let dx = DeviceBuf::from_slice(&x).unwrap();
+            let dpos = DeviceBuf::from_slice(&[pos as u32]).unwrap();
+            let mut xa = dx.raw_ptr(); let mut ca = dcos.raw_ptr(); let mut sa = dsin.raw_ptr();
+            let mut hdv = hd as u32; let mut rd = hd as u32; let mut nh = n_heads as u32; let mut pp = dpos.raw_ptr();
+            let mut args: [*mut c_void; 7] = [&mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+                &mut sa as *mut _ as *mut c_void, &mut hdv as *mut _ as *mut c_void, &mut rd as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void];
+            unsafe { f.launch((((hd / 2) as u32 + 63) / 64, n_heads as u32, 1), (64, 1, 1), 0, Some(&stream), &mut args).unwrap(); }
+            stream.synchronize().unwrap();
+            let mut y = vec![0.0f32; x.len()]; dx.copy_to_host(&mut y).unwrap();
+            let mut expect = x.clone();
+            for h in 0..n_heads { crate::cpu::rope::apply_rope(&mut expect[h*hd..(h+1)*hd], &rc, pos); }
+            let e = rel_l2(&y, &expect);
+            eprintln!("rope_dpos pos {pos}: rel_l2 vs cpu {e:.2e}");
+            assert!(e < 1e-5, "rope_dpos at pos {pos}: rel_l2 {e:.2e}");
+        }
+    }
+
     /// The register-resident GDN recurrent step (v2) against the
     /// original kernel on random q/k/v/state: same state update and
     /// output to fp32 reduction-order tolerance, and the microbench of
@@ -3037,6 +3114,56 @@ mod tests {
             eprintln!("matvec_q6k_repacked {out_dim}x{in_dim}: rel_l2={e6:.3e}");
             assert!(e6 < DP4A_REL_L2_MAX,
                 "q6k repacked rel_l2 {e6:.3e} exceeds {DP4A_REL_L2_MAX:.1e}");
+        }
+    }
+
+    /// The repacked K-quant decode matvecs at Gemma 31B's in_dims — 5376,
+    /// 8192 and 16384 (power-of-two sub-block counts, the anti-alias pad
+    /// path) and 21504 — against the CPU dequant. Qwen's shapes never
+    /// hit the pad path with these dtypes.
+    #[test]
+    fn matvec_kquant_repacked_gemma_shapes_match_dequant() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::quant::half::f32_to_f16;
+        let out_dim = 64usize;
+        for &in_dim in &[5376usize, 8192, 16384, 21504] {
+            let mut xs: u64 = 0x1357_9BDF ^ in_dim as u64;
+            let mut x_rng = || { xs = xs.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                 ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+            let x: Vec<f32> = (0..in_dim).map(|_| x_rng()).collect();
+            let mut s: u64 = 0xD4A4_0001 ^ (in_dim as u64) << 8;
+            let mut r = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 56) as u8 };
+            for dt in ["q4_k", "q5_k", "q6_k"] {
+                let (bpb, d_off) = match dt { "q4_k" => (crate::quant::q4_k::BYTES_PER_BLOCK, 0usize),
+                                              "q5_k" => (crate::quant::q5_k::BYTES_PER_BLOCK, 0), _ => (crate::quant::q6_k::BYTES_PER_BLOCK, 208) };
+                let tb = out_dim * (in_dim / 256);
+                let mut wb = vec![0u8; tb * bpb];
+                for blk in 0..tb {
+                    let o = blk * bpb;
+                    for i in 0..bpb { wb[o + i] = r(); }
+                    let d = ((blk % 29) as f32 - 14.0) * 0.003;
+                    wb[o + d_off..o + d_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                    if dt != "q6_k" {
+                        let dmin = ((blk % 17) as f32 - 8.0) * 0.0015;
+                        wb[o + 2..o + 4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+                    }
+                }
+                let mut wf = vec![0.0f32; out_dim * in_dim];
+                let (packed, name, src, kname) = match dt {
+                    "q4_k" => { crate::quant::q4_k::dequantize_to_f32(&wb, &mut wf);
+                                (crate::quant::q4_k::repack_for_matvec(&wb, in_dim, out_dim), "matvec_q4k_repacked", MATVEC_Q4K_REPACKED_SRC, "matvec_q4k_repacked_f32") }
+                    "q5_k" => { crate::quant::q5_k::dequantize_to_f32(&wb, &mut wf);
+                                (crate::quant::q5_k::repack_for_matvec(&wb, in_dim, out_dim), "matvec_q5k_repacked", MATVEC_Q5K_REPACKED_SRC, "matvec_q5k_repacked_f32") }
+                    _      => { crate::quant::q6_k::dequantize_to_f32(&wb, &mut wf);
+                                (crate::quant::q6_k::repack_for_matvec(&wb, in_dim, out_dim), "matvec_q6k_repacked", MATVEC_Q6K_REPACKED_SRC, "matvec_q6k_repacked_f32") }
+                };
+                let mut cpu = vec![0.0f32; out_dim];
+                crate::cpu::ops::matvec(&x, &wf, in_dim, out_dim, &mut cpu);
+                let gpu = run_repacked_matvec(&cache, name, src, kname, &packed, &x, in_dim, out_dim).expect(name);
+                let e = rel_l2(&gpu, &cpu);
+                eprintln!("{name} {out_dim}x{in_dim}: rel_l2={e:.3e}");
+                assert!(e < DP4A_REL_L2_MAX, "{name} at in_dim {in_dim}: rel_l2 {e:.3e}");
+            }
         }
     }
 

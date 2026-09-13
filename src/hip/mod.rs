@@ -63,6 +63,18 @@ pub fn mem_info() -> Result<(usize, usize)> {
 /// `stream`, which must belong to one of the two devices. Raw pointers
 /// because the producer of a pipeline handoff only publishes its
 /// activation's address, not a `DeviceBuf`.
+/// Synchronous D2H copy from a raw device pointer (diagnostics).
+pub unsafe fn memcpy_d2h_raw(dst: &mut [f32], src: *const c_void) -> Result<()> {
+    let api = hip().map_err(|s| s.to_string())?;
+    // SAFETY: the caller guarantees `src` is a device pointer to at least
+    // `dst.len()` f32s.
+    unsafe {
+        ck(api, (api.memcpy)(dst.as_mut_ptr() as *mut c_void, src,
+                             dst.len() * std::mem::size_of::<f32>(), HipMemcpyKind::DeviceToHost),
+           "hipMemcpy D2H raw")
+    }
+}
+
 pub unsafe fn memcpy_peer_async(dst: *mut c_void, dst_dev: HipDevice,
                                 src: *const c_void, src_dev: HipDevice,
                                 bytes: usize, stream: &Stream) -> Result<()> {

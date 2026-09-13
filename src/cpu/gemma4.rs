@@ -206,8 +206,12 @@ impl Gemma4CpuModel {
             AttnKind::Sliding => cfg.rope_dim_swa,
             AttnKind::Full    => cfg.rope_dim_full,
         } as usize;
-        let rope = RopeCache::new(rotary, cfg.context_length.min(8192) as usize + 8,
-                                  cfg.rope_base(layer));
+        let rope = match (kind, cfg.rope_freqs.as_deref()) {
+            (AttnKind::Full, Some(f)) => RopeCache::with_freq_factors(
+                rotary, cfg.context_length.min(8192) as usize + 8, cfg.rope_base(layer), f),
+            _ => RopeCache::new(rotary, cfg.context_length.min(8192) as usize + 8,
+                                cfg.rope_base(layer)),
+        };
         let pos = state.pos;
 
         // --- Attention sub-layer ---

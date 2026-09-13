@@ -62,6 +62,35 @@ impl RopeCache {
         Self { rotary_dim, max_seq_len, cos, sin }
     }
 
+    /// RoPE with a per-pair frequency-factor table (GGUF `rope_freqs.weight`,
+    /// llama.cpp's `freq_factors`): `theta_i = pos · base^(-2i/rotary_dim)
+    /// / factors[i]`. Gemma 4 ships one for its global-attention layers —
+    /// 64 ones followed by 1e30s over the 256 pairs of a 512-wide head —
+    /// which is how "rotate only the first 64 pairs" (HF's
+    /// `partial_rotary_factor = 0.25`) is expressed: the tail pairs get an
+    /// angle of ~0 and pass through. `factors.len()` must be `rotary_dim/2`.
+    pub fn with_freq_factors(rotary_dim: usize, max_seq_len: usize, freq_base: f32,
+                             factors: &[f32]) -> Self
+    {
+        assert!(rotary_dim % 2 == 0, "rotary_dim must be even");
+        let half = rotary_dim / 2;
+        assert_eq!(factors.len(), half, "rope freq factors must have rotary_dim/2 entries");
+        let mut cos = vec![1.0_f32; max_seq_len * rotary_dim];
+        let mut sin = vec![0.0_f32; max_seq_len * rotary_dim];
+        for i in 0..half {
+            let inv_freq = freq_base.powf(-2.0 * i as f32 / rotary_dim as f32) / factors[i];
+            for pos in 0..max_seq_len {
+                let theta = pos as f32 * inv_freq;
+                let (s, c) = theta.sin_cos();
+                cos[pos * rotary_dim + i]        = c;
+                cos[pos * rotary_dim + i + half] = c;
+                sin[pos * rotary_dim + i]        = s;
+                sin[pos * rotary_dim + i + half] = s;
+            }
+        }
+        Self { rotary_dim, max_seq_len, cos, sin }
+    }
+
     /// Slice the (cos, sin) row for a given position.
     pub fn get(&self, position: usize) -> (&[f32], &[f32]) {
         let off = position * self.rotary_dim;

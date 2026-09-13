@@ -979,8 +979,11 @@ impl GpuGemma4 {
         let ple_dim = (cfg.n_embd_per_layer as usize * cfg.block_count as usize).max(1);
 
         // RoPE tables for both kinds.
-        let build_rope = |rotary: usize, base: f32| -> Result<(DeviceBuf<f32>, DeviceBuf<f32>), String> {
-            let rc = crate::cpu::rope::RopeCache::new(rotary, max_seq, base);
+        let build_rope = |rotary: usize, base: f32, factors: Option<&[f32]>| -> Result<(DeviceBuf<f32>, DeviceBuf<f32>), String> {
+            let rc = match factors {
+                Some(f) => crate::cpu::rope::RopeCache::with_freq_factors(rotary, max_seq, base, f),
+                None => crate::cpu::rope::RopeCache::new(rotary, max_seq, base),
+            };
             let mut cos = vec![0.0f32; max_seq * rotary];
             let mut sin = vec![0.0f32; max_seq * rotary];
             for pos in 0..max_seq {
@@ -990,10 +993,12 @@ impl GpuGemma4 {
             }
             Ok((DeviceBuf::from_slice(&cos)?, DeviceBuf::from_slice(&sin)?))
         };
+        // The frequency-factor table applies to the global layers only
+        // (llama.cpp: `freq_factors = rope_freqs` when `!is_swa(il)`).
         let (rope_cos_swa, rope_sin_swa) =
-            build_rope(cfg.rope_dim_swa as usize, cfg.rope_freq_base_swa)?;
+            build_rope(cfg.rope_dim_swa as usize, cfg.rope_freq_base_swa, None)?;
         let (rope_cos_full, rope_sin_full) =
-            build_rope(cfg.rope_dim_full as usize, cfg.rope_freq_base)?;
+            build_rope(cfg.rope_dim_full as usize, cfg.rope_freq_base, cfg.rope_freqs.as_deref())?;
 
         let ld = |name: &str, src: &str| -> Result<Module, String> {
             Module::load(&cache.compile(name, src)?)
@@ -2527,6 +2532,18 @@ impl GpuGemma4 {
                 self.hidden_a.copy_to_host(&mut xh)?;
                 let nrm = xh.iter().map(|v| v*v).sum::<f32>().sqrt();
                 eprintln!("decode layer {li:2} kind={:?}: |x|={nrm:.4}", block.kind);
+                // REINSTINCT_DECODE_DEBUG_FILE: the per-layer residual of
+                // this forward, one line per layer (rewritten every token,
+                // so the file holds the last token's), for diffing against
+                // tests/golden/dump_layers.
+                if let Ok(path) = std::env::var("REINSTINCT_DECODE_DEBUG_FILE") {
+                    use std::io::Write;
+                    let mut f = if li == 0 { std::fs::File::create(&path) }
+                                else { std::fs::OpenOptions::new().append(true).open(&path) }
+                        .map_err(|e| format!("{path}: {e}"))?;
+                    let line: Vec<String> = xh.iter().map(|v| format!("{v:.6e}")).collect();
+                    writeln!(f, "layer {li}: {}", line.join(" ")).map_err(|e| e.to_string())?;
+                }
             }
         }
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), self.output_norm.raw_ptr(),
@@ -3193,6 +3210,23 @@ impl GpuGemma4 {
             // layer_output_scale already applied, which is exactly HF's
             // hidden_states[li+1]. No-op unless the block is tapped.
             self.maybe_tap(li, x.raw_ptr(), tap_dst, tap_stride, p)?;
+            // REINSTINCT_PREFILL_DEBUG=2: the last row's residual after
+            // every block, one line per layer (same format as the decode
+            // dump) into REINSTINCT_PREFILL_DEBUG_FILE.
+            if std::env::var("REINSTINCT_PREFILL_DEBUG").ok().as_deref() == Some("2") {
+                if let Ok(path) = std::env::var("REINSTINCT_PREFILL_DEBUG_FILE") {
+                    self.stream.synchronize()?;
+                    let mut v = vec![0.0f32; self.hidden];
+                    let last = unsafe { (x.raw_ptr() as *const f32).add((p - 1) * self.hidden) } as *const c_void;
+                    unsafe { crate::hip::memcpy_d2h_raw(&mut v, last)?; }
+                    use std::io::Write;
+                    let mut f = if li == 0 { std::fs::File::create(&path) }
+                                else { std::fs::OpenOptions::new().append(true).open(&path) }
+                        .map_err(|e| format!("{path}: {e}"))?;
+                    let line: Vec<String> = v.iter().map(|x| format!("{x:.6e}")).collect();
+                    writeln!(f, "layer {li}: {}", line.join(" ")).map_err(|e| e.to_string())?;
+                }
+            }
         }
 
         // --- output: last token only ---
@@ -3796,6 +3830,35 @@ impl GpuGemma4 {
     /// One transformer block, in place on `hidden_a`. All position-
     /// dependent work (rope, KV write, attention) reads `d_pos`, so the
     /// chain is identical for every decode step.
+    /// REINSTINCT_DECODE_DEBUG=2: append one intermediate of layer
+    /// REINSTINCT_DECODE_DEBUG_LAYER (default 0) to the debug file as
+    /// "op <name>: v0 v1 ...", for diffing against tests/golden/dump_layers
+    /// (DUMP_NAMES). Syncs the stream; diagnostics only.
+    fn dbg_vec(&self, li: usize, name: &str, ptr: *mut c_void, n: usize) -> Result<(), String> {
+        static ON: std::sync::OnceLock<Option<(usize, String)>> = std::sync::OnceLock::new();
+        let cfg = ON.get_or_init(|| {
+            if std::env::var("REINSTINCT_DECODE_DEBUG").ok().as_deref() != Some("2") { return None; }
+            let layer = std::env::var("REINSTINCT_DECODE_DEBUG_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            std::env::var("REINSTINCT_DECODE_DEBUG_FILE").ok().map(|f| (layer, f))
+        });
+        let Some((layer, path)) = cfg else { return Ok(()) };
+        if li != *layer { return Ok(()); }
+        self.stream.synchronize()?;
+        let mut v = vec![0.0f32; n];
+        unsafe { crate::hip::memcpy_d2h_raw(&mut v, ptr as *const c_void)?; }
+        let mut pos = [0u32; 1]; self.d_pos.copy_to_host(&mut pos)?;
+        use std::io::Write;
+        // Ops go to "<file>.ops", one line per (op, position); the file
+        // is rewritten at position 0's first op.
+        let path = format!("{path}.ops");
+        let mut f = if name == "attn_norm" && pos[0] == 0 { std::fs::File::create(&path) }
+                    else { std::fs::OpenOptions::new().create(true).append(true).open(&path) }
+            .map_err(|e| format!("{path}: {e}"))?;
+        let line: Vec<String> = v.iter().map(|x| format!("{x:.6e}")).collect();
+        writeln!(f, "op {name}@{}: {}", pos[0], line.join(" ")).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn block_forward(&self, b: &GpuGemma4Block, li: usize, state: &Gemma4GpuState)
         -> Result<(), String>
     {
@@ -3825,6 +3888,7 @@ impl GpuGemma4 {
         self.launch_rmsnorm(self.hidden_a.raw_ptr(), b.attn_norm.raw_ptr(),
                             self.normed.raw_ptr(), h)?;
         self.prof_lap("a_norm");
+        self.dbg_vec(li, "attn_norm", self.normed.raw_ptr(), self.hidden)?;
         // Quantize the shared post-norm activation ONCE — Q, K, V all
         // read the same `normed`. (launch_matvec would re-quantize per
         // call; that's 2-3 redundant quantize launches per layer.)
@@ -3839,11 +3903,14 @@ impl GpuGemma4 {
         } else {
             self.launch_matvec(&b.attn_q, self.normed.raw_ptr(), self.q_buf.raw_ptr())?;
         }
+        self.dbg_vec(li, "Qcur", self.q_buf.raw_ptr(), self.n_heads * head_dim)?;
         self.launch_rmsnorm_mh(self.q_buf.raw_ptr(), b.attn_q_norm.raw_ptr(),
                                self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32)?;
+        self.dbg_vec(li, "Qcur_normed", self.q_buf.raw_ptr(), self.n_heads * head_dim)?;
         self.launch_rope(self.q_buf.raw_ptr(), self.n_heads as u32, head_dim as u32,
                          b.kind)?;
         self.prof_lap("a_q_proj");
+        self.dbg_vec(li, "Qcur_pos", self.q_buf.raw_ptr(), self.n_heads * head_dim)?;
         // K/V: computed and written to the cache only on KV-owning layers.
         if need_kv {
             if qkv_repacked {
@@ -3862,15 +3929,20 @@ impl GpuGemma4 {
                 }
                 None => self.k_proj.raw_ptr(),  // full layers: V is the K projection
             };
+            self.dbg_vec(li, "Kcur", self.k_proj.raw_ptr(), n_kv * head_dim)?;
+            self.dbg_vec(li, "Vcur", v_src, n_kv * head_dim)?;
             // K: per-head weighted norm + RoPE.
             self.launch_rmsnorm_mh(self.k_proj.raw_ptr(), b.attn_k_norm.raw_ptr(),
                                    self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32)?;
+            self.dbg_vec(li, "Kcur_normed", self.k_norm.raw_ptr(), n_kv * head_dim)?;
             self.launch_rope(self.k_norm.raw_ptr(), n_kv as u32, head_dim as u32,
                              b.kind)?;
             // V: per-head plain RMSNorm (ones weight). Reads v_src, writes v_norm.
             self.launch_rmsnorm_mh(v_src, self.ones.raw_ptr(), self.v_norm.raw_ptr(),
                                    n_kv as u32, head_dim as u32)?;
             self.prof_lap("a_kv_proj");
+            self.dbg_vec(li, "Kcur_pos", self.k_norm.raw_ptr(), n_kv * head_dim)?;
+            self.dbg_vec(li, "Vcur_normed", self.v_norm.raw_ptr(), n_kv * head_dim)?;
             // Quantize (k, v) and append at d_pos. SuperQuant uses its
             // own internal pos (warm_count); standard int8 uses d_pos.
             if let Some(sq) = sq_own {
@@ -3922,12 +3994,14 @@ impl GpuGemma4 {
                                 n_kv as u32, head_dim as u32, window)?;
         }
         self.prof_lap("a_kernel");
+        self.dbg_vec(li, "kqv_out", self.attn_concat.raw_ptr(), self.n_heads * head_dim)?;
         // Output projection, fused post-norm + residual.
         self.launch_matvec(&b.attn_output, self.attn_concat.raw_ptr(),
                            self.hidden_b.raw_ptr())?;
         self.launch_rmsnorm_add(self.hidden_b.raw_ptr(), b.post_attn_norm.raw_ptr(),
                                 self.hidden_a.raw_ptr(), h)?;
         self.prof_lap("a_out_proj");
+        self.dbg_vec(li, "attn_out", self.hidden_a.raw_ptr(), self.hidden)?;
 
         // --- FFN --- (dense GeGLU, or the dual shared-MLP + MoE branch)
         match &b.moe {
@@ -3946,7 +4020,9 @@ impl GpuGemma4 {
                 }
                 self.launch_geglu(self.ffn_a.raw_ptr(), self.ffn_b.raw_ptr(),
                                   self.ffn_a.raw_ptr(), b.ffn_gate.out_dim as u32)?;
+                self.dbg_vec(li, "ffn_geglu", self.ffn_a.raw_ptr(), b.ffn_gate.out_dim as usize)?;
                 self.launch_matvec(&b.ffn_down, self.ffn_a.raw_ptr(), self.hidden_b.raw_ptr())?;
+                self.dbg_vec(li, "ffn_out", self.hidden_b.raw_ptr(), self.hidden)?;
                 // If there's no PLE residual after this, fold the per-layer
                 // output scale into the final rmsnorm_add (saves one launch).
                 let fold_scale = self.ple.is_none() || b.ple.is_none();

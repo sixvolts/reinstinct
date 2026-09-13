@@ -844,6 +844,9 @@ OpenAI-shaped error body on non-2xx:
 | `REINSTINCT_PREFILL_THRICE` | (Gemma 4 only) As `_TWICE` but also runs a third pass to measure the cache-replay path that skips `end_capture + instantiate`. Reports `warmup → captured → replay → fresh`. |
 | `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown (`=2` also prints every block by global index; `=3` times every launch and prints a per-kernel table sorted by total). Diagnostic; breaks graph capture. |
 | `REINSTINCT_PREFILL_ATTN=flash` | Both runtimes: the one-wave-per-query prefill attention (`attn_prefill_flash_f32`) instead of the tiled kernel. A/B only — 3-5× slower. |
+| `REINSTINCT_PREFILL_SEQ` | `generate-text`: feed the prompt through the decode forward one token at a time instead of the batched prefill (diagnostic). |
+| `REINSTINCT_DECODE_DEBUG_FILE` / `_LAYER` | gemma4, with `REINSTINCT_DECODE_DEBUG=1`/`=2`: write the per-layer residual (and, at `=2`, every intermediate of one layer) of each decode forward — see NOTES, Gemma 4 global-attention RoPE. |
+| `REINSTINCT_PREFILL_DEBUG=2` + `REINSTINCT_PREFILL_DEBUG_FILE` | gemma4: the batched prefill's per-layer residual of the last row, same format. |
 | `REINSTINCT_REQUIRE_FIXTURES` | `cargo test`: a missing model fixture or GPU fails the test instead of skipping it (see *Tests*). |
 | `REINSTINCT_PREFILL_CHUNK` | Multi-GPU pipeline: largest micro-batch (tokens) a prompt is prefilled in (default 256; rounded to 64). The prompt is cut into at least four equal chunks so the stages overlap; see *Multi-GPU*. |
 
@@ -1399,17 +1402,38 @@ would require projecting the prefill via int8 matvec, which would
 defeat the GEMM batching. The chosen direction is int8 decode as the
 production path.
 
-### Gemma 31B K-quant on long prompts
+### Gemma 4 global-attention RoPE (fixed 2026-09-13)
 
-The dense 31B **K-quant** build (`gemma-4-31B-it-UD-Q4_K_XL`) degrades
-on chat prompts past ~800 tokens: the reply collapses into a repeated
-`// a single-` / `la la la` pattern (sometimes recovering after a few
-tokens), while the QAT build (Q4_0) and the 26B MoE answer the same
-1.6K-token prompt normally and the K-quant build answers a 480-token one
-normally. It is independent of the attention kernels (old and new
-prefill kernels give identical token ids), of graph capture and of the
-dp4a matvec path. Not yet diagnosed; treat that file as unreliable past
-~800 tokens and prefer the QAT build for long contexts.
+Gemma 4's global-attention layers (head_dim 512) rotate the full head
+with NEOX pairs `(i, i+256)` and a per-pair frequency-factor table the
+GGUF ships as `rope_freqs.weight` — 64 ones then 1e30s — so only the
+first 64 pairs turn (HF `partial_rotary_factor = 0.25`) at frequencies
+`base^(-2i/512)`; llama.cpp applies it as `freq_factors` on the
+non-sliding layers. The engine used to read that as "rotate the first
+128 dims as a 128-wide RoPE", which paired the wrong dims at 4x the
+frequency. The error is zero at position 0 and grows with position:
+against llama.cpp the residual was 2% off after the first global layer
+and 40-85% off by the last layers at 128 tokens, both prefill and
+decode, both the K-quant and the QAT 31B (which merely tolerated it —
+the K-quant build collapsed into `// a single-` past ~800 tokens). With
+the table honoured (`RopeCache::with_freq_factors`, GPU and CPU paths)
+the residual is 0.5% after that layer and 5-16% at the end, and the
+K-quant answers 3.5K-token prompts normally.
+
+How it was found, and the tools that stay: `tests/golden/dump_layers`
+(built by `tests/golden/build.sh` against `~/llama.cpp`) decodes a token
+list on the CPU and prints the per-layer residual of the last token
+(`DUMP_NAMES="-5" DUMP_VECS=1` adds every layer-5 tensor);
+`REINSTINCT_DECODE_DEBUG=1` with `REINSTINCT_DECODE_DEBUG_FILE` writes
+the engine's per-layer residual in the same format, `=2` with
+`REINSTINCT_DECODE_DEBUG_LAYER=<l>` also every intermediate of layer
+`l` (`<file>.ops`), `REINSTINCT_PREFILL_DEBUG=2` +
+`REINSTINCT_PREFILL_DEBUG_FILE` the batched prefill's, and
+`REINSTINCT_PREFILL_SEQ=1` feeds a `generate-text` prompt through the
+decode path token by token. Comparing op by op against llama.cpp put
+the projections within 1% of exact f32 (better than llama.cpp's own
+Q8_K path), the int8 KV cache at 2% on the attention output, and the
+RoPE at 60% — on the global layers only.
 
 ### CPU oracle caveat
 
