@@ -144,6 +144,9 @@ variant directory) so a kernel edit re-benches without a rebuild:
 | `bench_matvec_stream_overlap` | two independent matvecs on one stream vs fork/join on two, direct and in a graph (negative result: ≤2%, nothing in a graph) | — |
 | `bench_mmq_wide_kernels` | prefill MMQ GEMM per dtype | — |
 | `bench_attn_decode` | split-K decode attention, old per-query-head kernel vs the GQA kernel, at 32 / 512 / 2048 / 8192 tokens on a cold KV cache, with a correctness check between them | `REINSTINCT_ATTN_GEOM=heads,kv,head_dim` (default 24,4,256 = the 27B), `REINSTINCT_ATTN_SPLITS`, `REINSTINCT_ATTN_DEFS="#define UNR 2\n"` |
+| `bench_attn_decode_q8` | the same over Gemma's int8 KV cache at the 31B's sliding (32/16/256, window 1024) and global (32/4/512) layer geometries | `REINSTINCT_ATTN_GEOM=heads,kv,head_dim,window`, `REINSTINCT_ATTN_DEFS` |
+| `bench_attn_prefill` | prefill attention, `attn_prefill_flash_f32` vs the tiled kernel, at 512 / 1000 / 2048 / 3968 rows and a mid-sequence chunk, at the 27B and both Gemma 31B geometries, with a correctness check | `REINSTINCT_ATTN_GEOM=heads,kv,head_dim,window`, `REINSTINCT_ATTN_DEFS="#define OCC 2\n"` |
+| `bench_gdn_batched_recurrent` | the prefill GDN recurrence (general / LDS-resident / v2 kernels) at the 27B's shape, µs per row | `REINSTINCT_GDN_ROWS` (default 512; 3971 shows the old kernel's occupancy collapse) |
 | `gdn_recurrent_v2_matches_v1_and_bench` (not ignored) | GDN recurrent step v1 vs v2 on a cold state | `REINSTINCT_GDN_GEOM=cols,groups` |
 
 ## COMMANDS
@@ -839,7 +842,8 @@ OpenAI-shaped error body on non-2xx:
 | `REINSTINCT_PREFILL` | `generate-text` + `--gpu`: run only the batched prefill on the prompt, print timing and top-10 logits, then exit (skips generation). Drops the per-call generation noise so a prefill-only bench is one-line. |
 | `REINSTINCT_PREFILL_TWICE` | Used with `REINSTINCT_PREFILL=1`. Two passes: first warms the pool + captures the graph, second is the captured measurement. Prints both timings. The captured number is what's fair to compare against `llama-bench pp512` (steady state). |
 | `REINSTINCT_PREFILL_THRICE` | (Gemma 4 only) As `_TWICE` but also runs a third pass to measure the cache-replay path that skips `end_capture + instantiate`. Reports `warmup → captured → replay → fresh`. |
-| `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown (`=2` also prints every block by global index). Diagnostic; breaks graph capture. |
+| `REINSTINCT_PREFILL_TRACE` | Per-block timing trace inside the qwen35 prefill chain — syncs after each Full/Linear block and emits an F/L breakdown (`=2` also prints every block by global index; `=3` times every launch and prints a per-kernel table sorted by total). Diagnostic; breaks graph capture. |
+| `REINSTINCT_PREFILL_ATTN=flash` | Both runtimes: the one-wave-per-query prefill attention (`attn_prefill_flash_f32`) instead of the tiled kernel. A/B only — 3-5× slower. |
 | `REINSTINCT_REQUIRE_FIXTURES` | `cargo test`: a missing model fixture or GPU fails the test instead of skipping it (see *Tests*). |
 | `REINSTINCT_PREFILL_CHUNK` | Multi-GPU pipeline: largest micro-batch (tokens) a prompt is prefilled in (default 256; rounded to 64). The prompt is cut into at least four equal chunks so the stages overlap; see *Multi-GPU*. |
 
@@ -1334,6 +1338,31 @@ on qwen 35B-MoE). Key changes:
   the 27B cold (the v1 kernel: 47 µs). Its alpha|beta projection is a
   split-K Q8_0 matvec whose partials the kernel sums (96 rows over
   5120 was pure launch latency otherwise).
+- Prefill attention (both runtimes, `attn_prefill_tiled_f32.cpp`): one
+  workgroup per 32 queries, 16-key tiles staged once into LDS as fp16
+  (K row-major with a 16-bank pad, V key-pair-interleaved), threads
+  blocked as (query pair, key, 32-dim slice of head_dim) with the query
+  slices register-resident and `v_dot2_f32_f16` for both Q·Kᵀ and P·V,
+  online softmax per tile. 3.5 TFLOPS against the 0.7 of the one-wave-
+  per-query kernel it replaces: 27B 273 → 56 ms per layer at 3968 rows,
+  Gemma 31B sliding layers 164 → 35, global (head_dim 512) 516 → 161.
+  fp16 tiles round the output by 2e-4 relative; the prefill-vs-decode
+  oracle and the pipeline suites pass and greedy output matches the f32
+  kernel on 3.5K-token prompts. Prefill of a 4K prompt on the 27B
+  22.3 → 13.8 s (with the recurrence below), Gemma 31B 26.3 → 16.9 s.
+  Sliding window supported; head_dim 128 / 256 / 512.
+- Prefill GDN recurrence (qwen35, `gdn_recurrent_batched_v2.cpp`):
+  the LDS-resident kernel staged every row's a/b scalar in LDS, 32 KB
+  at 3971 rows, one workgroup per CU and the 384 workgroups in ~6
+  sequential rounds (31 µs/row in the model, 9 in its own bench). v2
+  keeps a 9 KB footprint (XOR-swizzled state slice, row r+1 prefetched
+  into registers) so all workgroups are co-resident: 122 → 18 ms per
+  layer at 3971 rows.
+- Decode attention (gemma4, `attn_decode_gqa_q8.cpp`): the GQA design
+  below on the int8 cache — Q quantised per head in the kernel, 2 sdot4
+  per head per row, per-token K/V scales, sliding window. 31B global
+  layers at 8K 641 → 292 µs, sliding 68 → 41; decode at 3.8K context
+  39.1 → 36.2 ms/token, output ids identical.
 - Decode attention (qwen35, `attn_decode_gqa_f32.cpp`): GQA
   flash-decoding. One workgroup per (kv head, group of ≤6 query heads,
   split): K/V rows read once per group as float4s, query slices in
@@ -1369,6 +1398,18 @@ prefill attention tracks decode within ~0.1% per layer. Bit-matching
 would require projecting the prefill via int8 matvec, which would
 defeat the GEMM batching. The chosen direction is int8 decode as the
 production path.
+
+### Gemma 31B K-quant on long prompts
+
+The dense 31B **K-quant** build (`gemma-4-31B-it-UD-Q4_K_XL`) degrades
+on chat prompts past ~800 tokens: the reply collapses into a repeated
+`// a single-` / `la la la` pattern (sometimes recovering after a few
+tokens), while the QAT build (Q4_0) and the 26B MoE answer the same
+1.6K-token prompt normally and the K-quant build answers a 480-token one
+normally. It is independent of the attention kernels (old and new
+prefill kernels give identical token ids), of graph capture and of the
+dp4a matvec path. Not yet diagnosed; treat that file as unreliable past
+~800 tokens and prefer the QAT build for long contexts.
 
 ### CPU oracle caveat
 
