@@ -2,16 +2,17 @@
 
 Note - this was developed as an open-loop playground for optimizing for these older Vega20/gfx906 GPUs to see how far we can push performance. The majority of the improvements here have been backported to llama-cpp in this repo: https://github.com/sixvolts/llama-cpp-vega-retune.
 
+Reinstinct is a custom inference engine for AMD Radeon Instinct MI50/MI60 GPUs for local AI inference. Reinstinct outperforms llama.cpp on the same hardware, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
+
 ## Recent updates (Sept-2026)
 * Added support for multiple GPUs
 * Updated support and kernels for Qwen 3.8
-* cleanliness an performance overhauls 
-
-Reinstinct is a custom inference engine for AMD Radeon Instinct MI50/MI60 GPUs for local AI inference. Reinstinct outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
+* cleanliness an performance overhauls
+* Added support for DFLASH (WIP)
 
 ## Why does this exist?
 
-GPUs are expensive. HBM is even harder to get. An NVIDIA RTX 3090 runs $800-1200 used. An M4 Max MacBook Pro starts at $3500. A single H100 rents for $2-3/hr.
+GPUs are expensive. HBM is even harder to get. 5090s are now $5000 or more - used. RTX pro cards are now over $10k PER CARD. Even the basic Mac mini costs $899 now. 
 
 Meanwhile, AMD Instinct MI50s are $400-500 on eBay. They have **32 GB of HBM2** and **1 TB/s of memory bandwidth** — the same bandwidth class as an RTX 4090, with 33% more VRAM than a 3090. The reason they are cheap is that AMD declared them end-of-life in 2023 and stopped shipping optimized software. Stock inference frameworks leave 70-90% of the cards bandwidth on the table due to kernel launch overhead and unoptimized dispatch.
 
