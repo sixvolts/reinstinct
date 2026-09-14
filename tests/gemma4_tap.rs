@@ -1,9 +1,9 @@
 //! DFlash target-context tap: does `enable_target_tap` capture the layer
 //! outputs it claims to?
 //!
-//! Needs a real Gemma 4 GGUF — set `REINSTINCT_GEMMA_FIXTURE` to one.
-//! Skips (does not fail) without it or without a GPU, matching the rest
-//! of the GPU test suite.
+//! Needs a real Gemma 4 GGUF — defaults to `~/models/gemma4-31B/`, or
+//! set `REINSTINCT_GEMMA_FIXTURE` to override.  Skips without it or
+//! without a GPU, matching the rest of the GPU test suite.
 
 use reinstinct_engine::model::gemma4::Gemma4Model;
 use reinstinct_engine::runtime::gemma4::{Gemma4GpuState, GpuGemma4};
@@ -21,7 +21,7 @@ fn fixture() -> Option<std::path::PathBuf> {
 #[test]
 fn tap_of_final_block_matches_prenorm_hidden() {
     let Some(path) = fixture() else {
-        eprintln!("skip: set REINSTINCT_GEMMA_FIXTURE to a Gemma 4 GGUF");
+        eprintln!("skip: Gemma 4 GGUF not found");
         return;
     };
     let Some(cache) = reinstinct_engine::test_support::kernel_cache() else { return };

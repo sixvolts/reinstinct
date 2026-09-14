@@ -7,8 +7,8 @@
 //! semantics — degrades the block to noise, and a noise drafter accepts
 //! essentially nothing. A healthy DFlash block should accept most of it.
 //!
-//! Needs REINSTINCT_GEMMA_FIXTURE (target) and REINSTINCT_DFLASH_FIXTURE
-//! (drafter). Skips without them.
+//! Defaults to `~/models/gemma4-31B/` for both target and drafter, or set
+//! REINSTINCT_GEMMA_FIXTURE / REINSTINCT_DFLASH_FIXTURE to override.
 
 use reinstinct_engine::gguf::GgufFile;
 use reinstinct_engine::hip;

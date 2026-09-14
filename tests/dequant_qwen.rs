@@ -1,6 +1,6 @@
-//! Dequantize one real tensor of each type appearing in the Qwen 0.8B
-//! UD-Q4_K_XL file and sanity-check the output. This is the first end-to-end
-//! exercise of the quant module against production data.
+//! Dequantize one real tensor of each type appearing in a Qwen
+//! UD-Q4_K_XL file and sanity-check the output. This is the first
+//! end-to-end exercise of the quant module against production data.
 //!
 //! Skipped when the file is absent (set REINSTINCT_GGUF_FIXTURE to override).
 
@@ -21,7 +21,7 @@ fn dequantize_one_tensor_per_type() {
         return;
     };
 
-    let g = GgufFile::open(&path).expect("open Qwen 0.8B");
+    let g = GgufFile::open(&path).expect("open GGUF");
 
     let mut seen: HashSet<GgmlType> = HashSet::new();
     let mut tested = 0;
@@ -59,21 +59,16 @@ fn dequantize_one_tensor_per_type() {
         assert_eq!(nan_or_inf, 0,
             "tensor {} ({:?}) contains {} non-finite values",
             t.name, t.ggml_type, nan_or_inf);
-        // Loose sanity: RMS within [1e-6, 1e3] for any production weight tensor.
         assert!(rms > 1e-6 && rms < 1e3,
             "tensor {} ({:?}) rms {} outside reasonable range",
             t.name, t.ggml_type, rms);
         tested += 1;
     }
 
-    // Make sure we exercised the ones we care about for Qwen 3.5.
-    for required in [
-        GgmlType::F32, GgmlType::F16,
-        GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0,
-        GgmlType::IQ4_XS,
-    ] {
+    // Every UD-Q4_K_XL file has F32 norms and Q4_K bulk weights at minimum.
+    for required in [GgmlType::F32, GgmlType::Q4_K] {
         assert!(seen.contains(&required),
-            "expected {:?} to appear in Qwen 0.8B, but no tensor of that type was found",
+            "expected {:?} to appear in the GGUF, but no tensor of that type was found",
             required);
     }
 

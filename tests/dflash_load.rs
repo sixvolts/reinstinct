@@ -1,7 +1,7 @@
 //! DFlash GGUF parsing against the real checkpoint.
 //!
-//! Set `REINSTINCT_DFLASH_FIXTURE` to a DFlash drafter GGUF. Skips
-//! without it, like the other fixture-backed tests.
+//! Defaults to `~/models/gemma4-31B/`, or set `REINSTINCT_DFLASH_FIXTURE`
+//! to override. Skips without it, like the other fixture-backed tests.
 
 use reinstinct_engine::gguf::GgufFile;
 use reinstinct_engine::model::dflash::{DFlashAttn, DFlashModel};
@@ -13,7 +13,7 @@ fn fixture() -> Option<std::path::PathBuf> {
 #[test]
 fn loads_gemma4_31b_dflash_with_expected_topology() {
     let Some(path) = fixture() else {
-        eprintln!("skip: set REINSTINCT_DFLASH_FIXTURE to a DFlash GGUF");
+        eprintln!("skip: DFlash GGUF not found");
         return;
     };
     let gguf = GgufFile::open(&path).expect("open");

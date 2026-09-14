@@ -31,29 +31,24 @@ direction.*
 
 | Model | Params | reinstinct (mean ± σ) | llama.cpp | Delta |
 |---|---|---|---:|---:|
-| Qwen 3.5 0.8B | 0.8B | **272.1 ± 1.1** | 192.0 | **+42%** |
-| Qwen 3.5 4B | 4.2B | **108.2 ± 0.3** | 75.9 | **+43%** |
 | Gemma 4 E4B | 7.5B | **105.7 ± 0.2** | 81.2 | **+30%** |
-| Qwen 3.5 35B-A3B MoE | 3.3B active | **92.6 ± 0.4** | 78.3 | **+18%** |
 | Qwen 3.6 35B-A3B MoE | 3.3B active | **92.7 ± 0.4** | 77.1 | **+20%** |
 | Gemma 4 26B-A4B MoE | 4B active | **91.5 ± 0.2** | 85.5 | **+7%** |
+| Qwen 3.8 27B | 26.9B | **35.3 ± 0.1** | 26.0 | **+36%** |
 | Gemma 4 31B Dense | 30.7B | **28.0 ± 0.2** | 21.0 | **+33%** |
-| Qwen 3.5 27B (GDN hybrid) | 26.9B | **27.4 ± 0.05** | 23.4 | **+17%** |
 | Qwen 3.6 27B-MTP | 26.9B | **28.1 ± 0.1** | 23.2 | **+21%** |
 | Qwen 3.6 27B | 26.9B | **27.7 ± 0.1** | 23.2 | **+19%** |
 
-reinstinct wins **10 of 10** tested configurations.
+reinstinct wins **7 of 7** tested configurations.
 
 ### Prefill throughput (tok/s, pp512)
 
 | Model | reinstinct | llama.cpp | Delta |
 |---|---|---|---|
-| Qwen 3.5 4B | **915** | 882 | **+4%** |
 | Gemma 4 E4B | **1070** | 1070 | par |
-| Qwen 3.5 27B | **210** | 187 | **+12%** |
+| Qwen 3.8 27B | **298** | 202 | **+48%** |
 | Qwen 3.6 27B | **211** | 187 | **+13%** |
 | Gemma 4 31B Dense | **217** | 172 | **+26%** |
-| Qwen 3.5 35B-A3B MoE | **820** | 803 | **+2%** |
 | Qwen 3.6 35B-A3B MoE | **809** | 802 | **+1%** |
 | Gemma 4 26B-A4B MoE | **768** | 621 | **+24%** |
 
@@ -64,9 +59,9 @@ choice drives the MoE wins.
 
 ### How does this compare to other hardware?
 
-| Hardware | Price (used) | VRAM | Qwen 3.5 35B MoE tok/s | Gemma 31B Dense tok/s |
+| Hardware | Price (used) | VRAM | Qwen 3.6 35B MoE tok/s | Gemma 31B Dense tok/s |
 |---|---|---|---|---|
-| **MI50 + reinstinct** | **~$500** | 32 GB HBM2 | **92.6** | **28.0** |
+| **MI50 + reinstinct** | **~$500** | 32 GB HBM2 | **92.7** | **28.0** |
 | RTX 3090 + llama.cpp | $800-1200 | 24 GB GDDR6X | ~136 | ~21* |
 | M4 Max + llama.cpp | $3500+ | 36 GB unified | ~44 | ~20 |
 | M4 Max + MLX | $3500+ | 36 GB unified | ~92 | N/A |
@@ -97,7 +92,7 @@ the drafter is likely to land.
 
 ## Features
 
-- **Dense + MoE model support**: Gemma 4 (E4B, 26B MoE, 31B), Qwen 3.5 (0.8B-35B), Qwen 3.6 (27B, 35B MoE)
+- **Dense + MoE model support**: Gemma 4 (E4B, 26B MoE, 31B), Qwen 3.6 (27B, 35B MoE), Qwen 3.8 (27B)
 - **Unsloth Dynamic GGUF**: Native support for UD-Q4_K_XL and UD-Q6_K_XL
 - **Google QAT GGUF**: Native `Q4_0` kernels — smaller and ~19% faster to decode than the K-quant build of the same model
 - **Repacked v2 quantization**: Custom weight layout with denser scale planes for better HBM utilization
@@ -105,7 +100,7 @@ the drafter is likely to land.
 - **SuperQuant tiered KV cache**: Opt-in 2-tier (int8 + turbo3) cache that extends context capacity ~1.7× vs int8 / ~3.3× vs fp16. Capacity feature, not a perf feature — trade ~30% decode tok/s for room to attend over longer contexts. Gemma 4 only today; see [docs/SUPERQUANT.md](docs/SUPERQUANT.md).
 - **MTP speculative decoding**: Multi-Token Prediction with per-request control
 - **DFlash block-diffusion drafting**: Gemma 4 31B with its DFlash drafter, runtime-sized blocks (`dflash-gen`)
-- **Multi-GPU pipeline parallelism**: split a dense Qwen 3.x model's layers across cards (`--gpus 0,1`) — Qwen3.8-27B at Q8 on two MI50s at 95% of the two-card bandwidth roofline; prefill micro-batched so both cards work at once
+- **Multi-GPU pipeline parallelism**: split a dense Qwen 3.x model's layers across cards (`--gpus 0,1`) — Qwen 3.8 27B at Q8 on two MI50s at 95% of the two-card bandwidth roofline; prefill micro-batched so both cards work at once
 - **Every Unsloth UD-XL tensor type loads at its real size**: IQ4_XS native kernels (v_perm codebook), IQ4_NL / IQ3_S / Q3_K relabelled onto layouts with kernels, BF16 requantized to Q8_0 — nothing widens to F32
 - **OpenAI-compatible serve endpoint**: /v1/chat/completions with streaming, logprobs, prefix cache
 - **HIP graph capture**: Entire decode step as a single GPU submission
@@ -113,7 +108,7 @@ the drafter is likely to land.
 - **Wave64-native**: All kernels designed for GCN5.1 64-lane wavefronts with DPP reductions
 - **Zero ROCm link dependency**: Runtime dlopen, embedded kernel sources compiled and cached
 - **Sliding window attention**: Gemma 4 5:1 sliding/global ratio
-- **Gated-DeltaNet**: Qwen 3.5/3.6 hybrid GDN+attention with fused recurrent kernels
+- **Gated-DeltaNet**: Qwen 3.6/3.8 hybrid GDN+attention with fused recurrent kernels
 
 ## Supported hardware
 

@@ -8,9 +8,6 @@
 
 use std::path::PathBuf;
 
-/// The default Qwen 3.5 0.8B fixture, relative to `$HOME`.
-pub const QWEN_FIXTURE_REL: &str = "models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf";
-
 fn required() -> bool {
     std::env::var_os("REINSTINCT_REQUIRE_FIXTURES").is_some()
 }
@@ -42,19 +39,60 @@ pub fn gguf_fixture(env_var: &str, home_rel: Option<&str>) -> Option<PathBuf> {
     missing(&format!("set {env_var} to a GGUF"))
 }
 
-/// The Qwen 3.5 0.8B fixture (`REINSTINCT_GGUF_FIXTURE` or the `~/models` default).
+/// Qwen dense fixture — Qwen 3.8 27B by default.
 pub fn qwen_fixture() -> Option<PathBuf> {
-    gguf_fixture("REINSTINCT_GGUF_FIXTURE", Some(QWEN_FIXTURE_REL))
+    gguf_fixture(
+        "REINSTINCT_GGUF_FIXTURE",
+        Some("models/qwen-3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf"),
+    )
 }
 
-/// A Gemma 4 GGUF (`REINSTINCT_GEMMA_FIXTURE`).
+/// Qwen MoE fixture — Qwen 3.6 35B-A3B.
+pub fn qwen_moe_fixture() -> Option<PathBuf> {
+    gguf_fixture(
+        "REINSTINCT_QWEN_MOE_FIXTURE",
+        Some("models/qwen-3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+    )
+}
+
+/// Gemma 4 dense fixture — 31B by default.
 pub fn gemma_fixture() -> Option<PathBuf> {
-    gguf_fixture("REINSTINCT_GEMMA_FIXTURE", None)
+    gguf_fixture(
+        "REINSTINCT_GEMMA_FIXTURE",
+        Some("models/gemma4-31B/gemma-4-31B-it-UD-Q4_K_XL.gguf"),
+    )
+}
+
+/// Gemma 4 MoE fixture — 26B-A4B.
+pub fn gemma_moe_fixture() -> Option<PathBuf> {
+    gguf_fixture(
+        "REINSTINCT_GEMMA_MOE_FIXTURE",
+        Some("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"),
+    )
+}
+
+/// Gemma 4 E4B fixture — small dense model.
+pub fn gemma_e4b_fixture() -> Option<PathBuf> {
+    gguf_fixture(
+        "REINSTINCT_GEMMA_E4B_FIXTURE",
+        Some("models/gemma4-E4B/gemma-4-E4B-it-UD-Q4_K_XL.gguf"),
+    )
 }
 
 /// A DFlash drafter GGUF (`REINSTINCT_DFLASH_FIXTURE`).
 pub fn dflash_fixture() -> Option<PathBuf> {
-    gguf_fixture("REINSTINCT_DFLASH_FIXTURE", None)
+    gguf_fixture(
+        "REINSTINCT_DFLASH_FIXTURE",
+        Some("models/gemma4-31B/gemma4-31b-it-dflash-Q8_0.gguf"),
+    )
+}
+
+/// Gemma 4 MTP assistant GGUF.
+pub fn gemma4_assistant_fixture() -> Option<PathBuf> {
+    gguf_fixture(
+        "REINSTINCT_GEMMA4_ASSISTANT_FIXTURE",
+        Some("models/gemma4-31B/mtp-gemma-4-31B-it-Q8_0.gguf"),
+    )
 }
 
 /// `Some(())` when a HIP device is present; reports and `None` otherwise.
