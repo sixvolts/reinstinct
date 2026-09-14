@@ -33,13 +33,13 @@ pub enum Gemma4AssistantError {
     WrongArchitecture { got: String, expected: &'static [&'static str] },
 
     #[error("missing required GGUF metadata key: {0}")]
-    MissingMetadata(&'static str),
+    MissingMetadata(String),
 
     #[error("metadata key {key} has wrong type (expected {expected})")]
-    WrongMetadataType { key: &'static str, expected: &'static str },
+    WrongMetadataType { key: String, expected: &'static str },
 
     #[error("metadata array {key} has {got} entries, expected {expected}")]
-    WrongArrayLength { key: &'static str, got: usize, expected: usize },
+    WrongArrayLength { key: String, got: usize, expected: usize },
 
     #[error("missing required tensor: {0}")]
     MissingTensor(String),
@@ -121,13 +121,13 @@ impl Gemma4AssistantConfig {
             gguf, &format!("{p}.attention.head_count_kv"), block_count as usize)?;
         if kv_heads.len() != block_count as usize {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "gemma4_assistant.attention.head_count_kv",
+                key: "gemma4_assistant.attention.head_count_kv".into(),
                 got: kv_heads.len(), expected: block_count as usize });
         }
         let pattern = read_bool_vec(gguf, &format!("{p}.attention.sliding_window_pattern"))?;
         if pattern.len() != block_count as usize {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "gemma4_assistant.attention.sliding_window_pattern",
+                key: "gemma4_assistant.attention.sliding_window_pattern".into(),
                 got: pattern.len(), expected: block_count as usize });
         }
         let attn_kinds: Vec<AttnKind> = pattern.iter()
@@ -153,7 +153,7 @@ impl Gemma4AssistantConfig {
             Some(MetaValue::Bool(b)) => *b,
             None => false,
             _ => return Err(Gemma4AssistantError::WrongMetadataType {
-                key: "gemma4_assistant.attention.k_eq_v", expected: "bool" }),
+                key: "gemma4_assistant.attention.k_eq_v".into(), expected: "bool" }),
         };
         let shared_kv_layers = optional_u32(
             gguf, &format!("{p}.attention.shared_kv_layers")).unwrap_or(0);
@@ -251,7 +251,7 @@ impl Gemma4AssistantModel {
         let expect_pre_in = (self.config.n_embd_backbone * 2) as u64;
         if pre.shape() != [expect_pre_in, self.config.hidden_size as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "pre_projection.weight.shape",
+                key: "pre_projection.weight.shape".into(),
                 got: pre.shape().len(),
                 expected: 2,
             });
@@ -261,7 +261,7 @@ impl Gemma4AssistantModel {
         if post.shape() != [self.config.hidden_size as u64,
                             self.config.n_embd_backbone as u64] {
             return Err(Gemma4AssistantError::WrongArrayLength {
-                key: "post_projection.weight.shape",
+                key: "post_projection.weight.shape".into(),
                 got: post.shape().len(),
                 expected: 2,
             });
@@ -272,31 +272,29 @@ impl Gemma4AssistantModel {
 
 // --- metadata helpers (mirror src/model/gemma4.rs) ---
 
-fn require_str<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a str> {
+fn require_str<'a>(gguf: &'a GgufFile, key: &str) -> Result<&'a str> {
     match gguf.metadata_get(key) {
         Some(MetaValue::String(s)) => Ok(s),
-        Some(_) => Err(Gemma4AssistantError::WrongMetadataType { key, expected: "string" }),
-        None => Err(Gemma4AssistantError::MissingMetadata(key)),
+        Some(_) => Err(Gemma4AssistantError::WrongMetadataType { key: key.into(), expected: "string" }),
+        None => Err(Gemma4AssistantError::MissingMetadata(key.into())),
     }
 }
 
 fn require_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(v) => v.as_u32()
             .ok_or(Gemma4AssistantError::WrongMetadataType {
-                key: static_key, expected: "u32" }),
-        None => Err(Gemma4AssistantError::MissingMetadata(static_key)),
+                key: key.into(), expected: "u32" }),
+        None => Err(Gemma4AssistantError::MissingMetadata(key.into())),
     }
 }
 
 fn require_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::F32(v)) => Ok(*v),
         Some(_) => Err(Gemma4AssistantError::WrongMetadataType {
-            key: static_key, expected: "f32" }),
-        None => Err(Gemma4AssistantError::MissingMetadata(static_key)),
+            key: key.into(), expected: "f32" }),
+        None => Err(Gemma4AssistantError::MissingMetadata(key.into())),
     }
 }
 
@@ -305,27 +303,25 @@ fn optional_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
 }
 
 fn read_u32_vec_or_broadcast(gguf: &GgufFile, key: &str, n: usize) -> Result<Vec<u32>> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::Array { values, .. }) => {
             let mut out = Vec::with_capacity(values.len());
             for v in values {
                 out.push(v.as_u32().ok_or(Gemma4AssistantError::WrongMetadataType {
-                    key: static_key, expected: "u32 array" })?);
+                    key: key.into(), expected: "u32 array" })?);
             }
             Ok(out)
         }
         Some(v) => match v.as_u32() {
             Some(x) => Ok(vec![x; n]),
             None => Err(Gemma4AssistantError::WrongMetadataType {
-                key: static_key, expected: "u32 or u32 array" }),
+                key: key.into(), expected: "u32 or u32 array" }),
         }
-        None => Err(Gemma4AssistantError::MissingMetadata(static_key)),
+        None => Err(Gemma4AssistantError::MissingMetadata(key.into())),
     }
 }
 
 fn read_bool_vec(gguf: &GgufFile, key: &str) -> Result<Vec<bool>> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::Array { values, .. }) => {
             let mut out = Vec::with_capacity(values.len());
@@ -333,14 +329,14 @@ fn read_bool_vec(gguf: &GgufFile, key: &str) -> Result<Vec<bool>> {
                 match v {
                     MetaValue::Bool(b) => out.push(*b),
                     _ => return Err(Gemma4AssistantError::WrongMetadataType {
-                        key: static_key, expected: "bool array" }),
+                        key: key.into(), expected: "bool array" }),
                 }
             }
             Ok(out)
         }
         Some(_) => Err(Gemma4AssistantError::WrongMetadataType {
-            key: static_key, expected: "bool array" }),
-        None => Err(Gemma4AssistantError::MissingMetadata(static_key)),
+            key: key.into(), expected: "bool array" }),
+        None => Err(Gemma4AssistantError::MissingMetadata(key.into())),
     }
 }
 

@@ -304,7 +304,7 @@ prioritize correctness, consistency, and clarity in the final answer."),
 focused, moving directly to the conclusion without unnecessary elaboration."),
         "medium" => None,
         other => return Err(format!(
-            "qwen3 chat: unexpected reasoning_effort '{other}' (xhigh, medium, low)")),
+            "qwen3 chat: unexpected reasoning_effort '{other}' (xhigh, high, medium, low)")),
     })
 }
 

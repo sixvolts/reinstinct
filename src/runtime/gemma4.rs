@@ -1943,9 +1943,9 @@ impl GpuGemma4 {
     /// concatenated along the feature axis per position — the layout
     /// DFlash's `fc` expects. Idempotent; call once per state.
     ///
-    /// Note the off-by-one that bit us in the spec: a GGUF's
-    /// `dflash.target_layers` holds HF *hidden-state* indices, so callers
-    /// must subtract one before passing them here. See docs/DFLASH_PORT.md.
+    /// Note the off-by-one: the GGUF's `dflash.target_layers` holds HF
+    /// *hidden-state* indices (1-based); `DFlashConfig::load` already
+    /// subtracts one, so values passed here are 0-based block indices.
     pub fn enable_target_tap(&self, layers: &[usize], state: &mut Gemma4GpuState,
                              max_seq: usize) -> Result<(), String>
     {
@@ -2526,6 +2526,9 @@ impl GpuGemma4 {
         self.prof_reset();
         for (li, block) in self.blocks.iter().enumerate() {
             self.block_forward(block, li, state)?;
+            self.maybe_tap(li, self.hidden_a.raw_ptr(),
+                           state.tap.as_ref().map(|b| b.raw_ptr()),
+                           state.tap_stride, 1)?;
             if debug {
                 self.stream.synchronize()?;
                 let mut xh = vec![0.0f32; self.hidden];

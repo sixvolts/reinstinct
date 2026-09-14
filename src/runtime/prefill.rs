@@ -300,7 +300,6 @@ impl PrefillGemm {
     /// allocations. Only `Y` (`[n_rows, out_dim]` fp32) is freshly
     /// allocated; the fp16 scratch is pooled.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     /// Allocating form of [`matmul_into`]: sizes and returns the output
     /// buffer instead of writing into a caller-owned one.
     pub fn matmul(&self, stream: &hip::Stream,

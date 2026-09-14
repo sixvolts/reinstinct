@@ -31,13 +31,13 @@ pub enum DFlashError {
     WrongArchitecture { got: String, expected: &'static str },
 
     #[error("missing required GGUF metadata key: {0}")]
-    MissingMetadata(&'static str),
+    MissingMetadata(String),
 
     #[error("metadata key {key} has wrong type (expected {expected})")]
-    WrongMetadataType { key: &'static str, expected: &'static str },
+    WrongMetadataType { key: String, expected: &'static str },
 
     #[error("metadata array {key} has {got} entries, expected {expected}")]
-    WrongArrayLength { key: &'static str, got: usize, expected: usize },
+    WrongArrayLength { key: String, got: usize, expected: usize },
 
     #[error("missing required tensor: {0}")]
     MissingTensor(String),
@@ -129,14 +129,14 @@ impl DFlashConfig {
         let v_len = require_u32(gguf, &format!("{p}.attention.value_length"))?;
         if v_len != head_dim {
             return Err(DFlashError::WrongArrayLength {
-                key: "dflash.attention.value_length",
+                key: "dflash.attention.value_length".into(),
                 got: v_len as usize, expected: head_dim as usize });
         }
 
         let pattern = read_bool_vec(gguf, &format!("{p}.attention.sliding_window_pattern"))?;
         if pattern.len() != block_count as usize {
             return Err(DFlashError::WrongArrayLength {
-                key: "dflash.attention.sliding_window_pattern",
+                key: "dflash.attention.sliding_window_pattern".into(),
                 got: pattern.len(), expected: block_count as usize });
         }
         let attn_kinds = pattern.iter()
@@ -150,7 +150,7 @@ impl DFlashConfig {
             if v == 0 {
                 // hidden_states[0] is the embedding output, not a block.
                 return Err(DFlashError::WrongMetadataType {
-                    key: "dflash.target_layers",
+                    key: "dflash.target_layers".into(),
                     expected: "hidden-state indices >= 1" });
             }
             target_layers.push(v - 1);
@@ -258,52 +258,48 @@ fn shape(gguf: &GgufFile, name: &str, expected: &[u64]) -> Result<()> {
     Ok(())
 }
 
-fn require_str<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a str> {
+fn require_str<'a>(gguf: &'a GgufFile, key: &str) -> Result<&'a str> {
     match gguf.metadata_get(key) {
         Some(MetaValue::String(s)) => Ok(s),
-        Some(_) => Err(DFlashError::WrongMetadataType { key, expected: "string" }),
-        None => Err(DFlashError::MissingMetadata(key)),
+        Some(_) => Err(DFlashError::WrongMetadataType { key: key.into(), expected: "string" }),
+        None => Err(DFlashError::MissingMetadata(key.into())),
     }
 }
 
 fn require_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(v) => v.as_u32().ok_or(DFlashError::WrongMetadataType {
-            key: static_key, expected: "u32" }),
-        None => Err(DFlashError::MissingMetadata(static_key)),
+            key: key.into(), expected: "u32" }),
+        None => Err(DFlashError::MissingMetadata(key.into())),
     }
 }
 
 fn require_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::F32(v)) => Ok(*v),
         Some(_) => Err(DFlashError::WrongMetadataType {
-            key: static_key, expected: "f32" }),
-        None => Err(DFlashError::MissingMetadata(static_key)),
+            key: key.into(), expected: "f32" }),
+        None => Err(DFlashError::MissingMetadata(key.into())),
     }
 }
 
 fn read_u32_vec(gguf: &GgufFile, key: &str) -> Result<Vec<u32>> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::Array { values, .. }) => {
             let mut out = Vec::with_capacity(values.len());
             for v in values {
                 out.push(v.as_u32().ok_or(DFlashError::WrongMetadataType {
-                    key: static_key, expected: "u32 array" })?);
+                    key: key.into(), expected: "u32 array" })?);
             }
             Ok(out)
         }
         Some(_) => Err(DFlashError::WrongMetadataType {
-            key: static_key, expected: "u32 array" }),
-        None => Err(DFlashError::MissingMetadata(static_key)),
+            key: key.into(), expected: "u32 array" }),
+        None => Err(DFlashError::MissingMetadata(key.into())),
     }
 }
 
 fn read_bool_vec(gguf: &GgufFile, key: &str) -> Result<Vec<bool>> {
-    let static_key: &'static str = Box::leak(key.to_string().into_boxed_str());
     match gguf.metadata_get(key) {
         Some(MetaValue::Array { values, .. }) => {
             let mut out = Vec::with_capacity(values.len());
@@ -311,13 +307,13 @@ fn read_bool_vec(gguf: &GgufFile, key: &str) -> Result<Vec<bool>> {
                 match v {
                     MetaValue::Bool(b) => out.push(*b),
                     _ => return Err(DFlashError::WrongMetadataType {
-                        key: static_key, expected: "bool array" }),
+                        key: key.into(), expected: "bool array" }),
                 }
             }
             Ok(out)
         }
         Some(_) => Err(DFlashError::WrongMetadataType {
-            key: static_key, expected: "bool array" }),
-        None => Err(DFlashError::MissingMetadata(static_key)),
+            key: key.into(), expected: "bool array" }),
+        None => Err(DFlashError::MissingMetadata(key.into())),
     }
 }

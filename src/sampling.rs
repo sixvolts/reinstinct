@@ -246,13 +246,6 @@ pub fn top_k_threshold(logits: &[f32], k: usize) -> Option<f32> {
     Some(unkey(heap.peek().unwrap().0))
 }
 
-pub fn apply_top_k(logits: &mut [f32], k: usize) {
-    let Some(threshold) = top_k_threshold(logits, k) else { return };
-    for v in logits.iter_mut() {
-        if !v.is_finite() || *v < threshold { *v = f32::NEG_INFINITY; }
-    }
-}
-
 /// Nucleus (top-p) filter: sort descending probabilities, keep the smallest
 /// prefix that covers `p` of the mass; mask the rest. `p >= 1.0` is a no-op.
 /// Operates on logits in-place; computes a temporary softmax internally.
