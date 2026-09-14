@@ -2,7 +2,12 @@
 
 Note - this was developed as an open-loop playground for optimizing for these older Vega20/gfx906 GPUs to see how far we can push performance. The majority of the improvements here have been backported to llama-cpp in this repo: https://github.com/sixvolts/llama-cpp-vega-retune.
 
-A custom HIP inference engine that brings AMD Instinct MI50/MI60 GPUs back from the dead for local AI inference. Outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
+## Recent updates (Sept-2026)
+* Added support for multiple GPUs
+* Updated support and kernels for Qwen 3.8
+* cleanliness an performance overhauls 
+
+Reinstinct is a custom inference engine for AMD Radeon Instinct MI50/MI60 GPUs for local AI inference. Reinstinct outperforms llama.cpp on the same hardware by 20-40%, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
 
 ## Why does this exist?
 
