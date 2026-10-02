@@ -57,20 +57,30 @@ void moe_matvec_q4k_repacked_f32(const unsigned char* __restrict__ slab,
     #pragma unroll
     for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
 
+    // Rows clamped, not branched, and every load of a trip issued before
+    // the first dot (the dense matvec_q4k_repacked schedule: a guarded
+    // row put an execz branch and a waitcnt between the rows' loads).
+    const int rmax = (int)out_dim - 1;
     for (unsigned int sb = lane; sb < n_sub; sb += 64) {
+        uint4 qv[ROWS]; uint16_t smv[ROWS]; uint32_t ddv[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = min(row0 + r, rmax);
+            qv[r]  = nib[(size_t)row * nsp + sb];
+            smv[r] = smp[(size_t)row * nsp + sb];
+            ddv[r] = ddp[(size_t)row * n_super + (sb >> 3)];
+        }
         const BlockQ8* xb   = xqs + sb;
         const float    dx   = xb->d;
         const float    xsum = xb->xsum;
         const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
+        __builtin_amdgcn_sched_barrier(0);
 
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int)out_dim) continue;
-
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint16_t sm = smp[(size_t)row * nsp + sb];
-            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
+            const uint4    q  = qv[r];
+            const uint16_t sm = smv[r];
+            const uint32_t dd = ddv[r];
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
             const uint16_t dmin_bits = (uint16_t)(dd >> 16);
             const float dsc  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
