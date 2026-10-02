@@ -1,0 +1,159 @@
+//! `prefill_forward_at`: a batched prefill that continues a restored
+//! prefix must match the per-token decode oracle (restore, then
+//! `forward_token` over the suffix) — the path `chat` has always used.
+//!
+//! Checks, per (base, suffix) case:
+//!   * KV rows [0, base) are untouched by the continuation;
+//!   * layer 0's suffix KV rows equal a full from-zero prefill's
+//!     bit-for-bit (no attention input yet: positions, RoPE offset and
+//!     the cache write offset are exact);
+//!   * deeper layers drift from a full prefill no more than the decode
+//!     oracle does (both read the prefix as int8);
+//!   * last-token logits sit within the decode-vs-prefill floor of both
+//!     the oracle and a full prefill.
+//!
+//! GPU + model required, so `#[ignore]`:
+//!   REINSTINCT_GEMMA_E4B_FIXTURE=... cargo test --release --test \
+//!       gemma4_prefill_continue -- --ignored --nocapture
+//! `REINSTINCT_PFC_MODEL=e4b|moe|dense` picks the fixture (default e4b).
+
+use reinstinct_engine::gguf::GgufFile;
+use reinstinct_engine::hip;
+use reinstinct_engine::model::gemma4::Gemma4Model;
+use reinstinct_engine::runtime::gemma4::{Gemma4GpuState, GpuGemma4};
+use reinstinct_engine::runtime::KernelCache;
+use reinstinct_engine::test_support;
+
+fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
+    let num: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+    let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+    (num / den.max(1e-30)).sqrt() as f32
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0
+}
+
+fn tokens(n: usize, seed: u64, vocab: usize) -> Vec<u32> {
+    let mut s = seed;
+    (0..n).map(|_| {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (1000 + (s >> 33) as usize % (vocab.min(60000) - 1000)) as u32
+    }).collect()
+}
+
+#[test]
+#[ignore]
+fn prefill_continuation_matches_decode_oracle() {
+    let which = std::env::var("REINSTINCT_PFC_MODEL").unwrap_or_else(|_| "e4b".into());
+    let fixture = match which.as_str() {
+        "moe"   => test_support::gemma_moe_fixture(),
+        "dense" => test_support::gemma_fixture(),
+        _       => test_support::gemma_e4b_fixture(),
+    };
+    let (Some(path), Some(())) = (fixture, test_support::gpu()) else { return };
+    let g = GgufFile::open(&path).expect("open");
+    let _dev = hip::Device::set(0).unwrap();
+    let cache = KernelCache::new().unwrap();
+    let model = Gemma4Model::load(&g).unwrap();
+    let max_seq = 2048;
+    let gm = GpuGemma4::new(&model, &g, &cache, max_seq).unwrap();
+    let mut state = Gemma4GpuState::new(&model, max_seq).unwrap();
+    let vocab = model.config.vocab_size as usize;
+    let sw = model.config.sliding_window as usize;
+    eprintln!("{}: sliding_window {sw}", path.display());
+
+    // Base not a multiple of 16; one case with base past the window.
+    let cases = [(203usize, 77usize), (sw + 97, 150), (40, 1)];
+    for (ci, &(base, p)) in cases.iter().enumerate() {
+        let all = tokens(base + p, 0x5eed + ci as u64, vocab);
+        let (pre, suf) = all.split_at(base);
+
+        state.reset();
+        gm.prefill_forward(pre, &mut state).unwrap();
+        let snap = state.snapshot().unwrap();
+        let nl = state.n_layers();
+        let before: Vec<_> = (0..nl).map(|l| state.kv_rows_to_host(l, 0, base).unwrap()).collect();
+
+        // Oracle: per-token decode over the suffix.
+        let mut l_oracle = Vec::new();
+        for &t in suf { l_oracle = gm.forward_token(t, &mut state).unwrap(); }
+        let kv_oracle: Vec<_> = (0..nl).map(|l| state.kv_rows_to_host(l, base, base + p).unwrap()).collect();
+
+        // Under test: batched continuation.
+        state.restore(&snap).unwrap();
+        state.truncate(base);
+        let l_cont = gm.prefill_forward_at(suf, &mut state, base).unwrap();
+        let mut worst_q = 0i32;
+        let mut over1 = 0usize;
+        let mut total = 0usize;
+        for l in 0..nl {
+            let (k0, v0, ks0, vs0) = state.kv_rows_to_host(l, 0, base).unwrap();
+            let (bk, bv, bks, bvs) = &before[l];
+            assert!(k0 == *bk && v0 == *bv && ks0 == *bks && vs0 == *bvs,
+                    "case {ci}: layer {l} prefix rows changed by the continuation");
+            let (k1, v1, _, _) = state.kv_rows_to_host(l, base, base + p).unwrap();
+            let (ko, vo, _, _) = &kv_oracle[l];
+            for (a, b) in k1.iter().chain(v1.iter()).zip(ko.iter().chain(vo.iter())) {
+                let d = (*a as i32 - *b as i32).abs();
+                worst_q = worst_q.max(d);
+                if d > 1 { over1 += 1; }
+                total += 1;
+            }
+        }
+        let frac = over1 as f64 / total as f64;
+
+        let kv_cont: Vec<_> = (0..nl).map(|l| state.kv_rows_to_host(l, base, base + p).unwrap()).collect();
+
+        // Reference: full prefill from zero.
+        state.reset();
+        let l_full = gm.prefill_forward(&all, &mut state).unwrap();
+        // Per-layer worst |Δq| of the suffix rows: continuation vs full
+        // prefill (same GEMM path — layer 0 has no attention input, so
+        // it must match bit-for-bit) and oracle vs full prefill (the
+        // decode/prefill rounding floor).
+        let dq = |a: &(Vec<i8>, Vec<i8>, Vec<f32>, Vec<f32>), b: &(Vec<i8>, Vec<i8>, Vec<f32>, Vec<f32>)| -> (i32, f64) {
+            let mut w = 0; let mut n1 = 0usize; let mut n = 0usize;
+            for (x, y) in a.0.iter().chain(a.1.iter()).zip(b.0.iter().chain(b.1.iter())) {
+                let d = (*x as i32 - *y as i32).abs(); w = w.max(d); if d > 1 { n1 += 1; } n += 1;
+            }
+            (w, n1 as f64 / n as f64)
+        };
+        let mut line_c = String::new(); let mut line_o = String::new();
+        let (mut n_cf, mut n_of) = (0.0f64, 0.0f64);
+        for l in 0..nl {
+            let full = state.kv_rows_to_host(l, base, base + p).unwrap();
+            let (wc, fc) = dq(&kv_cont[l], &full);
+            let (wo, fo) = dq(&kv_oracle[l], &full);
+            if l == 0 { assert_eq!(wc, 0, "case {ci}: layer 0 KV differs from a full prefill"); }
+            n_cf += fc; n_of += fo;
+            if l < 8 || l + 2 >= nl { line_c += &format!(" {wc}"); line_o += &format!(" {wo}"); }
+        }
+        eprintln!("  per-layer max|Δq| cont-vs-full:{line_c}\n  per-layer max|Δq| oracle-vs-full:{line_o}");
+
+        let r_or = rel_l2(&l_cont, &l_oracle);
+        let r_full = rel_l2(&l_cont, &l_full);
+        let r_of = rel_l2(&l_oracle, &l_full);
+        eprintln!("case {ci} base={base} p={p}: kv max|Δq|={worst_q} frac(|Δq|>1)={frac:.2e}  \
+                   logits rel_l2 vs oracle {r_or:.2e} (argmax {} vs {}), vs full {r_full:.2e} \
+                   (oracle vs full {r_of:.2e})",
+                  argmax(&l_cont), argmax(&l_oracle));
+        // The decode oracle's KV differs from any prefill's by the
+        // matvec/GEMM rounding floor; the continuation must sit at the
+        // prefill side of it (vs full prefill, only the int8 prefix in
+        // attention differs).
+        let _ = frac;
+        eprintln!("  mean frac(|Δq|>1) vs full prefill: continuation {:.2e}, decode oracle {:.2e}",
+                  n_cf / nl as f64, n_of / nl as f64);
+        assert!(n_cf <= 1.5 * n_of + 1e-3, "case {ci}: continuation KV drifts past the decode floor");
+        // Decode and prefill already differ by r_of (int8 KV, matvec vs
+        // GEMM rounding); the continuation sits between them, so bound
+        // it by that floor rather than a fixed number.
+        // The continuation runs the prefill GEMMs, so it is held to the
+        // full prefill; against the oracle it only has to stay within
+        // the two gaps combined.
+        let floor = r_of.max(0.02) * 1.25;
+        assert!(r_full < floor, "case {ci}: logits diverge from a full prefill");
+        assert!(r_or < r_of + r_full + 0.01, "case {ci}: logits diverge from the decode oracle");
+    }
+}

@@ -762,8 +762,10 @@ impl PrefixCache {
     fn best_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None;
         for (i, e) in self.slots.iter().enumerate() {
-            let c = common_prefix_len(&e.tokens, prompt);
-            if c >= PREFIX_CACHE_MIN_OVERLAP && c < prompt.len() {
+            // Leave at least the last prompt token to prefill — its
+            // logits seed the first sampled token.
+            let c = common_prefix_len(&e.tokens, prompt).min(prompt.len().saturating_sub(1));
+            if c >= PREFIX_CACHE_MIN_OVERLAP {
                 if best.map(|(_, bc)| c > bc).unwrap_or(true) {
                     best = Some((i, c));
                 }
@@ -1105,7 +1107,14 @@ impl ServerModel {
                         info!("req kv-cache hit: \
                                reused {overlap}/{} tokens; prefilling {} suffix",
                               prompt.len(), suffix.len());
-                        gpu.prefill_forward(suffix, state)?
+                        match gpu.prefill_forward_at(suffix, state, overlap) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                warn!("prefix continuation failed ({e}); full prefill");
+                                state.reset();
+                                gpu.prefill_forward(&prompt, state)?
+                            }
+                        }
                     } else {
                         gpu.prefill_forward(&prompt, state)?
                     };

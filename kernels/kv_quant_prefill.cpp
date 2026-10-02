@@ -93,3 +93,30 @@ void kv_quant_prefill_offset_f32(const float* __restrict__ src,
     }
     if (tid == 0) dst_s_base[row_idx * n_kv + h] = scale;
 }
+
+// Inverse of kv_quant_prefill_f32 over a row range: int8 cache rows
+// [row0, row0 + grid.y) back to f32. Lets a prefill that continues
+// from a restored prefix (base_pos > 0) hand the prefill attention
+// kernel the cached prefix as f32 — the same int8 values decode reads.
+//
+//   src_q : [max_seq, n_kv, head_dim] int8
+//   src_s : [max_seq, n_kv]           f32
+//   dst   : [grid.y, n_kv, head_dim]  f32   (row r = cache row row0 + r)
+//   grid = (n_kv, n_rows); block = 256.
+extern "C" __global__
+void kv_dequant_rows_f32(const signed char* __restrict__ src_q,
+                         const float*       __restrict__ src_s,
+                         float*             __restrict__ dst,
+                         unsigned int n_kv,
+                         unsigned int head_dim,
+                         unsigned int row0)
+{
+    const unsigned int h = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    const size_t src_row = (size_t)(row0 + r) * n_kv + h;
+    const float s = src_s[src_row];
+    const signed char* sq = src_q + src_row * head_dim;
+    float* d = dst + ((size_t)r * n_kv + h) * head_dim;
+    for (unsigned int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        d[i] = (float)sq[i] * s;
+}

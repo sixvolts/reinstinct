@@ -113,6 +113,11 @@ fn pf_off(p: *mut c_void, elems: usize) -> *mut c_void {
     unsafe { (p as *mut f32).add(elems) as *mut c_void }
 }
 
+/// Offset a device pointer by `bytes` bytes.
+fn pf_off_bytes(p: *mut c_void, bytes: usize) -> *mut c_void {
+    unsafe { (p as *mut u8).add(bytes) as *mut c_void }
+}
+
 /// Load an fp32 GGUF tensor straight to device.
 fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
     let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
@@ -557,6 +562,29 @@ impl Gemma4GpuState {
         Ok(())
     }
 
+    /// Host copy of layer `layer`'s KV cache rows `[r0, r1)`: (k, v)
+    /// int8 and (k, v) scales. Test/diagnostic helper.
+    #[doc(hidden)]
+    pub fn kv_rows_to_host(&self, layer: usize, r0: usize, r1: usize)
+        -> Result<(Vec<i8>, Vec<i8>, Vec<f32>, Vec<f32>), String>
+    {
+        let c = &self.caches[layer];
+        assert!(r0 <= r1 && r1 <= c.max_seq, "kv_rows_to_host: bad range");
+        let kv_dim = c.n_kv * c.head_dim;
+        let mut k = vec![0i8; (r1 - r0) * kv_dim];
+        let mut v = vec![0i8; (r1 - r0) * kv_dim];
+        let mut ks = vec![0f32; (r1 - r0) * c.n_kv];
+        let mut vs = vec![0f32; (r1 - r0) * c.n_kv];
+        crate::hip::Device(0).synchronize()?;
+        c.k.copy_range_to_host(&mut k, r0 * kv_dim)?;
+        c.v.copy_range_to_host(&mut v, r0 * kv_dim)?;
+        c.ks.copy_range_to_host(&mut ks, r0 * c.n_kv)?;
+        c.vs.copy_range_to_host(&mut vs, r0 * c.n_kv)?;
+        Ok((k, v, ks, vs))
+    }
+
+    pub fn n_layers(&self) -> usize { self.caches.len() }
+
     pub fn reset(&mut self) {
         for c in &mut self.caches { c.len = 0; }
         if let Some(sq) = &self.superquant {
@@ -933,6 +961,13 @@ pub struct GpuGemma4 {
     pool_u32: DeviceBufPool<u32>,
     pool_i32: DeviceBufPool<i32>,
     prefill_warm_p: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// f32 K/V scratch for `prefill_forward_at` with base > 0, one pair
+    /// per attention kind ([0] sliding, [1] full) so a KV-sharing
+    /// model's sliding and full donors stay live together. Grown on
+    /// demand before the layer loop; never pooled (that path doesn't
+    /// capture, and extra pool takes would shift the LIFO order the
+    /// cached base-0 prefill graphs depend on).
+    pf_kv_cont: std::cell::RefCell<[Option<(DeviceBuf<f32>, DeviceBuf<f32>)>; 2]>,
 }
 
 impl GpuGemma4 {
@@ -1228,6 +1263,7 @@ impl GpuGemma4 {
             pool_u32: DeviceBufPool::new(),
             pool_i32: DeviceBufPool::new(),
             prefill_warm_p: std::cell::RefCell::new(std::collections::HashSet::new()),
+            pf_kv_cont: std::cell::RefCell::new([None, None]),
         })
     }
 
@@ -2795,10 +2831,38 @@ impl GpuGemma4 {
     pub fn prefill_forward(&self, tokens: &[u32], state: &mut Gemma4GpuState)
         -> Result<Vec<f32>, String>
     {
+        self.prefill_forward_at(tokens, state, 0)
+    }
+
+    /// Batched prefill of `tokens` at positions `[base, base + P)`,
+    /// continuing a state whose cache already holds positions
+    /// `[0, base)` (e.g. a restored prefix-cache snapshot truncated to
+    /// `base`). `base == 0` is the ordinary prompt prefill. Returns the
+    /// last token's logits and leaves `pos = base + P`.
+    ///
+    /// With base > 0 the suffix's K/V are written into the int8 cache
+    /// first and each layer's attention then reads the cache rows it
+    /// needs dequantized back to f32 — the same values decode reads.
+    /// That path is never graph-captured.
+    pub fn prefill_forward_at(&self, tokens: &[u32], state: &mut Gemma4GpuState, base: usize)
+        -> Result<Vec<f32>, String>
+    {
         let p = tokens.len();
         let h = self.hidden;
-        assert!(p > 0 && p <= self.max_seq, "prefill: bad token count");
+        assert!(p > 0 && base + p <= self.max_seq, "prefill: bad token count");
         assert_eq!(state.caches.len(), self.blocks.len(), "prefill: state/model mismatch");
+        if base > 0 {
+            if state.superquant.is_some() {
+                return Err("prefill_forward_at: base > 0 not supported with SuperQuant".into());
+            }
+            if state.tap.is_some() {
+                return Err("prefill_forward_at: base > 0 not supported with a DFlash tap".into());
+            }
+            if state.pos != base || state.caches.iter().any(|c| c.len != base) {
+                return Err(format!("prefill_forward_at: state holds {} positions, base is {base}",
+                                   state.pos));
+            }
+        }
         // rocBLAS handle + prefill kernels were built once in new() — see
         // the prefill-context fields. Per-call grouped-MoE scratch below.
         let ne_a = self.n_expert.max(1);
@@ -2860,7 +2924,7 @@ impl GpuGemma4 {
         // write writes to a different LDS slot (warm_count++) so the
         // captured pointer-set would go stale.
         let sq_on = state.superquant.is_some();
-        let force_no_graph = trace || sq_on
+        let force_no_graph = trace || sq_on || base > 0
                            || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
 
         // Cache hit: skip the whole kernel chain — the captured graph
@@ -2987,6 +3051,41 @@ impl GpuGemma4 {
         // with the mutable borrow `state.caches` holds inside the loop.
         let tap_dst = state.tap.as_ref().map(|b| b.raw_ptr());
         let tap_stride = state.tap_stride;
+        // base > 0: first cache row each attention kind reads, and the
+        // f32 scratch the dequantized rows [row0, base + P) land in.
+        let cont_row0 = |kind: AttnKind, hd: usize| -> usize {
+            match kind {
+                // The tiled kernel starts a workgroup's key loop at its
+                // first query's window floor rounded down to its 16-key
+                // tile; the earliest query is at `base`.
+                AttnKind::Sliding if self.m_attn_prefill_tiled.contains_key(&(hd as u32)) =>
+                    ((base + 1).saturating_sub(self.sliding_window) / 16) * 16,
+                _ => 0,
+            }
+        };
+        let cont_ptrs: [Option<(*mut c_void, *mut c_void)>; 2] = if base > 0 {
+            let mut need = [0usize; 2];
+            for b in &self.blocks {
+                let ki = (b.kind == AttnKind::Full) as usize;
+                let rows = base + p - cont_row0(b.kind, b.head_dim);
+                need[ki] = need[ki].max(rows * b.n_kv * b.head_dim);
+            }
+            let mut sc = self.pf_kv_cont.borrow_mut();
+            let mut ptrs = [None, None];
+            for ki in 0..2 {
+                if need[ki] == 0 { continue; }
+                let fits = sc[ki].as_ref().map_or(false, |(k, _)| k.len() >= need[ki]);
+                if !fits {
+                    sc[ki] = None;
+                    sc[ki] = Some((DeviceBuf::new(need[ki])?, DeviceBuf::new(need[ki])?));
+                }
+                let (k, v) = sc[ki].as_ref().unwrap();
+                ptrs[ki] = Some((k.raw_ptr(), v.raw_ptr()));
+            }
+            ptrs
+        } else { [None, None] };
+        let mut cont_donor_swa:  Option<(*mut c_void, *mut c_void)> = None;
+        let mut cont_donor_full: Option<(*mut c_void, *mut c_void)> = None;
         for (li, b) in self.blocks.iter().enumerate() {
             let hd = b.head_dim;
             let n_kv = b.n_kv;
@@ -3001,7 +3100,7 @@ impl GpuGemma4 {
             self.launch_rmsnorm_mh_batched(q.raw_ptr(), b.attn_q_norm.raw_ptr(),
                 q.raw_ptr(), self.n_heads as u32, hd as u32, p as u32)?;
             self.launch_rope_prefill(&self.m_rope_pf, q.raw_ptr(), self.n_heads as u32,
-                                     hd as u32, b.kind, p)?;
+                                     hd as u32, b.kind, base, p)?;
 
             // K/V: computed on KV-owning layers; KV-sharing layers reuse
             // a donor layer's post-norm K/V (see kv_donor).
@@ -3020,29 +3119,59 @@ impl GpuGemma4 {
                 self.launch_rmsnorm_mh_batched(v_ptr, self.ones.raw_ptr(),
                     v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
                 self.launch_rope_prefill(&self.m_rope_pf, k_norm.raw_ptr(), n_kv as u32,
-                                         hd as u32, b.kind, p)?;
-                // populate this layer's decode KV cache (positions 0..P-1).
+                                         hd as u32, b.kind, base, p)?;
+                // populate this layer's decode KV cache (positions base..base+P-1).
                 let kvc = &state.caches[li];
-                self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(), kvc.k.raw_ptr(),
-                                             kvc.ks.raw_ptr(), n_kv as u32, hd as u32, p)?;
-                self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(), kvc.v.raw_ptr(),
-                                             kvc.vs.raw_ptr(), n_kv as u32, hd as u32, p)?;
+                let (kq_off, ks_off) = (base * kv_dim, base * n_kv * 4);
+                self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(),
+                    pf_off_bytes(kvc.k.raw_ptr(), kq_off), pf_off_bytes(kvc.ks.raw_ptr(), ks_off),
+                    n_kv as u32, hd as u32, p)?;
+                self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(),
+                    pf_off_bytes(kvc.v.raw_ptr(), kq_off), pf_off_bytes(kvc.vs.raw_ptr(), ks_off),
+                    n_kv as u32, hd as u32, p)?;
                 Some((k_norm, v_norm))
             } else {
                 lap(&t_gemm)?;
                 None
             };
             // attention reads either this layer's K/V or the donor's.
-            // Deref coercion: PooledBuf<f32> → DeviceBuf<f32>.
-            let (k_attn, v_attn): (&DeviceBuf<f32>, &DeviceBuf<f32>) = match &kv_owned {
-                Some((k, v)) => (k, v),
-                None => {
-                    let d = match b.kind {
-                        AttnKind::Sliding => donor_swa.as_ref(),
-                        AttnKind::Full    => donor_full.as_ref(),
-                    }.ok_or("prefill: KV donor not yet computed")?;
-                    (&d.0, &d.1)
+            let (k_attn, v_attn): (*mut c_void, *mut c_void) = if base == 0 {
+                // Deref coercion: PooledBuf<f32> → DeviceBuf<f32>.
+                match &kv_owned {
+                    Some((k, v)) => (k.raw_ptr(), v.raw_ptr()),
+                    None => {
+                        let d = match b.kind {
+                            AttnKind::Sliding => donor_swa.as_ref(),
+                            AttnKind::Full    => donor_full.as_ref(),
+                        }.ok_or("prefill: KV donor not yet computed")?;
+                        (d.0.raw_ptr(), d.1.raw_ptr())
+                    }
                 }
+            } else if kv_owned.is_some() {
+                // Continuation: dequantize this layer's cache rows
+                // [row0, base+P) into the kind's scratch, and point the
+                // kernel row-0-relative (it indexes keys by absolute
+                // position and never reads below row0).
+                let (ks_ptr, vs_ptr) = cont_ptrs[(b.kind == AttnKind::Full) as usize]
+                    .ok_or("prefill: missing continuation scratch")?;
+                let row0 = cont_row0(b.kind, hd);
+                let n_rows = base + p - row0;
+                let kvc = &state.caches[li];
+                self.launch_kv_dequant_rows(kvc.k.raw_ptr(), kvc.ks.raw_ptr(), ks_ptr,
+                                            n_kv as u32, hd as u32, row0, n_rows)?;
+                self.launch_kv_dequant_rows(kvc.v.raw_ptr(), kvc.vs.raw_ptr(), vs_ptr,
+                                            n_kv as u32, hd as u32, row0, n_rows)?;
+                let back = row0 * kv_dim * 4;
+                let ptrs = ((ks_ptr as *mut u8).wrapping_sub(back) as *mut c_void,
+                            (vs_ptr as *mut u8).wrapping_sub(back) as *mut c_void);
+                if sharing && li == donor_swa_idx       { cont_donor_swa = Some(ptrs); }
+                else if sharing && li == donor_full_idx { cont_donor_full = Some(ptrs); }
+                ptrs
+            } else {
+                match b.kind {
+                    AttnKind::Sliding => cont_donor_swa,
+                    AttnKind::Full    => cont_donor_full,
+                }.ok_or("prefill: KV donor not yet computed")?
             };
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
@@ -3050,8 +3179,8 @@ impl GpuGemma4 {
             };
             lap(&t_norm)?;
             let attn = self.pool_f32.take(p * q_dim)?;
-            self.launch_attn_prefill(&self.m_attn_pf, q.raw_ptr(), k_attn.raw_ptr(), v_attn.raw_ptr(),
-                                     attn.raw_ptr(), n_kv as u32, hd as u32, window, p)?;
+            self.launch_attn_prefill(&self.m_attn_pf, q.raw_ptr(), k_attn, v_attn,
+                                     attn.raw_ptr(), n_kv as u32, hd as u32, window, base, p)?;
             lap(&t_attn)?;
             // hand this layer's K/V to the KV-sharing layers that reuse it.
             if sharing && li == donor_swa_idx       { donor_swa = kv_owned; }
@@ -3266,10 +3395,10 @@ impl GpuGemma4 {
         self.stream.synchronize()?;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
-        // The KV cache now holds the P prompt tokens — decode continues
-        // from position P.
-        for c in &mut state.caches { c.len = p; }
-        state.pos = p;
+        // The KV cache now holds positions [0, base+P) — decode
+        // continues from there.
+        for c in &mut state.caches { c.len = base + p; }
+        state.pos = base + p;
         Ok(out)
     }
 
@@ -3672,8 +3801,11 @@ impl GpuGemma4 {
         unsafe { f.launch((n_kv, p as u32, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// RoPE for P prefill rows at positions `[base, base + P)` — the
+    /// kernel takes row index as position, so `base` just offsets the
+    /// `[max_seq, rotary_dim]` cos/sin tables.
     fn launch_rope_prefill(&self, m: &Module, x: *mut c_void, n_heads: u32, head_dim: u32,
-                           kind: AttnKind, p: usize) -> Result<(), String>
+                           kind: AttnKind, base: usize, p: usize) -> Result<(), String>
     {
         let f = m.function("rope_prefill_f32")?;
         let (cos, sin, rd) = match kind {
@@ -3682,6 +3814,8 @@ impl GpuGemma4 {
             AttnKind::Full    => (self.rope_cos_full.raw_ptr(), self.rope_sin_full.raw_ptr(),
                                   self.rope_dim_full as u32),
         };
+        let tab_off = base * rd as usize * 4;
+        let (cos, sin) = (pf_off_bytes(cos, tab_off), pf_off_bytes(sin, tab_off));
         let block: u32 = 64;
         let grid_x = ((rd / 2) + block - 1) / block;
         let mut xa=x; let mut ca=cos; let mut sa=sin;
@@ -3785,8 +3919,27 @@ impl GpuGemma4 {
                            Some(&self.stream), &mut args) }
     }
 
+    /// Dequantize int8 KV cache rows `[row0, row0 + n_rows)` to f32.
+    fn launch_kv_dequant_rows(&self, src_q: *mut c_void, src_s: *mut c_void, dst: *mut c_void,
+                              n_kv: u32, head_dim: u32, row0: usize, n_rows: usize)
+        -> Result<(), String>
+    {
+        let f = self.m_kvq_pf.function("kv_dequant_rows_f32")?;
+        let mut qa = src_q; let mut sa = src_s; let mut da = dst;
+        let mut nk = n_kv; let mut hd = head_dim; let mut r0 = row0 as u32;
+        let mut args: [*mut c_void; 6] = [
+            &mut qa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
+            &mut da as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut r0 as *mut _ as *mut c_void];
+        unsafe { f.launch((n_kv, n_rows as u32, 1), (256, 1, 1), 0, Some(&self.stream), &mut args) }
+    }
+
+    /// Causal prefill attention for P query rows at positions
+    /// `[base_pos, base_pos + P)` over K/V rows indexed by absolute
+    /// position (`k`/`v` row r = position r).
     fn launch_attn_prefill(&self, m: &Module, q: *mut c_void, k: *mut c_void, v: *mut c_void,
-                           out: *mut c_void, n_kv: u32, head_dim: u32, window: u32, p: usize)
+                           out: *mut c_void, n_kv: u32, head_dim: u32, window: u32,
+                           base_pos: usize, p: usize)
         -> Result<(), String>
     {
         // Flash-attention prefill: BQ=8 queries/workgroup (one wavefront
@@ -3802,7 +3955,7 @@ impl GpuGemma4 {
         };
         let mut qa=q; let mut ka=k; let mut va=v; let mut oa=out;
         let mut nh=self.n_heads as u32; let mut nkv=n_kv; let mut hd=head_dim;
-        let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=0u32;
+        let mut wn=window; let mut sc=1.0f32; let mut pr=p as u32; let mut bp=base_pos as u32;
         let mut args: [*mut c_void; 11] = [
             &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
