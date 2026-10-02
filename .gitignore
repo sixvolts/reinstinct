@@ -28,6 +28,9 @@ perf.data*
 
 # Compiled golden-logits helper (built per-host via tests/golden/build.sh)
 /tests/golden/dump_logits
+/tests/golden/dump_layers
+/tests/golden/tokenize
+/tests/golden/nll
 
 # Test artifacts (built from external sources e.g. llama.cpp)
 /tests/golden/llama_bench

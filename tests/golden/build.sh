@@ -26,7 +26,11 @@ build_one() {
 }
 
 # dump_logits: golden-logit reference. llama_bench: throughput harness.
+# tokenize: reference token ids for a text (vocab only). nll: mean
+# next-token NLL over token sequences (perplexity reference).
 # Both link libllama.so directly — the llama-cli / llama-bench frontends
 # segfault on this build, but the core llama_decode path is sound.
 build_one dump_logits
 build_one llama_bench
+build_one tokenize
+build_one nll

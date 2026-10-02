@@ -249,6 +249,10 @@ pub struct GemmaTokenizer {
     id_to_byte: HashMap<u32, u8>,
     pub bos_id: u32,
     pub eos_id: u32,
+    /// `tokenizer.ggml.add_space_prefix` — SPM's dummy leading space.
+    /// Gemma 4 GGUFs set it false (llama.cpp treats the `gemma4` model
+    /// as BPE, which never adds one).
+    add_space_prefix: bool,
 }
 
 const METASPACE: char = '\u{2581}';
@@ -308,16 +312,39 @@ impl GemmaTokenizer {
             }
         }
 
-        Ok(Self { tokens, vocab_map, merge_ranks, byte_to_id, id_to_byte, bos_id, eos_id })
+        let add_space_prefix = matches!(gguf.metadata_get("tokenizer.ggml.add_space_prefix"),
+                                        Some(MetaValue::Bool(true)));
+
+        Ok(Self { tokens, vocab_map, merge_ranks, byte_to_id, id_to_byte, bos_id, eos_id,
+                  add_space_prefix })
     }
 
     /// Encode text to token ids (no BOS — the caller prepends `bos_id`).
-    /// SPM metaspace: prepend a dummy space, replace spaces with `▁`,
-    /// split to chars (byte-fallback for non-vocab chars), merge-rank BPE.
+    /// llama.cpp's `gemma4` scheme: spaces become `▁`, the text splits
+    /// into runs of newlines and runs of everything else, a newline run
+    /// that is itself a vocab entry is that token, and every other piece
+    /// is merge-rank BPE'd on its own (byte fallback for non-vocab
+    /// chars). No dummy leading space unless the GGUF asks for one.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let prepared: String = format!(" {text}")
-            .chars().map(|c| if c == ' ' { METASPACE } else { c }).collect();
+        let mut prepared: String = if self.add_space_prefix { format!(" {text}") } else { text.to_string() };
+        prepared = prepared.chars().map(|c| if c == ' ' { METASPACE } else { c }).collect();
+        let mut out = Vec::new();
+        let mut rest = prepared.as_str();
+        while !rest.is_empty() {
+            let nl = rest.starts_with('\n');
+            let end = rest.find(|c: char| (c == '\n') != nl).unwrap_or(rest.len());
+            let (seg, tail) = rest.split_at(end);
+            match (nl, self.vocab_map.get(seg)) {
+                (true, Some(&id)) => out.push(id),
+                _ => self.bpe_segment(seg, &mut out),
+            }
+            rest = tail;
+        }
+        out
+    }
 
+    /// Merge-rank BPE over one pre-split segment, appending its ids.
+    fn bpe_segment(&self, prepared: &str, out: &mut Vec<u32>) {
         let mut word: Vec<String> = Vec::new();
         for ch in prepared.chars() {
             let s = ch.to_string();
@@ -345,7 +372,6 @@ impl GemmaTokenizer {
             word.remove(best_idx + 1);
         }
 
-        let mut out = Vec::with_capacity(word.len());
         for piece in &word {
             match self.vocab_map.get(piece) {
                 Some(&id) => out.push(id),
@@ -357,7 +383,6 @@ impl GemmaTokenizer {
                 }
             }
         }
-        out
     }
 
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
