@@ -10,8 +10,10 @@
 //   w_i = d·(q_i − 8),  q_i an unsigned nibble
 //   sum_i w_i·x_i = d·dx·sum_i (q_i − 8)·xq_i
 //
-// The −8 is applied against the *quantized* activation sum, not the
-// exact one BlockQ8::xsum carries. That matters: writing this as
+// The −8 is applied against the *quantized* activation sum. (BlockQ8::
+// xsum carried the exact sum when this was written; it now carries the
+// quantized one for the same reason — the K-quant min terms.) That
+// matters: writing this with the exact sum
 // `dx·idot − 8·xsum` mixes quantized activations in the dot with exact
 // ones in the offset, so each activation's quantization error enters
 // weighted by q_i ∈ [0,15] — mean 7.5 — instead of cancelling. Measured

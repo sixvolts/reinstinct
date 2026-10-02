@@ -144,8 +144,9 @@ pub fn format_gemma4(tok: &GemmaTokenizer, messages: &[ChatMessage],
             "gemma4 chat: role '{}' not in vocab", m.role.template_name()))?;
         out.push(TURN_OPEN);
         out.push(role_id);
-        out.push(NEWLINE);
-        out.extend(tok.encode(&m.content));
+        // The template's "\n" and the content tokenize as one text, so a
+        // content that itself starts with newlines joins that run.
+        out.extend(tok.encode(&format!("\n{}", m.content)));
         out.push(TURN_CLOSE);
         out.push(NEWLINE);
     }
@@ -170,8 +171,7 @@ pub fn format_gemma4_user_turn(tok: &GemmaTokenizer, content: &str)
     let mut out = Vec::with_capacity(8 + content.len() / 2);
     out.push(TURN_OPEN);
     out.push(user_id);
-    out.push(NEWLINE);
-    out.extend(tok.encode(content));
+    out.extend(tok.encode(&format!("\n{content}")));
     out.push(TURN_CLOSE);
     out.push(NEWLINE);
     out.push(TURN_OPEN);

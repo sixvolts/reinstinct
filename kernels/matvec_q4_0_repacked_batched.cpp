@@ -13,7 +13,7 @@
 // No superblock plane and no 6-bit scale/min pair: Q4_0's per-block fp16
 // scale and constant −8 offset collapse to `dw · dx · (idot − 8·xqsum)`,
 // where xqsum sums the *quantized* activations — see
-// matvec_q4_0_repacked.cpp for why the exact BlockQ8::xsum is wrong here.
+// matvec_q4_0_repacked.cpp for why the two must share a domain.
 //
 // Activation `xq` is [n_rows, n_sub, BlockQ8] (40-byte BlockQ8, per-row
 // per-block d/xsum/qs[32]). Output `y` is [n_rows, out_dim].

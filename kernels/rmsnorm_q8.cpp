@@ -4,7 +4,7 @@
 //     v[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]
 //     out[sb].qs[i] = round(v[i] * 127 / max(|v|))
 //     out[sb].d     = max(|v|) / 127
-//     out[sb].xsum  = sum(v)        (used by Q4_K/Q5_K dmin term)
+//     out[sb].xsum  = d·sum(qs)     (quantized sum; Q4_K/Q5_K min term)
 //
 // Replaces the two-kernel sequence:
 //   launch_rmsnorm(x, w, normed, n);

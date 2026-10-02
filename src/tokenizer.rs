@@ -247,9 +247,13 @@ impl Tokenizer {
 
 /// SentencePiece-style BPE tokenizer for Gemma 4 (`tokenizer.ggml.model
 /// == "gemma4"`). Differs from the GPT-2 `Tokenizer`: spaces are the
-/// metaspace char `▁` (U+2581), a dummy `▁` is prepended, and any
-/// character absent from the vocab falls back to `<0xXX>` byte tokens.
-/// Encoding is merge-rank BPE over the metaspace-transformed text.
+/// metaspace char `▁` (U+2581), the text is pre-split at newline runs
+/// (no dummy leading `▁`), and any character absent from the vocab
+/// falls back to `<0xXX>` byte tokens. Encoding is merge-rank BPE over
+/// each metaspace-transformed piece — llama.cpp's `gemma4` scheme.
+/// One divergence: llama.cpp also splits out the vocab's USER_DEFINED
+/// tokens (`<|channel>`, `<|tool_call>`, …) found in plain text; we BPE
+/// them as text, so user content can't forge them.
 pub struct GemmaTokenizer {
     tokens: Vec<String>,
     vocab_map: HashMap<String, u32>,
@@ -260,10 +264,6 @@ pub struct GemmaTokenizer {
     id_to_byte: HashMap<u32, u8>,
     pub bos_id: u32,
     pub eos_id: u32,
-    /// `tokenizer.ggml.add_space_prefix` — SPM's dummy leading space.
-    /// Gemma 4 GGUFs set it false (llama.cpp treats the `gemma4` model
-    /// as BPE, which never adds one).
-    add_space_prefix: bool,
 }
 
 const METASPACE: char = '\u{2581}';
@@ -323,11 +323,7 @@ impl GemmaTokenizer {
             }
         }
 
-        let add_space_prefix = matches!(gguf.metadata_get("tokenizer.ggml.add_space_prefix"),
-                                        Some(MetaValue::Bool(true)));
-
-        Ok(Self { tokens, vocab_map, merge_ranks, byte_to_id, id_to_byte, bos_id, eos_id,
-                  add_space_prefix })
+        Ok(Self { tokens, vocab_map, merge_ranks, byte_to_id, id_to_byte, bos_id, eos_id })
     }
 
     /// Encode text to token ids (no BOS — the caller prepends `bos_id`).
@@ -335,10 +331,11 @@ impl GemmaTokenizer {
     /// into runs of newlines and runs of everything else, a newline run
     /// that is itself a vocab entry is that token, and every other piece
     /// is merge-rank BPE'd on its own (byte fallback for non-vocab
-    /// chars). No dummy leading space unless the GGUF asks for one.
+    /// chars). No dummy leading space: llama.cpp's BPE path never adds
+    /// one, whatever `tokenizer.ggml.add_space_prefix` says (Gemma 4
+    /// GGUFs set it false).
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mut prepared: String = if self.add_space_prefix { format!(" {text}") } else { text.to_string() };
-        prepared = prepared.chars().map(|c| if c == ' ' { METASPACE } else { c }).collect();
+        let prepared: String = text.chars().map(|c| if c == ' ' { METASPACE } else { c }).collect();
         let mut out = Vec::new();
         let mut rest = prepared.as_str();
         while !rest.is_empty() {
@@ -405,7 +402,7 @@ impl GemmaTokenizer {
     /// Look up a literal vocab entry by string — `None` if the token isn't
     /// a single-piece vocab entry. Used by the chat template renderer to
     /// resolve role names (`system`, `user`, `model`) to their atomic ids
-    /// without going through SPM's leading-metaspace encoding.
+    /// without going through BPE.
     pub fn token_id(&self, s: &str) -> Option<u32> {
         self.vocab_map.get(s).copied()
     }
@@ -443,8 +440,7 @@ mod tests {
     }
 
     fn gemma_fixture() -> Option<PathBuf> {
-        crate::test_support::gguf_fixture("REINSTINCT_GEMMA_FIXTURE",
-            Some("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf"))
+        crate::test_support::gemma_e4b_fixture()
     }
 
     #[test]
@@ -461,16 +457,14 @@ mod tests {
         for b in [0x41u8, 0x0A, 0xFF] {
             eprintln!("  byte 0x{b:02X} -> id {:?}", tok.byte_to_id[b as usize]);
         }
-        // Round-trip: SPM is lossless, decode(encode(x)) == " " + x
-        // (the leading space is the dummy metaspace prefix).
+        // Round-trip: decode(encode(x)) == x (no dummy leading space).
         for case in ["Hello, world!", "The quick brown fox.", "numbers 123 + 456",
                      "unicode: café 日本語 🦀"] {
             let ids = tok.encode(case);
             let back = tok.decode(&ids);
             eprintln!("encode({case:?}) = {} ids: {ids:?}\n  decode -> {back:?}",
                       ids.len());
-            assert_eq!(back, format!(" {case}"),
-                       "round-trip failed for {case:?}");
+            assert_eq!(back, *case, "round-trip failed for {case:?}");
         }
     }
 
