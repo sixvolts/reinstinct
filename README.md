@@ -180,6 +180,9 @@ boot. Use the bundled script + systemd unit to apply them automatically:
 # Install upp (PowerPlay table editor)
 sudo pip install --break-system-packages upp
 
+# See which cards it will touch (every MI50/MI60 by PCI id, not card0)
+REINSTINCT_TUNE_DRY_RUN=1 scripts/reinstinct-gpu-tune.sh
+
 # One-shot install: script + systemd unit, enabled on boot
 sudo ln -sfn "$PWD/scripts/reinstinct-gpu-tune.sh" /usr/local/bin/reinstinct-gpu-tune.sh
 sudo cp scripts/reinstinct-gpu-tune.service /etc/systemd/system/
