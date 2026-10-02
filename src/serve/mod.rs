@@ -258,8 +258,9 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     // Absent: run to EOS or the end of the context (a thinking model's
     // reply routinely outruns any small fixed default). Either way the
     // model clamps it to the context left after the prompt.
-    let max_tokens = j.get("max_tokens").or_else(|| j.get("max_completion_tokens"))
-        .and_then(Json::as_f64).map(|n| (n as usize).max(1));
+    let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
+        .or_else(|| j.get("max_completion_tokens").and_then(Json::as_f64))
+        .map(|n| (n as usize).max(1));
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
@@ -551,8 +552,8 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
 
 /// OpenAI-shaped `chat.completion` response. Same usage stats as the
 /// Closing markers for instruction-tuned models' chain-of-thought
-/// preambles. The user-facing response is everything after the LAST
-/// occurrence of any of these in the full text:
+/// preambles. The user-facing response is everything after the first
+/// of these (and any bare closers repeated right after it):
 ///   * `</think>`     — Qwen 3.5/3.6 IT
 ///   * `<channel|>`   — Gemma 4 IT (channel/thought variant)
 ///   * `<|thought|>`  — Gemma 4 IT (alternate thought variant — also
@@ -565,21 +566,30 @@ const THINK_CLOSERS: &[&str] = &["</think>", "<channel|>", "<|thought|>"];
 /// the model can emit it once and go straight to the answer.
 const THINK_OPENERS: &[&str] = &["<think>", "<|channel>"];
 
-/// End of the LAST closing marker in `text`, if any.
-fn last_think_close(text: &str) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for m in THINK_CLOSERS {
-        if let Some(idx) = text.rfind(m) {
-            if best.map_or(true, |(_, e)| idx + m.len() > e) { best = Some((idx, idx + m.len())); }
-        }
-    }
-    best
+/// (start, end) of the FIRST closing marker in `text`, if any.
+fn first_think_close(text: &str) -> Option<(usize, usize)> {
+    THINK_CLOSERS.iter().filter_map(|m| text.find(m).map(|i| (i, i + m.len()))).min()
 }
 
-/// `text` after its first opening marker, or all of it.
+/// `text` after its first opening marker (and Gemma's `thought` channel
+/// name), or all of it.
 fn after_think_open(text: &str) -> &str {
-    THINK_OPENERS.iter().filter_map(|o| text.find(o).map(|i| i + o.len())).min()
-        .map_or(text, |e| &text[e..])
+    match THINK_OPENERS.iter().filter_map(|o| text.find(o).map(|i| i + o.len())).min() {
+        Some(e) => { let t = &text[e..]; t.strip_prefix("thought\n").unwrap_or(t) }
+        None => text,
+    }
+}
+
+/// The answer after a closer: leading whitespace and any further bare
+/// closers (Gemma can repeat `<|thought|>`) stripped.
+fn answer_after_close(mut t: &str) -> &str {
+    loop {
+        t = t.trim_start_matches(|c: char| c == '\n' || c == ' ');
+        match THINK_CLOSERS.iter().find(|m| t.starts_with(**m)) {
+            Some(m) => t = &t[m.len()..],
+            None => return t,
+        }
+    }
 }
 
 fn trim_think_ws(t: &str) -> &str { t.trim_matches(|c: char| c == '\n' || c == ' ') }
@@ -590,10 +600,14 @@ fn trim_think_ws(t: &str) -> &str { t.trim_matches(|c: char| c == '\n' || c == '
 /// opener of its own. A response cut off before its closer is all
 /// reasoning when a block was open, and all answer otherwise.
 fn split_thinking(text: &str, opened: bool) -> (Option<String>, String) {
-    match last_think_close(text) {
+    // A thinking block ends at its FIRST closer — a closer inside the
+    // answer (say, a reply about think tags) is answer text — and a run
+    // of bare closers right after it counts as one. The stream stripper
+    // makes the same cut.
+    match first_think_close(text) {
         Some((idx, end)) => {
             let r = trim_think_ws(after_think_open(&text[..idx]));
-            let a = text[end..].trim_start_matches(|c: char| c == '\n' || c == ' ');
+            let a = answer_after_close(&text[end..]);
             ((!r.is_empty()).then(|| r.to_string()), a.to_string())
         }
         None if opened => (Some(trim_think_ws(text).to_string()), String::new()),
@@ -628,6 +642,9 @@ pub struct ThinkingStripStream {
     /// an opener or closer).
     trim_reasoning: bool,
     trim_answer: bool,
+    /// Gemma's `<|channel>` is followed by the channel name `thought\n`;
+    /// drop it (it may arrive split across deltas).
+    strip_label: bool,
 }
 
 impl ThinkingStripStream {
@@ -635,13 +652,23 @@ impl ThinkingStripStream {
 
     pub fn new(opened: bool) -> Self {
         Self { mode: if opened { StripMode::Thinking } else { StripMode::Detect },
-               buf: String::new(), trim_reasoning: true, trim_answer: false }
+               buf: String::new(), trim_reasoning: true, trim_answer: false, strip_label: false }
     }
 
     fn answer(&mut self, t: &str) -> String {
-        let t = if self.trim_answer { t.trim_start_matches(|c: char| c == '\n' || c == ' ') } else { t };
-        if !t.is_empty() { self.trim_answer = false; }
-        t.to_string()
+        // Until the answer's first visible text: drop whitespace and any
+        // repeated bare closers, holding back a possible partial one.
+        if !self.trim_answer { return t.to_string(); }
+        self.buf.push_str(t);
+        let rest = answer_after_close(&self.buf).to_string();
+        if rest.is_empty() { self.buf.clear(); return String::new(); }
+        if THINK_CLOSERS.iter().any(|m| m.len() > rest.len() && m.starts_with(rest.as_str())) {
+            self.buf = rest;
+            return String::new();
+        }
+        self.buf.clear();
+        self.trim_answer = false;
+        rest
     }
 
     fn reasoning(&mut self, t: &str) -> String {
@@ -659,14 +686,15 @@ impl ThinkingStripStream {
         }
         self.buf.push_str(chunk);
         if self.mode == StripMode::Detect {
-            if let Some(e) = THINK_OPENERS.iter()
-                .filter_map(|o| self.buf.find(o).map(|i| i + o.len())).min()
+            if let Some((i, o)) = THINK_OPENERS.iter()
+                .filter_map(|o| self.buf.find(o).map(|i| (i, *o))).min()
             {
                 // Text before an opener is dropped, as the full-text
                 // split does.
-                self.buf.drain(..e);
+                self.buf.drain(..i + o.len());
+                self.strip_label = o == "<|channel>";
                 self.mode = StripMode::Thinking;
-            } else if let Some((idx, end)) = last_think_close(&self.buf) {
+            } else if let Some((idx, end)) = first_think_close(&self.buf) {
                 let (r, a) = (self.buf[..idx].to_string(), self.buf[end..].to_string());
                 self.buf.clear();
                 self.mode = StripMode::Answer;
@@ -684,6 +712,14 @@ impl ThinkingStripStream {
             }
         }
         // Thinking.
+        if self.strip_label {
+            const LABEL: &str = "thought\n";
+            if self.buf.len() < LABEL.len() && LABEL.starts_with(self.buf.as_str()) {
+                return out;
+            }
+            if self.buf.starts_with(LABEL) { self.buf.drain(..LABEL.len()); }
+            self.strip_label = false;
+        }
         if let Some((idx, end)) = THINK_CLOSERS.iter()
             .filter_map(|m| self.buf.find(m).map(|i| (i, i + m.len()))).min()
         {
@@ -714,7 +750,8 @@ impl ThinkingStripStream {
         match self.mode {
             StripMode::Thinking => out.reasoning = self.reasoning(&b),
             StripMode::Detect   => out.content = self.answer(&b),
-            StripMode::Answer   => {}
+            // A held-back partial closer that never completed.
+            StripMode::Answer   => out.content = b,
         }
         self.mode = StripMode::Answer;
         out
@@ -1050,16 +1087,13 @@ impl ServerModel {
         }
     }
 
-    /// Whether the rendered prompt ends inside an open thinking block,
-    /// so the response starts as reasoning with no opener of its own:
-    /// Qwen's template primes `<think>\n` whenever thinking is on; a raw
-    /// prompt can end on an opener itself.
+    /// Whether a chat request's rendered prompt ends inside an open
+    /// thinking block, so the response starts as reasoning with no
+    /// opener of its own: Qwen's template primes `<think>\n` whenever
+    /// thinking is on. (Raw completions are never stripped.)
     fn prompt_opens_thinking(&self, req: &GenReq) -> bool {
         match (&req.prompt, self) {
-            (PromptInput::Raw(t), _) => {
-                let t = t.trim_end();
-                THINK_OPENERS.iter().any(|o| t.ends_with(o))
-            }
+            (PromptInput::Raw(_), _) => false,
             (PromptInput::Chat(_), ServerModel::Qwen { think, .. }) =>
                 req.think.enable_thinking.unwrap_or(think.default_on),
             (PromptInput::Chat(_), ServerModel::Gemma { .. }) => false,
@@ -1521,7 +1555,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 ChatDelta { role: None,
                                             content: (!o.content.is_empty()).then_some(o.content.as_str()),
                                             reasoning: (!o.reasoning.is_empty()).then_some(o.reasoning.as_str()) },
-                                None, lp)
+                                // logprobs.content parallels content tokens.
+                                None, if o.content.is_empty() { None } else { lp })
                         } else {
                             completion_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
                                 delta, None, lp)
@@ -2101,12 +2136,19 @@ mod thinking_tests {
     #[test]
     fn gemma_channel() {
         check("<|channel>thought\nweighing it<channel|>The answer.", false,
-              "thought\nweighing it", "The answer.");
+              "weighing it", "The answer.");
     }
 
     #[test]
     fn gemma_bare_thought_closer() {
         check("musing<|thought|>The answer.", false, "musing", "The answer.");
+        check("musing<|thought|>\n<|thought|> <|thought|>The answer.", false, "musing", "The answer.");
+    }
+
+    #[test]
+    fn closer_inside_the_answer_stays_in_the_answer() {
+        check("hm\n</think>\n\nWrap it in </think> to close.", true,
+              "hm", "Wrap it in </think> to close.");
     }
 
     #[test]

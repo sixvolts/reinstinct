@@ -578,10 +578,12 @@ for long responses:
      Admin Panel → Settings → Models with the params baked in, which
      all users get when they select that model.
 
-2. **Streaming renders cleanly out of the box** — reinstinct strips
-   Gemma's `<|channel>thought` / `<|thought|>` markers and Qwen's
-   `<think>...</think>` blocks at the stream level. No OWUI toggle
-   needed.
+2. **Streaming renders cleanly out of the box** — reinstinct sends
+   Qwen's `<think>…</think>` reasoning and Gemma's `<|channel>thought`
+   channel as `reasoning_content` (streamed deltas and the non-streamed
+   message), separate from `content`, which OWUI shows as a collapsible
+   reasoning block. Since max_tokens now defaults to the rest of the
+   context, step 1 only matters if OWUI sends its own 256.
 
 **The tok/s display in the response footer is unreliable on OWUI 0.9.5
 with the OpenAI-API connection type** — even though reinstinct emits
@@ -746,7 +748,7 @@ instead of the flat `text` field on text_completion. Same `usage` block.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `prompt` / `messages` | string / array | — | One required, depending on endpoint. |
-| `max_tokens` | int | 256 | Decode-token budget. Clamped to `[1, 4096]`. |
+| `max_tokens` | int | rest of context | Decode-token budget (`max_completion_tokens` is accepted too). Clamped to the context left after the prompt. |
 | `temperature` | float | 0.8 | `0` ⇒ greedy (skip the sampler chain). |
 | `top_k` | int | 40 | Keep the K largest logits. `0` ⇒ no filter. |
 | `top_p` | float | 1.0 | Nucleus filter: keep smallest prefix covering P of the softmax mass. `1.0` ⇒ no filter. |
