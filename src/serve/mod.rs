@@ -158,6 +158,10 @@ struct GenReq {
     /// `logprobs: null`. Disable spec-decode (`use_speculative: false`)
     /// if you need logprobs.
     top_logprobs_n: usize,
+    /// OpenAI `stop`: up to 4 strings; generation ends before the first
+    /// occurrence of any of them (finish_reason "stop"), and no text from
+    /// a match is ever streamed.
+    stop: Vec<String>,
 }
 
 /// Per-token logprob diagnostic for the OpenAI `logprobs:true` field.
@@ -279,7 +283,11 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
         .map(|n| n as f32).unwrap_or(defaults.frequency_penalty);
     sp.presence_penalty = j.get("presence_penalty").and_then(Json::as_f64)
         .map(|n| n as f32).unwrap_or(0.0);
-    sp.seed = j.get("seed").and_then(Json::as_f64).map(|n| n as u64).unwrap_or(0);
+    // No seed: a fresh one per request, so a regenerate differs.
+    sp.seed = j.get("seed").and_then(Json::as_f64).map(|n| n as u64).unwrap_or_else(|| {
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        t ^ REQ_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
 
     // Mirostat v2: opt-in via `mirostat: 2`. tau + eta override defaults.
     if j.get("mirostat").and_then(Json::as_f64).map(|n| n as i64) == Some(2) {
@@ -473,9 +481,10 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n, think) =
         parse_common_fields(&j, COMPLETION_DEFAULTS);
+    let stop = parse_stop(&j).map_err(bad)?;
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
                 use_speculative, think, speculative_k, speculative_p_min,
-                request_timeout, stream, stream_include_usage, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n, stop })
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -512,9 +521,49 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n, think) =
         parse_common_fields(&j, CHAT_DEFAULTS);
+    let stop = parse_stop(&j).map_err(bad)?;
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
                 use_speculative, think, speculative_k, speculative_p_min,
-                request_timeout, stream, stream_include_usage, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n, stop })
+}
+
+/// OpenAI `stop`: a string or an array of up to 4 non-empty strings.
+fn parse_stop(j: &Json) -> Result<Vec<String>, String> {
+    let stops: Vec<String> = match j.get("stop") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Str(s)) => vec![s.clone()],
+        Some(Json::Arr(a)) => a.iter().map(|v| v.as_str().map(str::to_string)
+            .ok_or_else(|| "'stop' entries must be strings".to_string()))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("'stop' must be a string or an array of strings".into()),
+    };
+    if stops.len() > 4 { return Err("'stop' takes at most 4 sequences".into()); }
+    Ok(stops.into_iter().filter(|s| !s.is_empty()).collect())
+}
+
+/// Streaming stop-sequence scan. `scan(text, from)` is called after each
+/// token with the whole decoded text and the length already emitted; it
+/// returns how far the text may be emitted, and whether a stop matched
+/// (the text is then final up to that point). Text that could still turn
+/// into a match — a suffix that is a prefix of a stop — is held back.
+struct StopScan<'a> { stops: &'a [String] }
+
+impl StopScan<'_> {
+    fn scan(&self, text: &str, from: usize) -> (usize, bool) {
+        if self.stops.is_empty() { return (text.len(), false); }
+        let longest = self.stops.iter().map(String::len).max().unwrap_or(0);
+        // A match can start up to longest-1 bytes before `from`.
+        let mut start = from.saturating_sub(longest);
+        while !text.is_char_boundary(start) { start -= 1; }
+        if let Some(i) = self.stops.iter().filter_map(|s| text[start..].find(s.as_str())).min() {
+            return (start + i, true);
+        }
+        let hold = self.stops.iter().map(|s| {
+            (1..s.len()).rev().find(|&k| text.len() >= k && text.is_char_boundary(text.len() - k)
+                && s.as_bytes().starts_with(&text.as_bytes()[text.len() - k..])).unwrap_or(0)
+        }).max().unwrap_or(0);
+        (text.len() - hold, false)
+    }
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -1124,6 +1173,7 @@ impl ServerModel {
         // penalty); `counts` is the same data laid out per-vocab for
         // OpenAI-style frequency/presence penalties. Both are empty when
         // the per-request knobs leave their defaults.
+        let stop = StopScan { stops: &req.stop };
         let deadline = req.request_timeout
             .map(|d| std::time::Instant::now() + d);
 
@@ -1191,8 +1241,9 @@ impl ServerModel {
                     let tlp = if want_lp > 0 {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
-                    if full_text.len() > prev_text_len {
-                        let delta = &full_text[prev_text_len..];
+                    let (upto, stopped) = stop.scan(&full_text, prev_text_len);
+                    if upto > prev_text_len {
+                        let delta = &full_text[prev_text_len..upto];
                         let ok = on_token(delta, tlp.as_ref());
                         if let Some(t) = tlp { all_lp.push(t); }
                         if !ok {
@@ -1200,12 +1251,19 @@ impl ServerModel {
                             // generating; return what we have.
                             break;
                         }
-                        prev_text_len = full_text.len();
+                        prev_text_len = upto;
                     } else if let Some(t) = tlp {
                         all_lp.push(t);
                     }
+                    if stopped {
+                        full_text.truncate(upto);
+                        hit_eos = true;
+                        break;
+                    }
                     logits = if launched { gpu.decode_finish()? } else { gpu.forward_token(t, state)? };
                 }
+                // Text held back as a possible stop prefix that never completed.
+                if !hit_eos && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
                 Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
             ServerModel::Gemma { gpu, state, graph, think_closers, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
@@ -1230,9 +1288,16 @@ impl ServerModel {
                 let max_new = new_token_budget(req.max_tokens, prompt.len(), *max_seq, 8)?;
                 // Dispatch: spec-decode when a drafter is loaded AND the
                 // request hasn't opted out. Default-on if drafter present.
+                // Default spec-decode only where its loop is exact and
+                // supported: greedy (it samples with temperature alone and
+                // ignores top-k/p, penalties and min-p), unstreamed (it
+                // emits nothing until done), no stop strings or logprobs,
+                // and a dense target (on the MoE it measured 25-51% slower,
+                // MANUAL). use_speculative=true forces it anyway.
                 let want_spec = match req.use_speculative {
                     Some(b) => b,
-                    None    => drafter.is_some(),
+                    None => drafter.is_some() && req.sampler.temperature == 0.0 && !req.stream
+                        && req.stop.is_empty() && req.top_logprobs_n == 0 && !gpu.is_moe(),
                 };
                 let do_spec = want_spec && drafter.is_some();
                 if want_spec && drafter.is_none() {
@@ -1332,17 +1397,27 @@ impl ServerModel {
                         let tlp = if want_lp > 0 {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
-                        if full_text.len() > prev_text_len {
-                            let delta = &full_text[prev_text_len..];
+                        let (upto, stopped) = stop.scan(&full_text, prev_text_len);
+                        if upto > prev_text_len {
+                            let delta = &full_text[prev_text_len..upto];
                             let ok = on_token(delta, tlp.as_ref());
                             if let Some(t) = tlp { all_lp.push(t); }
                             if !ok { break; }
-                            prev_text_len = full_text.len();
+                            prev_text_len = upto;
                         } else if let Some(t) = tlp {
                             all_lp.push(t);
                         }
+                        if stopped {
+                            full_text.truncate(upto);
+                            hit_eos = true;
+                            // The launched graph step still has to land
+                            // before the state is snapshotted or reused.
+                            if launched { gpu.read_logits()?; }
+                            break;
+                        }
                         logits = if launched { gpu.read_logits()? } else { gpu.forward_token(t, state)? };
                     }
+                    if !hit_eos && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
                     return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
                 }
 
@@ -1818,6 +1893,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 stream: false,
                 stream_include_usage: false,
                 top_logprobs_n: 0,
+                stop: Vec::new(),
             })
         }
         Some("chat") => parse_chat_completions(&request.body),
@@ -2168,5 +2244,60 @@ mod thinking_tests {
         assert_eq!(new_token_budget(Some(256), 100, 4096, 8), Ok(256));
         assert_eq!(new_token_budget(Some(9999), 100, 4096, 8), Ok(3988));
         assert!(new_token_budget(Some(10), 4090, 4096, 8).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// Feed `text` a few chars at a time; return (streamed, final, hit).
+    fn run(stops: &[&str], text: &str, step: usize) -> (String, String, bool) {
+        let stops: Vec<String> = stops.iter().map(|s| s.to_string()).collect();
+        let sc = StopScan { stops: &stops };
+        let chars: Vec<char> = text.chars().collect();
+        let (mut full, mut streamed, mut prev) = (String::new(), String::new(), 0usize);
+        for c in chars.chunks(step) {
+            full.extend(c);
+            let (upto, hit) = sc.scan(&full, prev);
+            if upto > prev { streamed += &full[prev..upto]; prev = upto; }
+            if hit { full.truncate(upto); return (streamed, full, true); }
+        }
+        streamed += &full[prev..];
+        (streamed, full, false)
+    }
+
+    #[test]
+    fn stops_and_never_streams_the_match() {
+        for step in [1, 2, 3, 7, 100] {
+            let (s, f, hit) = run(&["\n\nUser:", "END"], "Hello there.\n\nUser: next", step);
+            assert!(hit);
+            assert_eq!((s.as_str(), f.as_str()), ("Hello there.", "Hello there."), "step {step}");
+        }
+    }
+
+    #[test]
+    fn partial_prefix_is_released_when_it_does_not_match() {
+        for step in [1, 2, 5] {
+            let (s, f, hit) = run(&["END"], "the ENtry and EN", step);
+            assert!(!hit);
+            assert_eq!((s.as_str(), f.as_str()), ("the ENtry and EN", "the ENtry and EN"));
+        }
+    }
+
+    #[test]
+    fn multibyte_text_and_stops() {
+        let (s, _, hit) = run(&["–stop"], "héllo wörld –stop now", 1);
+        assert!(hit);
+        assert_eq!(s, "héllo wörld ");
+    }
+
+    #[test]
+    fn parse() {
+        let j = Json::parse(r#"{"stop": ["a", "", "b"]}"#).unwrap();
+        assert_eq!(parse_stop(&j).unwrap(), vec!["a", "b"]);
+        assert_eq!(parse_stop(&Json::parse(r#"{"stop": "x"}"#).unwrap()).unwrap(), vec!["x"]);
+        assert!(parse_stop(&Json::parse(r#"{"stop": ["1","2","3","4","5"]}"#).unwrap()).is_err());
+        assert!(parse_stop(&Json::parse(r#"{"stop": 3}"#).unwrap()).is_err());
     }
 }
