@@ -122,9 +122,16 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q6k_grouped.cpp");
 
 /// Token-tile width of the grouped-expert GEMM — `tile_off` counts
-/// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles. Must match the BN
-/// the grouped-GEMM kernel is compiled with (mmq_gemm_q4k_grouped.cpp).
+/// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles for both of a layer's
+/// grouped GEMMs, so every `mmq_gemm_*_grouped` kernel is compiled with
+/// this BN (`grouped_src`). 16: the 35B routes ~16 tokens/expert at
+/// P≈504 (256 experts, top-8).
 const MOE_GEMM_BN: u32 = 16;
+
+/// A grouped-GEMM kernel source compiled at this runtime's MOE_GEMM_BN.
+fn grouped_src(src: &str) -> String {
+    format!("#define TN {}\n{src}", MOE_GEMM_BN / 16)
+}
 /// Per-kernel prefill timing (`REINSTINCT_PREFILL_TRACE=3`): name ->
 /// (total ms, launches). Filled by `GpuQwen35::ptrace`, printed and
 /// cleared at the end of `prefill_stage`.
@@ -634,19 +641,19 @@ impl MoeRuntime {
             m_down_q5_1:  Module::load(&cache.compile("moe_matvec_q5_1_down",
                               &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_DOWN_SOURCE))?)?,
             m_grouped_q5_1: Module::load(&cache.compile("mmq_gemm_q5_1_grouped",
-                              &crate::quant::q5_1::kernel_source(MOE_MMQ_Q5K_GROUPED_SOURCE))?)?,
+                              &grouped_src(&crate::quant::q5_1::kernel_source(MOE_MMQ_Q5K_GROUPED_SOURCE)))?)?,
             m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
             m_shexp_gate: Module::load(&cache.compile("moe_shexp_gate", MOE_SHEXP_GATE_SOURCE)?)?,
             m_expert_sort: Module::load(&cache.compile(
                               "moe_expert_sort", MOE_EXPERT_SORT_SOURCE)?)?,
             m_grouped_q4k: Module::load(&cache.compile(
-                              "mmq_gemm_q4k_grouped", MOE_MMQ_Q4K_GROUPED_SOURCE)?)?,
+                              "mmq_gemm_q4k_grouped", &grouped_src(MOE_MMQ_Q4K_GROUPED_SOURCE))?)?,
             m_grouped_q5k: Module::load(&cache.compile(
-                              "mmq_gemm_q5k_grouped", MOE_MMQ_Q5K_GROUPED_SOURCE)?)?,
+                              "mmq_gemm_q5k_grouped", &grouped_src(MOE_MMQ_Q5K_GROUPED_SOURCE))?)?,
             m_grouped_q6k: Module::load(&cache.compile(
-                              "mmq_gemm_q6k_grouped", MOE_MMQ_Q6K_GROUPED_SOURCE)?)?,
+                              "mmq_gemm_q6k_grouped", &grouped_src(MOE_MMQ_Q6K_GROUPED_SOURCE))?)?,
             m_grouped_q8_0: Module::load(&cache.compile(
-                              "mmq_gemm_q8_0_grouped", MOE_MMQ_Q8_0_GROUPED_SOURCE)?)?,
+                              "mmq_gemm_q8_0_grouped", &grouped_src(MOE_MMQ_Q8_0_GROUPED_SOURCE))?)?,
             logits:  DeviceBuf::new(c * n_expert)?,
             ids:     DeviceBuf::new(c * n_used)?,
             weights: DeviceBuf::new(c * n_used)?,

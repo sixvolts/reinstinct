@@ -104,9 +104,17 @@ const MOE_COMBINE_SRC:       &str = include_str!("../../kernels/moe_combine.cpp"
 const MOE_EXPERT_SORT_SRC:   &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MMQ_Q6K_GROUPED_SRC:   &str = include_str!("../../kernels/mmq_gemm_q6k_grouped.cpp");
 const MMQ_Q8_0_GROUPED_SRC:  &str = include_str!("../../kernels/mmq_gemm_q8_0_grouped.cpp");
-/// Grouped-expert GEMM token-tile width — must match `BN` in the
-/// `mmq_gemm_*_grouped` kernels.
+/// Grouped-expert GEMM token-tile width. `tile_off` counts
+/// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles for both of a layer's
+/// grouped GEMMs, so every `mmq_gemm_*_grouped` kernel is compiled with
+/// this BN (`grouped_src`). 32: the 26B routes ~31 tokens/expert at
+/// P≈490 (128 experts, top-8), and BN=16 doubles its tile count.
 const MOE_GEMM_BN: u32 = 32;
+
+/// A grouped-GEMM kernel source compiled at this runtime's MOE_GEMM_BN.
+fn grouped_src(src: &str) -> String {
+    format!("#define TN {}\n{src}", MOE_GEMM_BN / 16)
+}
 
 /// Offset an f32 device pointer by `elems` elements (prefill row indexing).
 fn pf_off(p: *mut c_void, elems: usize) -> *mut c_void {
@@ -966,7 +974,11 @@ pub struct GpuGemma4 {
     /// model's sliding and full donors stay live together. Grown on
     /// demand before the layer loop; never pooled (that path doesn't
     /// capture, and extra pool takes would shift the LIFO order the
-    /// cached base-0 prefill graphs depend on).
+    /// cached base-0 prefill graphs depend on). The full-attention pair
+    /// spans the whole context (base + P rows), so it holds ~2·ctx·
+    /// n_kv·head_dim·4 bytes after the first long hit (~0.5 GiB at 32K
+    /// on the 26B/31B); a failed grow makes serve fall back to a full
+    /// prefill.
     pf_kv_cont: std::cell::RefCell<[Option<(DeviceBuf<f32>, DeviceBuf<f32>)>; 2]>,
 }
 
@@ -1202,15 +1214,15 @@ impl GpuGemma4 {
             m_moe_down_q5_1: ld("moe_matvec_q5_1_down",
                 &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_DOWN_SRC))?,
             m_grouped_q5_1: ld("mmq_gemm_q5_1_grouped",
-                &crate::quant::q5_1::kernel_source(MMQ_Q5K_GROUPED_SRC))?,
+                &grouped_src(&crate::quant::q5_1::kernel_source(MMQ_Q5K_GROUPED_SRC)))?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
             m_moe_geglu_q8: ld("moe_geglu_q8", MOE_GEGLU_Q8_SRC)?,
             m_moe_combine:  ld("moe_combine", MOE_COMBINE_SRC)?,
             m_expert_sort:  ld("moe_expert_sort", MOE_EXPERT_SORT_SRC)?,
-            m_grouped_q4k:  ld("mmq_gemm_q4k_grouped", MMQ_Q4K_GROUPED_SRC)?,
-            m_grouped_q5k:  ld("mmq_gemm_q5k_grouped", MMQ_Q5K_GROUPED_SRC)?,
-            m_grouped_q6k:  ld("mmq_gemm_q6k_grouped", MMQ_Q6K_GROUPED_SRC)?,
-            m_grouped_q8_0: ld("mmq_gemm_q8_0_grouped", MMQ_Q8_0_GROUPED_SRC)?,
+            m_grouped_q4k:  ld("mmq_gemm_q4k_grouped", &grouped_src(MMQ_Q4K_GROUPED_SRC))?,
+            m_grouped_q5k:  ld("mmq_gemm_q5k_grouped", &grouped_src(MMQ_Q5K_GROUPED_SRC))?,
+            m_grouped_q6k:  ld("mmq_gemm_q6k_grouped", &grouped_src(MMQ_Q6K_GROUPED_SRC))?,
+            m_grouped_q8_0: ld("mmq_gemm_q8_0_grouped", &grouped_src(MMQ_Q8_0_GROUPED_SRC))?,
             m_kv_write:     ld("kv_write", KV_WRITE_SRC)?,
             d_token: DeviceBuf::new(1)?,
             d_pos:   DeviceBuf::new(1)?,

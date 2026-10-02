@@ -84,6 +84,7 @@ fn prefill_continuation_matches_decode_oracle() {
         state.restore(&snap).unwrap();
         state.truncate(base);
         let l_cont = gm.prefill_forward_at(suf, &mut state, base).unwrap();
+        assert_eq!(state.pos, base + p, "case {ci}: pos after continuation");
         let mut worst_q = 0i32;
         let mut over1 = 0usize;
         let mut total = 0usize;
@@ -121,6 +122,13 @@ fn prefill_continuation_matches_decode_oracle() {
         };
         let mut line_c = String::new(); let mut line_o = String::new();
         let (mut n_cf, mut n_of) = (0.0f64, 0.0f64);
+        let layer0_full = state.kv_rows_to_host(0, base, base + p).unwrap();
+        // int8 values are bit-identical; the f32 scales may differ in the
+        // last bits (the GEMM tiles a P-row suffix differently from the
+        // whole prompt), so compare them relatively.
+        let srel = layer0_full.2.iter().chain(&layer0_full.3).zip(kv_cont[0].2.iter().chain(&kv_cont[0].3))
+            .map(|(a, b)| ((a - b) / a.abs().max(1e-20)).abs()).fold(0.0f32, f32::max);
+        assert!(srel < 1e-4, "case {ci}: layer 0 KV scales differ from a full prefill ({srel:.2e})");
         for l in 0..nl {
             let full = state.kv_rows_to_host(l, base, base + p).unwrap();
             let (wc, fc) = dq(&kv_cont[l], &full);
@@ -142,10 +150,9 @@ fn prefill_continuation_matches_decode_oracle() {
         // matvec/GEMM rounding floor; the continuation must sit at the
         // prefill side of it (vs full prefill, only the int8 prefix in
         // attention differs).
-        let _ = frac;
-        eprintln!("  mean frac(|Δq|>1) vs full prefill: continuation {:.2e}, decode oracle {:.2e}",
-                  n_cf / nl as f64, n_of / nl as f64);
-        assert!(n_cf <= 1.5 * n_of + 1e-3, "case {ci}: continuation KV drifts past the decode floor");
+        let (m_cf, m_of) = (n_cf / nl as f64, n_of / nl as f64);
+        eprintln!("  mean frac(|Δq|>1) vs full prefill: continuation {m_cf:.2e}, decode oracle {m_of:.2e}");
+        assert!(m_cf <= 1.5 * m_of + 1e-3, "case {ci}: continuation KV drifts past the decode floor");
         // Decode and prefill already differ by r_of (int8 KV, matvec vs
         // GEMM rounding); the continuation sits between them, so bound
         // it by that floor rather than a fixed number.
@@ -155,5 +162,49 @@ fn prefill_continuation_matches_decode_oracle() {
         let floor = r_of.max(0.02) * 1.25;
         assert!(r_full < floor, "case {ci}: logits diverge from a full prefill");
         assert!(r_or < r_of + r_full + 0.01, "case {ci}: logits diverge from the decode oracle");
+    }
+}
+
+/// MoE diagnostic: on real text, last-token logits of a grouped-GEMM
+/// prefill, a per-token-matvec prefill (REINSTINCT_MOE_NO_GROUPED) and
+/// the decode loop should agree to the decode/prefill rounding floor.
+#[test]
+#[ignore]
+fn moe_prefill_paths_agree_with_decode() {
+    let (Some(path), Some(())) = (test_support::gemma_moe_fixture(), test_support::gpu()) else { return };
+    let g = GgufFile::open(&path).expect("open");
+    let _dev = hip::Device::set(0).unwrap();
+    let cache = KernelCache::new().unwrap();
+    let model = Gemma4Model::load(&g).unwrap();
+    let tok = reinstinct_engine::tokenizer::GemmaTokenizer::from_gguf(&g).unwrap();
+    let gm = GpuGemma4::new(&model, &g, &cache, 1024).unwrap();
+    let mut state = Gemma4GpuState::new(&model, 1024).unwrap();
+    let text = "The history of the lighthouse begins in the ancient world, where fires were \
+                lit on hilltops to guide ships into harbour. The most famous of these was the \
+                Pharos of Alexandria, built in the third century BC on a small island off the \
+                Egyptian coast. Standing more than one hundred metres tall, it remained one of \
+                the tallest man-made structures for many centuries, and its name became the \
+                root of the word for lighthouse in several languages. Later, the Romans built";
+    let mut ids = vec![tok.bos_id];
+    ids.extend(tok.encode(text));
+    let top = |v: &[f32]| { let mut i: Vec<usize> = (0..v.len()).collect();
+        i.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap()); i.truncate(5); i };
+    for p in [ids.len(), 33] {
+        let ids = &ids[..p];
+        state.reset();
+        // Single-threaded test binary section: env toggled between calls.
+        unsafe { std::env::remove_var("REINSTINCT_MOE_NO_GROUPED"); }
+        let l_grp = gm.prefill_forward(ids, &mut state).unwrap();
+        state.reset();
+        unsafe { std::env::set_var("REINSTINCT_MOE_NO_GROUPED", "1"); }
+        let l_mv = gm.prefill_forward(ids, &mut state).unwrap();
+        unsafe { std::env::remove_var("REINSTINCT_MOE_NO_GROUPED"); }
+        state.reset();
+        let mut l_dec = Vec::new();
+        for &t in ids { l_dec = gm.forward_token(t, &mut state).unwrap(); }
+        eprintln!("P={p}: grouped-vs-matvec {:.2e}  matvec-vs-decode {:.2e}  grouped-vs-decode {:.2e}\n  \
+                   top5 grouped {:?} matvec {:?} decode {:?}",
+                  rel_l2(&l_grp, &l_mv), rel_l2(&l_mv, &l_dec), rel_l2(&l_grp, &l_dec),
+                  top(&l_grp), top(&l_mv), top(&l_dec));
     }
 }

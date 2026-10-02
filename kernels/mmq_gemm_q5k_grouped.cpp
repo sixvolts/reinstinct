@@ -10,9 +10,15 @@
 
 #define BK 4
 #define TM 4
+// Token-tile width BN = 16*TN. The runtime prepends `#define TN` from
+// its MOE_GEMM_BN so the host's tile_off arithmetic and every grouped
+// kernel it launches agree; 1 is only the standalone default.
+#ifndef TN
 #define TN 1
+#endif
+static_assert(TN == 1 || TN == 2, "grouped MMQ: TN must be 1 or 2");
 #define BM (16 * TM)   // 64
-#define BN (16 * TN)   // 32
+#define BN (16 * TN)   // tokens / workgroup
 
 struct __attribute__((packed)) BlockQ8 {
     float  d;

@@ -755,10 +755,10 @@ impl PrefixCache {
     }
 
     /// Find the slot with the longest common prefix vs `prompt`. Returns
-    /// `(slot_index, overlap_len)` when a slot has ≥ MIN_OVERLAP common
-    /// tokens AND less than `prompt.len()` (need a non-empty suffix to
-    /// prefill — full match means no work to do but also no need to
-    /// snapshot again). None otherwise.
+    /// `(slot_index, overlap_len)` when a slot shares ≥ MIN_OVERLAP
+    /// tokens. The overlap is capped at `prompt.len() - 1` so there is
+    /// always a suffix to prefill (its last logits seed sampling). None
+    /// otherwise.
     fn best_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None;
         for (i, e) in self.slots.iter().enumerate() {
