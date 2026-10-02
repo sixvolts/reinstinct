@@ -124,9 +124,11 @@ const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
 /// Token-tile width of the grouped-expert GEMM — `tile_off` counts
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles for both of a layer's
 /// grouped GEMMs, so every `mmq_gemm_*_grouped` kernel is compiled with
-/// this BN (`grouped_src`). 16: the 35B routes ~16 tokens/expert at
-/// P≈504 (256 experts, top-8).
+/// this BN (`grouped_src`). 16: few tokens per expert (256 experts,
+/// top-8, MOE_PREFILL_CHUNK tokens per sort) leave BN=32 tiles half
+/// padding (737360f).
 const MOE_GEMM_BN: u32 = 16;
+const _: () = assert!(MOE_GEMM_BN == 16 || MOE_GEMM_BN == 32, "grouped MMQ BN is 16 * TN, TN 1|2");
 
 /// A grouped-GEMM kernel source compiled at this runtime's MOE_GEMM_BN.
 fn grouped_src(src: &str) -> String {
@@ -533,6 +535,20 @@ impl<T: Copy> DeviceBufPool<T> {
             None    => DeviceBuf::new(len)?,
         };
         Ok(PooledBuf { buf: Some(buf), pool: self, len })
+    }
+
+    /// Bytes held by idle (returned) buffers.
+    pub fn free_bytes(&self) -> usize {
+        self.free.borrow().iter()
+            .map(|(len, v)| len * v.len() * std::mem::size_of::<T>()).sum()
+    }
+
+    /// Free every idle buffer. Buffers are keyed by exact length, so a
+    /// server seeing many prompt lengths otherwise keeps one scratch set
+    /// per length forever. The caller must make sure no queued kernel
+    /// or cached graph still references them (sync; drop the graphs).
+    pub fn trim(&self) {
+        self.free.borrow_mut().clear();
     }
 }
 
@@ -3874,6 +3890,24 @@ impl GpuQwen35 {
         self.launch_embed_lookup_dispatch(self.token_embd(), self.hidden_a.raw_ptr(), token)?;
         self.prof_reset();
         self.enqueue_decode_body(state)
+    }
+
+    /// Device bytes held idle in the prefill / verify scratch pools.
+    pub fn scratch_bytes(&self) -> usize {
+        self.pool_f32.free_bytes() + self.pool_u8.free_bytes() + self.pool_u16.free_bytes()
+    }
+
+    /// Release the idle scratch pools (see `DeviceBufPool::trim`). Waits
+    /// for this stage's stream first. Prefill graphs are re-captured per
+    /// call, so only the "pools warm for n" marks need forgetting — a
+    /// capture at an n whose buffers are gone would hipMalloc mid-capture.
+    pub fn trim_scratch(&self) -> Result<(), String> {
+        self.stream.synchronize()?;
+        self.pool_f32.trim();
+        self.pool_u8.trim();
+        self.pool_u16.trim();
+        self.prefill_warm_p.borrow_mut().clear();
+        Ok(())
     }
 
     /// Capture the decode body into a replayable HIP graph. The graph

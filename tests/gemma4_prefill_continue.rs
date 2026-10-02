@@ -14,7 +14,8 @@
 //!
 //! GPU + model required, so `#[ignore]`:
 //!   REINSTINCT_GEMMA_E4B_FIXTURE=... cargo test --release --test \
-//!       gemma4_prefill_continue -- --ignored --nocapture
+//!       gemma4_prefill_continue -- --ignored --nocapture --test-threads=1
+//! (one model on the GPU at a time; the MoE diagnostic sets env vars).
 //! `REINSTINCT_PFC_MODEL=e4b|moe|dense` picks the fixture (default e4b).
 
 use reinstinct_engine::gguf::GgufFile;
@@ -179,6 +180,9 @@ fn moe_prefill_paths_agree_with_decode() {
     let tok = reinstinct_engine::tokenizer::GemmaTokenizer::from_gguf(&g).unwrap();
     let gm = GpuGemma4::new(&model, &g, &cache, 1024).unwrap();
     let mut state = Gemma4GpuState::new(&model, 1024).unwrap();
+    // No captured prefill graphs: a cached graph would replay whichever
+    // MoE path it was captured with, whatever the env var says.
+    unsafe { std::env::set_var("REINSTINCT_PREFILL_NO_GRAPH", "1"); }
     let text = "The history of the lighthouse begins in the ancient world, where fires were \
                 lit on hilltops to guide ships into harbour. The most famous of these was the \
                 Pharos of Alexandria, built in the third century BC on a small island off the \

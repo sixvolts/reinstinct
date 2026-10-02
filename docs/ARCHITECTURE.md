@@ -332,14 +332,14 @@ pair — for top-k=4 routing with 60 experts active that's 4 matvecs
 per token, each touching the full expert weight matrix once. At N=128
 prefill tokens × 4 experts = 512 matvecs.
 
-The grouped path (`REINSTINCT_MOE_GROUPED=1`, default-on):
+The grouped path (default-on; `REINSTINCT_MOE_NO_GROUPED=1` falls back to per-token matvecs):
 
 1. Counting-sort the (token, expert) pairs by expert.
 2. Scatter activations into expert-contiguous order.
-3. One tiled MMQ GEMM per expert (BN=16 for qwen MoE's Q4_K/Q5_K
-   experts, BN=32 for Gemma 26B-MoE's Q6_K/Q8_0 experts — sized so
-   the "tokens per expert" average exactly fills the tile, no
-   padding waste).
+3. One tiled MMQ GEMM per expert. The token-tile width BN is one
+   constant per runtime (`MOE_GEMM_BN`: 16 for Qwen, 32 for Gemma);
+   every grouped kernel is compiled with it (`#define TN`), since the
+   sort's `tile_off` and the kernels must agree on it.
 4. Scatter results back to original token order.
 
 Measured: Qwen MoE prefill ~2.1×, Gemma MoE prefill ~2.05× vs the

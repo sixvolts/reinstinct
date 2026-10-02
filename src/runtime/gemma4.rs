@@ -107,9 +107,11 @@ const MMQ_Q8_0_GROUPED_SRC:  &str = include_str!("../../kernels/mmq_gemm_q8_0_gr
 /// Grouped-expert GEMM token-tile width. `tile_off` counts
 /// `ceil(tokens_per_expert / MOE_GEMM_BN)` tiles for both of a layer's
 /// grouped GEMMs, so every `mmq_gemm_*_grouped` kernel is compiled with
-/// this BN (`grouped_src`). 32: the 26B routes ~31 tokens/expert at
-/// P≈490 (128 experts, top-8), and BN=16 doubles its tile count.
+/// this BN (`grouped_src`). 32 measured ahead of 16 on the 26B (2892-
+/// token prefill 3031 vs 3088 ms; 128 experts, top-8, MOE_PREFILL_CHUNK
+/// tokens per sort).
 const MOE_GEMM_BN: u32 = 32;
+const _: () = assert!(MOE_GEMM_BN == 16 || MOE_GEMM_BN == 32, "grouped MMQ BN is 16 * TN, TN 1|2");
 
 /// A grouped-GEMM kernel source compiled at this runtime's MOE_GEMM_BN.
 fn grouped_src(src: &str) -> String {
@@ -3412,6 +3414,31 @@ impl GpuGemma4 {
         for c in &mut state.caches { c.len = base + p; }
         state.pos = base + p;
         Ok(out)
+    }
+
+    /// Device bytes held idle in the prefill scratch pools plus the
+    /// prefix-continuation K/V scratch.
+    pub fn scratch_bytes(&self) -> usize {
+        let cont: usize = self.pf_kv_cont.borrow().iter().flatten()
+            .map(|(k, v)| (k.len() + v.len()) * 4).sum();
+        self.pool_f32.free_bytes() + self.pool_u8.free_bytes()
+            + self.pool_u32.free_bytes() + self.pool_i32.free_bytes() + cont
+    }
+
+    /// Release the idle prefill scratch. The prefill graphs cached on
+    /// `state` hold pointers into the pools, so they go too, along with
+    /// the "pools warm for P" marks (a capture at a P whose buffers are
+    /// gone would hipMalloc mid-capture).
+    pub fn trim_scratch(&self, state: &mut Gemma4GpuState) -> Result<(), String> {
+        self.stream.synchronize()?;
+        state.prefill_graphs.clear();
+        self.prefill_warm_p.borrow_mut().clear();
+        self.pool_f32.trim();
+        self.pool_u8.trim();
+        self.pool_u32.trim();
+        self.pool_i32.trim();
+        *self.pf_kv_cont.borrow_mut() = [None, None];
+        Ok(())
     }
 
     /// Incremental batched forward — process K candidate tokens at

@@ -1027,6 +1027,29 @@ impl ServerModel {
         match self { ServerModel::Qwen { name, .. } | ServerModel::Gemma { name, .. } => name }
     }
 
+    /// Free the runtime's idle prefill scratch once it holds more than
+    /// `budget` bytes. The pools key buffers by exact size, so without
+    /// this every distinct prompt length pins another scratch set
+    /// (~0.45 MB/token on the 27B) until the card runs out.
+    fn trim_scratch_over(&mut self, budget: usize) {
+        let (held, r) = match self {
+            ServerModel::Qwen { gpu, .. } => {
+                let held = gpu.scratch_bytes();
+                (held, if held > budget { gpu.trim_scratch() } else { Ok(()) })
+            }
+            ServerModel::Gemma { gpu, state, .. } => {
+                let held = gpu.scratch_bytes();
+                (held, if held > budget { gpu.trim_scratch(state) } else { Ok(()) })
+            }
+        };
+        if held > budget {
+            match r {
+                Ok(()) => info!("freed {:.0} MiB of idle prefill scratch", held as f64 / 1048576.0),
+                Err(e) => warn!("prefill scratch trim failed: {e}"),
+            }
+        }
+    }
+
     /// Whether the rendered prompt ends inside an open thinking block,
     /// so the response starts as reasoning with no opener of its own:
     /// Qwen's template primes `<think>\n` whenever thinking is on; a raw
@@ -1402,6 +1425,11 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
         }
     };
     info!("ready — serving requests.");
+    // Idle prefill scratch kept between requests (repeat prompt lengths
+    // reuse it, and Gemma replays its captured prefill graph); past this
+    // it is freed after the request. REINSTINCT_SERVE_SCRATCH_MB overrides.
+    let scratch_budget = std::env::var("REINSTINCT_SERVE_SCRATCH_MB").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20;
 
     for job in rx {
         let reply = match job.req {
@@ -1502,6 +1530,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     };
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
+                    model.trim_scratch_over(scratch_budget);
                     match result {
                         Ok(Ok((text, n_p, n_c, eos, lp))) => {
                             let wall_us = t.elapsed().as_micros() as u64;

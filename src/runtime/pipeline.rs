@@ -179,6 +179,20 @@ impl Qwen35Pipeline {
 
     pub fn n_stages(&self) -> usize { self.stages.len() }
 
+    /// Idle prefill scratch across all stages (`GpuQwen35::scratch_bytes`).
+    pub fn scratch_bytes(&self) -> usize {
+        self.stages.iter().map(|s| s.gpu.scratch_bytes()).sum()
+    }
+
+    /// Release every stage's idle prefill scratch.
+    pub fn trim_scratch(&self) -> Result<(), String> {
+        for s in &self.stages {
+            set_dev(s.dev)?;
+            s.gpu.trim_scratch()?;
+        }
+        set_dev(self.stages[0].dev)
+    }
+
     /// `(device, block range)` per stage.
     pub fn layout(&self) -> Vec<(i32, Range<usize>)> {
         self.stages.iter().map(|s| {
