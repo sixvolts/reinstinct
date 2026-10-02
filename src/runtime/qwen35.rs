@@ -4909,11 +4909,38 @@ mod tests {
         crate::test_support::qwen_fixture()
     }
 
+    /// These tests each build a whole-model GpuQwen35 on device 0; two at
+    /// once overrun a 32 GB card with the 27B fixture. Serialize them.
+    static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+        GPU_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The fixture, only when it is small enough to dequantize whole on
+    /// the host. These oracles materialise the model (or its embedding
+    /// and output matrices) as f32 — ~4 bytes/param, ~100 GB for the
+    /// default 27B fixture, which takes the machine down with a global
+    /// OOM. Point REINSTINCT_GGUF_FIXTURE at a small Qwen (e.g. 0.8B)
+    /// to run them.
+    fn small_fixture_path() -> Option<PathBuf> {
+        const MAX_BYTES: u64 = 3 << 30;
+        let p = fixture_path()?;
+        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
+        if len > MAX_BYTES {
+            eprintln!("skipping: {} is {:.1} GB; this oracle dequantizes the model to f32 on \
+                       the host — set REINSTINCT_GGUF_FIXTURE to a <= 3 GB Qwen",
+                      p.display(), len as f64 / (1u64 << 30) as f64);
+            return None;
+        }
+        Some(p)
+    }
+
     #[test]
     fn embed_norm_proj_matches_cpu_chain() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -4976,9 +5003,10 @@ mod tests {
 
     #[test]
     fn swiglu_ffn_matches_cpu_for_real_block() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5041,9 +5069,10 @@ mod tests {
 
     #[test]
     fn forward_token_matches_cpu_oracle() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5113,9 +5142,10 @@ mod tests {
 
     #[test]
     fn forward_tokens_batched_matches_sequential() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return }
         };
@@ -5159,10 +5189,11 @@ mod tests {
 
     #[test]
     fn forward_tokens_matches_repeated_forward_token_gpu() {
+        let _gpu = gpu_lock();
         // Multi-token wrapper bit-equivalence (same stream → same logits).
         if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip"); return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { eprintln!("skip"); return };
+        let Some(path) = small_fixture_path() else { eprintln!("skip"); return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5189,6 +5220,7 @@ mod tests {
 
     #[test]
     fn linear_attention_step_matches_cpu_for_real_block() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
         let Some(path) = fixture_path() else { return };
@@ -5269,6 +5301,7 @@ mod tests {
 
     #[test]
     fn linear_attention_block_matches_cpu_for_real_block() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
         let Some(path) = fixture_path() else { return };
@@ -5320,8 +5353,13 @@ mod tests {
             let mut cpu_state_out = input.clone();
             linear_attention_block(&mut cpu_state_out, weights, cfg, &mut cpu_state);
 
-            let gpu_state_out = gpu.apply_linear_attention_block(&input, &gpu_block, &mut gpu_state)
-                .expect("gpu GDN block");
+            // The fp oracle path needs on-disk kernels; UD mixes put
+            // IQ4_XS on some tensors, which only exist repacked (int8).
+            let gpu_state_out = match gpu.apply_linear_attention_block(&input, &gpu_block, &mut gpu_state) {
+                Ok(o) => o,
+                Err(e) if e.contains("no kernel") => { eprintln!("skipping: {e}"); return; }
+                Err(e) => panic!("gpu GDN block: {e}"),
+            };
 
             const ABS_TOL: f32 = 5.0e-3;
             const REL_TOL: f32 = 5.0e-3;
@@ -5345,6 +5383,7 @@ mod tests {
 
     #[test]
     fn full_attention_block_matches_cpu_for_real_block() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
         let Some(path) = fixture_path() else { return };
@@ -5422,9 +5461,10 @@ mod tests {
 
     #[test]
     fn full_attention_step_matches_cpu_for_real_block() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
@@ -5515,9 +5555,10 @@ mod tests {
 
     #[test]
     fn embed_norm_proj_is_deterministic() {
+        let _gpu = gpu_lock();
         if crate::test_support::gpu().is_none() { return; }
         let _dev = hip::Device::set(0).unwrap();
-        let Some(path) = fixture_path() else { return };
+        let Some(path) = small_fixture_path() else { return };
         let cache = match KernelCache::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: kernel cache: {e}"); return }
