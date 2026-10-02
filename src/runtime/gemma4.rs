@@ -2929,7 +2929,35 @@ impl GpuGemma4 {
     /// first and each layer's attention then reads the cache rows it
     /// needs dequantized back to f32 — the same values decode reads.
     /// That path is never graph-captured.
+    ///
+    /// Inputs over REINSTINCT_SINGLE_PREFILL_CHUNK tokens (default 2048)
+    /// go through in equal chunks, each continuing from the cache, so
+    /// prefill scratch is bounded by the chunk rather than the prompt
+    /// (an unchunked 31B prefill ran out of VRAM near 10-12K tokens).
+    /// Not with a DFlash tap or SuperQuant, whose continuation is
+    /// unsupported.
     pub fn prefill_forward_at(&self, tokens: &[u32], state: &mut Gemma4GpuState, base: usize)
+        -> Result<Vec<f32>, String>
+    {
+        let max = std::env::var("REINSTINCT_SINGLE_PREFILL_CHUNK").ok()
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048);
+        let p = tokens.len();
+        if p <= max || state.tap.is_some() || state.superquant.is_some() {
+            return self.prefill_chunk_at(tokens, state, base);
+        }
+        let chunk = p.div_ceil(p.div_ceil(max)).div_ceil(64) * 64;
+        let mut logits = Vec::new();
+        let mut at = 0;
+        while at < p {
+            let end = (at + chunk).min(p);
+            logits = self.prefill_chunk_at(&tokens[at..end], state, base + at)?;
+            at = end;
+        }
+        Ok(logits)
+    }
+
+    /// One prefill pass over `tokens` at positions `[base, base + P)`.
+    fn prefill_chunk_at(&self, tokens: &[u32], state: &mut Gemma4GpuState, base: usize)
         -> Result<Vec<f32>, String>
     {
         let p = tokens.len();
