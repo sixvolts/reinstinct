@@ -2736,14 +2736,16 @@ impl GpuQwen35 {
     {
         match ffn {
             BlockFfn::Dense(d) => self.step_swiglu_ffn(input_ptr, output_ptr, d, false),
-            BlockFfn::Moe(m)   => self.step_moe_ffn(input_ptr, output_ptr, m),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(input_ptr, output_ptr, m, false),
         }
     }
 
     /// Qwen MoE FFN for one token: router → top-k routed experts (SwiGLU)
     /// → sigmoid-gated shared expert. Writes `output_ptr` [hidden].
-    fn step_moe_ffn(&self, input_ptr: *mut c_void, output_ptr: *mut c_void, w: &GpuMoeFfn)
-        -> Result<(), String>
+    /// `prequant`: `self.xq8` already holds `input` quantized (the fused
+    /// add_rmsnorm_q8 that produced it wrote both), as in step_swiglu_ffn.
+    fn step_moe_ffn(&self, input_ptr: *mut c_void, output_ptr: *mut c_void, w: &GpuMoeFfn,
+                    prequant: bool) -> Result<(), String>
     {
         let moe = self.moe.as_ref().expect("step_moe_ffn on a non-MoE model");
         let h  = self.hidden as u32;
@@ -2753,17 +2755,19 @@ impl GpuQwen35 {
 
         self.prof_lap("attn+norm");
         // --- Router: logits → top-k expert ids + renormalised weights ---
-        self.launch_matvec_dispatch(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
+        // The int8 copy of `input` in xq8 serves the router (if it is a
+        // quantized tensor), the routed gate/up and the shared gate/up.
+        if !prequant { self.launch_quantize_q8(input_ptr, h)?; }
+        self.prof_lap("moe_quant_in");
+        self.launch_matvec_prequant(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
         self.prof_lap("router_matvec");
         self.launch_moe_topk(moe, 1)?;
         self.prof_lap("router_topk");
 
-        // --- Routed experts --- shared int8 activation, quantised once.
+        // --- Routed experts --- on the shared int8 activation.
         // (Routed result lands in e_out; the combine into `output` is
         //  deferred until the shared expert has read `input` — callers
         //  pass input == output, so the combine would clobber it.)
-        self.launch_quantize_q8(input_ptr, h)?;
-        self.prof_lap("moe_quant_in");
         // Fused gate+up+SwiGLU when both expert slabs are Q4_K (one
         // launch vs three); otherwise the unfused path.
         if w.gate_exps.dtype == GgmlType::Q4_K && w.up_exps.dtype == GgmlType::Q4_K {
@@ -2787,11 +2791,13 @@ impl GpuQwen35 {
 
         // --- Shared expert --- runs every token, scaled by a sigmoid gate.
         // Reads `input` — must finish before the combine writes `output`.
-        self.launch_matvec_dispatch(&w.gate_shexp, input_ptr, moe.sh_gate.raw_ptr())?;
-        self.launch_matvec_dispatch(&w.up_shexp,   input_ptr, moe.sh_up.raw_ptr())?;
-        self.launch_swiglu(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
-                           moe.sh_gate.raw_ptr(), shff)?;
-        self.launch_matvec_dispatch(&w.down_shexp, moe.sh_gate.raw_ptr(),
+        // gate/up read the xq8 copy of `input` (the routed down used its
+        // own xq8_exp); the fused SwiGLU re-quantizes into xq8 for down.
+        self.launch_matvec_prequant(&w.gate_shexp, input_ptr, moe.sh_gate.raw_ptr())?;
+        self.launch_matvec_prequant(&w.up_shexp,   input_ptr, moe.sh_up.raw_ptr())?;
+        self.launch_swiglu_q8(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
+                              moe.sh_gate.raw_ptr(), shff)?;
+        self.launch_matvec_prequant(&w.down_shexp, moe.sh_gate.raw_ptr(),
                                     moe.sh_out.raw_ptr())?;
         self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
                                    w.gate_inp_shexp.raw_ptr(), 1)?;
@@ -3264,7 +3270,7 @@ impl GpuQwen35 {
                                    self.rms_eps)?;
         match &weights.ffn {
             BlockFfn::Dense(d) => self.step_swiglu_ffn(self.normed.raw_ptr(), scratch, d, true),
-            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m, true),
         }
     }
 
@@ -3291,7 +3297,7 @@ impl GpuQwen35 {
                                    self.rms_eps)?;
         match &weights.ffn {
             BlockFfn::Dense(d) => self.step_swiglu_ffn(self.normed.raw_ptr(), scratch, d, true),
-            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m),
+            BlockFfn::Moe(m)   => self.step_moe_ffn(self.normed.raw_ptr(), scratch, m, true),
         }
     }
 
@@ -3690,7 +3696,7 @@ impl GpuQwen35 {
                         self.hidden_b.raw_ptr()));
                 }
                 BlockFfn::Moe(m) => {
-                    traced!("moe_ffn", self.step_moe_ffn(normed, self.hidden_b.raw_ptr(), m));
+                    traced!("moe_ffn", self.step_moe_ffn(normed, self.hidden_b.raw_ptr(), m, true));
                 }
             }
             traced!("add_inplace", self.launch_add_inplace(self.hidden_a.raw_ptr(),
