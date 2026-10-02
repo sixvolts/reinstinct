@@ -40,11 +40,18 @@ fn bytes_to_unicode() -> [char; 256] {
     out
 }
 
-/// Qwen2-family pre-tokenizer regex. Qwen 2 / 2.5 / 3 (and the "qwen35"
-/// pre type) all use this split pattern; it isolates contractions,
-/// letter runs, number runs, punctuation runs, and whitespace.
+/// Qwen2-family pre-tokenizer regex (Qwen 2 / 2.5 / 3): isolates
+/// contractions, letter runs, number runs, punctuation runs, and
+/// whitespace.
 const QWEN_PRETOKENIZER_REGEX: &str =
     r#"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#;
+
+/// `tokenizer.ggml.pre = "qwen35"` (Qwen 3.5+): the same split with
+/// combining marks (\p{M}) counted as letters, so a Devanagari, Thai or
+/// decomposed-accent word stays one pre-token (llama.cpp
+/// LLAMA_VOCAB_PRE_TYPE_QWEN35).
+const QWEN35_PRETOKENIZER_REGEX: &str =
+    r#"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#;
 
 pub struct Tokenizer {
     /// Vocab table: token_id → vocab string (in GPT2 byte-encoded form).
@@ -122,7 +129,11 @@ impl Tokenizer {
             _ => return Err("missing tokenizer.ggml.merges".into()),
         };
 
-        let pre_regex = fancy_regex::Regex::new(QWEN_PRETOKENIZER_REGEX)
+        let pre = match gguf.metadata_get("tokenizer.ggml.pre") {
+            Some(MetaValue::String(p)) if p == "qwen35" => QWEN35_PRETOKENIZER_REGEX,
+            _ => QWEN_PRETOKENIZER_REGEX,
+        };
+        let pre_regex = fancy_regex::Regex::new(pre)
             .map_err(|e| format!("compile pre-tokenizer regex: {e}"))?;
 
         Ok(Self { tokens, byte_decoder, byte_encoder, vocab_map, merge_ranks,
