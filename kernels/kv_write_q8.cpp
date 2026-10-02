@@ -14,10 +14,11 @@ void kv_write_q8_f32(const float*        __restrict__ src,      // [n_kv, head_d
                      float*              __restrict__ dst_s,    // [max_seq, n_kv]
                      const unsigned int* __restrict__ pos_ptr,
                      unsigned int n_kv,
-                     unsigned int head_dim)
+                     unsigned int head_dim,
+                     unsigned int ring_mask)   // slot = position & ring_mask
 {
     const unsigned int h   = blockIdx.x;
-    const unsigned int pos = *pos_ptr;
+    const unsigned int pos = *pos_ptr & ring_mask;
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
     const float* sh = src + (size_t)h * head_dim;

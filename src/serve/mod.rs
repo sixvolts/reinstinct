@@ -1366,9 +1366,12 @@ impl ServerModel {
                 } else if let Some((idx, c)) = prefix_cache.best_match(&prompt) {
                     let snap = prefix_cache.touch(idx);
                     state.restore(snap)?;
-                    state.truncate(c);
-                    overlap = c;
-                    true
+                    // A sliding-window ring can't move back further than
+                    // its slack: then this snapshot is no use, start over.
+                    match state.truncate(c) {
+                        Ok(()) => { overlap = c; true }
+                        Err(e) => { info!("prefix cache: {e}; full prefill"); state.reset(); false }
+                    }
                 } else {
                     state.reset();
                     false

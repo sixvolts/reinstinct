@@ -285,7 +285,7 @@ impl GpuGemma4Assistant {
                                    kv.k.raw_ptr(), kv.ks.raw_ptr(),
                                    kv.v.raw_ptr(), kv.vs.raw_ptr(),
                                    self.attn_out.raw_ptr(),
-                                   n_kv, head_dim, window)?;
+                                   n_kv, head_dim, window, kv.ring_mask)?;
 
             target.launch_matvec(&b.attn_output,
                                  self.attn_out.raw_ptr(), self.block_b.raw_ptr())?;

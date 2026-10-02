@@ -29,6 +29,10 @@
 // at one position overran LDS when replayed at a later one, and full
 // layers capped out at ~15.8K positions in 64 KB.)
 //
+// `ring_mask`: cache rows are stored at slot (position & ring_mask) — a
+// sliding-window layer's cache is a power-of-two ring of the last
+// positions; ~0u for a full-length cache (slot = position).
+//
 // grid = (n_heads, n_q_rows); block = 256 (4 wave64s); head_dim <= 512
 // and a multiple of 4.
 
@@ -77,7 +81,8 @@ void attn_step_q8_batched_body(const float*       __restrict__ q,
                                unsigned int base_pos,
                                unsigned int n_q_rows,
                                unsigned int window,
-                               float        scaling)
+                               float        scaling,
+                               unsigned int ring_mask)
 {
     __shared__ int   qi32[512 / 4];
     __shared__ float p[AQB_BS];
@@ -120,7 +125,7 @@ void attn_step_q8_batched_body(const float*       __restrict__ q,
         // --- this chunk's scores: one key per thread ---
         float sc = -INFINITY;
         if (tid < n) {
-            const int t = c0 + tid;
+            const int t = (int)((unsigned)(c0 + tid) & ring_mask);
             const int* k32 = reinterpret_cast<const int*>(
                 k_cache + (size_t)t * kv_row + (size_t)kv_h * head_dim);
             int idot = 0;
@@ -133,7 +138,7 @@ void attn_step_q8_batched_body(const float*       __restrict__ q,
         const float alpha = __expf(m - m_new);          // 0 on the first chunk
         const float e     = tid < n ? __expf(sc - m_new) : 0.0f;
         // P carries the per-token V scale; l sums the plain weights.
-        p[tid] = tid < n ? e * v_scale[(size_t)(c0 + tid) * n_kv_heads + kv_h] : 0.0f;
+        p[tid] = tid < n ? e * v_scale[(size_t)((unsigned)(c0 + tid) & ring_mask) * n_kv_heads + kv_h] : 0.0f;
         l = l * alpha + aqb_block_sum(e, red);          // its barrier publishes p[]
         m = m_new;
         // --- P.V over the chunk, dims tid, tid + bs ---
@@ -141,9 +146,10 @@ void attn_step_q8_batched_body(const float*       __restrict__ q,
         for (int j = 0; j < AQB_DPT; j++) {
             const int d = tid + j * AQB_BS;
             if (d < (int)head_dim) {
-                const signed char* vp = v_cache + (size_t)c0 * kv_row + (size_t)kv_h * head_dim + d;
+                const signed char* vp = v_cache + (size_t)kv_h * head_dim + d;
                 float a = 0.0f;
-                for (int s = 0; s < n; s++) a += p[s] * (float)vp[(size_t)s * kv_row];
+                for (int s = 0; s < n; s++)
+                    a += p[s] * (float)vp[(size_t)((unsigned)(c0 + s) & ring_mask) * kv_row];
                 acc[j] = acc[j] * alpha + a;
             }
         }
@@ -172,11 +178,12 @@ void attn_step_q8_batched_f32(const float*       __restrict__ q,
                               unsigned int base_pos,
                               unsigned int n_q_rows,
                               unsigned int window,
-                              float        scaling)
+                              float        scaling,
+                              unsigned int ring_mask)
 {
     attn_step_q8_batched_body(q, k_cache, k_scale, v_cache, v_scale, out,
                               n_heads, n_kv_heads, head_dim, base_pos,
-                              n_q_rows, window, scaling);
+                              n_q_rows, window, scaling, ring_mask);
 }
 
 // Variant that reads `base_pos` from a device-resident uint32 — used
@@ -195,9 +202,10 @@ void attn_step_q8_batched_offset_f32(const float*       __restrict__ q,
                                      const unsigned int* __restrict__ base_pos_ptr,
                                      unsigned int n_q_rows,
                                      unsigned int window,
-                                     float        scaling)
+                                     float        scaling,
+                                     unsigned int ring_mask)
 {
     attn_step_q8_batched_body(q, k_cache, k_scale, v_cache, v_scale, out,
                               n_heads, n_kv_heads, head_dim, *base_pos_ptr,
-                              n_q_rows, window, scaling);
+                              n_q_rows, window, scaling, ring_mask);
 }

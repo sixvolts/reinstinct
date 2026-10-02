@@ -12,6 +12,10 @@
 // per row, reduced across the row's lanes with DPP; softmax runs online
 // per TILE tokens; partial (m, l, o) into the buffers the merge reads.
 //
+// `ring_mask`: cache rows are stored at slot (position & ring_mask) — a
+// sliding-window layer's cache is a power-of-two ring of the last
+// positions; ~0u for a full-length cache (slot = position).
+//
 // Compiled with `#define HD <head_dim>` (a multiple of 64 up to 512) and
 // `#define GH <query heads per group>` prepended by the launcher.
 #include <hip/hip_runtime.h>
@@ -93,7 +97,8 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
                             const unsigned int* __restrict__ pos_ptr,
                             unsigned int window,
                             float        scaling,
-                            unsigned int n_splits)
+                            unsigned int n_splits,
+                            unsigned int ring_mask)
 {
     __shared__ float s_p[GH][TILE];
     __shared__ float s_red[NW][GH];
@@ -187,7 +192,7 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
             #pragma unroll
             for (int u = 0; u < UNR; u++) {
                 const int i = (st + u) * TPB + wave * TPW + tl;
-                const int t = t0 + min(i, tn - 1);
+                const int t = (int)((unsigned)(t0 + min(i, tn - 1)) & ring_mask);
                 kk[u] = load_row(kbase + (size_t)t * kv_row);
                 dk[u] = ks[(size_t)t * n_kv_heads];
             }
@@ -256,7 +261,7 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
             #pragma unroll
             for (int u = 0; u < UNR; u++) {
                 const int i = (st + u) * TPB + wave * TPW + tl;
-                const int t = t0 + min(i, tn - 1);
+                const int t = (int)((unsigned)(t0 + min(i, tn - 1)) & ring_mask);
                 vv[u] = load_row(vbase + (size_t)t * kv_row);
                 dv[u] = vs[(size_t)t * n_kv_heads];
             }

@@ -2622,7 +2622,7 @@ mod tests {
         // softmax exists for.
         for &(n_heads, n_kv, head_dim, window, qscale) in
             &[(32usize, 16usize, 256usize, 1024u32, 4.0f32), (32, 4, 512, 0, 4.0), (32, 4, 512, 0, 160.0)] {
-            let positions: Vec<usize> = if big { vec![5, 300, 4000, 15000, 20000] } else { vec![5, 300, 1500] };
+            let positions: Vec<usize> = if big { vec![5, 300, 4000, 15000, 20000] } else { vec![5, 300, 1500, 3000] };
             let max_seq = positions.iter().max().unwrap() + n_rows;
             let kv_dim = n_kv * head_dim;
             let mut sd: u64 = 0x5EED_A77E ^ head_dim as u64;
@@ -2639,26 +2639,53 @@ mod tests {
             let dout: DeviceBuf<f32> = DeviceBuf::new(n_rows * n_heads * head_dim).unwrap();
             let scaling = 1.0f32 / (head_dim as f32).sqrt();
             for &base in &positions {
-                let launch = |func: &crate::hip::Function, smem: u32| {
+                // (k, v, ks, vs) buffers and ring mask for a launch.
+                type Kv<'a> = (&'a DeviceBuf<i8>, &'a DeviceBuf<i8>, &'a DeviceBuf<f32>, &'a DeviceBuf<f32>, u32);
+                let full: Kv = (&dk, &dv, &dks, &dvs, u32::MAX);
+                let launch_kv = |func: &crate::hip::Function, smem: u32, kv: Kv| {
                     let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
-                        (dq.raw_ptr(), dk.raw_ptr(), dks.raw_ptr(), dv.raw_ptr(), dvs.raw_ptr(), dout.raw_ptr());
-                    let (mut nh, mut nk, mut hd, mut bp, mut nr, mut wn, mut sc) =
-                        (n_heads as u32, n_kv as u32, head_dim as u32, base as u32, n_rows as u32, window, scaling);
-                    let mut args: [*mut c_void; 13] = [
+                        (dq.raw_ptr(), kv.0.raw_ptr(), kv.2.raw_ptr(), kv.1.raw_ptr(), kv.3.raw_ptr(), dout.raw_ptr());
+                    let (mut nh, mut nk, mut hd, mut bp, mut nr, mut wn, mut sc, mut rm) =
+                        (n_heads as u32, n_kv as u32, head_dim as u32, base as u32, n_rows as u32, window, scaling, kv.4);
+                    let mut args: [*mut c_void; 14] = [
                         &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
                         &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
                         &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void,
                         &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
                         &mut hd as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
                         &mut nr as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-                        &mut sc as *mut _ as *mut c_void];
+                        &mut sc as *mut _ as *mut c_void, &mut rm as *mut _ as *mut c_void];
                     unsafe { func.launch((n_heads as u32, n_rows as u32, 1), (256, 1, 1), smem,
                                          Some(&stream), &mut args).unwrap(); }
                 };
+                let launch = |func: &crate::hip::Function, smem: u32| launch_kv(func, smem, full);
                 launch(&f, 0);
                 stream.synchronize().unwrap();
                 let mut got = vec![0f32; n_rows * n_heads * head_dim];
                 dout.copy_to_host(&mut got).unwrap();
+                // Sliding window: the same cache as a 2048-slot ring (the
+                // runtime's for window 1024), position t at slot t & 2047,
+                // must give bit-identical output once the ring has wrapped.
+                if window > 0 && base + n_rows > 2048 {
+                    let rr = 2048usize;
+                    let mut rk = vec![0i8; rr * kv_dim]; let mut rv = vec![0i8; rr * kv_dim];
+                    let mut rks = vec![0f32; rr * n_kv]; let mut rvs = vec![0f32; rr * n_kv];
+                    for t in 0..base + n_rows {
+                        let sl = t & (rr - 1);
+                        rk[sl * kv_dim..(sl + 1) * kv_dim].copy_from_slice(&kc[t * kv_dim..(t + 1) * kv_dim]);
+                        rv[sl * kv_dim..(sl + 1) * kv_dim].copy_from_slice(&vc[t * kv_dim..(t + 1) * kv_dim]);
+                        rks[sl * n_kv..(sl + 1) * n_kv].copy_from_slice(&ksc[t * n_kv..(t + 1) * n_kv]);
+                        rvs[sl * n_kv..(sl + 1) * n_kv].copy_from_slice(&vsc[t * n_kv..(t + 1) * n_kv]);
+                    }
+                    let (bk, bv) = (DeviceBuf::from_slice(&rk).unwrap(), DeviceBuf::from_slice(&rv).unwrap());
+                    let (bks, bvs) = (DeviceBuf::from_slice(&rks).unwrap(), DeviceBuf::from_slice(&rvs).unwrap());
+                    launch_kv(&f, 0, (&bk, &bv, &bks, &bvs, (rr - 1) as u32));
+                    stream.synchronize().unwrap();
+                    let mut ring = vec![0f32; got.len()];
+                    dout.copy_to_host(&mut ring).unwrap();
+                    assert!(ring == got, "ring cache output differs at base {base}");
+                    eprintln!("hd {head_dim} window {window} base {base}: 2048-slot ring output identical");
+                }
                 // CPU reference over the same int8 data (Q quantised the
                 // kernel's way: per-row amax / 127, round to nearest).
                 let groups = n_heads / n_kv;
@@ -2794,7 +2821,8 @@ mod tests {
                     let mut op = dop.raw_ptr(); let mut mpp = dmp.raw_ptr(); let mut lp = dlp.raw_ptr();
                     let mut nh = n_heads as u32; let mut nkv = n_kv as u32; let mut hd = head_dim as u32;
                     let mut pp = dpos.raw_ptr(); let mut wn = window; let mut sc = 1.0f32; let mut ns = n_splits;
-                    let mut pargs: [*mut c_void; 15] = [
+                    let mut rm = u32::MAX;
+                    let mut pargs: [*mut c_void; 16] = [
                         &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
                         &mut ksa as *mut _ as *mut c_void, &mut va as *mut _ as *mut c_void,
                         &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
@@ -2802,7 +2830,7 @@ mod tests {
                         &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
                         &mut hd as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
                         &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
-                        &mut ns as *mut _ as *mut c_void];
+                        &mut ns as *mut _ as *mut c_void, &mut rm as *mut _ as *mut c_void];
                     unsafe { fp.launch((n_heads as u32, n_splits, 1), (block, 1, 1), smem, Some(st), &mut pargs).unwrap(); }
                     merge(st, &dout);
                 };
@@ -2812,14 +2840,16 @@ mod tests {
                     let mut op = dop.raw_ptr(); let mut mpp = dmp.raw_ptr(); let mut lp = dlp.raw_ptr();
                     let mut nh = n_heads as u32; let mut nkv = n_kv as u32;
                     let mut pp = dpos.raw_ptr(); let mut wn = window; let mut sc = 1.0f32; let mut ns = n_splits;
-                    let mut pargs: [*mut c_void; 14] = [
+                    let mut rm = u32::MAX;
+                    let mut pargs: [*mut c_void; 15] = [
                         &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
                         &mut ksa as *mut _ as *mut c_void, &mut va as *mut _ as *mut c_void,
                         &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
                         &mut mpp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
                         &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
                         &mut pp as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-                        &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+                        &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void,
+                        &mut rm as *mut _ as *mut c_void];
                     let groups = (g + gh - 1) / gh;
                     unsafe { fg.launch((n_kv as u32 * groups, n_splits, 1), (block, 1, 1), 0, Some(st), &mut pargs).unwrap(); }
                     merge(st, &dout2);

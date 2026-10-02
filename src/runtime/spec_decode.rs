@@ -221,7 +221,7 @@ pub fn spec_decode_generate(
                 if d == eos { stats.hit_eos = true; rejected = true; break; }
                 if generated.len() >= max_tokens { rejected = true; break; }
             } else {
-                state.truncate(pre_verify_pos + i);
+                state.truncate(pre_verify_pos + i)?;
                 let new_verify = target.forward_token(replacement, state)?;
                 generated.push(replacement);
                 last_tok = replacement;

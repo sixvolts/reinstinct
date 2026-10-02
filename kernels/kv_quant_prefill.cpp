@@ -16,15 +16,21 @@
 #include <math.h>
 #include "gfx906_dpp.h"
 
+// Rows land at slot (base + p) & ring_mask. With a ring (ring_mask + 1 <
+// P) rows R apart share a slot; only the last R rows are kept — earlier
+// ones are skipped rather than raced (their later twin wins).
 extern "C" __global__
 void kv_quant_prefill_f32(const float* __restrict__ src,
                           signed char* __restrict__ dst_q,
                           float*       __restrict__ dst_s,
                           unsigned int n_kv,
-                          unsigned int head_dim)
+                          unsigned int head_dim,
+                          unsigned int base,
+                          unsigned int ring_mask)
 {
     const unsigned int h = blockIdx.x;
     const unsigned int p = blockIdx.y;
+    if (ring_mask != 0xFFFFFFFFu && p + ring_mask + 1u < gridDim.y) return;
     const int tid = threadIdx.x;
     const int bs  = blockDim.x;
     const float* sh = src + ((size_t)p * n_kv + h) * head_dim;
@@ -42,13 +48,14 @@ void kv_quant_prefill_f32(const float* __restrict__ src,
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
     const float inv   = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
 
-    signed char* dq = dst_q + ((size_t)p * n_kv + h) * head_dim;
+    const size_t row = (size_t)((base + p) & ring_mask);
+    signed char* dq = dst_q + (row * n_kv + h) * head_dim;
     for (int i = tid; i < (int)head_dim; i += bs) {
         int q = (int)rintf(sh[i] * inv);
         q = max(-127, min(127, q));
         dq[i] = (signed char)q;
     }
-    if (tid == 0) dst_s[(size_t)p * n_kv + h] = scale;
+    if (tid == 0) dst_s[row * n_kv + h] = scale;
 }
 
 // Variant that reads `base_pos` from a device-resident uint32, then
@@ -62,7 +69,8 @@ void kv_quant_prefill_offset_f32(const float* __restrict__ src,
                                  float*       __restrict__ dst_s_base,
                                  const unsigned int* __restrict__ base_pos_ptr,
                                  unsigned int n_kv,
-                                 unsigned int head_dim)
+                                 unsigned int head_dim,
+                                 unsigned int ring_mask)
 {
     const unsigned int h = blockIdx.x;
     const unsigned int p = blockIdx.y;
@@ -84,7 +92,7 @@ void kv_quant_prefill_offset_f32(const float* __restrict__ src,
     const float inv   = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
 
     const unsigned int base_pos = *base_pos_ptr;
-    const size_t row_idx = (size_t)(base_pos + p);
+    const size_t row_idx = (size_t)((base_pos + p) & ring_mask);
     signed char* dq = dst_q_base + (row_idx * n_kv + h) * head_dim;
     for (int i = tid; i < (int)head_dim; i += bs) {
         int q = (int)rintf(sh[i] * inv);
@@ -109,11 +117,12 @@ void kv_dequant_rows_f32(const signed char* __restrict__ src_q,
                          float*             __restrict__ dst,
                          unsigned int n_kv,
                          unsigned int head_dim,
-                         unsigned int row0)
+                         unsigned int row0,
+                         unsigned int ring_mask)
 {
     const unsigned int h = blockIdx.x;
     const unsigned int r = blockIdx.y;
-    const size_t src_row = (size_t)(row0 + r) * n_kv + h;
+    const size_t src_row = (size_t)((row0 + r) & ring_mask) * n_kv + h;
     const float s = src_s[src_row];
     const signed char* sq = src_q + src_row * head_dim;
     float* d = dst + ((size_t)r * n_kv + h) * head_dim;

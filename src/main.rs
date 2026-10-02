@@ -2560,7 +2560,7 @@ fn dflash_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
 
         // Drop the rejected tail from the target's KV, then feed the
         // accepted rows' context features to the drafter.
-        t_state.truncate(start + produced);
+        t_state.truncate(start + produced).map_err(anyhow::Error::msg)?;
         let tc = std::time::Instant::now();
         draft.append_context(&mut d_state, t_state.tap.as_ref().unwrap(), produced, start)
             .map_err(anyhow::Error::msg)?;

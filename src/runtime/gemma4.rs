@@ -414,28 +414,58 @@ impl GpuGemma4Block {
 /// one f32 scale per (token, head) — 4× smaller than f32, and the
 /// attention kernel dots K against a quantized Q via dp4a. Sliding and
 /// full layers have different (n_kv, head_dim), so each sizes its own.
+///
+/// A sliding-window layer only ever reads its last `window` positions,
+/// so its cache can be a ring: `rows` (a power of two) slots, position
+/// t at slot `t & ring_mask`. `len` and `max_seq` stay logical (a ring's
+/// `len` exceeds `rows`). Full-length caches have `rows == max_seq` and
+/// `ring_mask == !0`, i.e. slot = position.
 pub struct Gemma4KvCache {
-    k:  DeviceBuf<i8>,    // [max_seq, n_kv, head_dim]
+    k:  DeviceBuf<i8>,    // [rows, n_kv, head_dim]
     v:  DeviceBuf<i8>,
-    ks: DeviceBuf<f32>,   // [max_seq, n_kv]
+    ks: DeviceBuf<f32>,   // [rows, n_kv]
     vs: DeviceBuf<f32>,
     n_kv: usize,
     head_dim: usize,
     max_seq: usize,
+    rows: usize,
+    ring_mask: u32,
+    /// How far `len` may move back and still have the window behind the
+    /// new end in the ring (`rows - window`); usize::MAX without a ring.
+    slack: usize,
     len: usize,
 }
 
+/// Extra ring slots beyond the window: room for a spec-decode verify
+/// batch (≤ MAX_VERIFY_K new rows) and its rollback, and for a prefix-
+/// cache hit to truncate a restored snapshot back a little — anything
+/// that moves `len` back by up to `rows - window` keeps the window
+/// behind the new end intact.
+const SWA_RING_SLACK: usize = 256;
+
 impl Gemma4KvCache {
-    fn new(n_kv: usize, head_dim: usize, max_seq: usize) -> Result<Self, String> {
+    /// `rows < max_seq` makes a ring (`rows` a power of two; `window`
+    /// positions are what the layer reads).
+    fn new(n_kv: usize, head_dim: usize, max_seq: usize, rows: usize, window: usize)
+        -> Result<Self, String>
+    {
         let kv_dim = n_kv * head_dim;
+        let ring = rows < max_seq;
+        assert!(!ring || (rows.is_power_of_two() && rows >= window + SWA_RING_SLACK));
         Ok(Self {
-            k:  DeviceBuf::new(max_seq * kv_dim)?,
-            v:  DeviceBuf::new(max_seq * kv_dim)?,
-            ks: DeviceBuf::new(max_seq * n_kv)?,
-            vs: DeviceBuf::new(max_seq * n_kv)?,
-            n_kv, head_dim, max_seq, len: 0,
+            k:  DeviceBuf::new(rows * kv_dim)?,
+            v:  DeviceBuf::new(rows * kv_dim)?,
+            ks: DeviceBuf::new(rows * n_kv)?,
+            vs: DeviceBuf::new(rows * n_kv)?,
+            n_kv, head_dim, max_seq, rows,
+            ring_mask: if ring { rows as u32 - 1 } else { u32::MAX },
+            slack: if ring { rows - window } else { usize::MAX },
+            len: 0,
         })
     }
+
+    /// Slots holding data: `[0, min(len, rows))`.
+    fn stored(&self) -> usize { self.len.min(self.rows) }
 }
 
 /// Per-token mutable state: one KV cache per layer.
@@ -470,18 +500,38 @@ pub struct Gemma4GpuState {
 }
 
 impl Gemma4GpuState {
+    /// Sliding-window layers get a ring of the next power of two ≥
+    /// `window + SWA_RING_SLACK` slots when that is below `max_seq` (31B:
+    /// 2048 slots instead of max_seq — 416 of its 457 KB/token was SWA
+    /// cache it never read again). REINSTINCT_NO_SWA_RING=1 sizes every
+    /// cache to max_seq.
     pub fn new(model: &Gemma4Model, max_seq: usize) -> Result<Self, String> {
+        Self::new_inner(model, max_seq, std::env::var_os("REINSTINCT_NO_SWA_RING").is_none())
+    }
+
+    fn new_inner(model: &Gemma4Model, max_seq: usize, ring: bool) -> Result<Self, String> {
         let cfg = &model.config;
+        let window = cfg.sliding_window as usize;
+        let ring_rows = (window + SWA_RING_SLACK).next_power_of_two();
         let mut caches = Vec::with_capacity(cfg.block_count as usize);
         for layer in 0..cfg.block_count as usize {
+            let sliding = cfg.attn_kinds[layer] == AttnKind::Sliding;
+            let rows = if ring && sliding && ring_rows < max_seq { ring_rows } else { max_seq };
             caches.push(Gemma4KvCache::new(
                 cfg.kv_heads[layer] as usize,
                 cfg.head_dim(layer) as usize,
-                max_seq)?);
+                max_seq, rows, window)?);
         }
         Ok(Self { caches, superquant: None, pos: 0,
                   prefill_graphs: std::collections::HashMap::new(),
                   tap: None, tap_stride: 0 })
+    }
+
+    /// Smallest ring among the sliding-window caches (None without one):
+    /// a continuation prefill chunk must fit in it, since the chunk's own
+    /// rows are read back from the cache after they are written.
+    pub fn min_ring_rows(&self) -> Option<usize> {
+        self.caches.iter().filter(|c| c.rows < c.max_seq).map(|c| c.rows).min()
     }
 
     /// Opt-in constructor — allocates BOTH the standard int8 caches
@@ -495,7 +545,8 @@ impl Gemma4GpuState {
         config: crate::runtime::kv_superquant::SuperQuantConfig,
     ) -> Result<Self, String> {
         use crate::runtime::kv_superquant::SuperQuantKvCache;
-        let mut state = Self::new(model, max_seq)?;
+        // SuperQuant demotes from the standard caches by position: no ring.
+        let mut state = Self::new_inner(model, max_seq, false)?;
         let cfg = &model.config;
         let mut sq = Vec::with_capacity(cfg.block_count as usize);
         for layer in 0..cfg.block_count as usize {
@@ -590,22 +641,35 @@ impl Gemma4GpuState {
     pub fn kv_rows_to_host(&self, layer: usize, r0: usize, r1: usize)
         -> Result<(Vec<i8>, Vec<i8>, Vec<f32>, Vec<f32>), String>
     {
+        // Positions, not slots: a ring keeps position t at t & ring_mask
+        // (and only the last `rows` positions).
         let c = &self.caches[layer];
         assert!(r0 <= r1 && r1 <= c.max_seq, "kv_rows_to_host: bad range");
+        assert!(c.rows == c.max_seq || r1 - r0 <= c.rows, "kv_rows_to_host: range exceeds the ring");
         let kv_dim = c.n_kv * c.head_dim;
-        let mut k = vec![0i8; (r1 - r0) * kv_dim];
-        let mut v = vec![0i8; (r1 - r0) * kv_dim];
-        let mut ks = vec![0f32; (r1 - r0) * c.n_kv];
-        let mut vs = vec![0f32; (r1 - r0) * c.n_kv];
+        let (mut ka, mut va) = (vec![0i8; c.rows * kv_dim], vec![0i8; c.rows * kv_dim]);
+        let (mut ksa, mut vsa) = (vec![0f32; c.rows * c.n_kv], vec![0f32; c.rows * c.n_kv]);
         crate::hip::Device(0).synchronize()?;
-        c.k.copy_range_to_host(&mut k, r0 * kv_dim)?;
-        c.v.copy_range_to_host(&mut v, r0 * kv_dim)?;
-        c.ks.copy_range_to_host(&mut ks, r0 * c.n_kv)?;
-        c.vs.copy_range_to_host(&mut vs, r0 * c.n_kv)?;
+        c.k.copy_to_host(&mut ka)?;
+        c.v.copy_to_host(&mut va)?;
+        c.ks.copy_to_host(&mut ksa)?;
+        c.vs.copy_to_host(&mut vsa)?;
+        let (mut k, mut v, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for t in r0..r1 {
+            let sl = (t as u32 & c.ring_mask) as usize;
+            k.extend_from_slice(&ka[sl * kv_dim..(sl + 1) * kv_dim]);
+            v.extend_from_slice(&va[sl * kv_dim..(sl + 1) * kv_dim]);
+            ks.extend_from_slice(&ksa[sl * c.n_kv..(sl + 1) * c.n_kv]);
+            vs.extend_from_slice(&vsa[sl * c.n_kv..(sl + 1) * c.n_kv]);
+        }
         Ok((k, v, ks, vs))
     }
 
     pub fn n_layers(&self) -> usize { self.caches.len() }
+
+    /// Physical rows of layer `layer`'s cache (its ring size, or max_seq).
+    #[doc(hidden)]
+    pub fn kv_layer_rows(&self, layer: usize) -> usize { self.caches[layer].rows }
 
     pub fn reset(&mut self) {
         for c in &mut self.caches { c.len = 0; }
@@ -620,7 +684,7 @@ impl Gemma4GpuState {
     /// rejection: the rejected slot's KV is unused (overwritten when
     /// the replacement token is forwarded), so just reset the
     /// high-water-marks.
-    pub fn truncate(&mut self, new_len: usize) {
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), String> {
         // SuperQuant doesn't support truncate (would need per-tier
         // rollback + potential cold→warm re-promotion). Spec-decode
         // is incompatible with SuperQuant for now; the public path
@@ -630,10 +694,20 @@ impl Gemma4GpuState {
                     (would need per-tier rollback). Disable SuperQuant for \
                     spec-decode workloads.");
         }
+        // A ring only holds the window behind its end plus `slack` rows:
+        // moving the end back further would leave the new window's rows
+        // already overwritten.
+        if let Some(c) = self.caches.iter()
+            .find(|c| c.len > new_len && c.len - new_len > c.slack)
+        {
+            return Err(format!("truncate: {} -> {new_len} moves back further than the \
+                sliding-window ring keeps ({} rows past its window)", c.len, c.slack));
+        }
         for c in &mut self.caches {
             c.len = new_len.min(c.max_seq);
         }
         self.pos = new_len;
+        Ok(())
     }
 
     /// Snapshot the populated portion of every layer's KV cache plus
@@ -645,7 +719,7 @@ impl Gemma4GpuState {
     /// snapshot before taking it.
     pub fn snapshot_bytes(&self, len: Option<usize>) -> usize {
         self.caches.iter().map(|c| {
-            let l = len.unwrap_or(c.len).min(c.max_seq);
+            let l = len.unwrap_or(c.len).min(c.max_seq).min(c.rows);
             l * (2 * c.n_kv * c.head_dim + 2 * 4 * c.n_kv)
         }).sum()
     }
@@ -658,20 +732,22 @@ impl Gemma4GpuState {
         }
         let mut layers = Vec::with_capacity(self.caches.len());
         for c in &self.caches {
+            // Slots verbatim — right before and after a ring wraps.
             let kv_dim = c.n_kv * c.head_dim;
-            let k  = DeviceBuf::new(c.len * kv_dim)?;
-            let v  = DeviceBuf::new(c.len * kv_dim)?;
-            let ks = DeviceBuf::new(c.len * c.n_kv)?;
-            let vs = DeviceBuf::new(c.len * c.n_kv)?;
-            if c.len > 0 {
-                k .copy_range_from_device(&c.k,  0, 0, c.len * kv_dim)?;
-                v .copy_range_from_device(&c.v,  0, 0, c.len * kv_dim)?;
-                ks.copy_range_from_device(&c.ks, 0, 0, c.len * c.n_kv)?;
-                vs.copy_range_from_device(&c.vs, 0, 0, c.len * c.n_kv)?;
+            let n = c.stored();
+            let k  = DeviceBuf::new(n * kv_dim)?;
+            let v  = DeviceBuf::new(n * kv_dim)?;
+            let ks = DeviceBuf::new(n * c.n_kv)?;
+            let vs = DeviceBuf::new(n * c.n_kv)?;
+            if n > 0 {
+                k .copy_range_from_device(&c.k,  0, 0, n * kv_dim)?;
+                v .copy_range_from_device(&c.v,  0, 0, n * kv_dim)?;
+                ks.copy_range_from_device(&c.ks, 0, 0, n * c.n_kv)?;
+                vs.copy_range_from_device(&c.vs, 0, 0, n * c.n_kv)?;
             }
             layers.push(Gemma4LayerSnapshot {
                 k, v, ks, vs,
-                n_kv: c.n_kv, head_dim: c.head_dim, len: c.len,
+                n_kv: c.n_kv, head_dim: c.head_dim, len: c.len, rows: c.rows,
             });
         }
         Ok(Gemma4StateSnapshot { layers, pos: self.pos })
@@ -696,12 +772,17 @@ impl Gemma4GpuState {
                 return Err(format!("restore: layer {i} snapshot len {} > cache max_seq {}",
                                    l.len, c.max_seq));
             }
-            if l.len > 0 {
+            if l.rows != c.rows {
+                return Err(format!("restore: layer {i} snapshot ring of {} rows, cache has {}",
+                                   l.rows, c.rows));
+            }
+            let n = l.len.min(l.rows);
+            if n > 0 {
                 let kv_dim = c.n_kv * c.head_dim;
-                c.k .copy_range_from_device(&l.k,  0, 0, l.len * kv_dim)?;
-                c.v .copy_range_from_device(&l.v,  0, 0, l.len * kv_dim)?;
-                c.ks.copy_range_from_device(&l.ks, 0, 0, l.len * c.n_kv)?;
-                c.vs.copy_range_from_device(&l.vs, 0, 0, l.len * c.n_kv)?;
+                c.k .copy_range_from_device(&l.k,  0, 0, n * kv_dim)?;
+                c.v .copy_range_from_device(&l.v,  0, 0, n * kv_dim)?;
+                c.ks.copy_range_from_device(&l.ks, 0, 0, n * c.n_kv)?;
+                c.vs.copy_range_from_device(&l.vs, 0, 0, n * c.n_kv)?;
             }
             c.len = l.len;
         }
@@ -724,6 +805,8 @@ pub struct LayerKvView<'a> {
     pub head_dim: usize,
     pub len: usize,
     pub max_seq: usize,
+    /// Slot of position t is `t & ring_mask` (!0 for a full-length cache).
+    pub ring_mask: u32,
 }
 
 impl Gemma4GpuState {
@@ -734,7 +817,7 @@ impl Gemma4GpuState {
         LayerKvView {
             k: &c.k, v: &c.v, ks: &c.ks, vs: &c.vs,
             n_kv: c.n_kv, head_dim: c.head_dim,
-            len: c.len, max_seq: c.max_seq,
+            len: c.len, max_seq: c.max_seq, ring_mask: c.ring_mask,
         }
     }
 }
@@ -765,6 +848,7 @@ struct Gemma4LayerSnapshot {
     n_kv: usize,
     head_dim: usize,
     len: usize,
+    rows: usize,
 }
 
 pub struct GpuGemma4 {
@@ -1449,15 +1533,16 @@ impl GpuGemma4 {
     /// Quantize a normed K/V vector to int8 and append it to the cache
     /// at `d_pos` — one f32 scale per head. grid = n_kv heads.
     fn launch_kv_write_q8(&self, src: *mut c_void, dst_q: *mut c_void, dst_s: *mut c_void,
-                          n_kv: u32, head_dim: u32) -> Result<(), String>
+                          n_kv: u32, head_dim: u32, ring_mask: u32) -> Result<(), String>
     {
         let f = self.m_kv_write.function("kv_write_q8_f32")?;
         let mut sa=src; let mut dq=dst_q; let mut ds=dst_s;
-        let mut pa=self.d_pos.raw_ptr(); let mut nk=n_kv; let mut hd=head_dim;
-        let mut args: [*mut c_void; 6] = [
+        let mut pa=self.d_pos.raw_ptr(); let mut nk=n_kv; let mut hd=head_dim; let mut rm=ring_mask;
+        let mut args: [*mut c_void; 7] = [
             &mut sa as *mut _ as *mut c_void, &mut dq as *mut _ as *mut c_void,
             &mut ds as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void,
-            &mut nk as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void];
+            &mut nk as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut rm as *mut _ as *mut c_void];
         unsafe { f.launch((n_kv,1,1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -2506,14 +2591,20 @@ impl GpuGemma4 {
     /// kernel combines the splits. This keeps every CU busy at depth and
     /// shortens the serial P·V scan. `REINSTINCT_OLD_ATTN` falls back to
     /// the original single-block-per-head kernel for A/B comparison.
+    /// `ring_mask`: the cache's slot mask (`LayerKvView::ring_mask`; !0
+    /// for a full-length cache).
     pub(crate) fn launch_attn_q8(&self, q: *mut c_void, kq: *mut c_void, ks: *mut c_void,
                       vq: *mut c_void, vs: *mut c_void, out: *mut c_void,
-                      n_kv: u32, head_dim: u32, window: u32) -> Result<(), String>
+                      n_kv: u32, head_dim: u32, window: u32, ring_mask: u32) -> Result<(), String>
     {
         let n_heads = self.n_heads as u32;
         let block: u32 = 256;
 
         if self.use_old_attn {
+            if ring_mask != u32::MAX {
+                return Err("the old per-head attention kernel reads the KV cache by \
+                            position; run with REINSTINCT_NO_SWA_RING=1".into());
+            }
             let f = self.m_attn_win.function("attn_step_q8_f32")?;
             let smem = head_dim + (self.max_seq as u32 + block) * 4;
             let mut qa=q; let mut kqa=kq; let mut ksa=ks; let mut vqa=vq; let mut vsa=vs;
@@ -2554,15 +2645,16 @@ impl GpuGemma4 {
             let mut lp=self.attn_l_partial.raw_ptr();
             let mut nh=n_heads; let mut nkv=n_kv;
             let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
-            let mut ns=n_splits;
-            let mut gargs: [*mut c_void; 14] = [
+            let mut ns=n_splits; let mut rm=ring_mask;
+            let mut gargs: [*mut c_void; 15] = [
                 &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
                 &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
                 &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
                 &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
                 &mut tl as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
-                &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void];
+                &mut sc as *mut _ as *mut c_void, &mut ns as *mut _ as *mut c_void,
+                &mut rm as *mut _ as *mut c_void];
             unsafe {
                 fg.launch((n_kv * groups, n_splits, 1), (block,1,1), 0, Some(&self.stream), &mut gargs)?;
             }
@@ -2575,8 +2667,8 @@ impl GpuGemma4 {
             let mut lp=self.attn_l_partial.raw_ptr();
             let mut nh=n_heads; let mut nkv=n_kv; let mut hd=head_dim;
             let mut tl=self.d_pos.raw_ptr(); let mut wn=window; let mut sc=1.0f32;
-            let mut ns=n_splits;
-            let mut pargs: [*mut c_void; 15] = [
+            let mut ns=n_splits; let mut rm=ring_mask;
+            let mut pargs: [*mut c_void; 16] = [
                 &mut qa as *mut _ as *mut c_void, &mut kqa as *mut _ as *mut c_void,
                 &mut ksa as *mut _ as *mut c_void, &mut vqa as *mut _ as *mut c_void,
                 &mut vsa as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
@@ -2584,7 +2676,7 @@ impl GpuGemma4 {
                 &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
                 &mut wn as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
-                &mut ns as *mut _ as *mut c_void];
+                &mut ns as *mut _ as *mut c_void, &mut rm as *mut _ as *mut c_void];
             unsafe {
                 fp.launch((n_heads, n_splits, 1), (block,1,1), smem, Some(&self.stream), &mut pargs)?;
             }
@@ -2939,8 +3031,11 @@ impl GpuGemma4 {
     pub fn prefill_forward_at(&self, tokens: &[u32], state: &mut Gemma4GpuState, base: usize)
         -> Result<Vec<f32>, String>
     {
+        // A continuation chunk reads its own rows back from the cache after
+        // writing them, so it must fit in the smallest sliding-window ring.
         let max = std::env::var("REINSTINCT_SINGLE_PREFILL_CHUNK").ok()
-            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048);
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048)
+            .min(state.min_ring_rows().unwrap_or(usize::MAX));
         let p = tokens.len();
         if p <= max || state.tap.is_some() || state.superquant.is_some() {
             return self.prefill_chunk_at(tokens, state, base);
@@ -3233,15 +3328,28 @@ impl GpuGemma4 {
                     v_norm.raw_ptr(), n_kv as u32, hd as u32, p as u32)?;
                 self.launch_rope_prefill(&self.m_rope_pf, k_norm.raw_ptr(), n_kv as u32,
                                          hd as u32, b.kind, base, p)?;
-                // populate this layer's decode KV cache (positions base..base+P-1).
                 let kvc = &state.caches[li];
-                let (kq_off, ks_off) = (base * kv_dim, base * n_kv * 4);
+                // Continuation: the cached prefix rows this chunk attends
+                // to are dequantized BEFORE the chunk is written — in a
+                // ring the chunk's rows can land on their slots.
+                if base > 0 {
+                    let (ks_ptr, vs_ptr) = cont_ptrs[(b.kind == AttnKind::Full) as usize]
+                        .ok_or("prefill: missing continuation scratch")?;
+                    let row0 = cont_row0(b.kind, hd);
+                    if base > row0 {
+                        self.launch_kv_dequant_rows(kvc.k.raw_ptr(), kvc.ks.raw_ptr(), ks_ptr,
+                            n_kv as u32, hd as u32, row0, base - row0, kvc.ring_mask)?;
+                        self.launch_kv_dequant_rows(kvc.v.raw_ptr(), kvc.vs.raw_ptr(), vs_ptr,
+                            n_kv as u32, hd as u32, row0, base - row0, kvc.ring_mask)?;
+                    }
+                }
+                // populate this layer's decode KV cache (positions base..base+P-1).
                 self.launch_kv_quant_prefill(&self.m_kvq_pf, k_norm.raw_ptr(),
-                    pf_off_bytes(kvc.k.raw_ptr(), kq_off), pf_off_bytes(kvc.ks.raw_ptr(), ks_off),
-                    n_kv as u32, hd as u32, p)?;
+                    kvc.k.raw_ptr(), kvc.ks.raw_ptr(), n_kv as u32, hd as u32,
+                    base, kvc.ring_mask, p)?;
                 self.launch_kv_quant_prefill(&self.m_kvq_pf, v_norm.raw_ptr(),
-                    pf_off_bytes(kvc.v.raw_ptr(), kq_off), pf_off_bytes(kvc.vs.raw_ptr(), ks_off),
-                    n_kv as u32, hd as u32, p)?;
+                    kvc.v.raw_ptr(), kvc.vs.raw_ptr(), n_kv as u32, hd as u32,
+                    base, kvc.ring_mask, p)?;
                 Some((k_norm, v_norm))
             } else {
                 lap(&t_gemm)?;
@@ -3261,19 +3369,21 @@ impl GpuGemma4 {
                     }
                 }
             } else if kv_owned.is_some() {
-                // Continuation: dequantize this layer's cache rows
-                // [row0, base+P) into the kind's scratch, and point the
-                // kernel row-0-relative (it indexes keys by absolute
-                // position and never reads below row0).
+                // Continuation: the prefix rows [row0, base) were
+                // dequantized above, before the write; now the chunk's own
+                // rows [base, base+P), read back through the cache so the
+                // whole span carries the same int8 values decode reads.
+                // The kernel indexes the scratch row-0-relative (keys by
+                // absolute position, never below row0).
                 let (ks_ptr, vs_ptr) = cont_ptrs[(b.kind == AttnKind::Full) as usize]
                     .ok_or("prefill: missing continuation scratch")?;
                 let row0 = cont_row0(b.kind, hd);
-                let n_rows = base + p - row0;
                 let kvc = &state.caches[li];
-                self.launch_kv_dequant_rows(kvc.k.raw_ptr(), kvc.ks.raw_ptr(), ks_ptr,
-                                            n_kv as u32, hd as u32, row0, n_rows)?;
-                self.launch_kv_dequant_rows(kvc.v.raw_ptr(), kvc.vs.raw_ptr(), vs_ptr,
-                                            n_kv as u32, hd as u32, row0, n_rows)?;
+                let suf = (base - row0) * kv_dim;
+                self.launch_kv_dequant_rows(kvc.k.raw_ptr(), kvc.ks.raw_ptr(), pf_off(ks_ptr, suf),
+                                            n_kv as u32, hd as u32, base, p, kvc.ring_mask)?;
+                self.launch_kv_dequant_rows(kvc.v.raw_ptr(), kvc.vs.raw_ptr(), pf_off(vs_ptr, suf),
+                                            n_kv as u32, hd as u32, base, p, kvc.ring_mask)?;
                 let back = row0 * kv_dim * 4;
                 let ptrs = ((ks_ptr as *mut u8).wrapping_sub(back) as *mut c_void,
                             (vs_ptr as *mut u8).wrapping_sub(back) as *mut c_void);
@@ -3736,10 +3846,10 @@ impl GpuGemma4 {
             // (host-resolved dst+offset) but graph-safe.
             self.launch_kv_quant_prefill_offset(k_norm.raw_ptr(),
                                                  kvc.k.raw_ptr(), kvc.ks.raw_ptr(),
-                                                 n_kv as u32, hd as u32, p)?;
+                                                 n_kv as u32, hd as u32, kvc.ring_mask, p)?;
             self.launch_kv_quant_prefill_offset(v_norm.raw_ptr(),
                                                  kvc.v.raw_ptr(), kvc.vs.raw_ptr(),
-                                                 n_kv as u32, hd as u32, p)?;
+                                                 n_kv as u32, hd as u32, kvc.ring_mask, p)?;
 
             let window = match b.kind {
                 AttnKind::Sliding => self.sliding_window as u32,
@@ -3753,7 +3863,7 @@ impl GpuGemma4 {
                 kvc.v.raw_ptr(),  kvc.vs.raw_ptr(),
                 attn.raw_ptr(),
                 n_kv as u32, hd as u32,
-                p as u32, window)?;
+                p as u32, window, kvc.ring_mask)?;
 
             gemm_into(&b.attn_output, attn, attn_out)?;
             self.launch_rmsnorm_batched(attn_out.raw_ptr(), b.post_attn_norm.raw_ptr(),
@@ -3920,17 +4030,21 @@ impl GpuGemma4 {
 
     /// Batched per-(token,head) int8 quantization of a prefill K or V
     /// tensor straight into the decode KV cache — grid (n_kv, P).
+    /// Quantize P prefill rows into cache slots `(base + i) & ring_mask`.
+    #[allow(clippy::too_many_arguments)]
     fn launch_kv_quant_prefill(&self, m: &Module, src: *mut c_void, dst_q: *mut c_void,
-                               dst_s: *mut c_void, n_kv: u32, head_dim: u32, p: usize)
+                               dst_s: *mut c_void, n_kv: u32, head_dim: u32,
+                               base: usize, ring_mask: u32, p: usize)
         -> Result<(), String>
     {
         let f = m.function("kv_quant_prefill_f32")?;
         let mut sa=src; let mut dq=dst_q; let mut ds=dst_s;
-        let mut nk=n_kv; let mut hd=head_dim;
-        let mut args: [*mut c_void; 5] = [
+        let mut nk=n_kv; let mut hd=head_dim; let mut ba=base as u32; let mut rm=ring_mask;
+        let mut args: [*mut c_void; 7] = [
             &mut sa as *mut _ as *mut c_void, &mut dq as *mut _ as *mut c_void,
             &mut ds as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void];
+            &mut hd as *mut _ as *mut c_void, &mut ba as *mut _ as *mut c_void,
+            &mut rm as *mut _ as *mut c_void];
         unsafe { f.launch((n_kv, p as u32, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -3976,17 +4090,18 @@ impl GpuGemma4 {
 
     fn launch_kv_quant_prefill_offset(&self, src: *mut c_void,
                                        dst_q_base: *mut c_void, dst_s_base: *mut c_void,
-                                       n_kv: u32, head_dim: u32, p: usize)
+                                       n_kv: u32, head_dim: u32, ring_mask: u32, p: usize)
         -> Result<(), String>
     {
         let f = self.m_kvq_pf.function("kv_quant_prefill_offset_f32")?;
         let mut sa = src; let mut dqb = dst_q_base; let mut dsb = dst_s_base;
         let mut bp = self.v_base_pos.raw_ptr();
-        let mut nk = n_kv; let mut hd = head_dim;
-        let mut args: [*mut c_void; 6] = [
+        let mut nk = n_kv; let mut hd = head_dim; let mut rm = ring_mask;
+        let mut args: [*mut c_void; 7] = [
             &mut sa  as *mut _ as *mut c_void, &mut dqb as *mut _ as *mut c_void,
             &mut dsb as *mut _ as *mut c_void, &mut bp  as *mut _ as *mut c_void,
-            &mut nk  as *mut _ as *mut c_void, &mut hd  as *mut _ as *mut c_void];
+            &mut nk  as *mut _ as *mut c_void, &mut hd  as *mut _ as *mut c_void,
+            &mut rm  as *mut _ as *mut c_void];
         unsafe { f.launch((n_kv, p as u32, 1),(256,1,1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -4020,7 +4135,7 @@ impl GpuGemma4 {
         out: *mut c_void,
         n_kv: u32, head_dim: u32,
         n_q_rows: u32,
-        window: u32) -> Result<(), String>
+        window: u32, ring_mask: u32) -> Result<(), String>
     {
         let f = self.m_attn_step_q8_b.function("attn_step_q8_batched_offset_f32")?;
         let n_heads = self.n_heads as u32;
@@ -4037,31 +4152,35 @@ impl GpuGemma4 {
         let mut vca = v_cache; let mut vsa = v_scale; let mut oa = out;
         let mut nh = n_heads; let mut nkv = n_kv; let mut hd = head_dim;
         let mut bp = self.v_base_pos.raw_ptr();
-        let mut nq = n_q_rows; let mut wn = window; let mut sc = scaling;
-        let mut args: [*mut c_void; 13] = [
+        let mut nq = n_q_rows; let mut wn = window; let mut sc = scaling; let mut rm = ring_mask;
+        let mut args: [*mut c_void; 14] = [
             &mut qa  as *mut _ as *mut c_void, &mut kca as *mut _ as *mut c_void,
             &mut ksa as *mut _ as *mut c_void, &mut vca as *mut _ as *mut c_void,
             &mut vsa as *mut _ as *mut c_void, &mut oa  as *mut _ as *mut c_void,
             &mut nh  as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd  as *mut _ as *mut c_void, &mut bp  as *mut _ as *mut c_void,
             &mut nq  as *mut _ as *mut c_void, &mut wn  as *mut _ as *mut c_void,
-            &mut sc  as *mut _ as *mut c_void];
+            &mut sc  as *mut _ as *mut c_void, &mut rm  as *mut _ as *mut c_void];
         unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), 0,
                            Some(&self.stream), &mut args) }
     }
 
     /// Dequantize int8 KV cache rows `[row0, row0 + n_rows)` to f32.
+    /// Dequantize the cache rows of positions `[row0, row0 + n_rows)`.
+    #[allow(clippy::too_many_arguments)]
     fn launch_kv_dequant_rows(&self, src_q: *mut c_void, src_s: *mut c_void, dst: *mut c_void,
-                              n_kv: u32, head_dim: u32, row0: usize, n_rows: usize)
+                              n_kv: u32, head_dim: u32, row0: usize, n_rows: usize,
+                              ring_mask: u32)
         -> Result<(), String>
     {
         let f = self.m_kvq_pf.function("kv_dequant_rows_f32")?;
         let mut qa = src_q; let mut sa = src_s; let mut da = dst;
-        let mut nk = n_kv; let mut hd = head_dim; let mut r0 = row0 as u32;
-        let mut args: [*mut c_void; 6] = [
+        let mut nk = n_kv; let mut hd = head_dim; let mut r0 = row0 as u32; let mut rm = ring_mask;
+        let mut args: [*mut c_void; 7] = [
             &mut qa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
             &mut da as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void, &mut r0 as *mut _ as *mut c_void];
+            &mut hd as *mut _ as *mut c_void, &mut r0 as *mut _ as *mut c_void,
+            &mut rm as *mut _ as *mut c_void];
         unsafe { f.launch((n_kv, n_rows as u32, 1), (256, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -4237,9 +4356,11 @@ impl GpuGemma4 {
                               self.k_norm.raw_ptr(), self.v_norm.raw_ptr())?;
             } else {
                 self.launch_kv_write_q8(self.k_norm.raw_ptr(), own_kv.k.raw_ptr(),
-                                        own_kv.ks.raw_ptr(), n_kv as u32, head_dim as u32)?;
+                                        own_kv.ks.raw_ptr(), n_kv as u32, head_dim as u32,
+                                        own_kv.ring_mask)?;
                 self.launch_kv_write_q8(self.v_norm.raw_ptr(), own_kv.v.raw_ptr(),
-                                        own_kv.vs.raw_ptr(), n_kv as u32, head_dim as u32)?;
+                                        own_kv.vs.raw_ptr(), n_kv as u32, head_dim as u32,
+                                        own_kv.ring_mask)?;
             }
             self.prof_lap("a_kv_write");
         }
@@ -4278,7 +4399,7 @@ impl GpuGemma4 {
         } else {
             self.launch_attn_q8(self.q_buf.raw_ptr(), attn_kv.k.raw_ptr(), attn_kv.ks.raw_ptr(),
                                 attn_kv.v.raw_ptr(), attn_kv.vs.raw_ptr(), self.attn_concat.raw_ptr(),
-                                n_kv as u32, head_dim as u32, window)?;
+                                n_kv as u32, head_dim as u32, window, attn_kv.ring_mask)?;
         }
         self.prof_lap("a_kernel");
         self.dbg_vec(li, "kqv_out", self.attn_concat.raw_ptr(), self.n_heads * head_dim)?;

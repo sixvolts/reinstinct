@@ -34,7 +34,8 @@ void attn_partial_q8_f32(const float*       __restrict__ q,        // [n_heads, 
                          const unsigned int* __restrict__ pos_ptr,
                          unsigned int window,
                          float        scaling,
-                         unsigned int n_splits)
+                         unsigned int n_splits,
+                         unsigned int ring_mask)   // slot = position & ring_mask
 {
     extern __shared__ float lds[];
     const int h   = blockIdx.x;
@@ -96,7 +97,7 @@ void attn_partial_q8_f32(const float*       __restrict__ q,        // [n_heads, 
 
     // --- scores: int8 dp4a Q·Kᵀ over the slice ---
     for (int i = tid; i < slice_len; i += bs) {
-        const int t = slice_start + i;
+        const int t = (int)((unsigned)(slice_start + i) & ring_mask);
         const int* k32 = reinterpret_cast<const int*>(
             k_cache + (size_t)t * kv_row + (size_t)kv_h * head_dim);
         int idot = 0;
@@ -141,7 +142,7 @@ void attn_partial_q8_f32(const float*       __restrict__ q,        // [n_heads, 
     for (int d = tid; d < (int)head_dim; d += bs) {
         float acc = 0.0f;
         for (int i = 0; i < slice_len; i++) {
-            const int t = slice_start + i;
+            const int t = (int)((unsigned)(slice_start + i) & ring_mask);
             acc += scores[i] * (float)v_cache[(size_t)t * kv_row
                                               + (size_t)kv_h * head_dim + d];
         }
