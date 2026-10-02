@@ -434,14 +434,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let p = PathBuf::from(home).join("models/gemma4-31b/gemma-4-31B-it-UD-Q4_K_XL.gguf");
-        p.exists().then_some(p)
+        crate::test_support::gemma_fixture()
     }
 
     #[test]
     fn loads_gemma4_31b_config_and_schedule() {
-        let Some(p) = fixture_path() else { eprintln!("skip: no gemma4-31B fixture"); return };
+        let Some(p) = fixture_path() else { return };
         let gguf = GgufFile::open(&p).expect("open gguf");
         let model = Gemma4Model::load(&gguf).expect("load gemma4");
         let c = &model.config;
@@ -470,10 +468,7 @@ mod tests {
 
     #[test]
     fn loads_gemma4_26b_moe_config() {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let Some(home) = home else { return };
-        let p = home.join("models/gemma4-26B/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf");
-        if !p.exists() { eprintln!("skip: no gemma4-26B fixture"); return; }
+        let Some(p) = crate::test_support::gemma_moe_fixture() else { return };
         let gguf = GgufFile::open(&p).expect("open gguf");
         let model = Gemma4Model::load(&gguf).expect("load gemma4 26B");
         let c = &model.config;

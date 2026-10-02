@@ -4918,19 +4918,22 @@ mod tests {
 
     /// The fixture, only when it is small enough to dequantize whole on
     /// the host. These oracles materialise the model (or its embedding
-    /// and output matrices) as f32 — ~4 bytes/param, ~100 GB for the
+    /// and output matrices) as f32 — 4 bytes/param, ~100 GB for the
     /// default 27B fixture, which takes the machine down with a global
     /// OOM. Point REINSTINCT_GGUF_FIXTURE at a small Qwen (e.g. 0.8B)
-    /// to run them.
+    /// to run them; under REINSTINCT_REQUIRE_FIXTURES a too-big fixture
+    /// fails like a missing one (the test would not have run).
     fn small_fixture_path() -> Option<PathBuf> {
-        const MAX_BYTES: u64 = 3 << 30;
+        const MAX_F32_BYTES: u64 = 8 << 30;
         let p = fixture_path()?;
-        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
-        if len > MAX_BYTES {
-            eprintln!("skipping: {} is {:.1} GB; this oracle dequantizes the model to f32 on \
-                       the host — set REINSTINCT_GGUF_FIXTURE to a <= 3 GB Qwen",
-                      p.display(), len as f64 / (1u64 << 30) as f64);
-            return None;
+        let f32_bytes: u64 = GgufFile::open(&p).ok()
+            .map(|g| g.tensors.iter().map(|t| t.n_elements() * 4).sum())
+            .unwrap_or(u64::MAX);
+        if f32_bytes > MAX_F32_BYTES {
+            return crate::test_support::missing(&format!(
+                "a Qwen fixture <= {} GiB as f32 ({} is {:.0} GiB; this oracle dequantizes \
+                 the whole model on the host — set REINSTINCT_GGUF_FIXTURE)",
+                MAX_F32_BYTES >> 30, p.display(), f32_bytes as f64 / (1u64 << 30) as f64));
         }
         Some(p)
     }
@@ -5276,8 +5279,15 @@ mod tests {
             let mut cpu_out = vec![0.0f32; h];
             linear_attention_step(&input, weights, cfg, &mut cpu_state, &mut cpu_out);
 
-            let gpu_out = gpu.apply_linear_attention(&input, &gpu_w, &mut gpu_state)
-                .expect("gpu GDN");
+            // Same on-disk-kernel limit as the block test below.
+            let gpu_out = match gpu.apply_linear_attention(&input, &gpu_w, &mut gpu_state) {
+                Ok(o) => o,
+                Err(e) if e.contains("no kernel") => {
+                    let _ = crate::test_support::missing::<()>(&format!("an on-disk kernel: {e}"));
+                    return;
+                }
+                Err(e) => panic!("gpu GDN: {e}"),
+            };
 
             const ABS_TOL: f32 = 1.0e-3;
             const REL_TOL: f32 = 5.0e-3;
@@ -5357,7 +5367,10 @@ mod tests {
             // IQ4_XS on some tensors, which only exist repacked (int8).
             let gpu_state_out = match gpu.apply_linear_attention_block(&input, &gpu_block, &mut gpu_state) {
                 Ok(o) => o,
-                Err(e) if e.contains("no kernel") => { eprintln!("skipping: {e}"); return; }
+                Err(e) if e.contains("no kernel") => {
+                    let _ = crate::test_support::missing::<()>(&format!("an on-disk kernel: {e}"));
+                    return;
+                }
                 Err(e) => panic!("gpu GDN block: {e}"),
             };
 
