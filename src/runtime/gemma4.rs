@@ -78,6 +78,7 @@ const EMBED_Q4_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q4_
 const TAP_COPY_SRC:          &str = include_str!("../../kernels/tap_copy_f32.cpp");
 const EMBED_Q5K_SRC:         &str = include_str!("../../kernels/embed_lookup_q5_k.cpp");
 const EMBED_Q8_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q8_0.cpp");
+const EMBED_REPACKED_SRC:    &str = include_str!("../../kernels/embed_lookup_repacked.cpp");
 // MoE kernel sources.
 const MATVEC_Q8_0_DP4A_SRC:  &str = include_str!("../../kernels/matvec_q8_0_dp4a.cpp");
 const MATVEC_Q8_0_REPACKED_SRC: &str = include_str!("../../kernels/matvec_q8_0_repacked.cpp");
@@ -853,6 +854,8 @@ pub struct GpuGemma4 {
     m_embed_q4_0: Module,
     m_embed_q5k: Module,
     m_embed_q8_0: Module,
+    /// Gathers from a repacked Q8_0 / Q4_0 token_embd (tied head).
+    m_embed_repacked: Module,
     m_mv_f32:    Module,
     m_mv_q4k:    Module,
     m_mv_q5k:    Module,
@@ -1002,7 +1005,15 @@ impl GpuGemma4 {
         let q_max  = n_heads * hd_max;
         let kv_max = cfg.kv_heads.iter().copied().max().unwrap_or(0) as usize * hd_max;
 
-        let token_embd  = GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?;
+        // The tied embedding is also the LM head, read in full every
+        // token. Q8_0 / Q4_0 tables load repacked (the head then runs on
+        // the repacked matvec, ~750 vs ~500 GB/s) and the embedding
+        // gathers from that layout; other dtypes stay on disk layout.
+        let token_embd = match gguf.tensor("token_embd.weight").map(|t| t.ggml_type) {
+            Some(GgmlType::Q8_0) | Some(GgmlType::Q4_0) =>
+                GpuMatvecTensor::from_gguf_matvec(gguf, "token_embd.weight")?,
+            _ => GpuMatvecTensor::from_gguf(gguf, "token_embd.weight")?,
+        };
         let output_norm = load_fp32(gguf, "output_norm.weight")?;
 
         let moe = cfg.is_moe();
@@ -1187,6 +1198,7 @@ impl GpuGemma4 {
             m_embed_q4_0: ld("embed_lookup_q4_0", EMBED_Q4_0_SRC)?,
             m_embed_q5k:  ld("embed_lookup_q5_k", EMBED_Q5K_SRC)?,
             m_embed_q8_0: ld("embed_lookup_q8_0", EMBED_Q8_0_SRC)?,
+            m_embed_repacked: ld("embed_lookup_repacked", EMBED_REPACKED_SRC)?,
             m_mv_f32:     ld("matvec_f32_b256", MATVEC_F32_B256_SRC)?,
             m_mv_q4k:     ld("matvec_q4_k_rowblock", MATVEC_Q4K_W_SRC)?,
             m_mv_q5k:     ld("matvec_q5_k_rowblock", MATVEC_Q5K_W_SRC)?,
@@ -2050,6 +2062,9 @@ impl GpuGemma4 {
     /// Embedding lookup — the token row is read from `d_token` on device
     /// (capturable). gemma4's token_embd is Q5_K (31B) or Q8_0 (26B).
     fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void) -> Result<(), String> {
+        if table.repacked {
+            return self.launch_embed_repacked(table, out, self.d_token.raw_ptr(), 1);
+        }
         let hidden = table.in_dim;   // [hidden, vocab]
         let (module, kname, threads, grid): (&Module, &str, u32, u32) = match table.dtype {
             GgmlType::Q4_0 => (&self.m_embed_q4_0, "embed_lookup_q4_0_f32", 256,
@@ -2068,12 +2083,38 @@ impl GpuGemma4 {
         unsafe { f.launch((grid,1,1),(threads,1,1), 0, Some(&self.stream), &mut args) }
     }
 
+    /// Embedding gather from a repacked Q8_0 / Q4_0 table for `n_tokens`
+    /// ids at `tokens_dev` (rows of `out`).
+    fn launch_embed_repacked(&self, table: &GpuMatvecTensor, out: *mut c_void,
+                             tokens_dev: *mut c_void, n_tokens: u32) -> Result<(), String>
+    {
+        let (kname, nsp) = match table.dtype {
+            GgmlType::Q8_0 => ("embed_lookup_q8_0_repacked_batched_f32",
+                               crate::quant::q8_0::repacked_n_sub_padded(table.in_dim as usize)),
+            GgmlType::Q4_0 => ("embed_lookup_q4_0_repacked_batched_f32",
+                               crate::quant::q4_0::repacked_n_sub_padded(table.in_dim as usize)),
+            other => return Err(format!("gemma4 embed: no repacked gather for {other:?}")),
+        };
+        let f = self.m_embed_repacked.function(kname)?;
+        let mut t = table.data.raw_ptr(); let mut o = out; let mut row = tokens_dev;
+        let mut h = table.in_dim; let mut ns = nsp as u32; let mut v = table.out_dim;
+        let mut args: [*mut c_void; 6] = [
+            &mut t as *mut _ as *mut c_void, &mut o as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void, &mut h as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void, &mut v as *mut _ as *mut c_void];
+        unsafe { f.launch(((table.in_dim + 255) / 256, n_tokens, 1), (256, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
     /// Batched embedding lookup for prefill — one launch over all
     /// `n_tokens` token ids (resident in `tokens_dev`), writing row `r`
     /// of `out`. Replaces the per-token launch+sync embed loop.
     pub(crate) fn launch_embed_batched(&self, table: &GpuMatvecTensor, out: *mut c_void,
                             tokens_dev: *mut c_void, n_tokens: u32) -> Result<(), String>
     {
+        if table.repacked {
+            return self.launch_embed_repacked(table, out, tokens_dev, n_tokens);
+        }
         let hidden = table.in_dim;
         let (module, kname, grid_x): (&Module, &str, u32) = match table.dtype {
             GgmlType::Q4_0 => (&self.m_embed_q4_0, "embed_lookup_q4_0_batched_f32",
