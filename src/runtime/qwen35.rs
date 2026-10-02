@@ -3892,10 +3892,15 @@ impl GpuQwen35 {
         self.enqueue_decode_body(state)
     }
 
-    /// Device bytes held idle in the prefill / verify scratch pools.
+    /// Device bytes held idle in the prefill / verify scratch pools. The
+    /// fp16 weight-dequant pool is left out: its buffers are weight-sized,
+    /// the same every call, so trimming them would only force re-dequant.
     pub fn scratch_bytes(&self) -> usize {
-        self.pool_f32.free_bytes() + self.pool_u8.free_bytes() + self.pool_u16.free_bytes()
+        self.pool_f32.free_bytes() + self.pool_u8.free_bytes()
     }
+
+    /// Wait for this stage's stream.
+    pub fn sync(&self) -> Result<(), String> { self.stream.synchronize() }
 
     /// Release the idle scratch pools (see `DeviceBufPool::trim`). Waits
     /// for this stage's stream first. Prefill graphs are re-captured per
@@ -3905,7 +3910,6 @@ impl GpuQwen35 {
         self.stream.synchronize()?;
         self.pool_f32.trim();
         self.pool_u8.trim();
-        self.pool_u16.trim();
         self.prefill_warm_p.borrow_mut().clear();
         Ok(())
     }
@@ -4334,6 +4338,13 @@ impl GpuQwen35 {
         if !no_graph {
             Graph::begin_capture(&self.stream, HipStreamCaptureMode::Global)?;
         }
+        // An error between here and end_capture must not leave the stream
+        // capturing (every later launch and sync on it would fail).
+        struct CaptureGuard<'a> { stream: &'a Stream, active: bool }
+        impl Drop for CaptureGuard<'_> {
+            fn drop(&mut self) { if self.active { let _ = Graph::end_capture(self.stream); } }
+        }
+        let mut capture_guard = CaptureGuard { stream: &self.stream, active: !no_graph };
 
         // 1) Embed all tokens into ba (one row each) — first stage only.
         if input.is_none() {
@@ -4407,6 +4418,7 @@ impl GpuQwen35 {
         }
 
         if !no_graph {
+            capture_guard.active = false;
             let g = Graph::end_capture(&self.stream)?;
             let exec = g.instantiate()?;
             drop(g);

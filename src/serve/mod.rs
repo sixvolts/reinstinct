@@ -1565,7 +1565,6 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     };
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
-                    model.trim_scratch_over(scratch_budget);
                     match result {
                         Ok(Ok((text, n_p, n_c, eos, lp))) => {
                             let wall_us = t.elapsed().as_micros() as u64;
@@ -1714,6 +1713,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             },
         };
         let _ = job.reply.send(StreamMsg::Done(reply));
+        // After the reply, so freeing scratch is off the request's latency.
+        big_m.trim_scratch_over(scratch_budget);
+        if let Some(s) = small_m.as_mut() { s.trim_scratch_over(scratch_budget); }
     }
 }
 

@@ -184,13 +184,20 @@ impl Qwen35Pipeline {
         self.stages.iter().map(|s| s.gpu.scratch_bytes()).sum()
     }
 
-    /// Release every stage's idle prefill scratch.
+    /// Release every stage's idle prefill scratch. Every stage's stream
+    /// is drained before any pool is freed (a later stage's peer copy
+    /// reads an earlier stage's buffers), and the caller's current device
+    /// is restored whatever happens — other models in the process (serve's
+    /// small model) rely on it.
     pub fn trim_scratch(&self) -> Result<(), String> {
-        for s in &self.stages {
-            set_dev(s.dev)?;
-            s.gpu.trim_scratch()?;
-        }
-        set_dev(self.stages[0].dev)
+        let home = hip::Device::current()?;
+        let r = (|| {
+            for s in &self.stages { set_dev(s.dev)?; s.gpu.sync()?; }
+            for s in &self.stages { set_dev(s.dev)?; s.gpu.trim_scratch()?; }
+            Ok(())
+        })();
+        set_dev(home)?;
+        r
     }
 
     /// `(device, block range)` per stage.
