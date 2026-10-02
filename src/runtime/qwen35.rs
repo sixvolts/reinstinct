@@ -2755,10 +2755,13 @@ impl GpuQwen35 {
 
         self.prof_lap("attn+norm");
         // --- Router: logits → top-k expert ids + renormalised weights ---
-        // The int8 copy of `input` in xq8 serves the router (if it is a
-        // quantized tensor), the routed gate/up and the shared gate/up.
-        if !prequant { self.launch_quantize_q8(input_ptr, h)?; }
-        self.prof_lap("moe_quant_in");
+        // The int8 copy of `input` in xq8 serves the routed gate/up and
+        // the shared gate/up. (The router — gate_inp, never repacked —
+        // takes launch_matvec_dispatch from the f32 input.)
+        if !prequant {
+            self.launch_quantize_q8(input_ptr, h)?;
+            self.prof_lap("moe_quant_in");
+        }
         self.launch_matvec_prequant(&w.gate_inp, input_ptr, moe.logits.raw_ptr())?;
         self.prof_lap("router_matvec");
         self.launch_moe_topk(moe, 1)?;
