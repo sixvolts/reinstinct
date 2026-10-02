@@ -248,18 +248,19 @@ impl Qwen35Pipeline {
     /// prompt sizes every prefill scratch buffer to its full length, which
     /// capped usable prompts well below the KV cache's room. Prompts over
     /// `REINSTINCT_SINGLE_PREFILL_CHUNK` tokens (default 2048, far above
-    /// where the MMQ tiles fill the card) go through in equal chunks of at
-    /// most that size, each attending to the earlier ones through the KV
-    /// cache.
+    /// where the MMQ tiles fill the card) go through in chunks of exactly
+    /// that size plus a tail, each attending to the earlier ones through
+    /// the KV cache. Fixed-size chunks (not an equal split) keep one warm
+    /// scratch set — the pool keys buffers by exact size — and let later
+    /// long prompts capture their chunks into graphs.
     fn prefill_chunks(&self, n: usize) -> Vec<usize> {
         if self.stages.len() == 1 {
             let max = std::env::var("REINSTINCT_SINGLE_PREFILL_CHUNK").ok()
-                .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048);
+                .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048)
+                .div_ceil(64) * 64;
             if n <= max { return vec![n]; }
-            let chunk = n.div_ceil(n.div_ceil(max)).div_ceil(64) * 64;
-            let mut chunks = Vec::with_capacity(n.div_ceil(chunk));
-            let mut left = n;
-            while left > 0 { let c = chunk.min(left); chunks.push(c); left -= c; }
+            let mut chunks = vec![max; n / max];
+            if n % max > 0 { chunks.push(n % max); }
             return chunks;
         }
         if n < 2 * 64 { return vec![n]; }

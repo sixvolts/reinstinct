@@ -3041,6 +3041,9 @@ impl GpuGemma4 {
             return self.prefill_chunk_at(tokens, state, base);
         }
         let chunk = p.div_ceil(p.div_ceil(max)).div_ceil(64) * 64;
+        // Size the continuation scratch once, for the last (largest) span.
+        let last = p - (p - 1) / chunk * chunk;
+        if base + p > last { self.reserve_cont_scratch(base + p - last, last.max(chunk.min(p)))?; }
         let mut logits = Vec::new();
         let mut at = 0;
         while at < p {
@@ -3049,6 +3052,32 @@ impl GpuGemma4 {
             at = end;
         }
         Ok(logits)
+    }
+
+    /// Grow the continuation K/V scratch to hold a pass over `[base, base
+    /// + p)`: full layers dequantize every row from 0, sliding layers from
+    /// their window floor. Growing frees the old buffer, so the chunk loop
+    /// reserves for its whole span up front — a resize between chunks
+    /// would otherwise rely on the previous chunk's sync.
+    fn reserve_cont_scratch(&self, base: usize, p: usize) -> Result<(), String> {
+        let sw = self.sliding_window;
+        let mut need = [0usize; 2];
+        for b in &self.blocks {
+            let full = b.kind == AttnKind::Full;
+            let row0 = if !full && self.m_attn_prefill_tiled.contains_key(&(b.head_dim as u32)) {
+                ((base + 1).saturating_sub(sw) / 16) * 16
+            } else { 0 };
+            need[full as usize] = need[full as usize].max((base + p - row0) * b.n_kv * b.head_dim);
+        }
+        let mut sc = self.pf_kv_cont.borrow_mut();
+        for ki in 0..2 {
+            if need[ki] == 0 { continue; }
+            if !sc[ki].as_ref().map_or(false, |(k, _)| k.len() >= need[ki]) {
+                sc[ki] = None;
+                sc[ki] = Some((DeviceBuf::new(need[ki])?, DeviceBuf::new(need[ki])?));
+            }
+        }
+        Ok(())
     }
 
     /// One prefill pass over `tokens` at positions `[base, base + P)`.
@@ -3272,25 +3301,9 @@ impl GpuGemma4 {
             }
         };
         let cont_ptrs: [Option<(*mut c_void, *mut c_void)>; 2] = if base > 0 {
-            let mut need = [0usize; 2];
-            for b in &self.blocks {
-                let ki = (b.kind == AttnKind::Full) as usize;
-                let rows = base + p - cont_row0(b.kind, b.head_dim);
-                need[ki] = need[ki].max(rows * b.n_kv * b.head_dim);
-            }
-            let mut sc = self.pf_kv_cont.borrow_mut();
-            let mut ptrs = [None, None];
-            for ki in 0..2 {
-                if need[ki] == 0 { continue; }
-                let fits = sc[ki].as_ref().map_or(false, |(k, _)| k.len() >= need[ki]);
-                if !fits {
-                    sc[ki] = None;
-                    sc[ki] = Some((DeviceBuf::new(need[ki])?, DeviceBuf::new(need[ki])?));
-                }
-                let (k, v) = sc[ki].as_ref().unwrap();
-                ptrs[ki] = Some((k.raw_ptr(), v.raw_ptr()));
-            }
-            ptrs
+            self.reserve_cont_scratch(base, p)?;
+            let sc = self.pf_kv_cont.borrow();
+            [0, 1].map(|ki| sc[ki].as_ref().map(|(k, v)| (k.raw_ptr(), v.raw_ptr())))
         } else { [None, None] };
         let mut cont_donor_swa:  Option<(*mut c_void, *mut c_void)> = None;
         let mut cont_donor_full: Option<(*mut c_void, *mut c_void)> = None;
