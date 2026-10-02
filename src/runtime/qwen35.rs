@@ -236,11 +236,11 @@ impl GpuMatvecTensor {
         })
     }
 
-    /// Like [`from_gguf`], but a Q4_K weight is repacked at load time into
-    /// the contiguous two-plane layout the `matvec_q4k_repacked` kernel
-    /// streams at near-peak bandwidth. Other dtypes load unchanged. Use
-    /// this for pure matvec weights — not for `token_embd`, which is also
-    /// the embedding-lookup table and must keep its on-disk layout.
+    /// Like [`from_gguf`], but the weight is repacked at load time into
+    /// the layout its repacked matvec kernel streams at near-peak
+    /// bandwidth (dtypes without one load unchanged). For a tied
+    /// `token_embd` the embedding gather must then read the repacked
+    /// layout too (Gemma does, for Q8_0 / Q4_0).
     pub fn from_gguf_matvec(gguf: &GgufFile, name: &str) -> Result<Self, String> {
         let info = gguf.tensor(name).ok_or_else(|| format!("tensor {name} not found"))?;
         let bytes = gguf.tensor_data(name)
@@ -4931,14 +4931,20 @@ mod tests {
     /// fails like a missing one (the test would not have run).
     fn small_fixture_path() -> Option<PathBuf> {
         const MAX_F32_BYTES: u64 = 8 << 30;
-        let p = fixture_path()?;
+        // A separate small model for these oracles, so one
+        // REINSTINCT_REQUIRE_FIXTURES run can cover the module: the other
+        // tests keep the (big) REINSTINCT_GGUF_FIXTURE.
+        let p = match std::env::var_os("REINSTINCT_SMALL_GGUF_FIXTURE") {
+            Some(s) => PathBuf::from(s),
+            None => fixture_path()?,
+        };
         let f32_bytes: u64 = GgufFile::open(&p).ok()
             .map(|g| g.tensors.iter().map(|t| t.n_elements() * 4).sum())
             .unwrap_or(u64::MAX);
         if f32_bytes > MAX_F32_BYTES {
             return crate::test_support::missing(&format!(
                 "a Qwen fixture <= {} GiB as f32 ({} is {:.0} GiB; this oracle dequantizes \
-                 the whole model on the host — set REINSTINCT_GGUF_FIXTURE)",
+                 the whole model on the host — set REINSTINCT_SMALL_GGUF_FIXTURE)",
                 MAX_F32_BYTES >> 30, p.display(), f32_bytes as f64 / (1u64 << 30) as f64));
         }
         Some(p)

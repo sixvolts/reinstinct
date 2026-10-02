@@ -82,7 +82,7 @@ for card in "${cards[@]}"; do
   tune_card "$card" || { echo "[reinstinct-gpu-tune] $(basename "$card"): FAILED" >&2; failed=1; }
 done
 
-[[ "$DRY" == 1 ]] && exit "$failed"
+[[ "$DRY" == 1 || "$failed" == 1 ]] && exit "$failed"
 echo "[reinstinct-gpu-tune] applied to ${#cards[@]} card(s): ${CAP_W}W cap, mclk top=1125 MHz, sclk top=1825 MHz, perflevel=high"
 rocm-smi --showclocks    2>&1 | grep -E "sclk|mclk" || true
 rocm-smi --showmaxpower  2>&1 | grep "Max Graphics" || true

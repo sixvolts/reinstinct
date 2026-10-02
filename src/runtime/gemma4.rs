@@ -2070,7 +2070,8 @@ impl GpuGemma4 {
     }
 
     /// Embedding lookup — the token row is read from `d_token` on device
-    /// (capturable). gemma4's token_embd is Q5_K (31B) or Q8_0 (26B).
+    /// (capturable). gemma4's token_embd is Q5_K (31B, E4B; on-disk
+    /// layout) or Q8_0 (26B) / Q4_0 (QAT 31B), which load repacked.
     fn launch_embed(&self, table: &GpuMatvecTensor, out: *mut c_void) -> Result<(), String> {
         if table.repacked {
             return self.launch_embed_repacked(table, out, self.d_token.raw_ptr(), 1);
