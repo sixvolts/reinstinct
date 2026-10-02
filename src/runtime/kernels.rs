@@ -2153,6 +2153,138 @@ mod tests {
         eprintln!("(each cell: ms per launch, GB/s of repacked weight bytes)");
     }
 
+    /// MoE decode expert kernels at the two MoE models' shapes, each
+    /// against a reference build of the same kernel (REINSTINCT_MOE_REF_DIR,
+    /// e.g. a copy of kernels/ from the previous commit): GB/s of expert
+    /// weight bytes and the max |Δ| vs the reference output. Expert ids
+    /// rotate over 32 sets so the 8 routed experts come from HBM, not L2,
+    /// as in decode. Sources are read from disk
+    /// (REINSTINCT_MMQ_BENCH_SRC_DIR) so a kernel edit re-benches without
+    /// a rebuild.  `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_moe_kernels() {
+        use crate::quant::{q4_k, q5_k, q6_k, q5_1};
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
+        let ref_dir = std::env::var("REINSTINCT_MOE_REF_DIR").ok();
+        let read = |d: &str, f: &str| std::fs::read_to_string(format!("{d}/{f}.cpp"))
+            .unwrap_or_else(|e| panic!("{d}/{f}.cpp: {e}"));
+        let qmod = Module::load(&cache.compile("quantize_q8", QUANTIZE_Q8_SOURCE).unwrap()).unwrap();
+        let qf = qmod.function("quantize_q8_f32").unwrap();
+        let stream = hip::Stream::new().unwrap();
+        // (label, file, kernel, dtype, in, out, n_expert, defs, fused gate+up, down grid)
+        let cases: &[(&str, &str, &str, &str, usize, usize, usize, &str, bool, bool)] = &[
+            ("35B gate|up q4k swiglu", "moe_gate_up_swiglu_q4k_repacked", "moe_gate_up_swiglu_q4k_repacked_f32", "q4k", 2048, 512, 256, "", true, false),
+            ("35B down q5k",          "moe_matvec_q5k_down", "moe_matvec_q5k_down_f32", "q5k", 512, 2048, 256, "", false, true),
+            ("35B down q6k",          "moe_matvec_q6k_down", "moe_matvec_q6k_down_f32", "q6k", 512, 2048, 256, "", false, true),
+            ("26B gate_up q4k",       "moe_matvec_q4k_repacked", "moe_matvec_q4k_repacked_f32", "q4k", 2816, 1408, 128, "", false, false),
+            ("26B down q5_1",         "moe_matvec_q5k_down", "moe_matvec_q5k_down_f32", "q5_1", 704, 2816, 128, "#define Q5_1_SCALES 1\n", false, true),
+        ];
+        let n_used = 8usize;
+        let mut s: u64 = 0x0E0E_5EED;
+        let mut rnd = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 33) as u32 };
+        for &(label, file, kname, dt, in_dim, out_dim, ne, defs, fused, down) in cases {
+            // Random expert weights with sane fp16 scales, repacked per expert.
+            let (bs, bpb, d_offs): (usize, usize, &[usize]) = match dt {
+                "q4k" => (256, q4_k::BYTES_PER_BLOCK, &[0, 2]), "q5k" => (256, q5_k::BYTES_PER_BLOCK, &[0, 2]),
+                "q6k" => (256, q6_k::BYTES_PER_BLOCK, &[208]), _ => (32, q5_1::BYTES_PER_BLOCK, &[0, 2]),
+            };
+            let n_slabs = if fused { 2 } else { 1 };
+            let mut slabs: Vec<DeviceBuf<u8>> = Vec::new();
+            let mut bpe = 0usize;
+            for _ in 0..n_slabs {
+                let mut all = Vec::new();
+                for _ in 0..ne {
+                    let mut w = vec![0u8; out_dim * (in_dim / bs) * bpb];
+                    for b in w.iter_mut() { *b = rnd() as u8; }
+                    for blk in 0..out_dim * (in_dim / bs) {
+                        for &o in d_offs {
+                            let v = if o == 2 && dt == "q5_1" { -0.01f32 } else { 0.001 };
+                            w[blk * bpb + o..blk * bpb + o + 2].copy_from_slice(&crate::quant::half::f32_to_f16(v).to_le_bytes());
+                        }
+                    }
+                    let r = match dt {
+                        "q4k" => q4_k::repack_for_matvec(&w, in_dim, out_dim),
+                        "q5k" => q5_k::repack_for_matvec(&w, in_dim, out_dim),
+                        "q6k" => q6_k::repack_for_matvec(&w, in_dim, out_dim),
+                        _     => q5_1::repack_for_matvec(&w, in_dim, out_dim),
+                    };
+                    bpe = r.len();
+                    all.extend_from_slice(&r);
+                }
+                slabs.push(DeviceBuf::from_slice(&all).unwrap());
+            }
+            // Activations: one shared row (gate/up) or one per slot (down).
+            let n_rows = if down { n_used } else { 1 };
+            let x: Vec<f32> = (0..in_dim * n_rows).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+            let dx = DeviceBuf::from_slice(&x).unwrap();
+            let dxq: DeviceBuf<u8> = DeviceBuf::new(n_rows * (in_dim / 32) * 40).unwrap();
+            {
+                let (mut xp, mut qp, mut ind) = (dx.raw_ptr(), dxq.raw_ptr(), in_dim as u32);
+                let mut a: [*mut c_void; 3] = [&mut xp as *mut _ as *mut c_void,
+                    &mut qp as *mut _ as *mut c_void, &mut ind as *mut _ as *mut c_void];
+                unsafe { qf.launch(((in_dim as u32 + 255) / 256, n_rows as u32, 1), (256, 1, 1), 0, Some(&stream), &mut a).unwrap(); }
+            }
+            // 32 id sets of 8 distinct experts.
+            let mut idsets: Vec<DeviceBuf<i32>> = Vec::new();
+            for k in 0..32 {
+                let ids: Vec<i32> = (0..n_used).map(|j| ((k * 37 + j * 13) % ne) as i32).collect();
+                idsets.push(DeviceBuf::from_slice(&ids).unwrap());
+            }
+            let dy: DeviceBuf<f32> = DeviceBuf::new(n_used * out_dim).unwrap();
+            let down_r: u32 = std::env::var("REINSTINCT_MOE_DOWN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+            let src_of = |d: &str| if down && d != ref_dir.as_deref().unwrap_or("") {
+                format!("#define DOWN_R {down_r}\n{defs}{}", read(d, file))
+            } else { format!("{defs}{}", read(d, file)) };
+            let run = |src: &str, tag: &str| -> (f64, Vec<f32>) {
+                let m = Module::load(&cache.compile(&format!("{file}_bench_{tag}_{}", defs.len()), src).unwrap()).unwrap();
+                let f = m.function(kname).unwrap();
+                let launch = |ids: &DeviceBuf<i32>| {
+                    let (mut ia, mut oa, mut bp) = (in_dim as u32, out_dim as u32, bpe as u32);
+                    let (mut tst, mut sst, mut nu) = (0u32, if down { (in_dim / 32) as u32 } else { 0 }, n_used as u32);
+                    let (mut g, mut u, mut idp, mut xa, mut ya) =
+                        (slabs[0].raw_ptr(), slabs[n_slabs - 1].raw_ptr(), ids.raw_ptr(), dxq.raw_ptr(), dy.raw_ptr());
+                    let gr = if tag == "new" { down_r } else { 1 };
+                    let grid_x = if down { let rpb = (256 / (in_dim as u32 / 32)).max(1) * gr; (out_dim as u32 + rpb - 1) / rpb }
+                                 else { (out_dim as u32 + 7) / 8 };
+                    let mut args: Vec<*mut c_void> = vec![&mut g as *mut _ as *mut c_void];
+                    if fused { args.push(&mut u as *mut _ as *mut c_void); }
+                    for p in [&mut idp as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
+                              &mut ya as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+                              &mut oa as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
+                              &mut tst as *mut _ as *mut c_void, &mut sst as *mut _ as *mut c_void,
+                              &mut nu as *mut _ as *mut c_void] { args.push(p); }
+                    unsafe { f.launch((grid_x, n_used as u32, 1), (256, 1, 1), 0, Some(&stream), &mut args).unwrap(); }
+                };
+                launch(&idsets[0]); stream.synchronize().unwrap();
+                let mut out = vec![0f32; n_used * out_dim];
+                dy.copy_to_host(&mut out).unwrap();
+                for k in 0..32 { launch(&idsets[k]); }
+                stream.synchronize().unwrap();
+                let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+                let iters = 320;
+                e0.record(&stream).unwrap();
+                for k in 0..iters { launch(&idsets[k % 32]); }
+                e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+                let us = hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 * 1000.0 / iters as f64;
+                (us, out)
+            };
+            let (us, out) = run(&src_of(&dir), "new");
+            let gbs = (n_used * n_slabs * bpe) as f64 / (us * 1e-6) / 1e9;
+            let mut line = format!("{label:24} {in_dim}x{out_dim}: {us:7.1} us {gbs:6.0} GB/s");
+            if let Some(rd) = &ref_dir {
+                let (us0, out0) = run(&src_of(rd), "ref");
+                let gbs0 = (n_used * n_slabs * bpe) as f64 / (us0 * 1e-6) / 1e9;
+                let scale = out0.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-30);
+                let md = out.iter().zip(&out0).fold(0f32, |a, (x, y)| a.max((x - y).abs())) / scale;
+                line += &format!("   ref {us0:7.1} us {gbs0:6.0} GB/s   max|Δ|/max {md:.1e}");
+            }
+            eprintln!("{line}");
+        }
+    }
+
     /// Can two independent decode matvecs overlap their ramp/drain? The
     /// GDN block's qkv [5120->10240] and gate [5120->6144] projections
     /// (both Q5_K here) read the same activation, so they can run

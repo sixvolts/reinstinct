@@ -108,6 +108,17 @@ const MOE_GATE_UP_SWIGLU_Q4K_SOURCE: &str =
     include_str!("../../kernels/moe_gate_up_swiglu_q4k_repacked.cpp");
 const MOE_MV_Q5K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_down.cpp");
 const MOE_MV_Q6K_DOWN_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_down.cpp");
+
+/// Row groups per workgroup in the MoE down kernels — prepended to their
+/// sources (`down_src`) and used for the launch grid, so the two agree.
+/// 2 measured best at both MoE shapes (Q5_K 512->2048: 144 -> 463 GB/s;
+/// 4 loses occupancy).
+const MOE_DOWN_R: u32 = 2;
+
+/// A MoE down-kernel source compiled at MOE_DOWN_R.
+fn down_src(src: &str) -> String {
+    format!("#define DOWN_R {MOE_DOWN_R}\n{src}")
+}
 const MOE_MV_Q5K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q5k_repacked.cpp");
 const MOE_MV_Q6K_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q6k_repacked.cpp");
 const MOE_MV_Q8_0_REPACKED_SOURCE: &str = include_str!("../../kernels/moe_matvec_q8_0_repacked.cpp");
@@ -641,9 +652,9 @@ impl MoeRuntime {
             m_gate_up_swiglu_q4k: Module::load(&cache.compile(
                               "moe_gate_up_swiglu_q4k_repacked", MOE_GATE_UP_SWIGLU_Q4K_SOURCE)?)?,
             m_down_q5k:   Module::load(&cache.compile(
-                              "moe_matvec_q5k_down", MOE_MV_Q5K_DOWN_SOURCE)?)?,
+                              "moe_matvec_q5k_down", &down_src(MOE_MV_Q5K_DOWN_SOURCE))?)?,
             m_down_q6k:   Module::load(&cache.compile(
-                              "moe_matvec_q6k_down", MOE_MV_Q6K_DOWN_SOURCE)?)?,
+                              "moe_matvec_q6k_down", &down_src(MOE_MV_Q6K_DOWN_SOURCE))?)?,
             m_mv_q4k:     Module::load(&cache.compile(
                               "moe_matvec_q4k_repacked", MOE_MV_Q4K_REPACKED_SOURCE)?)?,
             m_mv_q5k:     Module::load(&cache.compile(
@@ -655,7 +666,7 @@ impl MoeRuntime {
             m_mv_q5_1:    Module::load(&cache.compile("moe_matvec_q5_1_repacked",
                               &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_REPACKED_SOURCE))?)?,
             m_down_q5_1:  Module::load(&cache.compile("moe_matvec_q5_1_down",
-                              &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_DOWN_SOURCE))?)?,
+                              &crate::quant::q5_1::kernel_source(&down_src(MOE_MV_Q5K_DOWN_SOURCE)))?)?,
             m_grouped_q5_1: Module::load(&cache.compile("mmq_gemm_q5_1_grouped",
                               &grouped_src(&crate::quant::q5_1::kernel_source(MOE_MMQ_Q5K_GROUPED_SOURCE)))?)?,
             m_combine:    Module::load(&cache.compile("moe_combine", MOE_COMBINE_SOURCE)?)?,
@@ -3150,7 +3161,10 @@ impl GpuQwen35 {
                                                       n_tok, xq_tok_stride, xq_slot_stride),
         };
         let f = module.function(kname)?;
-        let rpb = (256 / (in_dim / 32)).max(1);
+        // The Q5_K / Q6_K / Q5_1 down kernels cover MOE_DOWN_R row groups
+        // per workgroup; the Q8_0 one covers one.
+        let groups = if et.dtype == GgmlType::Q8_0 { 1 } else { MOE_DOWN_R };
+        let rpb = (256 / (in_dim / 32)).max(1) * groups;
         let grid_x = (out_dim + rpb - 1) / rpb;
         let mut sa = et.data.raw_ptr(); let mut ida = moe.ids.raw_ptr();
         let mut xa = xq8; let mut ya = y;

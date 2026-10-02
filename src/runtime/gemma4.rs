@@ -97,6 +97,17 @@ const MOE_MV_Q6K_REPACKED_SRC: &str = include_str!("../../kernels/moe_matvec_q6k
 const MOE_MV_Q8_0_REPACKED_SRC: &str = include_str!("../../kernels/moe_matvec_q8_0_repacked.cpp");
 const MOE_MV_Q5K_DOWN_SRC:   &str = include_str!("../../kernels/moe_matvec_q5k_down.cpp");
 const MOE_MV_Q6K_DOWN_SRC:   &str = include_str!("../../kernels/moe_matvec_q6k_down.cpp");
+
+/// Row groups per workgroup in the MoE down kernels — prepended to their
+/// sources (`down_src`) and used for the launch grid, so the two agree.
+/// 2 measured best at both MoE shapes (Q5_K 512->2048: 144 -> 463 GB/s;
+/// 4 loses occupancy).
+const MOE_DOWN_R: u32 = 2;
+
+/// A MoE down-kernel source compiled at MOE_DOWN_R.
+fn down_src(src: &str) -> String {
+    format!("#define DOWN_R {MOE_DOWN_R}\n{src}")
+}
 const MMQ_Q4K_GROUPED_SRC:   &str = include_str!("../../kernels/mmq_gemm_q4k_grouped.cpp");
 const MMQ_Q5K_GROUPED_SRC:   &str = include_str!("../../kernels/mmq_gemm_q5k_grouped.cpp");
 const MOE_GEGLU_SRC:         &str = include_str!("../../kernels/moe_geglu.cpp");
@@ -1236,12 +1247,12 @@ impl GpuGemma4 {
             m_moe_mv_q5k_repacked: ld("moe_matvec_q5k_repacked", MOE_MV_Q5K_REPACKED_SRC)?,
             m_moe_mv_q6k_repacked: ld("moe_matvec_q6k_repacked", MOE_MV_Q6K_REPACKED_SRC)?,
             m_moe_mv_q8_0_repacked: ld("moe_matvec_q8_0_repacked", MOE_MV_Q8_0_REPACKED_SRC)?,
-            m_moe_down_q5k: ld("moe_matvec_q5k_down", MOE_MV_Q5K_DOWN_SRC)?,
-            m_moe_down_q6k: ld("moe_matvec_q6k_down", MOE_MV_Q6K_DOWN_SRC)?,
+            m_moe_down_q5k: ld("moe_matvec_q5k_down", &down_src(MOE_MV_Q5K_DOWN_SRC))?,
+            m_moe_down_q6k: ld("moe_matvec_q6k_down", &down_src(MOE_MV_Q6K_DOWN_SRC))?,
             m_moe_mv_q5_1_repacked: ld("moe_matvec_q5_1_repacked",
                 &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_REPACKED_SRC))?,
             m_moe_down_q5_1: ld("moe_matvec_q5_1_down",
-                &crate::quant::q5_1::kernel_source(MOE_MV_Q5K_DOWN_SRC))?,
+                &crate::quant::q5_1::kernel_source(&down_src(MOE_MV_Q5K_DOWN_SRC)))?,
             m_grouped_q5_1: ld("mmq_gemm_q5_1_grouped",
                 &grouped_src(&crate::quant::q5_1::kernel_source(MMQ_Q5K_GROUPED_SRC)))?,
             m_moe_geglu:    ld("moe_geglu", MOE_GEGLU_SRC)?,
@@ -1812,7 +1823,10 @@ impl GpuGemma4 {
             _ => None,
         };
         if let (Some((module, kname)), true) = (down, repacked && n_sub >= 1 && n_sub <= 256) {
-            let rpb = 256 / n_sub;
+            // The Q5_K / Q6_K / Q5_1 down kernels cover MOE_DOWN_R row
+            // groups per workgroup; the Q8_0 one covers one.
+            let groups = if dtype == GgmlType::Q8_0 { 1 } else { MOE_DOWN_R };
+            let rpb = 256 / n_sub * groups;
             let f = module.function(kname)?;
             let grid_x = (out_dim + rpb - 1) / rpb;
             let mut sa=slab; let mut ida=self.moe_ids.raw_ptr(); let mut xa=xq; let mut ya=y;
