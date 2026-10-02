@@ -970,15 +970,30 @@ impl<S> PrefixCache<S> {
 
     fn total_bytes(&self) -> usize { self.slots.iter().map(|e| e.bytes).sum() }
 
-    /// Add a fresh (tokens, snapshot) pair of `bytes` device bytes.
-    fn insert(&mut self, tokens: Vec<u32>, snapshot: S, bytes: usize) {
+    /// Decide whether a `bytes`-sized snapshot of `tokens` should be
+    /// taken, and if so make room for it, so the device never holds the
+    /// budget plus a doomed snapshot. Not taken when a slot already
+    /// covers `tokens` (it is a prefix of that slot — regenerate / edit
+    /// flows; that slot is refreshed instead) or when it alone exceeds
+    /// the budget (nothing is evicted then). Otherwise slots the new one
+    /// supersedes (prefixes of `tokens`) go, then the LRU end until it fits.
+    fn admit(&mut self, tokens: &[u32], bytes: usize) -> bool {
+        if let Some(i) = self.slots.iter().position(|e| e.tokens.starts_with(tokens)) {
+            self.touch(i);
+            return false;
+        }
+        if bytes > self.max_bytes { return false; }
         self.slots.retain(|e| !tokens.starts_with(&e.tokens));
-        if bytes > self.max_bytes { return; }
         while !self.slots.is_empty()
             && (self.slots.len() >= self.cap || self.total_bytes() + bytes > self.max_bytes)
         {
             self.slots.pop_front();
         }
+        true
+    }
+
+    /// Store a snapshot `admit` made room for.
+    fn push(&mut self, tokens: Vec<u32>, snapshot: S, bytes: usize) {
         self.slots.push_back(PrefixCacheEntry { tokens, snapshot, bytes });
     }
 }
@@ -994,9 +1009,12 @@ const PREFIX_CACHE_MIN_OVERLAP: usize = 32;
 /// env in serve startup if a deployment wants more.
 const PREFIX_CACHE_SLOTS: usize = 4;
 
-/// Default snapshot budget per Gemma model (REINSTINCT_PREFIX_CACHE_MB).
-/// One 4K-token snapshot of the 31B is ~1.8 GB of KV.
+/// Snapshot budget cap per Gemma model (REINSTINCT_PREFIX_CACHE_MB). The
+/// budget actually used is the smaller of this and the VRAM free after
+/// load, less one full-context snapshot and PREFIX_CACHE_HEADROOM_MB for
+/// prefill scratch. One 4K-token snapshot of the 31B is ~1.8 GB.
 const PREFIX_CACHE_MB: usize = 4096;
+const PREFIX_CACHE_HEADROOM_MB: usize = 3072;
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
@@ -1084,11 +1102,18 @@ impl ServerModel {
             } else { None };
             let think_closers: Vec<u32> = ["<channel|>", "<|thought|>"].iter()
                 .filter_map(|t| tok.token_id(t)).collect();
+            // Snapshot budget: the configured cap, but never more than the
+            // VRAM left after load minus one full-context snapshot (the
+            // live one being taken) and prefill-scratch headroom.
+            let cap = std::env::var("REINSTINCT_PREFIX_CACHE_MB").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(PREFIX_CACHE_MB) << 20;
+            let free = crate::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+            let budget = cap.min(free.saturating_sub(state.snapshot_bytes(Some(max_seq))
+                                                     + (PREFIX_CACHE_HEADROOM_MB << 20)));
+            info!("  prefix cache: {} MiB snapshot budget ({} MiB free after load)",
+                  budget >> 20, free >> 20);
             Ok(ServerModel::Gemma { gpu, state, graph: None, think_closers, tok, eos, bos, max_seq, name, drafter,
-                                    prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS,
-                                        std::env::var("REINSTINCT_PREFIX_CACHE_MB").ok()
-                                            .and_then(|v| v.parse::<usize>().ok())
-                                            .unwrap_or(PREFIX_CACHE_MB) << 20) })
+                                    prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS, budget) })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
             use crate::model::qwen3_5::Qwen35Model;
@@ -1373,9 +1398,9 @@ impl ServerModel {
                     // allocation failure shouldn't abort the request,
                     // just skip caching this turn. SuperQuant states
                     // never support snapshot, so skip silently there.
-                    if !state.is_superquant() {
+                    if !state.is_superquant() && prefix_cache.admit(&prompt, state.snapshot_bytes(None)) {
                         match state.snapshot() {
-                            Ok(snap) => { let b = snap.bytes(); prefix_cache.insert(prompt.clone(), snap, b) }
+                            Ok(snap) => { let b = snap.bytes(); prefix_cache.push(prompt.clone(), snap, b) }
                             Err(e) => warn!("prefix-cache snapshot failed: {e}"),
                         }
                     }
@@ -2336,34 +2361,53 @@ mod prefix_cache_tests {
 
     fn toks(n: usize, tag: u32) -> Vec<u32> { (0..n as u32).map(|i| i * 7 + tag).collect() }
 
+    fn insert(c: &mut PrefixCache<u32>, t: Vec<u32>, s: u32, b: usize) -> bool {
+        let ok = c.admit(&t, b);
+        if ok { c.push(t, s, b); }
+        ok
+    }
+    fn ids(c: &PrefixCache<u32>) -> Vec<u32> { c.slots.iter().map(|e| e.snapshot).collect() }
+
     #[test]
     fn a_longer_turn_replaces_its_prefix() {
         let mut c: PrefixCache<u32> = PrefixCache::new(4, 1000);
         let t1 = toks(100, 0);
         let mut t2 = t1.clone(); t2.extend(toks(50, 9));
-        c.insert(t1.clone(), 1, 100);
-        c.insert(toks(80, 3), 2, 100);
-        c.insert(t2.clone(), 3, 150);
-        assert_eq!(c.slots.len(), 2);                      // t1 dropped, other session kept
+        insert(&mut c, t1.clone(), 1, 100);
+        insert(&mut c, toks(80, 3), 2, 100);
+        insert(&mut c, t2.clone(), 3, 150);
+        assert_eq!(ids(&c), vec![2, 3]);                   // t1 dropped, other session kept
         assert_eq!(c.best_match(&t1).map(|(i, _)| c.slots[i].snapshot), Some(3));
     }
 
     #[test]
-    fn byte_budget_evicts_lru_and_skips_oversize() {
+    fn a_prompt_covered_by_a_slot_is_not_snapshotted() {
+        let mut c: PrefixCache<u32> = PrefixCache::new(4, 1000);
+        let long = toks(150, 0);
+        insert(&mut c, long.clone(), 1, 150);
+        insert(&mut c, toks(40, 5), 2, 40);
+        assert!(!insert(&mut c, long[..100].to_vec(), 3, 100));  // regenerate an earlier turn
+        assert_eq!(ids(&c), vec![2, 1]);                   // covering slot refreshed, nothing added
+    }
+
+    #[test]
+    fn byte_budget_evicts_lru_and_oversize_evicts_nothing() {
         let mut c: PrefixCache<u32> = PrefixCache::new(8, 300);
-        c.insert(toks(40, 1), 1, 120);
-        c.insert(toks(40, 2), 2, 120);
-        c.insert(toks(40, 3), 3, 120);                     // 360 > 300: oldest goes
-        assert_eq!(c.slots.iter().map(|e| e.snapshot).collect::<Vec<_>>(), vec![2, 3]);
-        c.insert(toks(40, 4), 4, 400);                     // alone over budget: not kept
-        assert_eq!(c.slots.len(), 2);
+        let t1 = toks(40, 1);
+        insert(&mut c, t1.clone(), 1, 120);
+        insert(&mut c, toks(40, 2), 2, 120);
+        insert(&mut c, toks(40, 3), 3, 120);               // 360 > 300: oldest goes
+        assert_eq!(ids(&c), vec![2, 3]);
+        let mut t4 = toks(40, 2); t4.extend(toks(10, 7));  // supersedes 2 but is oversize
+        assert!(!insert(&mut c, t4, 4, 400));
+        assert_eq!(ids(&c), vec![2, 3]);                   // 2 kept: nothing replaced it
         assert!(c.total_bytes() <= 300);
     }
 
     #[test]
     fn slot_cap_still_applies() {
         let mut c: PrefixCache<u32> = PrefixCache::new(2, 1 << 30);
-        for k in 1..=3 { c.insert(toks(40, k), k, 1); }
-        assert_eq!(c.slots.iter().map(|e| e.snapshot).collect::<Vec<_>>(), vec![2, 3]);
+        for k in 1..=3 { insert(&mut c, toks(40, k), k, 1); }
+        assert_eq!(ids(&c), vec![2, 3]);
     }
 }

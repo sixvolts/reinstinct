@@ -629,6 +629,16 @@ impl Gemma4GpuState {
     /// the current decode position. The snapshot lives on the device
     /// (no host roundtrip) and is sized to exactly the bytes in use,
     /// so it's cheap to take and restore for prefix-caching workflows.
+    /// Device bytes `snapshot()` would allocate with every cache holding
+    /// `len` rows (`None`: the current lengths) — lets a caller budget a
+    /// snapshot before taking it.
+    pub fn snapshot_bytes(&self, len: Option<usize>) -> usize {
+        self.caches.iter().map(|c| {
+            let l = len.unwrap_or(c.len).min(c.max_seq);
+            l * (2 * c.n_kv * c.head_dim + 2 * 4 * c.n_kv)
+        }).sum()
+    }
+
     pub fn snapshot(&self) -> Result<Gemma4StateSnapshot, String> {
         if self.superquant.is_some() {
             return Err("Gemma4GpuState::snapshot not supported with SuperQuant \

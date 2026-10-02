@@ -48,12 +48,12 @@ if (( ${#cards[@]} == 0 )); then
   exit 1
 fi
 
-for card in "${cards[@]}"; do
-  dev="$card/device"
+tune_card() {
+  local card=$1 dev="$1/device"
   echo "[reinstinct-gpu-tune] $(basename "$card") ($(basename "$(readlink -f "$dev")"), $(<"$dev/device"))"
   if [[ "$DRY" != 1 && ! -w "$dev/pp_table" ]]; then
     echo "$dev/pp_table not writable — run as root." >&2
-    exit 1
+    return 1
   fi
   run upp -p "$dev/pp_table" set --write \
     SmallPowerLimit1=$CAP_W \
@@ -63,17 +63,27 @@ for card in "${cards[@]}"; do
     smcPPTable/SocketPowerLimitDc=$CAP_W \
     smcPPTable/FreqTableUclk/2=1125 \
     smcPPTable/FreqTableUclk/3=1125 \
-    smcPPTable/FreqTableGfx/8=1825
+    smcPPTable/FreqTableGfx/8=1825 || return 1
   # Bounce perflevel so the kernel re-reads the table, then pin it high.
-  put auto "$dev/power_dpm_force_performance_level"
+  put auto "$dev/power_dpm_force_performance_level" || return 1
   [[ "$DRY" == 1 ]] || sleep 1
-  put high "$dev/power_dpm_force_performance_level"
+  put high "$dev/power_dpm_force_performance_level" || return 1
   for cap in "$dev"/hwmon/hwmon*/power1_cap; do
-    [[ -e "$cap" ]] && put $((CAP_W * 1000000)) "$cap"
+    if [[ -e "$cap" ]]; then put $((CAP_W * 1000000)) "$cap" || return 1; fi
   done
+}
+
+# One card failing (upp error, a rejected write) must not leave the rest
+# untuned: try them all, report, and exit non-zero at the end. (set -e
+# does not apply inside a function called from `||`, hence the explicit
+# `|| return 1` on every step above.)
+failed=0
+for card in "${cards[@]}"; do
+  tune_card "$card" || { echo "[reinstinct-gpu-tune] $(basename "$card"): FAILED" >&2; failed=1; }
 done
 
-[[ "$DRY" == 1 ]] && exit 0
+[[ "$DRY" == 1 ]] && exit "$failed"
 echo "[reinstinct-gpu-tune] applied to ${#cards[@]} card(s): ${CAP_W}W cap, mclk top=1125 MHz, sclk top=1825 MHz, perflevel=high"
 rocm-smi --showclocks    2>&1 | grep -E "sclk|mclk" || true
 rocm-smi --showmaxpower  2>&1 | grep "Max Graphics" || true
+exit "$failed"
