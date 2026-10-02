@@ -18,8 +18,10 @@
 //
 // grid = (ceil(out_dim / (rows_per_block * DOWN_R)), n_used, n_tok); block 256.
 
+// No default: a kernel compiled with fewer groups than its launcher's
+// grid assumes would leave rows unwritten.
 #ifndef DOWN_R
-#define DOWN_R 4
+#error "moe down kernel: the runtime must #define DOWN_R (see down_src)"
 #endif
 
 #include <hip/hip_runtime.h>

@@ -1981,7 +1981,8 @@ mod tests {
         let mv = Module::load(&cache.compile("moe_matvec_q5_1_repacked",
             &q5_1::kernel_source(include_str!("../../kernels/moe_matvec_q5k_repacked.cpp"))).unwrap()).unwrap();
         let dn = Module::load(&cache.compile("moe_matvec_q5_1_down",
-            &q5_1::kernel_source(include_str!("../../kernels/moe_matvec_q5k_down.cpp"))).unwrap()).unwrap();
+            &q5_1::kernel_source(&format!("#define DOWN_R 1\n{}",   // one group: the grid below
+                include_str!("../../kernels/moe_matvec_q5k_down.cpp")))).unwrap()).unwrap();
         let dslab: DeviceBuf<u8> = DeviceBuf::from_slice(&slab).unwrap();
         let dids: DeviceBuf<i32> = DeviceBuf::from_slice(&ids).unwrap();
         let dy: DeviceBuf<f32> = DeviceBuf::new(n_used * out_dim).unwrap();
@@ -2234,9 +2235,12 @@ mod tests {
                 idsets.push(DeviceBuf::from_slice(&ids).unwrap());
             }
             let dy: DeviceBuf<f32> = DeviceBuf::new(n_used * out_dim).unwrap();
-            let down_r: u32 = std::env::var("REINSTINCT_MOE_DOWN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-            let src_of = |d: &str| if down && d != ref_dir.as_deref().unwrap_or("") {
-                format!("#define DOWN_R {down_r}\n{defs}{}", read(d, file))
+            // The "new" build's row groups (default: the runtimes'
+            // MOE_DOWN_R); the reference is the pre-DOWN_R kernel, one
+            // group per workgroup — define it as 1 in case it has DOWN_R.
+            let down_r: u32 = std::env::var("REINSTINCT_MOE_DOWN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let src_of = |d: &str, tag: &str| if down {
+                format!("#define DOWN_R {}\n{defs}{}", if tag == "new" { down_r } else { 1 }, read(d, file))
             } else { format!("{defs}{}", read(d, file)) };
             let run = |src: &str, tag: &str| -> (f64, Vec<f32>) {
                 let m = Module::load(&cache.compile(&format!("{file}_bench_{tag}_{}", defs.len()), src).unwrap()).unwrap();
@@ -2271,11 +2275,11 @@ mod tests {
                 let us = hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 * 1000.0 / iters as f64;
                 (us, out)
             };
-            let (us, out) = run(&src_of(&dir), "new");
+            let (us, out) = run(&src_of(&dir, "new"), "new");
             let gbs = (n_used * n_slabs * bpe) as f64 / (us * 1e-6) / 1e9;
             let mut line = format!("{label:24} {in_dim}x{out_dim}: {us:7.1} us {gbs:6.0} GB/s");
             if let Some(rd) = &ref_dir {
-                let (us0, out0) = run(&src_of(rd), "ref");
+                let (us0, out0) = run(&src_of(rd, "ref"), "ref");
                 let gbs0 = (n_used * n_slabs * bpe) as f64 / (us0 * 1e-6) / 1e9;
                 let scale = out0.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-30);
                 let md = out.iter().zip(&out0).fold(0f32, |a, (x, y)| a.max((x - y).abs())) / scale;
