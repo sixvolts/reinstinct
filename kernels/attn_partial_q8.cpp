@@ -135,7 +135,7 @@ void attn_partial_q8_f32(const float*       __restrict__ q,        // [n_heads, 
     __syncthreads();
     // fold the per-token V scale into the (unnormalised) probabilities.
     for (int i = tid; i < slice_len; i += bs)
-        scores[i] *= v_scale[(size_t)(slice_start + i) * n_kv_heads + kv_h];
+        scores[i] *= v_scale[(size_t)((unsigned)(slice_start + i) & ring_mask) * n_kv_heads + kv_h];
     __syncthreads();
 
     // --- P·V: o[d] = Σ_i scores[i]·V[t][d] ---

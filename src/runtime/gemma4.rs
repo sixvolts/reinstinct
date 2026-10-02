@@ -697,8 +697,10 @@ impl Gemma4GpuState {
         // A ring only holds the window behind its end plus `slack` rows:
         // moving the end back further would leave the new window's rows
         // already overwritten.
-        if let Some(c) = self.caches.iter()
-            .find(|c| c.len > new_len && c.len - new_len > c.slack)
+        // Exactly: positions below len - rows are gone, and the new end
+        // needs [new_len - window, new_len); window = rows - slack.
+        if let Some(c) = self.caches.iter().find(|c| c.slack != usize::MAX
+            && new_len.saturating_sub(c.rows - c.slack) < c.len.saturating_sub(c.rows))
         {
             return Err(format!("truncate: {} -> {new_len} moves back further than the \
                 sliding-window ring keeps ({} rows past its window)", c.len, c.slack));

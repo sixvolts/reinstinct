@@ -2386,7 +2386,9 @@ mod tests {
         let (n_heads, n_kv, head_dim) = std::env::var("REINSTINCT_ATTN_GEOM").ok()
             .map(|g| { let v: Vec<usize> = g.split(',').map(|x| x.parse().unwrap()).collect(); (v[0], v[1], v[2]) })
             .unwrap_or((24, 4, 256));
-        let max_seq = 8192usize;
+        // REINSTINCT_ATTN_MAXSEQ: cache length (positions benched up to it).
+        let max_seq: usize = std::env::var("REINSTINCT_ATTN_MAXSEQ").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(8192);
         let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
         let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
@@ -2439,7 +2441,7 @@ mod tests {
             unsafe { qf.launch(((flush_n as u32) / 256, 1, 1), (256, 1, 1), 0, Some(st), &mut a).unwrap(); }
         };
         let dout2: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
-        for &pos in &[31u32, 511, 2047, 8191] {
+        for &pos in &[31u32, 511, 2047, 8191, 32767].iter().filter(|&&p| (p as usize) < max_seq).copied().collect::<Vec<_>>() {
             dpos.copy_from_host(&[pos]).unwrap();
             let launch_gqa = |st: &hip::Stream| {
                 let mut qa = dq.raw_ptr(); let mut ka = dk.raw_ptr(); let mut va = dv.raw_ptr();
@@ -2751,7 +2753,9 @@ mod tests {
             Some(g) => { let v: Vec<usize> = g.split(',').map(|x| x.parse().unwrap()).collect(); vec![(v[0], v[1], v[2], v[3] as u32)] }
             None => vec![(32, 16, 256, 1024), (32, 4, 512, 0)],
         };
-        let max_seq = 8192usize;
+        // REINSTINCT_ATTN_MAXSEQ: cache length (positions benched up to it).
+        let max_seq: usize = std::env::var("REINSTINCT_ATTN_MAXSEQ").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(8192);
         let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());
         let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.cpp"))
@@ -2804,7 +2808,7 @@ mod tests {
             let dout2: DeviceBuf<f32> = DeviceBuf::new(n_heads * head_dim).unwrap();
             let dpos: DeviceBuf<u32> = DeviceBuf::new(1).unwrap();
             eprintln!("geometry {n_heads}/{n_kv}/{head_dim} window {window} (GH {gh}, n_splits {n_splits})");
-            for &pos in &[31u32, 511, 2047, 8191] {
+            for &pos in &[31u32, 511, 2047, 8191, 32767].iter().filter(|&&p| (p as usize) < max_seq).copied().collect::<Vec<_>>() {
                 dpos.copy_from_host(&[pos]).unwrap();
                 let merge = |st: &hip::Stream, out: &DeviceBuf<f32>| {
                     let mut op2 = dop.raw_ptr(); let mut mp2 = dmp.raw_ptr(); let mut lp2 = dlp.raw_ptr();
