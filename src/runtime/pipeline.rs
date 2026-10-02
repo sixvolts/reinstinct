@@ -243,8 +243,26 @@ impl Qwen35Pipeline {
     /// much as one twice its size — measured on the 27B at pp644, 64-token
     /// end chunks came out slightly *slower* than four equal 192s. So:
     /// equal chunks, and more of them only as the prompt grows.
+    ///
+    /// On a single stage there is nothing to overlap, but an unchunked
+    /// prompt sizes every prefill scratch buffer to its full length, which
+    /// capped usable prompts well below the KV cache's room. Prompts over
+    /// `REINSTINCT_SINGLE_PREFILL_CHUNK` tokens (default 2048, far above
+    /// where the MMQ tiles fill the card) go through in equal chunks of at
+    /// most that size, each attending to the earlier ones through the KV
+    /// cache.
     fn prefill_chunks(&self, n: usize) -> Vec<usize> {
-        if self.stages.len() == 1 || n < 2 * 64 { return vec![n]; }
+        if self.stages.len() == 1 {
+            let max = std::env::var("REINSTINCT_SINGLE_PREFILL_CHUNK").ok()
+                .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(2048);
+            if n <= max { return vec![n]; }
+            let chunk = n.div_ceil(n.div_ceil(max)).div_ceil(64) * 64;
+            let mut chunks = Vec::with_capacity(n.div_ceil(chunk));
+            let mut left = n;
+            while left > 0 { let c = chunk.min(left); chunks.push(c); left -= c; }
+            return chunks;
+        }
+        if n < 2 * 64 { return vec![n]; }
         let max_chunk = std::env::var("REINSTINCT_PREFILL_CHUNK").ok()
             .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 64).unwrap_or(256)
             .div_ceil(64) * 64;
@@ -288,7 +306,9 @@ impl Qwen35Pipeline {
             for (stage, (dev, st)) in self.stages.iter().zip(state.stages.iter_mut()) {
                 set_dev(*dev)?;
                 let (act, out, lg) = stage.gpu.prefill_stage(ch, st, prev.as_ref(), last_chunk)?;
-                held.push(act);
+                // A single stage has no peer copy to protect: its chunk
+                // scratch goes back to the pool for the next chunk.
+                if self.stages.len() > 1 { held.push(act); } else { drop(act); }
                 prev = Some(out);
                 logits = lg;
             }
