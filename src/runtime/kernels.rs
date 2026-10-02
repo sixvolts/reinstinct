@@ -2462,6 +2462,120 @@ mod tests {
     /// layers 32/16/256 with window 1024, global layers 32/4/512) over a
     /// range of context lengths, with a correctness check between them.
     /// `--ignored --nocapture`; REINSTINCT_ATTN_GEOM=heads,kv,head_dim,window.
+    /// The batched int8 verify attention (`attn_step_q8_batched`) against
+    /// a CPU reference built from the same int8 cache, at positions from
+    /// tiny to past the old kernel's ~15.8K LDS limit, full and sliding.
+    /// Not ignored for correctness at the small sizes; set
+    /// REINSTINCT_ATTN_OLD_SRC=<old .cpp> to also time the pre-online-
+    /// softmax kernel (which sizes LDS by the window) where it fits.
+    #[test]
+    fn attn_step_q8_batched_matches_reference() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        let src = include_str!("../../kernels/attn_step_q8_batched.cpp");
+        let m = Module::load(&cache.compile("attn_step_q8_batched", src).unwrap()).unwrap();
+        let f = m.function("attn_step_q8_batched_f32").unwrap();
+        let old = std::env::var("REINSTINCT_ATTN_OLD_SRC").ok().map(|p| {
+            let s = std::fs::read_to_string(&p).unwrap();
+            Module::load(&cache.compile("attn_step_q8_batched_old", &s).unwrap()).unwrap()
+        });
+        let big = std::env::var_os("REINSTINCT_ATTN_BIG").is_some();
+        let stream = hip::Stream::new().unwrap();
+        let n_rows = 4usize;
+        for &(n_heads, n_kv, head_dim, window) in &[(32usize, 16usize, 256usize, 1024u32), (32, 4, 512, 0)] {
+            let positions: Vec<usize> = if big { vec![5, 300, 4000, 15000, 20000] } else { vec![5, 300, 1500] };
+            let max_seq = positions.iter().max().unwrap() + n_rows;
+            let kv_dim = n_kv * head_dim;
+            let mut sd: u64 = 0x5EED_A77E ^ head_dim as u64;
+            let mut rnd = || { sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                               ((sd >> 40) as f32 / (1u64 << 24) as f32) - 0.5 };
+            let kc: Vec<i8> = (0..max_seq * kv_dim).map(|_| (rnd() * 254.0) as i8).collect();
+            let vc: Vec<i8> = (0..max_seq * kv_dim).map(|_| (rnd() * 254.0) as i8).collect();
+            let ksc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.002 + rnd().abs() * 0.002).collect();
+            let vsc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.02 + rnd().abs() * 0.02).collect();
+            let q: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| rnd() * 4.0).collect();
+            let dk = DeviceBuf::from_slice(&kc).unwrap(); let dv = DeviceBuf::from_slice(&vc).unwrap();
+            let dks = DeviceBuf::from_slice(&ksc).unwrap(); let dvs = DeviceBuf::from_slice(&vsc).unwrap();
+            let dq = DeviceBuf::from_slice(&q).unwrap();
+            let dout: DeviceBuf<f32> = DeviceBuf::new(n_rows * n_heads * head_dim).unwrap();
+            let scaling = 1.0f32 / (head_dim as f32).sqrt();
+            for &base in &positions {
+                let launch = |func: &crate::hip::Function, smem: u32| {
+                    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+                        (dq.raw_ptr(), dk.raw_ptr(), dks.raw_ptr(), dv.raw_ptr(), dvs.raw_ptr(), dout.raw_ptr());
+                    let (mut nh, mut nk, mut hd, mut bp, mut nr, mut wn, mut sc) =
+                        (n_heads as u32, n_kv as u32, head_dim as u32, base as u32, n_rows as u32, window, scaling);
+                    let mut args: [*mut c_void; 13] = [
+                        &mut a0 as *mut _ as *mut c_void, &mut a1 as *mut _ as *mut c_void,
+                        &mut a2 as *mut _ as *mut c_void, &mut a3 as *mut _ as *mut c_void,
+                        &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void,
+                        &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
+                        &mut hd as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void,
+                        &mut nr as *mut _ as *mut c_void, &mut wn as *mut _ as *mut c_void,
+                        &mut sc as *mut _ as *mut c_void];
+                    unsafe { func.launch((n_heads as u32, n_rows as u32, 1), (256, 1, 1), smem,
+                                         Some(&stream), &mut args).unwrap(); }
+                };
+                launch(&f, 0);
+                stream.synchronize().unwrap();
+                let mut got = vec![0f32; n_rows * n_heads * head_dim];
+                dout.copy_to_host(&mut got).unwrap();
+                // CPU reference over the same int8 data (Q quantised the
+                // kernel's way: per-row amax / 127, round to nearest).
+                let groups = n_heads / n_kv;
+                let mut worst = 0f64;
+                for r in 0..n_rows {
+                    let total = base + r + 1;
+                    let lo = if window > 0 && total > window as usize { total - window as usize } else { 0 };
+                    for h in 0..n_heads {
+                        let kh = h / groups;
+                        let qh = &q[(r * n_heads + h) * head_dim..][..head_dim];
+                        let amax = qh.iter().fold(0f32, |a, x| a.max(x.abs()));
+                        let dqs = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                        let qi: Vec<i32> = qh.iter().map(|x| ((x * (127.0 / amax)).round() as i32).clamp(-127, 127)).collect();
+                        let sc: Vec<f64> = (lo..total).map(|t| {
+                            let k = &kc[t * kv_dim + kh * head_dim..][..head_dim];
+                            let dot: i32 = qi.iter().zip(k).map(|(a, b)| a * *b as i32).sum();
+                            dqs as f64 * ksc[t * n_kv + kh] as f64 * dot as f64 * scaling as f64
+                        }).collect();
+                        let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+                        let e: Vec<f64> = sc.iter().map(|s| (s - mx).exp()).collect();
+                        let l: f64 = e.iter().sum();
+                        let (mut num, mut den) = (0f64, 0f64);
+                        for d in 0..head_dim {
+                            let mut a = 0f64;
+                            for (i, t) in (lo..total).enumerate() {
+                                a += e[i] * vsc[t * n_kv + kh] as f64 * vc[t * kv_dim + kh * head_dim + d] as f64;
+                            }
+                            let want = a / l;
+                            let g = got[(r * n_heads + h) * head_dim + d] as f64;
+                            num += (g - want).powi(2); den += want.powi(2);
+                        }
+                        worst = worst.max((num / den.max(1e-30)).sqrt());
+                    }
+                }
+                // Timing: new kernel, and the old one where its LDS fits.
+                let time = |func: &crate::hip::Function, smem: u32| -> f64 {
+                    launch(func, smem); stream.synchronize().unwrap();
+                    let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+                    e0.record(&stream).unwrap();
+                    for _ in 0..20 { launch(func, smem); }
+                    e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+                    hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 * 1000.0 / 20.0
+                };
+                let t_new = time(&f, 0);
+                let old_t = old.as_ref().and_then(|mo| {
+                    let win = (base + n_rows) as u32;
+                    let win = if window > 0 { window.min(win) } else { win };
+                    let smem = head_dim as u32 + (win + 256) * 4;
+                    (smem <= 65536).then(|| time(&mo.function("attn_step_q8_batched_f32").unwrap(), smem))
+                });
+                eprintln!("hd {head_dim} window {window} base {base}: rel_l2 {worst:.2e}  {t_new:.1} us{}",
+                          old_t.map_or(String::new(), |t| format!("  (old kernel {t:.1} us)")));
+                assert!(worst < 2e-3, "attn_step_q8_batched diverges at base {base}: {worst:.2e}");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "benchmark — run explicitly with --ignored"]
     fn bench_attn_decode_q8() {

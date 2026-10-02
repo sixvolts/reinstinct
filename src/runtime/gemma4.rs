@@ -3646,18 +3646,15 @@ impl GpuGemma4 {
                 AttnKind::Sliding => self.sliding_window as u32,
                 AttnKind::Full    => 0,
             };
-            // Pass the current base_pos as the LDS-sizing upper bound
-            // for the captured launch — the kernel itself reads base_pos
-            // from v_base_pos. Any later replay must have base_pos in
-            // the same magnitude range (which the spec-decode loop
-            // satisfies since rounds advance monotonically by ≤K+1).
+            // The kernel reads base_pos from v_base_pos, so a captured
+            // graph replays correctly at any position.
             self.launch_attn_step_q8_batched_offset(
                 q_buf.raw_ptr(),
                 kvc.k.raw_ptr(),  kvc.ks.raw_ptr(),
                 kvc.v.raw_ptr(),  kvc.vs.raw_ptr(),
                 attn.raw_ptr(),
                 n_kv as u32, hd as u32,
-                base_pos as u32, p as u32, window)?;
+                p as u32, window)?;
 
             gemm_into(&b.attn_output, attn, attn_out)?;
             self.launch_rmsnorm_batched(attn_out.raw_ptr(), b.post_attn_norm.raw_ptr(),
@@ -3751,9 +3748,7 @@ impl GpuGemma4 {
         }
         // Capture-time placeholders: v_base_pos / v_tokens just need
         // valid bytes for the kernels to read; the values don't affect
-        // the captured graph's structure. (Use state.pos so the LDS
-        // sizing in attn_step_q8_batched_offset matches replay-time
-        // base_pos magnitudes — see launch_attn_step_q8_batched_offset.)
+        // the captured graph's structure.
         self.v_base_pos.copy_from_host(&[state.pos as u32])?;
         let zeros = vec![0u32; self.max_verify_k];
         self.v_tokens.copy_from_host(&zeros)?;
@@ -3925,20 +3920,16 @@ impl GpuGemma4 {
         v_cache: *mut c_void, v_scale: *mut c_void,
         out: *mut c_void,
         n_kv: u32, head_dim: u32,
-        max_base_pos: u32, n_q_rows: u32,
+        n_q_rows: u32,
         window: u32) -> Result<(), String>
     {
         let f = self.m_attn_step_q8_b.function("attn_step_q8_batched_offset_f32")?;
         let n_heads = self.n_heads as u32;
+        // The kernel's block size is fixed (online softmax over 256-key
+        // chunks, static LDS) — nothing here depends on base_pos, so a
+        // captured graph replays at any position.
         let block: u32 = 256;
-        // LDS sized to the worst-case window — `max_base_pos` is a host-
-        // side upper bound on the base_pos value we'll see during this
-        // capture's lifetime (passed in so the LDS size is captured
-        // correctly; if a future caller exceeds it the kernel would OOB
-        // its scores buffer).
-        let max_win = if window > 0 { window.min(max_base_pos + n_q_rows) }
-                      else { max_base_pos + n_q_rows };
-        let smem = head_dim + (max_win + block) * 4;
+        assert!(head_dim <= 512 && head_dim % 4 == 0, "attn_step_q8_batched: head_dim {head_dim}");
         let scaling: f32 = 1.0f32;
 
         let mut qa = q; let mut kca = k_cache; let mut ksa = k_scale;
@@ -3954,7 +3945,7 @@ impl GpuGemma4 {
             &mut hd  as *mut _ as *mut c_void, &mut bp  as *mut _ as *mut c_void,
             &mut nq  as *mut _ as *mut c_void, &mut wn  as *mut _ as *mut c_void,
             &mut sc  as *mut _ as *mut c_void];
-        unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), smem,
+        unsafe { f.launch((n_heads, n_q_rows, 1),(block,1,1), 0,
                            Some(&self.stream), &mut args) }
     }
 
