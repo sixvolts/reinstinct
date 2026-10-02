@@ -728,6 +728,11 @@ pub struct Gemma4StateSnapshot {
 
 impl Gemma4StateSnapshot {
     pub fn pos(&self) -> usize { self.pos }
+
+    /// Device bytes the snapshot holds.
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().map(|l| l.k.len() + l.v.len() + 4 * (l.ks.len() + l.vs.len())).sum()
+    }
 }
 
 struct Gemma4LayerSnapshot {

@@ -903,27 +903,29 @@ enum ServerModel {
     },
 }
 
-struct PrefixCacheEntry {
+struct PrefixCacheEntry<S> {
     tokens: Vec<u32>,
-    snapshot: crate::runtime::gemma4::Gemma4StateSnapshot,
+    snapshot: S,
+    bytes: usize,
 }
 
-/// Small LRU cache of `PrefixCacheEntry` per `ServerModel::Gemma`. On
-/// each request we scan all slots for the longest common prefix with
-/// the new prompt; on insert we evict the oldest. Multi-slot is the
-/// difference between "two back-to-back turns share state" (1-slot)
-/// and "multiple concurrent chat sessions on the same model can each
-/// reuse state" (N-slot). Cap chosen by VRAM budget — each snapshot
-/// is ~max_seq × per-layer-KV bytes (e.g. ~50 MB for a 500-token
-/// gemma-26B-MoE prompt), so 4 slots ≈ ~200 MB.
-struct PrefixCache {
-    slots: std::collections::VecDeque<PrefixCacheEntry>,
+/// Small LRU cache of KV snapshots per `ServerModel::Gemma`. On each
+/// request we scan all slots for the longest common prefix with the new
+/// prompt. A snapshot is a full copy of the populated KV cache, so a
+/// conversation's turn N contains turn N-1's: on insert, slots whose
+/// tokens are a prefix of the new prompt are dropped (any request that
+/// would hit them shares at least as much with the new one), and the
+/// LRU end is evicted past `cap` slots or `max_bytes` of snapshots. A
+/// snapshot alone over the budget is not kept.
+struct PrefixCache<S = crate::runtime::gemma4::Gemma4StateSnapshot> {
+    slots: std::collections::VecDeque<PrefixCacheEntry<S>>,
     cap: usize,
+    max_bytes: usize,
 }
 
-impl PrefixCache {
-    fn new(cap: usize) -> Self {
-        Self { slots: std::collections::VecDeque::with_capacity(cap), cap }
+impl<S> PrefixCache<S> {
+    fn new(cap: usize, max_bytes: usize) -> Self {
+        Self { slots: std::collections::VecDeque::with_capacity(cap), cap, max_bytes }
     }
 
     /// Find the slot with the longest common prefix vs `prompt`. Returns
@@ -949,9 +951,7 @@ impl PrefixCache {
     /// Mark slot `idx` as most-recently-used and return a reference
     /// to its snapshot for restore. Moves entry to the back of the
     /// deque (most-recent end).
-    fn touch(&mut self, idx: usize)
-        -> &crate::runtime::gemma4::Gemma4StateSnapshot
-    {
+    fn touch(&mut self, idx: usize) -> &S {
         if idx + 1 < self.slots.len() {
             let entry = self.slots.remove(idx).expect("idx valid");
             self.slots.push_back(entry);
@@ -961,24 +961,18 @@ impl PrefixCache {
         }
     }
 
-    /// Add a fresh (tokens, snapshot) pair. Evicts the oldest if at
-    /// cap. If a slot already holds an exact prefix duplicate, just
-    /// updates it (no point keeping two identical entries).
-    fn insert(&mut self, tokens: Vec<u32>,
-              snapshot: crate::runtime::gemma4::Gemma4StateSnapshot)
-    {
-        // Dedup: if some slot's tokens are identical to ours, swap its
-        // snapshot in place and move it to the back.
-        if let Some(pos) = self.slots.iter().position(|e| e.tokens == tokens) {
-            let mut e = self.slots.remove(pos).expect("pos valid");
-            e.snapshot = snapshot;
-            self.slots.push_back(e);
-            return;
-        }
-        if self.slots.len() >= self.cap {
+    fn total_bytes(&self) -> usize { self.slots.iter().map(|e| e.bytes).sum() }
+
+    /// Add a fresh (tokens, snapshot) pair of `bytes` device bytes.
+    fn insert(&mut self, tokens: Vec<u32>, snapshot: S, bytes: usize) {
+        self.slots.retain(|e| !tokens.starts_with(&e.tokens));
+        if bytes > self.max_bytes { return; }
+        while !self.slots.is_empty()
+            && (self.slots.len() >= self.cap || self.total_bytes() + bytes > self.max_bytes)
+        {
             self.slots.pop_front();
         }
-        self.slots.push_back(PrefixCacheEntry { tokens, snapshot });
+        self.slots.push_back(PrefixCacheEntry { tokens, snapshot, bytes });
     }
 }
 
@@ -992,6 +986,10 @@ const PREFIX_CACHE_MIN_OVERLAP: usize = 32;
 /// concurrent chat sessions without VRAM bloat. Override-able via
 /// env in serve startup if a deployment wants more.
 const PREFIX_CACHE_SLOTS: usize = 4;
+
+/// Default snapshot budget per Gemma model (REINSTINCT_PREFIX_CACHE_MB).
+/// One 4K-token snapshot of the 31B is ~1.8 GB of KV.
+const PREFIX_CACHE_MB: usize = 4096;
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
@@ -1080,7 +1078,10 @@ impl ServerModel {
             let think_closers: Vec<u32> = ["<channel|>", "<|thought|>"].iter()
                 .filter_map(|t| tok.token_id(t)).collect();
             Ok(ServerModel::Gemma { gpu, state, graph: None, think_closers, tok, eos, bos, max_seq, name, drafter,
-                                    prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS) })
+                                    prefix_cache: PrefixCache::new(PREFIX_CACHE_SLOTS,
+                                        std::env::var("REINSTINCT_PREFIX_CACHE_MB").ok()
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                            .unwrap_or(PREFIX_CACHE_MB) << 20) })
         } else {
             // qwen35 / qwen35moe — the dense + MoE Qwen runtime.
             use crate::model::qwen3_5::Qwen35Model;
@@ -1353,7 +1354,7 @@ impl ServerModel {
                     // never support snapshot, so skip silently there.
                     if !state.is_superquant() {
                         match state.snapshot() {
-                            Ok(snap) => prefix_cache.insert(prompt.clone(), snap),
+                            Ok(snap) => { let b = snap.bytes(); prefix_cache.insert(prompt.clone(), snap, b) }
                             Err(e) => warn!("prefix-cache snapshot failed: {e}"),
                         }
                     }
@@ -2299,5 +2300,43 @@ mod stop_tests {
         assert_eq!(parse_stop(&Json::parse(r#"{"stop": "x"}"#).unwrap()).unwrap(), vec!["x"]);
         assert!(parse_stop(&Json::parse(r#"{"stop": ["1","2","3","4","5"]}"#).unwrap()).is_err());
         assert!(parse_stop(&Json::parse(r#"{"stop": 3}"#).unwrap()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+
+    fn toks(n: usize, tag: u32) -> Vec<u32> { (0..n as u32).map(|i| i * 7 + tag).collect() }
+
+    #[test]
+    fn a_longer_turn_replaces_its_prefix() {
+        let mut c: PrefixCache<u32> = PrefixCache::new(4, 1000);
+        let t1 = toks(100, 0);
+        let mut t2 = t1.clone(); t2.extend(toks(50, 9));
+        c.insert(t1.clone(), 1, 100);
+        c.insert(toks(80, 3), 2, 100);
+        c.insert(t2.clone(), 3, 150);
+        assert_eq!(c.slots.len(), 2);                      // t1 dropped, other session kept
+        assert_eq!(c.best_match(&t1).map(|(i, _)| c.slots[i].snapshot), Some(3));
+    }
+
+    #[test]
+    fn byte_budget_evicts_lru_and_skips_oversize() {
+        let mut c: PrefixCache<u32> = PrefixCache::new(8, 300);
+        c.insert(toks(40, 1), 1, 120);
+        c.insert(toks(40, 2), 2, 120);
+        c.insert(toks(40, 3), 3, 120);                     // 360 > 300: oldest goes
+        assert_eq!(c.slots.iter().map(|e| e.snapshot).collect::<Vec<_>>(), vec![2, 3]);
+        c.insert(toks(40, 4), 4, 400);                     // alone over budget: not kept
+        assert_eq!(c.slots.len(), 2);
+        assert!(c.total_bytes() <= 300);
+    }
+
+    #[test]
+    fn slot_cap_still_applies() {
+        let mut c: PrefixCache<u32> = PrefixCache::new(2, 1 << 30);
+        for k in 1..=3 { c.insert(toks(40, k), k, 1); }
+        assert_eq!(c.slots.iter().map(|e| e.snapshot).collect::<Vec<_>>(), vec![2, 3]);
     }
 }
