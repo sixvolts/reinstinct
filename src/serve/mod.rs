@@ -541,6 +541,13 @@ fn parse_stop(j: &Json) -> Result<Vec<String>, String> {
     Ok(stops.into_iter().filter(|s| !s.is_empty()).collect())
 }
 
+/// Length of `text` that is final: the tokenizers decode with
+/// from_utf8_lossy, so a glyph split across tokens shows as a trailing
+/// U+FFFD until the next token completes it — never emit that yet.
+fn stable_len(text: &str) -> usize {
+    if text.ends_with('\u{FFFD}') { text.len() - '\u{FFFD}'.len_utf8() } else { text.len() }
+}
+
 /// Streaming stop-sequence scan. `scan(text, from)` is called after each
 /// token with the whole decoded text and the length already emitted; it
 /// returns how far the text may be emitted, and whether a stop matched
@@ -1209,6 +1216,7 @@ impl ServerModel {
                 let mut out: Vec<u32> = Vec::new();
                 let mut hit_eos = false;
                 let mut prev_text_len: usize = 0;
+                let mut gone = false;   // client disconnected
                 let mut full_text = String::new();
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 // Penalty history starts over after a thinking closer.
@@ -1243,6 +1251,7 @@ impl ServerModel {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
                     let (upto, stopped) = stop.scan(&full_text, prev_text_len);
+                    let upto = if stopped { upto } else { upto.min(stable_len(&full_text)) };
                     if upto > prev_text_len {
                         let delta = &full_text[prev_text_len..upto];
                         let ok = on_token(delta, tlp.as_ref());
@@ -1250,6 +1259,8 @@ impl ServerModel {
                         if !ok {
                             // Channel closed (client disconnected). Stop
                             // generating; return what we have.
+                            if launched { gpu.decode_finish()?; }
+                            gone = true;
                             break;
                         }
                         prev_text_len = upto;
@@ -1259,12 +1270,13 @@ impl ServerModel {
                     if stopped {
                         full_text.truncate(upto);
                         hit_eos = true;
+                        if launched { gpu.decode_finish()?; }
                         break;
                     }
                     logits = if launched { gpu.decode_finish()? } else { gpu.forward_token(t, state)? };
                 }
-                // Text held back as a possible stop prefix that never completed.
-                if !hit_eos && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
+                // Text held back (a possible stop prefix, a split glyph).
+                if !gone && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
                 Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
             }
             ServerModel::Gemma { gpu, state, graph, think_closers, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
@@ -1295,11 +1307,20 @@ impl ServerModel {
                 // emits nothing until done), no stop strings or logprobs,
                 // and a dense target (on the MoE it measured 25-51% slower,
                 // MANUAL). use_speculative=true forces it anyway.
+                let sp0 = &req.sampler;
+                let plain_greedy = sp0.temperature == 0.0 && sp0.repetition_penalty == 1.0
+                    && sp0.frequency_penalty == 0.0 && sp0.presence_penalty == 0.0
+                    && sp0.mirostat.is_none();
                 let want_spec = match req.use_speculative {
                     Some(b) => b,
-                    None => drafter.is_some() && req.sampler.temperature == 0.0 && !req.stream
+                    None => drafter.is_some() && plain_greedy && !req.stream
                         && req.stop.is_empty() && req.top_logprobs_n == 0 && !gpu.is_moe(),
                 };
+                if want_spec && (req.stream || !req.stop.is_empty()) {
+                    return Err("use_speculative=true does not support stream or stop \
+                                (the spec-decode loop emits its tokens at the end and \
+                                does not scan for stop strings)".into());
+                }
                 let do_spec = want_spec && drafter.is_some();
                 if want_spec && drafter.is_none() {
                     return Err("use_speculative=true but server has no drafter loaded \
@@ -1370,6 +1391,7 @@ impl ServerModel {
                     let mut out: Vec<u32> = Vec::new();
                     let mut hit_eos = false;
                     let mut prev_text_len: usize = 0;
+                    let mut gone = false;   // client disconnected
                     let mut full_text = String::new();
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
                     // Penalty history starts over after a thinking closer.
@@ -1399,11 +1421,16 @@ impl ServerModel {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
                         let (upto, stopped) = stop.scan(&full_text, prev_text_len);
+                        let upto = if stopped { upto } else { upto.min(stable_len(&full_text)) };
                         if upto > prev_text_len {
                             let delta = &full_text[prev_text_len..upto];
                             let ok = on_token(delta, tlp.as_ref());
                             if let Some(t) = tlp { all_lp.push(t); }
-                            if !ok { break; }
+                            if !ok {
+                                if launched { gpu.read_logits()?; }
+                                gone = true;
+                                break;
+                            }
                             prev_text_len = upto;
                         } else if let Some(t) = tlp {
                             all_lp.push(t);
@@ -1418,7 +1445,7 @@ impl ServerModel {
                         }
                         logits = if launched { gpu.read_logits()? } else { gpu.forward_token(t, state)? };
                     }
-                    if !hit_eos && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
+                    if !gone && full_text.len() > prev_text_len { on_token(&full_text[prev_text_len..], None); }
                     return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
                 }
 
