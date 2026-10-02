@@ -2481,7 +2481,11 @@ mod tests {
         let big = std::env::var_os("REINSTINCT_ATTN_BIG").is_some();
         let stream = hip::Stream::new().unwrap();
         let n_rows = 4usize;
-        for &(n_heads, n_kv, head_dim, window) in &[(32usize, 16usize, 256usize, 1024u32), (32, 4, 512, 0)] {
+        // The last case scales Q up 40x: peaked softmax, the running max
+        // jumping between chunks, exp underflow — the regime the online
+        // softmax exists for.
+        for &(n_heads, n_kv, head_dim, window, qscale) in
+            &[(32usize, 16usize, 256usize, 1024u32, 4.0f32), (32, 4, 512, 0, 4.0), (32, 4, 512, 0, 160.0)] {
             let positions: Vec<usize> = if big { vec![5, 300, 4000, 15000, 20000] } else { vec![5, 300, 1500] };
             let max_seq = positions.iter().max().unwrap() + n_rows;
             let kv_dim = n_kv * head_dim;
@@ -2492,7 +2496,7 @@ mod tests {
             let vc: Vec<i8> = (0..max_seq * kv_dim).map(|_| (rnd() * 254.0) as i8).collect();
             let ksc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.002 + rnd().abs() * 0.002).collect();
             let vsc: Vec<f32> = (0..max_seq * n_kv).map(|_| 0.02 + rnd().abs() * 0.02).collect();
-            let q: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| rnd() * 4.0).collect();
+            let q: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| rnd() * qscale).collect();
             let dk = DeviceBuf::from_slice(&kc).unwrap(); let dv = DeviceBuf::from_slice(&vc).unwrap();
             let dks = DeviceBuf::from_slice(&ksc).unwrap(); let dvs = DeviceBuf::from_slice(&vsc).unwrap();
             let dq = DeviceBuf::from_slice(&q).unwrap();
@@ -2569,7 +2573,7 @@ mod tests {
                     let smem = head_dim as u32 + (win + 256) * 4;
                     (smem <= 65536).then(|| time(&mo.function("attn_step_q8_batched_f32").unwrap(), smem))
                 });
-                eprintln!("hd {head_dim} window {window} base {base}: rel_l2 {worst:.2e}  {t_new:.1} us{}",
+                eprintln!("hd {head_dim} window {window} q x{qscale} base {base}: rel_l2 {worst:.2e}  {t_new:.1} us{}",
                           old_t.map_or(String::new(), |t| format!("  (old kernel {t:.1} us)")));
                 assert!(worst < 2e-3, "attn_step_q8_batched diverges at base {base}: {worst:.2e}");
             }

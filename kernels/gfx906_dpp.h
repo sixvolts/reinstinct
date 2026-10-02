@@ -65,7 +65,8 @@ __device__ __forceinline__ float rein_xfer_xor16_f32(float x) {
 }
 
 // Full-width Wave64 sum reduction. Five DPP/swizzle ops + one shfl
-// for the cross-half step. Caller's value at lane 0 holds the wave sum.
+// for the cross-half step. Every step is a full permutation, so every
+// lane ends up holding the wave sum.
 __device__ __forceinline__ float wave64_reduce_add_f32(float x) {
     x = rein_add_xor1_f32(x);
     x = rein_add_xor2_f32(x);

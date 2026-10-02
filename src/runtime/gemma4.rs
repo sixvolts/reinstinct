@@ -3929,7 +3929,9 @@ impl GpuGemma4 {
         // chunks, static LDS) — nothing here depends on base_pos, so a
         // captured graph replays at any position.
         let block: u32 = 256;
-        assert!(head_dim <= 512 && head_dim % 4 == 0, "attn_step_q8_batched: head_dim {head_dim}");
+        if head_dim > 512 || head_dim % 4 != 0 {
+            return Err(format!("attn_step_q8_batched: head_dim {head_dim} (needs <= 512, a multiple of 4)"));
+        }
         let scaling: f32 = 1.0f32;
 
         let mut qa = q; let mut kca = k_cache; let mut ksa = k_scale;

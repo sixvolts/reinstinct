@@ -24,7 +24,7 @@
 // softmax -> PV pattern as attn_step_q8, but the keys stream through in
 // chunks of blockDim.x with an online softmax (running max m, running
 // sum l, accumulators rescaled by exp(m_old - m_new) per chunk), so
-// LDS is fixed at qi[head_dim] | p[bs] | red[8] whatever the context
+// LDS is fixed at qi[head_dim] | p[bs] | red[4] whatever the context
 // length. (It used to hold every score of the window: a graph captured
 // at one position overran LDS when replayed at a later one, and full
 // layers capped out at ~15.8K positions in 64 KB.)
