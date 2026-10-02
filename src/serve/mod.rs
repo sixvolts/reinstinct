@@ -112,7 +112,8 @@ enum PromptInput {
 /// A parsed `/v1/completions` or `/v1/chat/completions` request.
 struct GenReq {
     prompt: PromptInput,
-    max_tokens: usize,
+    /// `None`: generate until EOS or the context window is full.
+    max_tokens: Option<usize>,
     sampler: crate::sampling::SamplerParams,
     /// MTP spec-decode opt-in/opt-out. `None` ⇒ use the server default
     /// (true if the target has a drafter loaded, false otherwise).
@@ -250,12 +251,15 @@ const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
 };
 
 fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
-    -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
+    -> (Option<usize>, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
         Option<std::time::Duration>, bool, bool, usize, crate::chat::Qwen3ThinkOpts)
 {
     use crate::sampling::{SamplerParams, MirostatV2};
-    let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
-        .map(|n| n as usize).unwrap_or(256).clamp(1, 4096);
+    // Absent: run to EOS or the end of the context (a thinking model's
+    // reply routinely outruns any small fixed default). Either way the
+    // model clamps it to the context left after the prompt.
+    let max_tokens = j.get("max_tokens").or_else(|| j.get("max_completion_tokens"))
+        .and_then(Json::as_f64).map(|n| (n as usize).max(1));
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
@@ -364,6 +368,7 @@ fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta,
     let mut d = Vec::with_capacity(2);
     if let Some(r) = delta.role    { d.push(("role".into(),    Json::Str(r.to_string()))); }
     if let Some(c) = delta.content { d.push(("content".into(), Json::Str(c.to_string()))); }
+    if let Some(r) = delta.reasoning { d.push(("reasoning_content".into(), Json::Str(r.to_string()))); }
     let mut choice = vec![
         ("index".into(), Json::Num(0.0)),
         ("delta".into(), Json::Obj(d)),
@@ -383,7 +388,13 @@ fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta,
     ]).to_string()
 }
 
-struct ChatDelta<'a> { role: Option<&'a str>, content: Option<&'a str> }
+struct ChatDelta<'a> {
+    role: Option<&'a str>,
+    content: Option<&'a str>,
+    /// Thinking-channel text (`reasoning_content`, the vLLM/DeepSeek
+    /// field OpenAI-compatible clients render as reasoning).
+    reasoning: Option<&'a str>,
+}
 
 /// Convert a `SampleResult` into a `TokenLogprob` by decoding each token
 /// id through the caller-provided decoder. The "delta" text we surface
@@ -549,105 +560,180 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
 ///                      style: multiple bare `<|thought|>` then prose)
 const THINK_CLOSERS: &[&str] = &["</think>", "<channel|>", "<|thought|>"];
 
-/// Strip any thinking-mode preamble from a fully decoded response.
-/// Returns the slice after the LAST closing marker, or the full text
-/// unchanged if none are present.
-fn strip_thinking_channels(text: &str) -> &str {
-    let mut best_end: Option<usize> = None;
+/// Opening markers of a thinking channel: `<think>` (Qwen) and
+/// `<|channel>` (Gemma 4). Gemma's bare `<|thought|>` is only a closer —
+/// the model can emit it once and go straight to the answer.
+const THINK_OPENERS: &[&str] = &["<think>", "<|channel>"];
+
+/// End of the LAST closing marker in `text`, if any.
+fn last_think_close(text: &str) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
     for m in THINK_CLOSERS {
         if let Some(idx) = text.rfind(m) {
-            let end = idx + m.len();
-            if best_end.map_or(true, |b| end > b) {
-                best_end = Some(end);
+            if best.map_or(true, |(_, e)| idx + m.len() > e) { best = Some((idx, idx + m.len())); }
+        }
+    }
+    best
+}
+
+/// `text` after its first opening marker, or all of it.
+fn after_think_open(text: &str) -> &str {
+    THINK_OPENERS.iter().filter_map(|o| text.find(o).map(|i| i + o.len())).min()
+        .map_or(text, |e| &text[e..])
+}
+
+fn trim_think_ws(t: &str) -> &str { t.trim_matches(|c: char| c == '\n' || c == ' ') }
+
+/// Split a fully decoded chat response into (reasoning, answer).
+/// `opened`: the prompt itself ended inside a thinking block (Qwen's
+/// template primes `<think>\n`), so the text starts as reasoning with no
+/// opener of its own. A response cut off before its closer is all
+/// reasoning when a block was open, and all answer otherwise.
+fn split_thinking(text: &str, opened: bool) -> (Option<String>, String) {
+    match last_think_close(text) {
+        Some((idx, end)) => {
+            let r = trim_think_ws(after_think_open(&text[..idx]));
+            let a = text[end..].trim_start_matches(|c: char| c == '\n' || c == ' ');
+            ((!r.is_empty()).then(|| r.to_string()), a.to_string())
+        }
+        None if opened => (Some(trim_think_ws(text).to_string()), String::new()),
+        None => {
+            let open_at = THINK_OPENERS.iter().filter_map(|o| text.find(o)).min();
+            match open_at {
+                Some(_) => (Some(trim_think_ws(after_think_open(text)).to_string()), String::new()),
+                None => (None, text.to_string()),
             }
         }
     }
-    match best_end {
-        Some(end) => text[end..].trim_start_matches(|c: char| c == '\n' || c == ' '),
-        None      => text,
-    }
 }
 
-/// Streaming-aware version of the same stripper. Buffers incoming text
-/// until either a closing marker is seen (then emits everything after
-/// it and switches to passthrough), or until enough text has been
-/// buffered with no marker that we conclude this response simply isn't
-/// using thinking mode (then flush the buffer verbatim and passthrough).
+/// One streaming step's output: reasoning text and answer text.
+#[derive(Default, Debug, PartialEq)]
+pub struct StripOut { pub reasoning: String, pub content: String }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StripMode { Detect, Thinking, Answer }
+
+/// Streaming version of `split_thinking`. Starts in `Thinking` when the
+/// prompt opened a thinking block, else in `Detect`: buffers until an
+/// opener (-> `Thinking`), a closer (-> `Answer`), or `MAX_BUFFER`
+/// bytes with neither (not a thinking response; flush as answer). In
+/// `Thinking`, text streams out as reasoning — minus a tail that could
+/// be the start of a closing marker split across deltas — until the
+/// closer; everything after it is answer.
 pub struct ThinkingStripStream {
-    /// `true` once we've passed the closing marker (or decided there
-    /// won't be one). All subsequent input is forwarded verbatim.
-    passthrough: bool,
-    /// Cumulative pre-passthrough text. Bounded by `MAX_BUFFER`.
+    mode: StripMode,
     buf: String,
+    /// Strip leading newlines/spaces from the next emitted text (after
+    /// an opener or closer).
+    trim_reasoning: bool,
+    trim_answer: bool,
 }
 
 impl ThinkingStripStream {
     const MAX_BUFFER: usize = 256;
 
-    pub fn new() -> Self {
-        Self { passthrough: false, buf: String::new() }
+    pub fn new(opened: bool) -> Self {
+        Self { mode: if opened { StripMode::Thinking } else { StripMode::Detect },
+               buf: String::new(), trim_reasoning: true, trim_answer: false }
     }
 
-    /// Push a streaming delta. Returns the (possibly empty) clean text
-    /// to forward downstream this call.
-    pub fn push(&mut self, chunk: &str) -> String {
-        if self.passthrough {
-            return chunk.to_string();
+    fn answer(&mut self, t: &str) -> String {
+        let t = if self.trim_answer { t.trim_start_matches(|c: char| c == '\n' || c == ' ') } else { t };
+        if !t.is_empty() { self.trim_answer = false; }
+        t.to_string()
+    }
+
+    fn reasoning(&mut self, t: &str) -> String {
+        let t = if self.trim_reasoning { t.trim_start_matches(|c: char| c == '\n' || c == ' ') } else { t };
+        if !t.is_empty() { self.trim_reasoning = false; }
+        t.to_string()
+    }
+
+    /// Push a streaming delta; returns the text to forward this call.
+    pub fn push(&mut self, chunk: &str) -> StripOut {
+        let mut out = StripOut::default();
+        if self.mode == StripMode::Answer {
+            out.content = self.answer(chunk);
+            return out;
         }
         self.buf.push_str(chunk);
-        // Look for any closing marker in the cumulative buffer.
-        let mut best_end: Option<usize> = None;
-        for m in THINK_CLOSERS {
-            if let Some(idx) = self.buf.rfind(m) {
-                let end = idx + m.len();
-                if best_end.map_or(true, |b| end > b) { best_end = Some(end); }
-            }
-        }
-        if let Some(end) = best_end {
-            let tail = self.buf[end..]
-                .trim_start_matches(|c: char| c == '\n' || c == ' ')
-                .to_string();
-            self.passthrough = true;
-            self.buf.clear();
-            return tail;
-        }
-        // No closer yet. If the buffer has grown past our cap AND we
-        // never saw any opening marker, this response isn't using
-        // thinking mode — flush verbatim and start passing through.
-        if self.buf.len() > Self::MAX_BUFFER {
-            let opened = ["<think>", "<|channel>", "<|thought|>"]
-                .iter().any(|o| self.buf.contains(o));
-            if !opened {
-                self.passthrough = true;
-                let out = std::mem::take(&mut self.buf);
+        if self.mode == StripMode::Detect {
+            if let Some(e) = THINK_OPENERS.iter()
+                .filter_map(|o| self.buf.find(o).map(|i| i + o.len())).min()
+            {
+                // Text before an opener is dropped, as the full-text
+                // split does.
+                self.buf.drain(..e);
+                self.mode = StripMode::Thinking;
+            } else if let Some((idx, end)) = last_think_close(&self.buf) {
+                let (r, a) = (self.buf[..idx].to_string(), self.buf[end..].to_string());
+                self.buf.clear();
+                self.mode = StripMode::Answer;
+                self.trim_answer = true;
+                out.reasoning = self.reasoning(trim_think_ws(&r));
+                out.content = self.answer(&a);
+                return out;
+            } else if self.buf.len() > Self::MAX_BUFFER {
+                let b = std::mem::take(&mut self.buf);
+                self.mode = StripMode::Answer;
+                out.content = self.answer(&b);
+                return out;
+            } else {
                 return out;
             }
         }
-        String::new()
+        // Thinking.
+        if let Some((idx, end)) = THINK_CLOSERS.iter()
+            .filter_map(|m| self.buf.find(m).map(|i| (i, i + m.len()))).min()
+        {
+            let (r, a) = (self.buf[..idx].to_string(), self.buf[end..].to_string());
+            self.buf.clear();
+            self.mode = StripMode::Answer;
+            self.trim_answer = true;
+            out.reasoning = self.reasoning(r.trim_end_matches(|c: char| c == '\n' || c == ' '));
+            out.content = self.answer(&a);
+            return out;
+        }
+        // Hold back the longest suffix that is a proper prefix of a closer.
+        let hold = THINK_CLOSERS.iter().map(|m| {
+            (1..m.len()).rev().find(|&k| self.buf.ends_with(&m[..k])).unwrap_or(0)
+        }).max().unwrap_or(0);
+        let cut = self.buf.len() - hold;
+        let r: String = self.buf.drain(..cut).collect();
+        out.reasoning = self.reasoning(&r);
+        out
     }
 
-    /// Flush whatever is in the buffer at end-of-stream. The model may
-    /// have stopped mid-thinking (rare) or emitted an opener with no
-    /// matching closer — emit what we have so the user sees the response.
-    pub fn flush(&mut self) -> String {
-        if self.passthrough { return String::new(); }
-        let out = std::mem::take(&mut self.buf);
-        self.passthrough = true;
+    /// End of stream: whatever is still buffered — reasoning when a
+    /// thinking block never closed (the response hit max_tokens), answer
+    /// otherwise.
+    pub fn flush(&mut self) -> StripOut {
+        let b = std::mem::take(&mut self.buf);
+        let mut out = StripOut::default();
+        match self.mode {
+            StripMode::Thinking => out.reasoning = self.reasoning(&b),
+            StripMode::Detect   => out.content = self.answer(&b),
+            StripMode::Answer   => {}
+        }
+        self.mode = StripMode::Answer;
         out
     }
 }
 
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
-fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
+fn chat_completion_response(model: &str, text: &str, think_opened: bool, n_prompt: usize,
                             n_completion: usize, hit_eos: bool,
                             logprobs: &[TokenLogprob]) -> String {
-    let text = strip_thinking_channels(text);
+    let (reasoning, content) = split_thinking(text, think_opened);
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let message = Json::Obj(vec![
+    let mut msg = vec![
         ("role".into(),    Json::Str("assistant".into())),
-        ("content".into(), Json::Str(text.to_string())),
-    ]);
+        ("content".into(), Json::Str(content)),
+    ];
+    if let Some(r) = reasoning { msg.push(("reasoning_content".into(), Json::Str(r))); }
+    let message = Json::Obj(msg);
     let choice = Json::Obj(vec![
         ("index".into(),         Json::Num(0.0)),
         ("message".into(),       message),
@@ -837,6 +923,18 @@ struct GemmaDrafter {
     verify_graphs: Vec<Option<crate::hip::GraphExec>>,
 }
 
+/// Tokens a request may generate: `max_tokens` (or everything) clamped
+/// to the context left after the prompt and `margin` reserved slots.
+fn new_token_budget(max_tokens: Option<usize>, prompt_len: usize, max_seq: usize, margin: usize)
+    -> Result<usize, String>
+{
+    let room = max_seq.saturating_sub(prompt_len + margin);
+    if room == 0 {
+        return Err(format!("prompt ({prompt_len} tokens) fills the context window ({max_seq})"));
+    }
+    Ok(max_tokens.map_or(room, |m| m.min(room)))
+}
+
 impl ServerModel {
     /// Load a GGUF, detecting the architecture, into a resident GPU model.
     /// `drafter_path` is honoured only on Gemma 4 targets — qwen35 has no
@@ -929,6 +1027,22 @@ impl ServerModel {
         match self { ServerModel::Qwen { name, .. } | ServerModel::Gemma { name, .. } => name }
     }
 
+    /// Whether the rendered prompt ends inside an open thinking block,
+    /// so the response starts as reasoning with no opener of its own:
+    /// Qwen's template primes `<think>\n` whenever thinking is on; a raw
+    /// prompt can end on an opener itself.
+    fn prompt_opens_thinking(&self, req: &GenReq) -> bool {
+        match (&req.prompt, self) {
+            (PromptInput::Raw(t), _) => {
+                let t = t.trim_end();
+                THINK_OPENERS.iter().any(|o| t.ends_with(o))
+            }
+            (PromptInput::Chat(_), ServerModel::Qwen { think, .. }) =>
+                req.think.enable_thinking.unwrap_or(think.default_on),
+            (PromptInput::Chat(_), ServerModel::Gemma { .. }) => false,
+        }
+    }
+
     /// Run one completion. Returns (text, prompt_tokens, completion_tokens,
     /// hit_eos, per_token_logprobs). `on_token`, if Some, receives the
     /// decoded text DELTA for each emitted token plus an optional
@@ -970,11 +1084,7 @@ impl ServerModel {
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
-                if prompt.len() + req.max_tokens + 4 > *max_seq {
-                    return Err(format!(
-                        "prompt ({}) + max_tokens ({}) exceeds context window ({})",
-                        prompt.len(), req.max_tokens, *max_seq));
-                }
+                let max_new = new_token_budget(req.max_tokens, prompt.len(), *max_seq, 4)?;
                 state.reset()?;
                 let mut logits = if prompt.len() > 1 {
                     gpu.forward_tokens_batched(&prompt, state)?
@@ -995,7 +1105,7 @@ impl ServerModel {
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 // Penalty history starts over after a thinking closer.
                 let mut answer_start = 0usize;
-                for _ in 0..req.max_tokens {
+                for _ in 0..max_new {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
                     }
@@ -1060,11 +1170,7 @@ impl ServerModel {
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
-                if prompt.len() + req.max_tokens + 8 > *max_seq {
-                    return Err(format!(
-                        "prompt ({}) + max_tokens ({}) exceeds context window ({})",
-                        prompt.len(), req.max_tokens, *max_seq));
-                }
+                let max_new = new_token_budget(req.max_tokens, prompt.len(), *max_seq, 8)?;
                 // Dispatch: spec-decode when a drafter is loaded AND the
                 // request hasn't opted out. Default-on if drafter present.
                 let want_spec = match req.use_speculative {
@@ -1145,7 +1251,7 @@ impl ServerModel {
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
                     // Penalty history starts over after a thinking closer.
                     let mut answer_start = 0usize;
-                    for _ in 0..req.max_tokens {
+                    for _ in 0..max_new {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
                         }
@@ -1212,7 +1318,7 @@ impl ServerModel {
                     verify_logits,
                     *prompt.last().unwrap(),
                     *eos,
-                    req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
+                    max_new, k, req.sampler.temperature, req.sampler.seed,
                     req.speculative_p_min,
                     adaptive_alpha, adaptive_window,
                 )?;
@@ -1354,7 +1460,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     // expectations).
                     if is_stream && is_chat {
                         let frame = chat_stream_chunk(&stream_id, &model_name,
-                            ChatDelta { role: Some("assistant"), content: None }, None, None);
+                            ChatDelta { role: Some("assistant"), content: None, reasoning: None }, None, None);
                         let _ = reply_tx.send(StreamMsg::Chunk(frame));
                     }
                     // `catch_unwind` around generate(): a panic in a kernel
@@ -1369,23 +1475,28 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     // worker thread; the closure mutates it through a
                     // RefCell so we can also flush at end-of-stream from
                     // outside the closure.
+                    // Chat only — raw completions stream the text as
+                    // generated, as their non-streamed response does.
+                    let think_opened = is_chat && model.prompt_opens_thinking(&req);
                     let stripper = std::rc::Rc::new(std::cell::RefCell::new(
-                        ThinkingStripStream::new()));
+                        ThinkingStripStream::new(think_opened)));
                     let stripper_cb = std::rc::Rc::clone(&stripper);
                     let on_token = move |delta: &str, lp: Option<&TokenLogprob>| -> bool {
                         if !is_stream { return true; }
-                        let clean = stripper_cb.borrow_mut().push(delta);
-                        if clean.is_empty() {
-                            // Still buffering inside a thinking block;
-                            // don't emit a frame this round.
-                            return true;
-                        }
                         let frame = if is_chat {
+                            let o = stripper_cb.borrow_mut().push(delta);
+                            if o.reasoning.is_empty() && o.content.is_empty() {
+                                // Buffering (a possible marker); no frame yet.
+                                return true;
+                            }
                             chat_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                ChatDelta { role: None, content: Some(&clean) }, None, lp)
+                                ChatDelta { role: None,
+                                            content: (!o.content.is_empty()).then_some(o.content.as_str()),
+                                            reasoning: (!o.reasoning.is_empty()).then_some(o.reasoning.as_str()) },
+                                None, lp)
                         } else {
                             completion_stream_chunk(&stream_id_for_cb, &model_name_for_cb,
-                                &clean, None, lp)
+                                delta, None, lp)
                         };
                         reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
                     };
@@ -1415,21 +1526,19 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 // emitted an opener with no matching
                                 // closer — show the user what we have).
                                 let tail = stripper.borrow_mut().flush();
-                                if !tail.is_empty() {
-                                    let frame = if is_chat {
-                                        chat_stream_chunk(&stream_id, &model_name,
-                                            ChatDelta { role: None, content: Some(&tail) }, None, None)
-                                    } else {
-                                        completion_stream_chunk(&stream_id, &model_name,
-                                            &tail, None, None)
-                                    };
+                                if is_chat && !(tail.reasoning.is_empty() && tail.content.is_empty()) {
+                                    let frame = chat_stream_chunk(&stream_id, &model_name,
+                                        ChatDelta { role: None,
+                                            content: (!tail.content.is_empty()).then_some(tail.content.as_str()),
+                                            reasoning: (!tail.reasoning.is_empty()).then_some(tail.reasoning.as_str()) },
+                                        None, None);
                                     let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 }
                                 // Final SSE frame: empty delta + finish_reason.
                                 let fin = if eos { "stop" } else { "length" };
                                 let frame = if is_chat {
                                     chat_stream_chunk(&stream_id, &model_name,
-                                        ChatDelta { role: None, content: None }, Some(fin), None)
+                                        ChatDelta { role: None, content: None, reasoning: None }, Some(fin), None)
                                 } else {
                                     completion_stream_chunk(&stream_id, &model_name,
                                         "", Some(fin), None)
@@ -1501,7 +1610,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp)
+                                    chat_completion_response(&model_name, &text, think_opened, n_p, n_c, eos, &lp)
                                 } else {
                                     completion_response(&model_name, &text, n_p, n_c, eos, &lp)
                                 };
@@ -1633,7 +1742,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             // Worker answers 503; keep the shape.
             Ok(GenReq {
                 prompt: PromptInput::Raw(String::new()),
-                max_tokens: 0,
+                max_tokens: None,
                 sampler: crate::sampling::SamplerParams::default(),
                 use_speculative: None,
                 think: crate::chat::Qwen3ThinkOpts::default(),
@@ -1893,5 +2002,98 @@ mod logprobs_tests {
     fn empty_logprobs_render_as_null() {
         assert_eq!(render_text_logprobs(&[]).to_string(), "null");
         assert_eq!(render_chat_logprobs(&[]).to_string(), "null");
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    /// Feed `deltas` through a stream stripper; return (reasoning, answer).
+    fn stream(deltas: &[&str], opened: bool) -> (String, String) {
+        let mut s = ThinkingStripStream::new(opened);
+        let (mut r, mut a) = (String::new(), String::new());
+        for d in deltas {
+            let o = s.push(d);
+            r += &o.reasoning; a += &o.content;
+        }
+        let o = s.flush();
+        r += &o.reasoning; a += &o.content;
+        (r, a)
+    }
+
+    /// Every way of chunking `text` (single chars and a few widths)
+    /// must give the same split as the full-text `split_thinking`.
+    fn check(text: &str, opened: bool, reasoning: &str, answer: &str) {
+        let (r, a) = split_thinking(text, opened);
+        assert_eq!(r.as_deref().unwrap_or(""), reasoning, "split reasoning: {text:?}");
+        assert_eq!(a, answer, "split answer: {text:?}");
+        for w in [1usize, 2, 3, 5, 7, 64, 4096] {
+            let chars: Vec<char> = text.chars().collect();
+            let deltas: Vec<String> = chars.chunks(w).map(|c| c.iter().collect()).collect();
+            let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+            let (sr, sa) = stream(&refs, opened);
+            assert_eq!(sr.trim_end(), reasoning, "stream reasoning, width {w}: {text:?}");
+            assert_eq!(sa, answer, "stream answer, width {w}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn qwen_prompt_opened_think() {
+        // The template primed `<think>\n`: no opener in the output.
+        check("Let me count the birds.\nHeron, crane.\n</think>\n\nTwo birds: heron and crane.",
+              true, "Let me count the birds.\nHeron, crane.", "Two birds: heron and crane.");
+    }
+
+    #[test]
+    fn long_reasoning_never_leaks_into_content() {
+        let thought = "step ".repeat(200);   // > MAX_BUFFER
+        let text = format!("{thought}</think>\n\nanswer");
+        check(&text, true, thought.trim_end(), "answer");
+    }
+
+    #[test]
+    fn cut_off_mid_thought_is_all_reasoning() {
+        check("thinking about it and then the tokens ran", true,
+              "thinking about it and then the tokens ran", "");
+    }
+
+    #[test]
+    fn thinking_off_passes_through() {
+        let text = "Plain answer with no thinking at all. ".repeat(10);
+        check(&text, false, "", &text);
+    }
+
+    #[test]
+    fn model_opened_think() {
+        check("<think>\nhmm\n</think>\n\nok", false, "hmm", "ok");
+    }
+
+    #[test]
+    fn gemma_channel() {
+        check("<|channel>thought\nweighing it<channel|>The answer.", false,
+              "thought\nweighing it", "The answer.");
+    }
+
+    #[test]
+    fn gemma_bare_thought_closer() {
+        check("musing<|thought|>The answer.", false, "musing", "The answer.");
+    }
+
+    #[test]
+    fn marker_split_across_deltas_is_held_back() {
+        let (r, a) = stream(&["abc</th", "ink>", "\n\nhi"], true);
+        assert_eq!((r.as_str(), a.as_str()), ("abc", "hi"));
+        // A '<' that turns out not to start a closer is released.
+        let (r, a) = stream(&["a <", "b</think>x"], true);
+        assert_eq!((r.as_str(), a.as_str()), ("a <b", "x"));
+    }
+
+    #[test]
+    fn token_budget() {
+        assert_eq!(new_token_budget(None, 100, 4096, 8), Ok(3988));
+        assert_eq!(new_token_budget(Some(256), 100, 4096, 8), Ok(256));
+        assert_eq!(new_token_budget(Some(9999), 100, 4096, 8), Ok(3988));
+        assert!(new_token_budget(Some(10), 4090, 4096, 8).is_err());
     }
 }
