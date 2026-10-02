@@ -83,21 +83,26 @@ void rmsnorm_q8_f32(const float* __restrict__ x,    // [n]
         const float v  = xv * rrms * wv;
 
         float amax = fabsf(v);
-        float vsum = v;
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            amax = fmaxf(amax, __shfl_xor(amax, o));
-            vsum += __shfl_xor(vsum, o);
-        }
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o));
 
         const float inv = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
         int q = (int)rintf(v * inv);
         q = max(-127, min(127, q));
+        // xsum is the sum of the QUANTIZED values (d·Σq), not the exact
+        // one: the Q4_K/Q5_K/Q5_1 kernels subtract dmin·m·xsum from a dot
+        // over quantized activations, and only a matching sum keeps each
+        // activation's rounding error weighted by the centred weight
+        // (d·sc·q − dmin·m) instead of by d·sc·q (see matvec_q4_0_repacked).
+        int qsum = q;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor(qsum, o);
 
         out[sb].qs[lane] = (int8_t)q;
         if (lane == 0) {
-            out[sb].d    = amax > 0.0f ? amax / 127.0f : 1.0f;
-            out[sb].xsum = vsum;
+            const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+            out[sb].d    = d;
+            out[sb].xsum = d * (float)qsum;
         }
     }
 }

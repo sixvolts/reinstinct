@@ -1,7 +1,7 @@
 // Quantize an f32 activation vector to int8 blocks of 32 for the dp4a
-// matvec path. Each block stores a per-block scale `d`, the plain sum
-// of the original values `xsum` (used for the Q4_K/Q5_K dmin term),
-// and 32 signed int8 quants.
+// matvec path. Each block stores a per-block scale `d`, `xsum` = d·Σq
+// (the sum of the quantized values, used for the Q4_K/Q5_K/Q5_1 min
+// term), and 32 signed int8 quants.
 //
 // grid = (ceil(in_dim/256), n_vec); block = 256 — a full wavefront ×4,
 // each block doing 8 sub-blocks of 32. The earlier block=32 launch was
@@ -36,19 +36,23 @@ void quantize_q8_f32(const float*  __restrict__ x,
 
     const float v = x[blk * 32 + l];
     float amax = fabsf(v);
-    float sum  = v;
-    // Reduction stays within the 32-aligned lane group.
+    // Reductions stay within the 32-aligned lane group.
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, o));
-        sum += __shfl_xor(sum, o);
-    }
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o));
 
     const float d   = amax > 0.0f ? amax / 127.0f : 1.0f;
     const float inv = amax > 0.0f ? 127.0f * fast_rcp_f32(amax) : 0.0f;
     int q = (int)rintf(v * inv);
     q = max(-127, min(127, q));
+    // xsum is the sum of the QUANTIZED values (d·Σq), not the exact
+    // one: the Q4_K/Q5_K/Q5_1 kernels subtract dmin·m·xsum from a dot
+    // over quantized activations, and only a matching sum keeps each
+    // activation's rounding error weighted by the centred weight
+    // (d·sc·q − dmin·m) instead of by d·sc·q (see matvec_q4_0_repacked).
+    int qsum = q;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor(qsum, o);
 
     out[blk].qs[l] = (int8_t)q;
-    if (l == 0) { out[blk].d = d; out[blk].xsum = sum; }
+    if (l == 0) { out[blk].d = d; out[blk].xsum = d * (float)qsum; }
 }

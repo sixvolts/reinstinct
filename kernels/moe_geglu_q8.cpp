@@ -48,20 +48,25 @@ void moe_geglu_q8_f32(const float* __restrict__ gu,    // [n_slot, 2*ff_exp]
     const float v    = gelu_tanh(gate) * up;
 
     float amax = fabsf(v);
-    float vsum = v;
     #pragma unroll
-    for (int o2 = 16; o2 > 0; o2 >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, o2));
-        vsum += __shfl_xor(vsum, o2);
-    }
+    for (int o2 = 16; o2 > 0; o2 >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o2));
 
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     int q = (int)rintf(v * inv);
     q = max(-127, min(127, q));
+    // xsum is the sum of the QUANTIZED values (d·Σq), not the exact
+    // one: the Q4_K/Q5_K/Q5_1 kernels subtract dmin·m·xsum from a dot
+    // over quantized activations, and only a matching sum keeps each
+    // activation's rounding error weighted by the centred weight
+    // (d·sc·q − dmin·m) instead of by d·sc·q (see matvec_q4_0_repacked).
+    int qsum = q;
+    #pragma unroll
+    for (int o2 = 16; o2 > 0; o2 >>= 1) qsum += __shfl_xor(qsum, o2);
 
     o[blk].qs[lane] = (int8_t)q;
     if (lane == 0) {
-        o[blk].d    = amax > 0.0f ? amax / 127.0f : 1.0f;
-        o[blk].xsum = vsum;
+        const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+        o[blk].d    = d;
+        o[blk].xsum = d * (float)qsum;
     }
 }

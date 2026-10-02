@@ -4338,3 +4338,113 @@ impl GpuGemma4 {
     }
 }
 
+
+#[cfg(test)]
+mod kquant_oracle {
+    //! Real-tensor oracle for the decode matvec / embed paths: each GPU
+    //! result against (a) the exact f64 product with the CPU-dequantized
+    //! weights and (b) the same with the activation int8-quantized the
+    //! way the kernels quantize it. GPU vs (b) isolates kernel bugs from
+    //! activation-quantization error; (b) vs (a) is that error.
+    //!   REINSTINCT_GEMMA_FIXTURE=<K-quant 31B> cargo test --release --lib \
+    //!       kquant_oracle -- --ignored --nocapture
+    use super::*;
+    use crate::runtime::KernelCache;
+
+    fn dequant_row(dtype: GgmlType, bytes: &[u8], in_dim: usize, row: usize) -> Vec<f32> {
+        let (bs, bpb) = (256usize, match dtype {
+            GgmlType::Q4_K => 144, GgmlType::Q5_K => 176, GgmlType::Q6_K => 210,
+            other => panic!("dequant_row: {other:?}") });
+        let rb = in_dim / bs * bpb;
+        let mut out = vec![0f32; in_dim];
+        let src = &bytes[row * rb..(row + 1) * rb];
+        match dtype {
+            GgmlType::Q4_K => crate::quant::q4_k::dequantize_to_f32(src, &mut out),
+            GgmlType::Q5_K => crate::quant::q5_k::dequantize_to_f32(src, &mut out),
+            _              => crate::quant::q6_k::dequantize_to_f32(src, &mut out),
+        }
+        out
+    }
+
+    fn rel(a: &[f64], b: &[f64]) -> f64 {
+        let n: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
+        let d: f64 = b.iter().map(|y| y * y).sum();
+        (n / d.max(1e-300)).sqrt()
+    }
+
+    #[test]
+    #[ignore]
+    fn kquant_matvecs_match_cpu() {
+        let Some(path) = crate::test_support::gemma_fixture() else { return };
+        let Some(()) = crate::test_support::gpu() else { return };
+        let g = GgufFile::open(&path).unwrap();
+        let _dev = crate::hip::Device::set(0).unwrap();
+        let cache = KernelCache::new().unwrap();
+        let model = Gemma4Model::load(&g).unwrap();
+        let gm = GpuGemma4::new(&model, &g, &cache, 64).unwrap();
+        // Activation: unit Gaussian with a few large outliers, like a
+        // normed residual.
+        let mut s: u64 = 0xA11CE;
+        let mut gauss = || { let mut u = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                             ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64 };
+                             (-2.0 * u().ln()).sqrt() * (6.283185307179586 * u()).cos() };
+        let mk_x = |n: usize, gauss: &mut dyn FnMut() -> f64| -> Vec<f32> {
+            (0..n).map(|i| { let v = gauss() as f32; if i % 97 == 0 { v * 20.0 } else { v } }).collect() };
+        let quant_ref = |x: &[f32]| -> Vec<f64> {
+            x.chunks(32).flat_map(|c| {
+                let amax = c.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                c.iter().map(move |v| d as f64 * ((v * inv).round().clamp(-127.0, 127.0) as f64)).collect::<Vec<_>>()
+            }).collect() };
+        let cases: Vec<(&str, &GpuMatvecTensor)> = vec![
+            ("blk.10.attn_q.weight",   &gm.blocks[10].attn_q),
+            ("blk.10.ffn_gate.weight", &gm.blocks[10].ffn_gate),
+            ("blk.10.ffn_down.weight", &gm.blocks[10].ffn_down),
+            ("blk.1.attn_q.weight",    &gm.blocks[1].attn_q),
+            ("blk.4.ffn_down.weight",  &gm.blocks[4].ffn_down),
+            ("blk.0.ffn_down.weight",  &gm.blocks[0].ffn_down),
+            ("blk.0.attn_v.weight",    gm.blocks[0].attn_v.as_ref().unwrap()),
+            ("token_embd.weight",      &gm.token_embd),
+        ];
+        for (name, w) in cases {
+            let info = g.tensor(name).unwrap();
+            let bytes = g.tensor_data(name).unwrap().unwrap();
+            let (in_dim, out_dim) = (w.in_dim as usize, w.out_dim as usize);
+            let x = mk_x(in_dim, &mut gauss);
+            let xq = quant_ref(&x);
+            let dx = DeviceBuf::from_slice(&x).unwrap();
+            let dy: DeviceBuf<f32> = DeviceBuf::new(out_dim).unwrap();
+            gm.launch_matvec(w, dx.raw_ptr(), dy.raw_ptr()).unwrap();
+            gm.stream.synchronize().unwrap();
+            let mut y = vec![0f32; out_dim];
+            dy.copy_to_host(&mut y).unwrap();
+            // Rows sampled across the output (every row for small ones).
+            let step = (out_dim / 4096).max(1);
+            let (mut ga, mut ex, mut iq) = (Vec::new(), Vec::new(), Vec::new());
+            for r in (0..out_dim).step_by(step) {
+                let wr = dequant_row(info.ggml_type, bytes, in_dim, r);
+                ex.push(wr.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>());
+                iq.push(wr.iter().zip(&xq).map(|(a, b)| *a as f64 * b).sum::<f64>());
+                ga.push(y[r] as f64);
+            }
+            eprintln!("{name:24} {:?} {}x{} repacked={}: gpu-vs-int8ref {:.2e}  gpu-vs-exact {:.2e}  int8ref-vs-exact {:.2e}",
+                      info.ggml_type, in_dim, out_dim, w.repacked, rel(&ga, &iq), rel(&ga, &ex), rel(&iq, &ex));
+        }
+        // Embedding rows (decode lookup) against the dequantized table row.
+        let info = g.tensor("token_embd.weight").unwrap();
+        let bytes = g.tensor_data("token_embd.weight").unwrap().unwrap();
+        let h = gm.hidden;
+        let out: DeviceBuf<f32> = DeviceBuf::new(h).unwrap();
+        for tok in [2u32, 818, 9079, 236761, 262143] {
+            gm.d_token.copy_from_host(&[tok]).unwrap();
+            gm.launch_embed(&gm.token_embd, out.raw_ptr()).unwrap();
+            gm.stream.synchronize().unwrap();
+            let mut e = vec![0f32; h];
+            out.copy_to_host(&mut e).unwrap();
+            let want: Vec<f64> = dequant_row(info.ggml_type, bytes, h, tok as usize).iter().map(|v| *v as f64).collect();
+            let got: Vec<f64> = e.iter().map(|v| *v as f64).collect();
+            eprintln!("embed token {tok:>6}: rel_l2 {:.2e}", rel(&got, &want));
+        }
+    }
+}

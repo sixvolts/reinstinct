@@ -80,3 +80,69 @@ fn verify_forward_matches_decode() {
         assert!(r < 1e-6, "verify graph replayed at a later position diverges: {r:.2e}");
     }
 }
+
+/// Diagnostic: last-position top-5 logits for REINSTINCT_DIAG_TOKENS
+/// (comma-separated ids) via batched prefill and via the decode loop,
+/// for comparison against tests/golden/dump_logits.
+#[test]
+#[ignore]
+fn diag_last_logits() {
+    let Ok(csv) = std::env::var("REINSTINCT_DIAG_TOKENS") else { return };
+    let ids: Vec<u32> = csv.split(',').map(|t| t.trim().parse().unwrap()).collect();
+    let (Some(path), Some(())) = (test_support::gemma_fixture(), test_support::gpu()) else { return };
+    let g = GgufFile::open(&path).expect("open");
+    let _dev = hip::Device::set(0).unwrap();
+    let cache = KernelCache::new().unwrap();
+    let model = Gemma4Model::load(&g).unwrap();
+    let gm = GpuGemma4::new(&model, &g, &cache, ids.len() + 8).unwrap();
+    let mut state = Gemma4GpuState::new(&model, ids.len() + 8).unwrap();
+    let top = |v: &[f32]| { let mut i: Vec<usize> = (0..v.len()).collect();
+        i.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap()); i.truncate(5);
+        i.iter().map(|&j| (j, (v[j] * 100.0).round() / 100.0)).collect::<Vec<_>>() };
+    state.reset();
+    let lp = gm.prefill_forward(&ids, &mut state).unwrap();
+    state.reset();
+    let mut ld = Vec::new();
+    for &t in &ids { ld = gm.forward_token(t, &mut state).unwrap(); }
+    eprintln!("prefill: {:?}\ndecode:  {:?}\nrel_l2 prefill vs decode {:.3e}", top(&lp), top(&ld), rel_l2(&lp, &ld));
+}
+
+/// Diagnostic: mean next-token NLL (and perplexity) of the decode loop
+/// over the texts in REINSTINCT_PPL_FILE (separated by "=====", each
+/// truncated to REINSTINCT_PPL_TOKENS, default 384, BOS-prefixed).
+#[test]
+#[ignore]
+fn diag_decode_perplexity() {
+    let Ok(file) = std::env::var("REINSTINCT_PPL_FILE") else { return };
+    let n_tok: usize = std::env::var("REINSTINCT_PPL_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(384);
+    let (Some(path), Some(())) = (test_support::gemma_fixture(), test_support::gpu()) else { return };
+    let g = GgufFile::open(&path).expect("open");
+    let _dev = hip::Device::set(0).unwrap();
+    let cache = KernelCache::new().unwrap();
+    let model = Gemma4Model::load(&g).unwrap();
+    let tok = reinstinct_engine::tokenizer::GemmaTokenizer::from_gguf(&g).unwrap();
+    let gm = GpuGemma4::new(&model, &g, &cache, n_tok + 8).unwrap();
+    let mut state = Gemma4GpuState::new(&model, n_tok + 8).unwrap();
+    let text = std::fs::read_to_string(file).unwrap();
+    let (mut nll, mut n) = (0f64, 0usize);
+    for chunk in text.split("=====") {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(chunk.trim()));
+        ids.truncate(n_tok);
+        state.reset();
+        let verbose = std::env::var_os("REINSTINCT_PPL_VERBOSE").is_some();
+        for w in ids.windows(2) {
+            let l = gm.forward_token(w[0], &mut state).unwrap();
+            let mx = l.iter().cloned().fold(f32::MIN, f32::max) as f64;
+            let lse = mx + l.iter().map(|&x| (x as f64 - mx).exp()).sum::<f64>().ln();
+            let t_nll = lse - l[w[1] as usize] as f64;
+            if verbose {
+                eprintln!("  next {:>7} {:<14?} nll {:6.2}  argmax {:>7} {:?}", w[1],
+                          tok.decode(&[w[1]]), t_nll, argmax(&l), tok.decode(&[argmax(&l) as u32]));
+            }
+            nll += t_nll;
+            n += 1;
+        }
+    }
+    eprintln!("{}: {n} tokens, mean NLL {:.4}, ppl {:.3}", path.display(), nll / n as f64, (nll / n as f64).exp());
+}
