@@ -61,8 +61,8 @@ const ATTN_MAX_SPLITS: u32 = 16;
 /// when max_seq >= GQA_LONG_MIN_SEQ; the kernel uses as many as give
 /// each >= 512 positions (at least 16), deciding from the device-side
 /// position, so short contexts in a long-context config stay at 16.
-const GQA_LONG_SPLITS: u32 = 32;
-const GQA_LONG_MIN_SEQ: usize = 16384;
+pub(crate) const GQA_LONG_SPLITS: u32 = 32;
+pub(crate) const GQA_LONG_MIN_SEQ: usize = 16384;
 /// Partial-buffer capacity: the largest split count any kernel launches.
 const ATTN_BUF_SPLITS: u32 = if GQA_LONG_SPLITS > ATTN_MAX_SPLITS { GQA_LONG_SPLITS } else { ATTN_MAX_SPLITS };
 
@@ -73,11 +73,11 @@ const ATTN_BUF_SPLITS: u32 = if GQA_LONG_SPLITS > ATTN_MAX_SPLITS { GQA_LONG_SPL
 /// 0.73 ms per layer on the 31B's global geometry; Qwen-like 256: 0.46
 /// -> 0.33). Sliding windows keep the original 8-byte-per-lane mapping,
 /// faster for a 1024-position window.
-fn gqa_q8_defs(hd: u32, sliding: bool) -> String {
+pub(crate) fn gqa_q8_defs(hd: u32, sliding: bool) -> String {
     if sliding {
         format!("#define HD {hd}\n#define KLPT {}\n#define KUNR 4\n", hd / 8)
     } else {
-        format!("#define HD {hd}\n#define KLPT {}\n#define KUNR 4\n#define MIN_CHUNK 512\n", (hd / 32).max(2))
+        format!("#define HD {hd}\n#define KLPT {}\n#define KUNR 4\n#define MIN_CHUNK 512\n", (hd / 32).max(4))
     }
 }
 
@@ -965,8 +965,8 @@ pub struct GpuGemma4 {
     /// attention kernel. Allocated once at GpuGemma4::new.
     q_rot_scratch: DeviceBuf<f32>,
     m_attn_merge:   Module,
-    /// Partial-attention scratch: [n_heads, ATTN_MAX_SPLITS, head_dim_max]
-    /// and [n_heads, ATTN_MAX_SPLITS] for the running max / denominator.
+    /// Partial-attention scratch: [n_heads, ATTN_BUF_SPLITS, head_dim_max]
+    /// and [n_heads, ATTN_BUF_SPLITS] for the running max / denominator.
     attn_o_partial: DeviceBuf<f32>,
     attn_m_partial: DeviceBuf<f32>,
     attn_l_partial: DeviceBuf<f32>,
@@ -1225,7 +1225,7 @@ impl GpuGemma4 {
                 let g = (n_heads as u32 / nkv).max(1);
                 let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
                 let sliding = b.kind == AttnKind::Sliding;
-                if hd % 64 != 0 || hd > 512 || attn_gqa_q8_modules.contains_key(&(hd, gh, sliding)) { continue; }
+                if !hd.is_power_of_two() || !(64..=512).contains(&hd) || attn_gqa_q8_modules.contains_key(&(hd, gh, sliding)) { continue; }
                 let m = ld(&format!("attn_decode_gqa_q8_hd{hd}_gh{gh}_{}", if sliding { "swa" } else { "full" }),
                            &format!("{}#define GH {gh}\n{ATTN_DECODE_GQA_Q8_SRC}", gqa_q8_defs(hd, sliding)))?;
                 attn_gqa_q8_modules.insert((hd, gh, sliding), m);

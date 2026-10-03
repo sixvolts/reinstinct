@@ -5,18 +5,19 @@
 // window. Replaces attn_partial_q8 for the per-token step; the merge
 // kernel (attn_merge.cpp) is shared and unchanged.
 //
-// One workgroup per (kv head, group of GH query heads, split). Lanes
-// hold 8 int8 of a K/V row (LPT = HD/8 lanes per row, TPW = 64/LPT rows
-// per wave step, UNR steps of loads in flight); the GH quantised query
-// slices live in registers as 2 x u32 each; scores are 2 sdot4 per head
-// per row, reduced across the row's lanes with DPP; softmax runs online
-// per TILE tokens; partial (m, l, o) into the buffers the merge reads.
+// One workgroup per (kv head, group of GH query heads, split). The
+// scores pass gives each K row KLPT lanes of KEPL = HD/KLPT int8 (KUNR
+// steps of loads in flight); the GH quantised query slices live in
+// registers in that layout; scores are sdot4s per head per row, reduced
+// across the row's lanes with DPP. The P.V pass keeps LPT = HD/EPL lanes
+// per V row (UNR steps in flight). Softmax runs online per TILE tokens;
+// partial (m, l, o) into the buffers the merge reads.
 //
 // `ring_mask`: cache rows are stored at slot (position & ring_mask) — a
 // sliding-window layer's cache is a power-of-two ring of the last
 // positions; ~0u for a full-length cache (slot = position).
 //
-// Compiled with `#define HD <head_dim>` (a multiple of 64 up to 512) and
+// Compiled with `#define HD <head_dim>` (a power of two, 64..512) and
 // `#define GH <query heads per group>` prepended by the launcher.
 #include <hip/hip_runtime.h>
 #include "gfx906_dpp.h"
@@ -76,6 +77,7 @@ static_assert(HD % 64 == 0 && LPT >= 4 && LPT <= 64, "head_dim must be 64..512, 
 static_assert(TILE == BS, "the exp pass maps one thread to one tile token");
 static_assert(TILE % (TPB * UNR) == 0, "tile must be a whole number of unrolled block steps");
 static_assert(GH >= 1 && GH <= 8, "GH <= 8");
+static_assert((KLPT & (KLPT - 1)) == 0 && (LPT & (LPT - 1)) == 0, "lane groups must be powers of two (HD a power of two)");
 
 __device__ __forceinline__ float slot_sum(float x) {
     for (int o = LPT; o < 64; o <<= 1) x += __shfl_xor(x, o);
@@ -175,7 +177,6 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
     // Quantise the GH query slices to int8 with a per-head scale (the
     // per-head amax reduced across the row's lanes; every token slot
     // computes the same, so the result is wave-uniform).
-    unsigned int qi[GH][WPL];
     float dq[GH];
     {
         float amax[GH];
@@ -198,10 +199,6 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
         for (int g = 0; g < GH; g++) {
             const float am = uniform_f32(amax[g], LPT - 1);
             dq[g] = am > 0.0f ? am / 127.0f * scaling : 0.0f;
-            const float inv = am > 0.0f ? 127.0f / am : 0.0f;
-            #pragma unroll
-            for (int c = 0; c < WPL; c++)
-                qi[g][c] = pack4(qf[g][c * 4], qf[g][c * 4 + 1], qf[g][c * 4 + 2], qf[g][c * 4 + 3], inv);
         }
     }
 

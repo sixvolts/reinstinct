@@ -2780,8 +2780,13 @@ mod tests {
             let g = (n_heads / n_kv) as u32;
             let gh_max: u32 = std::env::var("REINSTINCT_ATTN_GH").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
             let gh = (1..=gh_max).rev().find(|d| g % d == 0).unwrap_or(1);
-            let defs = std::env::var("REINSTINCT_ATTN_DEFS").unwrap_or_default().replace("\\n", "\n");
-            let gsrc = format!("#define HD {head_dim}\n#define GH {gh}\n{defs}{}", read("attn_decode_gqa_q8"));
+            // REINSTINCT_ATTN_DEFS replaces the runtime's per-layer-kind
+            // defines (gemma4::gqa_q8_defs) — set it to try other mappings.
+            let defs = match std::env::var("REINSTINCT_ATTN_DEFS") {
+                Ok(d) => format!("#define HD {head_dim}\n{}", d.replace("\\n", "\n")),
+                Err(_) => crate::runtime::gemma4::gqa_q8_defs(head_dim as u32, window > 0),
+            };
+            let gsrc = format!("#define GH {gh}\n{defs}{}", read("attn_decode_gqa_q8"));
             let mg = Module::load(&cache.compile(&format!("attn_decode_gqa_q8_bench_hd{head_dim}_gh{gh}_{}", defs.len()), &gsrc).unwrap()).unwrap();
             let fg = mg.function("attn_decode_gqa_q8_f32").unwrap();
             let mut sd: u64 = 0x0A8E_0001 ^ head_dim as u64;
@@ -2797,7 +2802,9 @@ mod tests {
             let dks = DeviceBuf::from_slice(&ksc).unwrap(); let dvs = DeviceBuf::from_slice(&vsc).unwrap();
             let dq = DeviceBuf::from_slice(&q).unwrap();
             let n_splits = std::env::var("REINSTINCT_ATTN_SPLITS").ok().and_then(|v| v.parse().ok())
-                .unwrap_or(((max_seq as u32 + 255) / 256).clamp(1, 16));
+                .unwrap_or(if window == 0 && max_seq >= crate::runtime::gemma4::GQA_LONG_MIN_SEQ {
+                    crate::runtime::gemma4::GQA_LONG_SPLITS   // as launch_attn_q8 does
+                } else { ((max_seq as u32 + 255) / 256).clamp(1, 16) });
             let win_max = if window > 0 { window.min(max_seq as u32) } else { max_seq as u32 };
             let chunk_max = (win_max + n_splits - 1) / n_splits;
             let block = 256u32;
