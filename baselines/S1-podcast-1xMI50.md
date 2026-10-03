@@ -71,3 +71,31 @@ What moved since the previous table (reinstinct commits on review-fixes):
 - ee7cbd5 L3: Qwen verify rows through the flash-decoding attention. MTP K=2 on the 27B with a 13.5K-token prompt: 45.9 tok/s vs plain 30.5 (was 0.44x plain); short prompts unchanged (~1.35-1.57x).
 
 Remaining fork leads: Gemma 26B-A4B prefill (-3%) and decode (-2%).
+
+## Update 2026-10-03 (fork patched): fork 905021dba + B1..R8 vs reinstinct @ ee7cbd5, same card and method
+
+Fork: 905021dba with patches/fork-fixes applied in order B1 B2 R7 R6a R6b R6c R8, same build flags and env as the original S1 run. Reinstinct numbers are the previous table (ee7cbd5, same day, same card).
+
+| Model | fork pp512 (S1 -> patched) | reinstinct pp512 | fork tg256 (S1 -> patched) | reinstinct tg256 | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 255.3 -> 269.3 ± 0.7 | **306.3** | 27.83 -> 28.27 ± 0.03 | **35.20** | +14% | +25% |
+| Gemma 4 31B Q4_K_XL | 218.9 -> 243.0 ± 0.8 | **253.9** | 27.35 -> 27.42 ± 0.01 | **29.04** | +4% | +6% |
+| Gemma 4 31B QAT (Q4_0) | 263.4 -> 263.3 ± 1.0 | **319.8** | 25.58 -> 25.57 ± 0.04 | **31.76** | +21% | +24% |
+| Gemma 4 26B-A4B Q4_K_XL | 1691.7 -> **1728.4** ± 23.9 | 1641.8 | 96.14 -> **96.35** ± 0.12 | 94.40 | -5% | -2% |
+| Gemma 4 E4B Q4_K_XL | 1303.0 -> 1471.1 ± 13.1 | **1507.6** | 98.16 -> 98.24 ± 0.07 | **101.48** | +2% | +3% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1576.3 -> 1728.9 ± 46.1 | **1741.0** | 88.55 -> 92.60 ± 0.12 | **124.36** | +1% | +34% |
+
+(prefill / decode columns: reinstinct vs patched fork.) The patches moved fork prefill (R7 Q6_K tile: Gemma 31B Q4_K_XL +11%, E4B +13% with R8; R8 split-K: 35B-A3B +10%; B1: 27B +5%) and 35B-A3B decode (R6 round 1: +4.6%). Nothing in the set touches Q4_0, and dense decode is flat.
+
+### MTP: Qwen 3.8-27B Q4_K_XL, depth 2, greedy, 256 tokens, server -c 16384
+
+Same three raw prompts as above plus a 13,482-token prompt (long-context verify, L3). Fork: decode tok/s from `timings.predicted_per_second`. Reinstinct: `qwen-mtp-gen --k 2 -n 256`, decode-only (prefill excluded), plain = its own non-speculative greedy run.
+
+| Prompt | fork no spec | fork MTP | fork accept | reinstinct plain | reinstinct MTP | reinstinct accept |
+|---|---:|---:|---:|---:|---:|---:|
+| palindrome | 28.0 | 42.5 (1.52x) | 83.2% | 34.4 | **54.5** (1.59x) | 80.3% |
+| lighthouse | 28.1 | 37.8 (1.35x) | 68.4% | 34.4 | **48.0** (1.40x) | 64.7% |
+| refrigerator | 28.1 | 38.1 (1.36x) | 69.2% | 34.1 | **51.0** (1.50x) | 71.2% |
+| 13.5K-token prompt | 25.9 | 38.0 (1.47x) | 77.9% | 30.3 | **45.8** (1.51x) | 81.1% |
+
+B1 fixed the fork's MTP (was 8.8-9.6 tok/s, ~0.33x plain); both engines now get 1.35-1.59x over their own plain decode, including at 13.5K context. The absolute gap is the plain-decode gap (R5). Reinstinct spec output equals its plain greedy output on 3 of 4 prompts (lighthouse diverges at token 134, a near-tie). Fork prefill of the 13.5K prompt: 249 tok/s (54.1 s); reinstinct 52.8-54.2 s.
