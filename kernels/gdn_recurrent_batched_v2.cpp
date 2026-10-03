@@ -37,6 +37,16 @@
 
 static_assert(HD % 64 == 0 && HD <= 256, "head_dim must be a multiple of 64, <= 256");
 
+// The workgroup is exactly one wave64 and a wave's LDS operations
+// complete in order, so ordering the compiler is enough. __syncthreads()
+// also drains outstanding global loads (its fence waits on vmcnt), which
+// stalled every row on the very prefetch meant to hide its latency.
+// (From the llama fork's gated_delta_net_lds_wave64, crossport L8b.)
+__device__ __forceinline__ void gdn_wave_sync() {
+    __builtin_amdgcn_wave_barrier();
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
 __device__ __forceinline__ float softplus_stable_r(float x) {
     return (x > 0.0f) ? x + __logf(1.0f + __expf(-x))
                       :     __logf(1.0f + __expf(x));
@@ -106,7 +116,7 @@ void gdn_recurrent_batched_v2_f32(
     const int swz = 2 * lvv;
 
     for (unsigned int r = 0; r < n_rows; r++) {
-        __syncthreads();                       // row r-1 done reading q/k
+        gdn_wave_sync();                       // row r-1 done reading q/k
         #pragma unroll
         for (int i = 0; i < PER_T; i++) { q_lds[tid + i * 64] = pq[i]; k_lds[tid + i * 64] = pk[i]; }
         const float vval = pv, a_r = pa, b_r = pb;
@@ -122,7 +132,7 @@ void gdn_recurrent_batched_v2_f32(
             pa = a_base[rn * ab_row_stride];
             pb = b_base[rn * ab_row_stride];
         }
-        __syncthreads();
+        gdn_wave_sync();
 
         const float dec = __expf(ssm_a_h * softplus_stable_r(a_r + dt_bias_h));
         const float bet = 1.0f / (1.0f + __expf(-b_r));
@@ -147,10 +157,18 @@ void gdn_recurrent_batched_v2_f32(
             const float s = s_arr[local] + k_lds[kk] * delta;
             lds_vv[kk ^ swz] = s;
             pout += s * q_lds[kk];
-            // Spec-decode verify: the state after row r, in `state`'s
-            // layout, so a partial accept restores it with one copy.
-            if (r < ckpt_rows)
-                ckpt[(size_t)r * n_heads * HD * HD + head_base + (size_t)kk * HD + vv] = s;
+        }
+        // Spec-decode verify: the state after row r, in `state`'s layout,
+        // so a partial accept restores it with one copy. Outside the loop
+        // above (a branch in it cost prefill 2x); each lane re-reads the
+        // LDS words it just wrote.
+        if (r < ckpt_rows) {
+            float* ck = ckpt + (size_t)r * n_heads * HD * HD + head_base + vv;
+            #pragma unroll 4
+            for (int local = 0; local < QUARTER; local++) {
+                const int kk = local * 4 + grp;
+                ck[(size_t)kk * HD] = lds_vv[kk ^ swz];
+            }
         }
         pout += __shfl_xor(pout, 16);
         const float acc = pout + __shfl_xor(pout, 32);
