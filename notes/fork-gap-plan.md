@@ -75,12 +75,20 @@ On Gemma 31B Q4_K_XL, the fork's Q5_K total (5.1 ms) includes the LM head: one c
 
 **Expected.** 27B -3.4 ms (Q5_K). Gemma 31B Q4_K_XL -0.7 ms. The 35B gains ~0, since its matvecs are ROWS=1 or are replaced by P3.
 
-### P1b: microbenchmark the Q4_K matvec before booking anything
+### P1b: Q4_K matvec — measured: the missing piece is a scheduling fence
 
-54eaa04 found Q4_K *flat* under the same change, yet the fork's Q4_K is 10-30% slower than reinstinct's per grid on the 27B: 50.1 vs 44.0 us at 1280 WGs, 37.9 vs 28.2 at 768, 82.1 vs 72.5 at 2176. So something other than the row guard differs.
-- Candidates: the activation block (`block_q8_1`, 36 B with fp16 `ds`, vs reinstinct's 40 B BlockQ8 with f32 d/xsum), the dsc/deff math, launch bounds.
-- Put both kernels on the same buffers in `test-repack-bench` and compare.
-- Worth up to ~0.55 ms on the 27B and ~0.5 on Gemma 31B Q4_K_XL.
+Microbench (`scripts/p1b-q4k-matvec-bench.cpp`, podcast GPU 1, same repacked weights, graph replay, 27B shapes): fork kernel as-is, with P1 (clamp + hoist), with P1 + `__builtin_amdgcn_sched_barrier(0)` after the loads, and reinstinct's `matvec_q4k_repacked_f32`.
+
+| out x in | fork | P1 | P1 + fence | reinstinct |
+|---|---:|---:|---:|---:|
+| 17408 x 5120 (51.5 MB) | 78.0 us (660 GB/s) | 76.4 | **70.1 (735)** | 70.7 (729) |
+| 12288 x 5120 | 58.7 | 56.4 | **50.1** | 50.1 |
+| 10240 x 5120 | 49.0 | 46.8 | **42.3** | 42.2 |
+| 6144 x 5120 | 33.2 | 32.6 | **26.5** | 26.4 |
+| 5120 x 17408 | 77.1 | 74.8 | **72.9** | 74.1 |
+| 1024 x 5120 | 10.1 | 9.2 | **7.3** | 6.9 |
+
+Clamp + hoist alone gives 2-5%; with the fence the fork matches reinstinct on every shape (the `block_q8_1` vs BlockQ8 activation difference does not matter). Without the fence the scheduler trades latency for registers and splits each trip into load -> wait -> dot phases with a full `vmcnt(0)` between (reinstinct 28f105f). **The fence is per kernel, measured:** reinstinct uses it in Q4_K and IQ4_XS (and its MoE Q4_K, small-batch and Q8_0 MMQ kernels); Q6_K and Q4_0 got *slower* with it, and Q5_K got the loads-first schedule from register pressure alone. So P1 = clamp + hoist everywhere, plus the fence in `q4k_repacked` (and try it per kernel on the rest). Q4_K worth: 27B ~0.55 ms/token, Gemma 31B Q4_K_XL ~0.5.
 
 ### P2 (R11): Q4_0 repack, end to end (matvec, fused GLU, short-batch nc, prefill tile, gating)
 
@@ -187,7 +195,7 @@ The traced numbers are at KV <= 16 (`-n 16`), so they measure fixed cost, not ba
 | step | item | owner | depends on | main risk |
 |---|---|---|---|---|
 | 1 | P1 R10a (+ launch bounds) | Furnace | - | VGPR spill in hoisted kernels |
-| 2 | P1b Q4_K microbench | Reinstinct (bench), Furnace (fix) | - | - |
+| 2 | P1b Q4_K: done (fence); fold into P1 | Furnace | - | - |
 | 3 | P2 R11: matvec -> glu -> nc -> tile -> gating | Furnace; Reinstinct drops source extracts in `patches/reinstinct-to-llama/R11/` | - | GLU fusion gate, consumers of the new layout |
 | 4 | P3 R4 down (seg for Q5_K/Q6_K + DOWN_R) | Furnace | - | - |
 | 5 | P4 glue | Furnace (MoE part in progress) | - | fusion liveness |
@@ -203,9 +211,9 @@ After each landed step, Reinstinct reruns S1 on podcast GPU 1 (same script and e
 
 | model | now | after P1-P6 | items | reinstinct |
 |---|---:|---:|---|---:|
-| Qwen 3.8-27B | 35.1 | ~29.1 ms | P1 3.4, P4 1.5, P5 0.75, P6 0.4 (+P1b <=0.55) | 28.1 |
+| Qwen 3.8-27B | 35.1 | ~28.5 ms | P1 3.4 + 0.55 (Q4_K fence), P4 1.5, P5 0.75, P6 0.4 | 28.1 |
 | Gemma 31B QAT | 39.1 | ~30.9 ms | P2 6.7, P6 1.5 | 31.0 |
-| Gemma 31B Q4_K_XL | 36.5 | ~35.0 ms | P1 0.7, P6 0.8 (+P1b ~0.5) | 34.4 |
+| Gemma 31B Q4_K_XL | 36.5 | ~34.5 ms | P1 0.7 + 0.5 (Q4_K fence), P6 0.8 | 34.4 |
 | Qwen 3.6-35B-A3B | 10.5 | ~8.1 ms | P3 0.9, P4 1.5 (+Q8_0 investigation <=0.9 -> ~7.2) | 7.7 |
 
 **Prefill (pp512)**
