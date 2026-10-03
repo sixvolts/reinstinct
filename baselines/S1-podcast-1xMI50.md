@@ -50,3 +50,24 @@ Reinstinct: `qwen-mtp-gen M --k 2 -n 256 --prompt P`, decode-only tok/s (prefill
 Decode unchanged (no regression). MoE prefill gap: 35B-A3B 1.79x -> 1.23x, 26B-A4B 1.54x -> 1.24x. E4B prefill (dense, 1.42x) is untouched by L8a-d and still open.
 
 E4B follow-up (reinstinct 2579a97): the gap was not MMQ (reinstinct's Q4_K/Q5_K/Q6_K dense tiles were level or ahead: 188/29/46 ms vs fork 196/31/91 per pp512) but the per-layer-embedding projection: F32 weight, converted to fp16 per call and run through a one-column-per-block GEMM, 236 ms vs the fork's gcn_f32_gemm_tn_rb 21 ms. With that kernel: **E4B pp512 919 -> 1483 tok/s** (fork 1303).
+
+## Update 2026-10-03 (later): reinstinct after L6, L8 remainder, L3 (review-fixes @ ee7cbd5), same card and method
+
+One run of the S1 reinstinct script on the current build; fork numbers are the original S1 run (905021dba, unchanged).
+
+| Model | fork pp512 | reinstinct pp512 | fork tg256 | reinstinct tg256 | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 255.3 | **306.3** ± 0.2 | 27.83 | **35.20** ± 0.07 | +20% | +26% |
+| Gemma 4 31B Q4_K_XL | 218.9 | **253.9** ± 0.2 | 27.35 | **29.04** ± 0.09 | +16% | +6% |
+| Gemma 4 31B QAT (Q4_0) | 263.4 | **319.8** ± 0.6 | 25.58 | **31.76** ± 0.05 | +21% | +24% |
+| Gemma 4 26B-A4B Q4_K_XL | **1691.7** | 1641.8 ± 1.0 | **96.14** | 94.40 ± 0.37 | -3% | -2% |
+| Gemma 4 E4B Q4_K_XL | 1303.0 | **1507.6** ± 0.5 | 98.16 | **101.48** ± 0.33 | +16% | +3% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1576.3 | **1741.0** ± 1.6 | 88.55 | **124.36** ± 0.42 | +10% | +40% |
+
+What moved since the previous table (reinstinct commits on review-fixes):
+- b54a0a9 L6 router top-k (parallel rank on logits, 20 -> 7 us/call): 35B-A3B tg 118 -> 124, 26B-A4B tg 91.6 -> 94.4.
+- 766be98 split-K for the skinny F32 GEMMs (router, GDN alpha/beta), 9ae9f04 GDN prefill kernel at 111 VGPRs (2 waves/SIMD), df7c742 MoE prefill chunk 256 -> 1024 tokens: 35B-A3B pp512 1286 -> 1741, 26B-A4B 1361 -> 1642.
+- 2579a97 (earlier) E4B per-layer-embedding F32 GEMM: 919 -> 1508.
+- ee7cbd5 L3: Qwen verify rows through the flash-decoding attention. MTP K=2 on the 27B with a 13.5K-token prompt: 45.9 tok/s vs plain 30.5 (was 0.44x plain); short prompts unchanged (~1.35-1.57x).
+
+Remaining fork leads: Gemma 26B-A4B prefill (-3%) and decode (-2%).
