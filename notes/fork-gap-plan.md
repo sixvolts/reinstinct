@@ -165,17 +165,39 @@ Today the fork runs IQ4_XS through the generic MMVQ at decode, which is level wi
 - IQ4_XS/IQ3_S under (a): KLD.
 - Tiles: `test-repack-bench --check` with IQ4_XS shapes added.
 
-### P6 (R3 class): Gemma decode attention. 31B 0.8-1.5 ms/token at short context; measure at length first
+### P6 (R3 class): Gemma decode attention, measured at 4K/16K. The gap is the sliding-window layers and is mostly KV precision
 
-The fork runs `flash_attn_tile` at decode for Gemma's 256-dim local and 512-dim global heads, 120 calls/token. That kernel runs WG = 32 on wave64 at 76-88 VGPRs; the q35 instance `<256,256,1,8>` shows 128 VGPRs + 8 scratch.
+Measurements: podcast GPU 1, Gemma 31B QAT and Q4_K_XL; the two give the same attention numbers.
+- Fork: `llama-bench -p 0 -n 64 -d D` untimed / `-n 8` traced.
+- Reinstinct: `generate-text --tokens <D ids> -n 64` (batched prefill, then decode).
+- Gemma 31B: 60 layers. 50 are sliding-window (window 1024, 16 kv heads x 256) and 10 global (4 kv heads x 512). Fork KV is F16; reinstinct KV is int8 (`attn_decode_gqa_q8_f32`).
 
-The traced numbers are at KV <= 16 (`-n 16`), so they measure fixed cost, not bandwidth.
-1. First trace both engines at 4K and 16K context (Gemma 31B QAT and Q4_K_XL).
-2. Reinstinct's Gemma path is `attn_decode_gqa_q8_f32`: int8 KV, i.e. R3 proper (784 + 259 us/token at short context).
-3. For the fork's F16 KV, port the GQA flash-decoding *structure*: one WG per (kv head, split), the group's q heads in registers, device-side split count, merge kernel. Use F16 loads.
-4. R3's int8 KV comes after that as a separate decision.
+| context | fork attention ms/token | reinstinct | fork tg (QAT / Q4_K_XL) | reinstinct |
+|---|---:|---:|---:|---:|
+| ~0 | 1.9 | 1.0 | 25.6 / 27.4 | 31.8 / 29.0 |
+| 4K | 5.3 | 3.3 | 23.6 / 25.0 | 29.8 / 27.6 |
+| 16K | 7.0 | 5.5 | 22.7 / 24.1 | 28.1 / 26.0 |
 
-**Validate.** test-backend-ops FLASH_ATTN_EXT at decode shapes (attention takes no repacked weights, so the stock test works here); KLD.
+Per call (kernel + combine/merge):
+
+| layer type | fork 4K | reinstinct 4K | fork 16K | reinstinct 16K |
+|---|---:|---:|---:|---:|
+| sliding window, 50/token: `flash_attn_tile<256,256,1,2>` vs `attn_decode_gqa_q8` | 73.5 + 7.0 us | 29.6 + 8.2 us | 73.3 + 7.0 | 29.6 + 8.3 |
+| global 512-dim, 10/token: `flash_attn_tile<512,512,1,8>` vs `attn_decode_gqa_q8` | 113 + 15 | 126 + 8 | **277 + 16** | 331 + 8 |
+
+- **Sliding-window layers: ~2.1 ms/token from 4K on**, ~1.3 at short context. This is the whole gap.
+  - Each call reads the full window: 16 kv heads x 256 x (K+V) x 1024 tokens = 16.8 MB in F16. The fork moves that at ~228 GB/s; reinstinct moves ~8.4 MB of int8 at ~285 GB/s.
+  - So most of reinstinct's lead is the int8 KV halving the bytes, and both kernels sit far below the ~720-830 GB/s a read can reach.
+- **Global layers: the fork is level at 4K and faster at 16K** (277 vs 331 us; reinstinct's int8 kernel runs ~200 GB/s there, a reinstinct item). Leave them alone.
+
+What to do, in order:
+1. **Make the fork's D=256 decode kernel bandwidth-efficient on F16 KV.** 228 GB/s -> ~600 GB/s would take a sliding-window call from 73 to ~28 us: -2.2 ms/token at >= 1K context, with no KV format change.
+   - Candidates: the tile kernel at decode runs WG = 32 on wave64 with 76-88 VGPRs and grid 32 x 88.
+   - Reinstinct's structure is one WG per (kv head, split) with the group's q heads in registers, and a device-side split count; `attn_decode_gqa_f32.cpp` is the F16-able body.
+   - Alternatively, route D=256 decode to the fork's `fattn_dec_chunk` path if it handles that head size.
+2. **Int8 KV for the sliding-window layers (R3 proper)** halves the bytes again. It is a KV-format change with its own accuracy check, so it comes second.
+
+**Validate.** test-backend-ops FLASH_ATTN_EXT at the decode shapes (D=256, n_kv up to 1024 with the SWA mask; attention has no repacked weights, so the stock test works); KLD at 4K.
 
 ### P7: dense K-quant prefill tiles (Gemma 31B ~81 ms, 27B Q5_K ~24 ms per pp512)
 
@@ -200,7 +222,7 @@ The traced numbers are at KV <= 16 (`-n 16`), so they measure fixed cost, not ba
 | 4 | P3 R4 down (seg for Q5_K/Q6_K + DOWN_R) | Furnace | - | - |
 | 5 | P4 glue | Furnace (MoE part in progress) | - | fusion liveness |
 | 6 | P5 R12 | Furnace; Reinstinct extracts | P1 | layout choice (a)/(b) |
-| 7 | P6 attention | Reinstinct traces at length first, then Furnace | - | ggml FA dispatch rules |
+| 7 | P6 sliding-window decode attention (F16 efficiency first, int8 KV second) | Furnace | - | ggml FA dispatch rules |
 | 8 | P7 tiles, Q8_0 investigation | Reinstinct compares first | - | - |
 
 After each landed step, Reinstinct reruns S1 on podcast GPU 1 (same script and env, fork worktree at the new patch set) and appends to `baselines/S1-podcast-1xMI50.md`. It also reruns the graph timer and `scripts/decode_cmp_fmt.py` when the attribution changes. Furnace checks Flash-Next tg/pp for regressions after each step.
@@ -212,7 +234,7 @@ After each landed step, Reinstinct reruns S1 on podcast GPU 1 (same script and e
 | model | now | after P1-P6 | items | reinstinct |
 |---|---:|---:|---|---:|
 | Qwen 3.8-27B | 35.1 | ~28.5 ms | P1 3.4 + 0.55 (Q4_K fence), P4 1.5, P5 0.75, P6 0.4 | 28.1 |
-| Gemma 31B QAT | 39.1 | ~30.9 ms | P2 6.7, P6 1.5 | 31.0 |
+| Gemma 31B QAT | 39.1 | ~31.1 ms | P2 6.7, P6 1.3 (short ctx; 2.1-2.2 at >=4K) | 31.0 |
 | Gemma 31B Q4_K_XL | 36.5 | ~34.5 ms | P1 0.7 + 0.5 (Q4_K fence), P6 0.8 | 34.4 |
 | Qwen 3.6-35B-A3B | 10.5 | ~8.1 ms | P3 0.9, P4 1.5 (+Q8_0 investigation <=0.9 -> ~7.2) | 7.7 |
 
@@ -242,3 +264,4 @@ After each landed step, Reinstinct reruns S1 on podcast GPU 1 (same script and e
 - Gemma 31B LM head: reinstinct runs a 2.1 ms/token f32 matvec where the fork runs Q5_K in 1.67 ms. Gemma 31B Q4_K_XL also has more glue launches in reinstinct (979 vs 731/token).
 - Gemma 26B-A4B: the fork still leads prefill (-5%) and decode (-2%).
 - Prefill attention: reinstinct's `attn_prefill_tiled` is ~4 ms slower than the fork's on the 27B.
+- Gemma global (512-dim) decode attention at 16K: reinstinct 331 us/call (int8 KV, ~200 GB/s) vs the fork's 277 (F16). Reinstinct prefill also slows from 3.1 ms/token at 512 to 5.0 at 16K on the 31B QAT.
