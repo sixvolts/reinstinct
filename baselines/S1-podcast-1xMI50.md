@@ -99,3 +99,45 @@ Same three raw prompts as above plus a 13,482-token prompt (long-context verify,
 | 13.5K-token prompt | 25.9 | 38.0 (1.47x) | 77.9% | 30.3 | **45.8** (1.51x) | 81.1% |
 
 B1 fixed the fork's MTP (was 8.8-9.6 tok/s, ~0.33x plain); both engines now get 1.35-1.59x over their own plain decode, including at 13.5K context. The absolute gap is the plain-decode gap (R5). Reinstinct spec output equals its plain greedy output on 3 of 4 prompts (lighthouse diverges at token 134, a near-tie). Fork prefill of the 13.5K prompt: 249 tok/s (54.1 s); reinstinct 52.8-54.2 s.
+
+## Update 2026-10-03 (fork + L6, R4, R11/R12, R10a): vs reinstinct @ ee7cbd5, same card and method
+
+Fork: the patched build above plus patches/fork-fixes 8-11 in order (L6, R4, R11/R12, R10a). Two runs: (a) through R11/R12, (b) with R10a added. Same flags and env (`GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1`); the Q4_0 and IQ repacks are on by default. Reinstinct numbers are the ee7cbd5 table.
+
+| Model | fork pp512 (B1..R8 -> a -> b) | reinstinct pp512 | fork tg256 (B1..R8 -> a -> b) | reinstinct tg256 | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 269.3 -> 291.7 -> 291.9 ± 0.7 | **306.3** | 28.27 -> 28.67 -> 32.27 ± 0.03 | **35.20** | +5% | +9% |
+| Gemma 4 31B Q4_K_XL | 243.0 -> 243.1 -> 243.1 ± 0.7 | **253.9** | 27.42 -> 27.42 -> **30.09** ± 0.01 | 29.04 | +4% | -3% |
+| Gemma 4 31B QAT (Q4_0) | 263.3 -> 268.0 -> 268.0 ± 1.2 | **319.8** | 25.57 -> 32.17 -> **32.18** ± 0.01 | 31.76 | +19% | -1% |
+| Gemma 4 26B-A4B Q4_K_XL | **1728.4** -> 1727.9 -> 1725.0 ± 35.6 | 1641.8 | 96.35 -> 95.55 -> 83.00 ± 0.07 | **94.40** | -5% | +14% |
+| Gemma 4 E4B Q4_K_XL | 1471.1 -> 1472.6 -> 1472.2 ± 20.2 | **1507.6** | 98.24 -> 98.96 -> **111.16** ± 0.08 | 101.48 | +2% | -9% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1728.9 -> 1730.0 -> 1729.4 ± 41.5 | **1741.0** | 92.60 -> 93.59 -> 94.97 ± 0.06 | **124.36** | +1% | +31% |
+
+(prefill / decode columns: reinstinct vs fork (b); negative = fork ahead.)
+
+A/B on build (b), same command:
+
+| Run | pp512 | tg256 |
+|---|---:|---:|
+| 27B, default | 291.9 | 32.27 |
+| 27B, `GGML_CUDA_REPACK_IQ=0` | 272.6 | 31.69 |
+| 27B, `GGML_CUDA_NO_Q4K_FENCE=1` | 292.0 | 31.66 |
+| 31B QAT, default | 268.0 | 32.18 |
+| 31B QAT, `GGML_CUDA_REPACK_Q4_0=0` | 262.9 | 25.55 |
+
+On build (a), `GGML_CUDA_Q3K_RELABEL=0` gave 288.2 / 28.70 on the 27B (relabel: ~1% prefill, decode flat). The single-column repacked IQ4_XS matvec is slower than canonical MMVQ (94.7 vs 86.7 us at 5120x17408, test-repack-bench t=1), but the IQ repack is a net decode win on the 27B because IQ4_NL / IQ3_S speed up more.
+
+**Regression: Gemma 26B-A4B decode with R10a**, 96 -> 83-89 tok/s (noisy run to run with R10a). Graph timer: 9.99 -> 10.85 ms GPU per replay, same capture/update counts (one capture, then replays). Not the Q4_K fence (82.4 with it off). Graphs-off kernel trace: the dense `mul_mat_vec_q8_0_repacked<1,1,false>` at 4096 rows (K = 2816) went 19.5 -> 43.9 us (25 calls/token, +0.61 ms), the 2816-row shape 23.9 -> 17.0 us, the HAS_IDS Q4_K path 37.3 -> 39.5 us. Sent to Furnace; a replacement for R10a is in progress.
+
+**QAT prefill stays 19% behind** after R11: the ported tile `mmq_gemm_nib_repacked<0,4>` runs at the generic MMQ's speed, not reinstinct's (per pp512: 1711 ms vs reinstinct 1407, generic 1743; same grid, 128 VGPRs, occupancy 2). The ISA shows the difference is the activation staging: the 36 B `block_q8_1` leaves `qs` 4 B aligned in LDS, so the tile issues 72 `ds_read2_b32` and 83 `s_waitcnt` where reinstinct's 40 B block issues 32 `ds_read2_b64` + 8 `ds_read2_b32` and 45 waits. Furnace is moving all repacked tiles to a 40 B staged block.
+
+### MTP: Qwen 3.8-27B Q4_K_XL, depth 2, build (b)
+
+| Prompt | fork no spec | fork MTP | fork accept | reinstinct plain | reinstinct MTP | reinstinct accept |
+|---|---:|---:|---:|---:|---:|---:|
+| palindrome | 32.0 | **55.3** (1.73x) | 92.7% | 34.4 | 54.5 | 80.3% |
+| lighthouse | 32.0 | 47.4 (1.48x) | 72.1% | 34.4 | **48.0** | 64.7% |
+| refrigerator | 31.9 | 50.6 (1.59x) | 80.5% | 34.1 | **51.0** | 71.2% |
+| 13.5K-token prompt | 29.1 | 44.1 (1.52x) | 73.8% | 30.3 | **45.8** | 81.1% |
+
+MTP is roughly level with reinstinct now. Fork acceptance moved with the R10a numerics (not bit-identical to the previous build).
