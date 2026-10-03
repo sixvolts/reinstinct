@@ -95,7 +95,10 @@ const MAX_VERIFY_K: usize = 16;
 /// to this many tokens per set of expert launches. Bounds the per-call
 /// expert-intermediate scratch; `moe_logits` / `moe_ids` / `moe_weights`
 /// are sized for one chunk so the batched topk + matvecs reuse them.
-const MOE_PREFILL_CHUNK: usize = 256;
+/// 1024 (was 256): fuller expert tiles and a quarter of the launches;
+/// 26B-A4B pp512 354 -> 312 ms, pp2048 1524 -> 1263 ms, same logits.
+/// The pooled expert scratch at a full chunk is ~150 MB.
+const MOE_PREFILL_CHUNK: usize = 1024;
 const KV_WRITE_SRC:          &str = include_str!("../../kernels/kv_write_q8.cpp");
 const EMBED_Q4_0_SRC:        &str = include_str!("../../kernels/embed_lookup_q4_0.cpp");
 const TAP_COPY_SRC:          &str = include_str!("../../kernels/tap_copy_f32.cpp");

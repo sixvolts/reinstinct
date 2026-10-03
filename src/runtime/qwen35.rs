@@ -506,9 +506,13 @@ impl BlockFfn {
 /// for a `qwen35moe` model and shared across all blocks.
 /// Prefill MoE batch size. `step_moe_ffn_batched` processes up to this
 /// many tokens in one set of launches; longer prompts are chunked. The
-/// MoE scratch buffers below are sized for it. 256 keeps the scratch
-/// ~30 MB while still amortising expert-weight reads across the batch.
-const MOE_PREFILL_CHUNK: usize = 256;
+/// MoE scratch buffers below are sized for it (~190 KB per token on the
+/// 35B-A3B, ~190 MB here). With 256 experts and top-8 a 256-token chunk
+/// gives each expert ~8 tokens, half of a 16-token GEMM tile, and twice
+/// the launches: 1024 took the 35B's pp512 from 340 to 294 ms and pp2048
+/// from 1395 to 1122 ms. (Per-token results don't depend on the chunk,
+/// except through the router GEMM's split-K count.)
+const MOE_PREFILL_CHUNK: usize = 1024;
 
 /// Upper bound on the batch size of `forward_tokens_verify` — sizes the
 /// resident `verify_hidden` stash. The MTP spec-decode verify batch is
