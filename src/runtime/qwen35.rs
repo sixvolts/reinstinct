@@ -2928,8 +2928,15 @@ impl GpuQwen35 {
         // down may differ (UD quants mix Q4_K/Q5_K/Q6_K per layer).
         let has_grouped = |t: &GpuExpertTensor| t.repacked && matches!(t.dtype,
             GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::Q5_1);
-        let grouped = std::env::var_os("REINSTINCT_MOE_NO_GROUPED").is_none()
+        let opted_out = std::env::var_os("REINSTINCT_MOE_NO_GROUPED").is_some();
+        let grouped = !opted_out
             && has_grouped(&w.gate_exps) && has_grouped(&w.up_exps) && has_grouped(&w.down_exps);
+        if !grouped && !opted_out {
+            let d = |t: &GpuExpertTensor| format!("{:?}{}", t.dtype, if t.repacked { "" } else { " (not repacked)" });
+            crate::runtime::fallback_once(
+                &format!("qwen-moe-grouped {} {} {}", d(&w.gate_exps), d(&w.up_exps), d(&w.down_exps)),
+                || "no grouped MoE GEMM for these expert dtypes; per-token expert matvecs instead (much slower prefill)".into());
+        }
         if grouped {
             self.ptrace("M.sort", || self.launch_moe_sort(moe, nt))?;
             self.ptrace("M.gather", || self.launch_moe_gather_xq(moe, h / 32, nt))?;
@@ -3648,6 +3655,10 @@ impl GpuQwen35 {
         let mut generated: Vec<u32> = Vec::new();
         let checkpointed = snapshot.ckpt_rows >= k && self.gdn_recurrent_batched_v2_module.is_some()
             && std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none();
+        if !checkpointed {
+            crate::runtime::fallback_once("qwen-mtp-gdn-checkpoints",
+                || format!("no per-row GDN checkpoints (snapshot rows {}, k {k}); partial accepts re-run the verify", snapshot.ckpt_rows));
+        }
         // REINSTINCT_MTP_PROF=1: per-phase round timing (syncs at each
         // phase, so only for diagnosis); with REINSTINCT_PREFILL_TRACE=3
         // also the per-kernel split of the batched forwards.
@@ -4263,6 +4274,8 @@ impl GpuQwen35 {
             w_ptr = w.data.raw_ptr();
             dq = None;
         } else {
+            crate::runtime::fallback_once(&format!("qwen-bmm {:?} repacked={}", w.dtype, w.repacked),
+                || "no int8 GEMM for this weight; dequant to fp16 per call + gemm_f16_rows".into());
             let b = self.dequant_weight(w)?;
             w_ptr = b.raw_ptr();
             dq = Some(b);
@@ -4683,6 +4696,8 @@ impl GpuQwen35 {
             && crate::runtime::prefill::SmallBatchMatvec::supports(out_w.dtype) {
             self.bmm(out_w, bnorm.raw_ptr(), n, logits_all.raw_ptr())?;
         } else {
+            crate::runtime::fallback_once(&format!("qwen-verify-lm-head {:?} repacked={}", out_w.dtype, out_w.repacked),
+                || "LM head not on the small-batch matvec; one decode matvec per verify row".into());
             for r in 0..n {
                 let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
                 let out_ptr = unsafe {

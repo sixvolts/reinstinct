@@ -8,6 +8,19 @@
 //! change in any of these forces a recompile, but unchanged sources skip
 //! the ~1-2 s `hipcc` invocation.
 
+/// One-time warning when a dispatch falls off its fast path (crossport
+/// ledger L7). Silent fallbacks have cost 2-10x on a kernel for months
+/// unnoticed on both engines (Q5_K/Q6_K MoE gate/up, the llama fork's
+/// few-token dense path); this logs each distinct `key` once per process.
+pub(crate) fn fallback_once(key: &str, why: impl FnOnce() -> String) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if seen.insert(key.to_string()) {
+        tracing::warn!("fast path rejected [{key}]: {}", why());
+    }
+}
+
 pub mod kernels;
 pub mod prefill;
 pub mod qwen35;

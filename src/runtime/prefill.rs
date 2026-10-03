@@ -462,6 +462,8 @@ impl PrefillGemm {
                                       in_dim, out_dim, n_rows);
         }
 
+        crate::runtime::fallback_once(&format!("prefill-gemm {dtype:?} repacked={repacked}"),
+            || "no int8 GEMM / small-batch matvec / F32 GEMM for this weight; dequant to fp16 per call + gemm_f16_rows".into());
         let n_w = out_dim * in_dim;
         Self::grow(&self.w_f16,  n_w, stream)?;
         let w_f16  = self.w_f16.borrow();
