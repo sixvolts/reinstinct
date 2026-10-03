@@ -48,3 +48,5 @@ Reinstinct: `qwen-mtp-gen M --k 2 -n 256 --prompt P`, decode-only tok/s (prefill
 | Qwen 3.6-35B-A3B Q4_K_XL | **1576.3** | 881.3 -> 1286.0 ± 1.1 | 88.55 | **118.22** ± 0.45 |
 
 Decode unchanged (no regression). MoE prefill gap: 35B-A3B 1.79x -> 1.23x, 26B-A4B 1.54x -> 1.24x. E4B prefill (dense, 1.42x) is untouched by L8a-d and still open.
+
+E4B follow-up (reinstinct 2579a97): the gap was not MMQ (reinstinct's Q4_K/Q5_K/Q6_K dense tiles were level or ahead: 188/29/46 ms vs fork 196/31/91 per pp512) but the per-layer-embedding projection: F32 weight, converted to fp16 per call and run through a one-column-per-block GEMM, 236 ms vs the fork's gcn_f32_gemm_tn_rb 21 ms. With that kernel: **E4B pp512 919 -> 1483 tok/s** (fork 1303).
