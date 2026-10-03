@@ -12,6 +12,6 @@
 | `dequant_iq4xs_repacked_f16.cpp` | fallback dequant |
 | `qwen35-relabel-excerpt.rs` | reinstinct's dtype routing for the UD-XL formats (which relabel onto which layout) |
 
-**Layout choice (plan P5).** Keep reinstinct's folded fp16 sub-block scale, with one kernel set for three formats and KLD validation for IQ4_XS/IQ3_S; or use a u16 `ls` plane + fp16 d per superblock (the fork's Q4_K plane style), which is exact for IQ4_XS but needs a separate scale plane for IQ4_NL. Reinstinct runs the folded form; its oracle/greedy checks pass on the Qwen 3.8-27B UD-XL file.
+**Layout choice (plan P5).** Keep reinstinct's folded fp16 sub-block scale, with one kernel set for three formats and KLD validation for IQ4_XS/IQ3_S; or use a u16 `ls` plane + fp16 d per superblock (the fork's Q4_K plane style), which is exact for IQ4_XS but needs a separate scale plane for IQ4_NL. Reinstinct runs the folded form for the Qwen 3.8-27B UD-XL file in every S1 number; it was not separately KLD-checked against an exact layout.
 
 **Order.** Do the Q3_K -> Q6_K relabel first. It is exact, small, and saves ~33 ms per pp512 on the 27B (the q3k tile is 13.9 ms/call).
