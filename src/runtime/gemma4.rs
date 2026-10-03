@@ -1856,8 +1856,8 @@ impl GpuGemma4 {
             &mut la as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
             &mut nu as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
             &mut wa as *mut _ as *mut c_void];
-        let block: u32 = 128;
-        let smem = self.n_expert as u32 * 4;
+        let block: u32 = 256;
+        let smem = self.n_expert as u32 * 8;   // one u64 rank key per expert
         unsafe { f.launch((n_tok as u32,1,1),(block,1,1), smem, Some(&self.stream), &mut args) }
     }
 

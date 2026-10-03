@@ -2995,8 +2995,8 @@ impl GpuQwen35 {
             &mut la as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
             &mut nu as *mut _ as *mut c_void, &mut ida as *mut _ as *mut c_void,
             &mut wa as *mut _ as *mut c_void];
-        let smem = moe.n_expert as u32 * 4;
-        unsafe { f.launch((n_tok,1,1),(128,1,1), smem, Some(&self.stream), &mut args) }
+        let smem = moe.n_expert as u32 * 8;   // one u64 rank key per expert
+        unsafe { f.launch((n_tok,1,1),(256,1,1), smem, Some(&self.stream), &mut args) }
     }
 
     /// Counting-sort the `n_tok * n_used` routing entries by expert id
