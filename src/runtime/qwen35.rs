@@ -2921,11 +2921,12 @@ impl GpuQwen35 {
         // expert-sorted order; only a single scatter at the end returns
         // to [token, slot] order. Default-on for MoE; opt out with
         // `REINSTINCT_MOE_NO_GROUPED=1`.
+        // Every repacked expert dtype with a grouped kernel; gate/up and
+        // down may differ (UD quants mix Q4_K/Q5_K/Q6_K per layer).
+        let has_grouped = |t: &GpuExpertTensor| t.repacked && matches!(t.dtype,
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::Q5_1);
         let grouped = std::env::var_os("REINSTINCT_MOE_NO_GROUPED").is_none()
-            && w.gate_exps.dtype == GgmlType::Q4_K && w.gate_exps.repacked
-            && w.up_exps.dtype == GgmlType::Q4_K && w.up_exps.repacked
-            && matches!(w.down_exps.dtype, GgmlType::Q5_K | GgmlType::Q6_K)
-            && w.down_exps.repacked;
+            && has_grouped(&w.gate_exps) && has_grouped(&w.up_exps) && has_grouped(&w.down_exps);
         if grouped {
             self.ptrace("M.sort", || self.launch_moe_sort(moe, nt))?;
             self.ptrace("M.gather", || self.launch_moe_gather_xq(moe, h / 32, nt))?;
