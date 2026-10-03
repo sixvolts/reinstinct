@@ -4638,18 +4638,24 @@ impl GpuQwen35 {
         // MTP spec-decode loop reads a row as the next `prev_hidden`.
         self.verify_hidden.copy_from_device_at(&ba, 0)?;
 
-        // Output norm (all rows) + projection. The projection stays a
-        // per-row decode matvec: the (tied) output weight is not in the
-        // repacked layout, so routing it through `bmm` would hit the
-        // dequant-to-fp16 fallback — far worse than n fast matvecs.
+        // Output norm (all rows) + projection. A repacked output weight
+        // goes through the small-batch matvec (read once for all rows);
+        // otherwise (a tied embedding in its on-disk layout) one decode
+        // matvec per row — `bmm` would take the dequant-to-fp16 fallback.
         self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm().raw_ptr(),
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
         let logits_all = self.pool_f32.take(n * self.vocab)?;
-        for r in 0..n {
-            let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
-            let out_ptr = unsafe {
-                (logits_all.raw_ptr() as *mut f32).add(r * self.vocab) } as *mut c_void;
-            self.launch_matvec_dispatch(self.output_proj_tensor(), in_ptr, out_ptr)?;
+        let out_w = self.output_proj_tensor();
+        if out_w.repacked && n <= crate::runtime::prefill::MAX_BATCHED_ROWS
+            && crate::runtime::prefill::SmallBatchMatvec::supports(out_w.dtype) {
+            self.bmm(out_w, bnorm.raw_ptr(), n, logits_all.raw_ptr())?;
+        } else {
+            for r in 0..n {
+                let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
+                let out_ptr = unsafe {
+                    (logits_all.raw_ptr() as *mut f32).add(r * self.vocab) } as *mut c_void;
+                self.launch_matvec_dispatch(out_w, in_ptr, out_ptr)?;
+            }
         }
         self.stream.synchronize()?;
         state.pos += n;
