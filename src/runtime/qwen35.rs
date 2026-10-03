@@ -75,7 +75,6 @@ const RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE: &str =
 
 const MATVEC_F16_SOURCE:    &str = include_str!("../../kernels/matvec_f16.cpp");
 const GEMM_F16_ROWS_SOURCE: &str = include_str!("../../kernels/gemm_f16_rows.cpp");
-const GEMM_F32_TN_SOURCE: &str = include_str!("../../kernels/gemm_f32_tn.cpp");
 const MATVEC_F32_B256_SOURCE: &str = include_str!("../../kernels/matvec_f32_b256.cpp");
 const EMBED_LOOKUP_Q6_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q6_k.cpp");
 const EMBED_LOOKUP_Q4_K_SOURCE: &str = include_str!("../../kernels/embed_lookup_q4_k.cpp");
@@ -1592,7 +1591,7 @@ impl GpuQwen35 {
             "rmsnorm_gated_multihead_batched", RMSNORM_GATED_MULTIHEAD_BATCHED_SOURCE)?;
         let matvec_f16_hsaco    = cache.compile("matvec_f16",    MATVEC_F16_SOURCE)?;
         let gemm_f16_rows_hsaco = cache.compile("gemm_f16_rows", GEMM_F16_ROWS_SOURCE)?;
-        let gemm_f32_tn_hsaco = cache.compile("gemm_f32_tn", GEMM_F32_TN_SOURCE)?;
+        let gemm_f32_tn_hsaco = cache.compile("gemm_f32_tn", crate::runtime::prefill::GEMM_F32_TN_SOURCE)?;
         let matvec_f32_b256_hsaco = cache.compile("matvec_f32_b256", MATVEC_F32_B256_SOURCE)?;
         let embed_lookup_q6_k_hsaco = cache.compile("embed_lookup_q6_k", EMBED_LOOKUP_Q6_K_SOURCE)?;
         let embed_lookup_q4_k_hsaco = cache.compile("embed_lookup_q4_k", EMBED_LOOKUP_Q4_K_SOURCE)?;
@@ -4279,24 +4278,12 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    /// `Y[n_rows, out_d] = X[n_rows, in_d] · Wᵀ` for an fp32 weight
-    /// (kernels/gemm_f32_tn.cpp, the llama fork's gcn_f32_gemm_tn_rb).
+    /// `Y[n_rows, out_d] = X[n_rows, in_d] · Wᵀ` for an fp32 weight.
     fn launch_gemm_f32_tn(&self, w: *mut c_void, x: *mut c_void, y: *mut c_void,
                           in_d: usize, out_d: usize, n_rows: usize) -> Result<(), String>
     {
-        let vec = in_d % 4 == 0 && (w as usize) % 16 == 0 && (x as usize) % 16 == 0;
-        let f = self.gemm_f32_tn_module.function(if vec { "gemm_f32_tn_vec_f32" } else { "gemm_f32_tn_f32" })?;
-        let (mut a, mut b, mut c) = (w, x, y);
-        let (mut m, mut n, mut k) = (out_d as i32, n_rows as i32, in_d as i32);
-        let (mut lda, mut ldb, mut ldc) = (in_d as i32, in_d as i32, out_d as i32);
-        let mut args: [*mut c_void; 9] = [
-            &mut a as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void,
-            &mut c as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void, &mut k as *mut _ as *mut c_void,
-            &mut lda as *mut _ as *mut c_void, &mut ldb as *mut _ as *mut c_void,
-            &mut ldc as *mut _ as *mut c_void];
-        let grid = (n_rows.div_ceil(64) as u32, out_d.div_ceil(64) as u32, 1);
-        unsafe { f.launch(grid, (256, 1, 1), 0, Some(&self.stream), &mut args) }
+        crate::runtime::prefill::launch_gemm_f32_tn(&self.gemm_f32_tn_module, &self.stream,
+                                                    w, x, y, in_d, out_d, n_rows)
     }
 
     /// `Y[n_rows, out_d] = X[n_rows, in_d] · Wᵀ` for an fp16 weight.

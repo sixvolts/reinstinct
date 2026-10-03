@@ -18,6 +18,29 @@ use super::KernelCache;
 
 const CVT_SOURCE: &str = include_str!("../../kernels/cvt_f32_f16.cpp");
 const GEMM_F16_ROWS_SOURCE: &str = include_str!("../../kernels/gemm_f16_rows.cpp");
+pub(crate) const GEMM_F32_TN_SOURCE: &str = include_str!("../../kernels/gemm_f32_tn.cpp");
+
+/// `Y[n_rows, out_dim] = X[n_rows, in_dim] · Wᵀ` for an fp32 weight:
+/// kernels/gemm_f32_tn.cpp (the llama fork's gcn_f32_gemm_tn_rb, 64x64
+/// tiles) straight off the weight — no fp16 conversion per call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_gemm_f32_tn(module: &Module, stream: &hip::Stream,
+                                 w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                                 in_dim: usize, out_dim: usize, n_rows: usize) -> Result<(), String> {
+    let vec = in_dim % 4 == 0 && (w as usize) % 16 == 0 && (x as usize) % 16 == 0;
+    let f = module.function(if vec { "gemm_f32_tn_vec_f32" } else { "gemm_f32_tn_f32" })?;
+    let (mut a, mut b, mut c) = (w, x, y);
+    let (mut m, mut n, mut k) = (out_dim as i32, n_rows as i32, in_dim as i32);
+    let (mut lda, mut ldb, mut ldc) = (in_dim as i32, in_dim as i32, out_dim as i32);
+    let mut args: [*mut c_void; 9] = [
+        &mut a as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void,
+        &mut c as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void, &mut k as *mut _ as *mut c_void,
+        &mut lda as *mut _ as *mut c_void, &mut ldb as *mut _ as *mut c_void,
+        &mut ldc as *mut _ as *mut c_void];
+    let grid = (n_rows.div_ceil(64) as u32, out_dim.div_ceil(64) as u32, 1);
+    unsafe { f.launch(grid, (256, 1, 1), 0, Some(stream), &mut args) }
+}
 /// Activation rows each `gemm_f16_rows_f32` block handles. Must match
 /// `NR_TILE` in `kernels/gemm_f16_rows.cpp`.
 const GEMM_F16_NR_TILE: usize = 8;
@@ -261,6 +284,7 @@ pub struct PrefillGemm {
     /// Multi-row fp16-weight GEMM. The fallback for dtypes with no
     /// repacked MMQ kernel, in place of what used to be a rocBLAS HGEMM.
     gemm_f16_rows: Module,
+    gemm_f32_tn:   Module,
     deq_q4k:   Module,
     deq_q5k:   Module,
     deq_q6k:   Module,
@@ -296,6 +320,7 @@ impl PrefillGemm {
             cvt:       Module::load(&cache.compile("cvt_f32_f16", CVT_SOURCE)?)?,
             gemm_f16_rows: Module::load(&cache.compile("gemm_f16_rows",
                            GEMM_F16_ROWS_SOURCE)?)?,
+            gemm_f32_tn: Module::load(&cache.compile("gemm_f32_tn", GEMM_F32_TN_SOURCE)?)?,
             deq_q4k:   Module::load(&cache.compile("dequant_q4_k_f16",
                            include_str!("../../kernels/dequant_q4_k_f16.cpp"))?)?,
             deq_q5k:   Module::load(&cache.compile("dequant_q5_k_f16",
@@ -428,6 +453,13 @@ impl PrefillGemm {
                                                        in_dim, out_dim, x, n_rows);
             }
             return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
+        }
+
+        // F32 weights (Gemma's per-layer-embedding projection, Unsloth's
+        // unquantized small tensors): a tiled F32 GEMM off the weight.
+        if dtype == GgmlType::F32 && !repacked && std::env::var_os("REINSTINCT_NO_F32_GEMM").is_none() {
+            return launch_gemm_f32_tn(&self.gemm_f32_tn, stream, w_dev.raw_ptr(), x, dst,
+                                      in_dim, out_dim, n_rows);
         }
 
         let n_w = out_dim * in_dim;
