@@ -33,3 +33,16 @@ Results:
 - Qwen3.5-4B `-ub 1` perplexity now runs and equals the unfused result.
 - Flash-Next keeps the elision: tg32 48.3, against 47.3 with the elision off.
 - Independent of B1; apply both.
+
+## R7: `R7-q6k-mmq-int8-staging-15d76b19d.patch`
+
+Ported from reinstinct's Q6_K tile: Q6_K weights are expanded to int8 (q6 - 32) at LDS staging, so the inner loop is a plain int8 dot. Fork commit 15d76b19d.
+
+Qwen3.5-4B, 1x MI50:
+
+| model | Q6_K tile per call | pp512 |
+|---|---|---|
+| UD-Q4_K_XL | 2534 -> 1432 us | 1397 -> 1555 tok/s |
+| Q5_K_M | 2277 -> 1311 us | 1263 -> 1468 tok/s |
+
+Output is unchanged: KLD 0.000000.

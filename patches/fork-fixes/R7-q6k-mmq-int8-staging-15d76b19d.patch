@@ -1,0 +1,148 @@
+From 15d76b19dc899fb5b31fe060bddf7c2b93ccda29 Mon Sep 17 00:00:00 2001
+From: sixvolts <rigel@sixvolts.org>
+Date: Sat, 3 Oct 2026 11:57:56 +0000
+Subject: [PATCH] cuda: expand Q6_K weights to int8 at LDS staging in the
+ repacked MMQ
+
+The Q6_K tile unpacked the 6-bit planes in the inner loop (TM*TN*8
+unpacks per tile step per thread) and corrected the symmetric -32 with
+per-token activation half-sums. Expand to int8 (q6 - 32) once at staging
+(repack_sub32, from reinstinct's Q6_K tile), so the inner loop is a plain
+int8 dot like Q8_0's; the integer dots equal the old (dot - 32*sum).
+
+Qwen3.5-4B, 1x MI50, pp512: mmq_gemm_q6k_repacked 2534 -> 1432 us/call
+(UD-Q4_K_XL), 2277 -> 1311 (Q5_K_M); pp512 1397 -> 1555 and 1263 -> 1468
+tok/s. KLD vs the old tile 0.000000 (max 6e-5, FMA contraction).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+---
+ ggml/src/ggml-cuda/repack-gcn.cu | 68 +++++++++++++++++++-------------
+ 1 file changed, 41 insertions(+), 27 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cu b/ggml/src/ggml-cuda/repack-gcn.cu
+index 8c179f2f0..8598ee2e7 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cu
++++ b/ggml/src/ggml-cuda/repack-gcn.cu
+@@ -542,6 +542,13 @@ static __device__ __forceinline__ uint32_t repack_spread2(const uint32_t h) {
+          | ((h & 0x30u) << 16) | ((h & 0xC0u) << 22);
+ }
+ 
++// Bytewise v - 32 on four 6-bit values with no borrow between bytes: setting bit 7
++// first keeps every byte >= 128 > 32; clearing it after leaves (v - 32) mod 256, the
++// two's-complement int8 that dp4a expects (from reinstinct's Q6_K tile).
++static __device__ __forceinline__ uint32_t repack_sub32(const uint32_t v) {
++    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
++}
++
+ // Q3_K reconstruction: four 2-bit fields to bits 0..1 of bytes 0..3 (the
+ // low pair) and four 1-bit fields to bit 2 of bytes 0..3 (the high bit).
+ static __device__ __forceinline__ uint32_t repack_spread2_lo(const uint32_t h) {
+@@ -2397,8 +2404,12 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
+ #endif // defined(GGML_USE_HIP) && defined(GCN)
+ }
+ 
+-// Q6_K MMQ — h2 plane staged as uint2, signed scale pairs, per-token
+-// activation half-sums for the symmetric -32 fold.
++// Q6_K MMQ — weights expanded to int8 (q6 - 32) at LDS staging (two uint4 per
++// sub-block, in the activation's dp4a group order), so the inner loop is a plain
++// int8 dot like Q8_0's. Unpacking the 6-bit planes there instead cost
++// TM*TN*8 unpacks per tile step per thread plus the activation half-sums for
++// the -32 fold (2x slower than reinstinct's staged form on Gemma E4B prefill).
++// The integer dots equal the old (dot - 32*sum), so results are unchanged.
+ template <bool HAS_IDS, int TN_>
+ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
+         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+@@ -2440,8 +2451,8 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
+     const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
+         wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 2);
+ 
+-    __shared__ uint4      sW  [MMQ_RP_BM][MMQ_RP_BK];
+-    __shared__ uint2      sWh2[MMQ_RP_BM][MMQ_RP_BK];
++    __shared__ uint4      sWlo[MMQ_RP_BM][MMQ_RP_BK]; // int8 (q6 - 32), weights 0-15
++    __shared__ uint4      sWhi[MMQ_RP_BM][MMQ_RP_BK]; // int8 (q6 - 32), weights 16-31
+     __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK];
+     __shared__ block_q8_1 sX  [(16 * TN_)][MMQ_RP_BK + 1];
+ 
+@@ -2467,8 +2478,23 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
+         const uint32_t sb   = sb0 + lk;
+         const uint32_t wrow = row0 + lr;
+         if (wrow < ne1 && sb < n_sub) {
+-            sW  [lr][lk] = nib[(size_t) wrow * nsp + sb];
+-            sWh2[lr][lk] = h2p[(size_t) wrow * nsp + sb];
++            const uint4 q  = nib[(size_t) wrow * nsp + sb];
++            const uint2 h2 = h2p[(size_t) wrow * nsp + sb];
++            // nibble word j: low nibbles = dp4a group 2j (activation int j), high = group 2j+1
++            // (activation int j+4); h2 byte g holds group g's four 2-bit high fields
++            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++            uint32_t lo[4], hi[4];
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++                const uint32_t ge = 2 * j;
++                const uint32_t go = 2 * j + 1;
++                const uint32_t he = ((ge < 4 ? h2.x : h2.y) >> (8 * (ge & 3))) & 0xFFu;
++                const uint32_t ho = ((go < 4 ? h2.x : h2.y) >> (8 * (go & 3))) & 0xFFu;
++                lo[j] = repack_sub32(( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he));
++                hi[j] = repack_sub32(((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho));
++            }
++            sWlo[lr][lk] = make_uint4(lo[0], lo[1], lo[2], lo[3]);
++            sWhi[lr][lk] = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+             const uint16_t sm     = smp[(size_t) wrow * nsp + sb];
+             const uint16_t d_bits = ddp[(size_t) wrow * n_super + (sb >> 3)];
+             const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+@@ -2495,12 +2521,12 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
+ 
+ #pragma unroll
+         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
+-            uint4 wq[MMQ_RP_TM]; uint2 wh2[MMQ_RP_TM];
++            uint4 wlo[MMQ_RP_TM], whi[MMQ_RP_TM];
+             float dlo[MMQ_RP_TM], dhi[MMQ_RP_TM];
+ #pragma unroll
+             for (int r = 0; r < MMQ_RP_TM; r++) {
+-                wq[r]  = sW  [ty + r * 16][kk];
+-                wh2[r] = sWh2[ty + r * 16][kk];
++                wlo[r] = sWlo[ty + r * 16][kk];
++                whi[r] = sWhi[ty + r * 16][kk];
+                 const float2 s = sWs[ty + r * 16][kk];
+                 dlo[r] = s.x;
+                 dhi[r] = s.y;
+@@ -2510,30 +2536,18 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
+                 const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                 const float dx = __low2float(xb->ds);
+-                int xis0 = 0, xis1 = 0;
+-#pragma unroll
+-                for (int j = 0; j < 4; j++) {
+-                    xis0 = ggml_cuda_dp4a(xq32[j],     0x01010101, xis0);
+-                    xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
+-                }
+ #pragma unroll
+                 for (int r = 0; r < MMQ_RP_TM; r++) {
+-                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
+-                    const uint32_t h2lo = wh2[r].x, h2hi = wh2[r].y;
++                    const int lo[4] = { (int) wlo[r].x, (int) wlo[r].y, (int) wlo[r].z, (int) wlo[r].w };
++                    const int hi[4] = { (int) whi[r].x, (int) whi[r].y, (int) whi[r].z, (int) whi[r].w };
+                     int idot0 = 0, idot1 = 0;
+ #pragma unroll
+                     for (int j = 0; j < 4; j++) {
+-                        const uint32_t ge = 2 * j;
+-                        const uint32_t go = 2 * j + 1;
+-                        const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
+-                        const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
+-                        const uint32_t q6lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he);
+-                        const uint32_t q6hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho);
+-                        idot0 = ggml_cuda_dp4a((int) q6lo, xq32[j],     idot0);
+-                        idot1 = ggml_cuda_dp4a((int) q6hi, xq32[j + 4], idot1);
++                        idot0 = ggml_cuda_dp4a(lo[j], xq32[j],     idot0);
++                        idot1 = ggml_cuda_dp4a(hi[j], xq32[j + 4], idot1);
+                     }
+-                    acc[r][n] += dlo[r] * dx * (float)(idot0 - 32 * xis0)
+-                               + dhi[r] * dx * (float)(idot1 - 32 * xis1);
++                    acc[r][n] += dlo[r] * dx * (float) idot0
++                               + dhi[r] * dx * (float) idot1;
+                 }
+             }
+         }
+-- 
+2.53.0
+
