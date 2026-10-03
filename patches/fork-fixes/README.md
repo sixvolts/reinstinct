@@ -11,6 +11,26 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 5. R6b
 6. R6c
 7. R8
+8. L6 (`L6-topk-rank-v3-bafaf7d73.patch`)
+9. R4 (`R4-moe-chain-q8-lds-nc-loads-first-69db7bf5d.patch`)
+10. R11/R12 (`R11-R12-q4_0-iq-family-q3k-relabel-7f70fff53.patch`)
+
+Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
+from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
+expert-dedup kernel is already resolved here). All three `git am` cleanly in this order and the
+three touched CUDA translation units pass a syntax-only hipcc compile on that tree. Report fork
+numbers as "905021dba + B1..R8 + L6 + R4 + R11/R12".
+
+- **L6**: rank-select top-k for 256/512-expert routing (`GGML_CUDA_NO_TOPK_RANK=1` = serial argmax).
+- **R4** bundle: fused MoE down + router-weighted sum (`GGML_CUDA_DOWN_REDUCE_R=0` off), thread-packed
+  Q5_1 down (`GGML_CUDA_Q5_1_DOWN_R=0`), gate/up kernel emitting the down's q8_1 (`GGML_CUDA_NO_GLU16_Q8`),
+  Q8_0 LDS-staged 4..8-column matvec (`GGML_CUDA_NO_Q8_LDS_NC`), 9..32-column chunking
+  (`GGML_CUDA_NO_Q8_NC_CHUNK`), loads-first Q8_0 multi / shared-expert GLU (`GGML_CUDA_NO_Q8_MULTI_UNROLL`,
+  `GGML_CUDA_NO_Q8_GLU_UNROLL`), `GGML_CUDA_REPACK_TRACE=1` shape log.
+- **R11/R12**: Q4_0 repack end to end (`GGML_CUDA_REPACK_Q4_0=0` off), IQ4_NL / IQ4_XS / IQ3_S on the same
+  planes (`GGML_CUDA_REPACK_IQ=0` off), Q3_K -> Q6_K relabel (`GGML_CUDA_Q3K_RELABEL=0` off), 16/32/48-wide
+  prefill token tiles for <= 48 columns (`GGML_CUDA_NO_MMQ_NARROW=1` off), `tests/test-repack-host`
+  (CPU-only layout check; run with `GGML_CUDA_REPACK=0`).
 
 On furnace the series applies cleanly in this order and compiles (plain `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906`, no NO_PEER_COPY). Single-GPU smoke run on Qwen3.5-4B UD-Q4_K_XL:
 
