@@ -1995,6 +1995,7 @@ fn qwen_mtp_gen_cli(path: &std::path::Path, prompt: Option<String>,
     let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
     let t_plain = std::time::Instant::now();
     let pre_b = prefill(&mut state_b)?;
+    let plain_prefill_s = t_plain.elapsed().as_secs_f64();
     let mut cur = argmax(&pre_b);
     let mut plain_out = Vec::with_capacity(out.len());
     for _ in 0..out.len() {
@@ -2022,6 +2023,10 @@ fn qwen_mtp_gen_cli(path: &std::path::Path, prompt: Option<String>,
     println!("  spec decode   = {spec_tps:.1} tok/s  ({spec_el:.2} s)");
     println!("  plain decode  = {plain_tps:.1} tok/s  ({plain_el:.2} s)");
     println!("  speedup       = {:.2}x", spec_tps / plain_tps);
+    let spec_dec = n / (spec_el - stats.prefill_s);
+    let plain_dec = n / (plain_el - plain_prefill_s);
+    println!("  decode only   = spec {spec_dec:.1} tok/s, plain {plain_dec:.1} tok/s ({:.2}x; prefill {:.0} / {:.0} ms excluded)",
+             spec_dec / plain_dec, stats.prefill_s * 1e3, plain_prefill_s * 1e3);
     if stats.hit_eos { println!("  (stopped at EOS)"); }
     Ok(())
 }

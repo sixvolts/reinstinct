@@ -1123,6 +1123,7 @@ pub struct QwenSpecStats {
     pub drafted:  usize,   // total MTP drafts proposed
     pub accepted: usize,   // drafts that survived verification
     pub hit_eos:  bool,
+    pub prefill_s: f64,    // prompt prefill + MTP catch-up, wall time
 }
 
 impl QwenSpecStats {
@@ -3619,6 +3620,7 @@ impl GpuQwen35 {
 
         // Prefill + catch-up over the prompt. Position 0 has no previous
         // hidden; it pairs with zeros.
+        let t_prefill = std::time::Instant::now();
         let zeros = DeviceBuf::from_slice(&vec![0.0f32; h])?;
         let pending = DeviceBuf::<f32>::new(h)?;   // target hidden of the last committed position
         let (logits, hid) = self.forward_tokens_batched_hidden(prompt, state)?;
@@ -3626,6 +3628,8 @@ impl GpuQwen35 {
         self.mtp_catchup(mtp, prompt, &zeros, &hid, 0, mtp_kv)?;
         pending.copy_range_from_device_async(&hid, (prompt.len() - 1) * h, 0, h, &self.stream)?;
         drop(hid);
+        self.stream.synchronize()?;
+        stats.prefill_s = t_prefill.elapsed().as_secs_f64();
         let mut t = crate::sampling::argmax(&logits);
         let mut generated: Vec<u32> = Vec::new();
         let checkpointed = snapshot.ckpt_rows >= k && self.gdn_recurrent_batched_v2_module.is_some()
