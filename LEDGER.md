@@ -28,5 +28,5 @@ Owner: who does the port/evaluation. See README for status values.
 
 | id | item | owner | status | notes |
 |---|---|---|---|---|
-| S1 | Like-for-like baselines: fork vs reinstinct on the same MI50, same models (Gemma 4 31B/26B-A4B/E4B, Qwen 3.8-27B, Qwen 3.6-35B-A3B), same settings | Reinstinct runs on podcast; Furnace supplies build + flags | proposed (after L2) | Fork build: branch `gfx906-perf`, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906`, env `GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1`, `-fa on`. |
+| S1 | Like-for-like baselines: fork vs reinstinct on the same MI50, same models (Gemma 4 31B/26B-A4B/E4B, Qwen 3.8-27B, Qwen 3.6-35B-A3B), same settings | Reinstinct runs on podcast; Furnace supplies build + flags | measured | baselines/S1-podcast-1xMI50.md (fork 905021dba vs reinstinct e2d4740, podcast GPU 1). Decode: reinstinct +3..+34% except Gemma 26B-A4B (-5%); prefill: reinstinct +14-21% on dense, fork +54-79% on MoE/E4B. Fork draft-mtp on Qwen 3.8-27B dense: 71-82% accept but ~9 tok/s vs 27.5 plain - needs a look on the fork side. |
 | S2 | DFlash | Reinstinct leads | proposed | Fork evaluated it 2026-08 for Qwen3.5-122B: no llama.cpp/GGUF path then, vLLM/SGLang only. Reinstinct has a WIP; fork follows. |
