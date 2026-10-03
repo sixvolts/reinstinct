@@ -16,7 +16,8 @@
 template <bool VEC>
 __device__ __forceinline__ void gcn_f32_gemm_tn_rb(
         const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
-        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const int k_begin) {
     __shared__ float As[GCN_F32_RB_BK][GCN_F32_RB_BM + 4];
     __shared__ float Bs[GCN_F32_RB_BK][GCN_F32_RB_BN + 4];
 
@@ -32,7 +33,7 @@ __device__ __forceinline__ void gcn_f32_gemm_tn_rb(
 
     float acc[4][4] = {{0.0f}};
 
-    for (int k0 = 0; k0 < K; k0 += GCN_F32_RB_BK) {
+    for (int k0 = k_begin; k0 < K; k0 += GCN_F32_RB_BK) {
         const int k = k0 + lk;
         float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -95,9 +96,44 @@ __device__ __forceinline__ void gcn_f32_gemm_tn_rb(
 extern "C" __global__ __launch_bounds__(256) void gemm_f32_tn_vec_f32(
         const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
         int M, int N, int K, int lda, int ldb, int ldc)
-{ gcn_f32_gemm_tn_rb<true>(A, B, C, M, N, K, lda, ldb, ldc); }
+{ gcn_f32_gemm_tn_rb<true>(A, B, C, M, N, K, lda, ldb, ldc, 0); }
 
 extern "C" __global__ __launch_bounds__(256) void gemm_f32_tn_f32(
         const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
         int M, int N, int K, int lda, int ldb, int ldc)
-{ gcn_f32_gemm_tn_rb<false>(A, B, C, M, N, K, lda, ldb, ldc); }
+{ gcn_f32_gemm_tn_rb<false>(A, B, C, M, N, K, lda, ldb, ldc, 0); }
+
+// Split-K: blockIdx.z takes k in [z * k_chunk, min(K, (z + 1) * k_chunk))
+// and writes its partial C to C + z * split_stride; gemm_f32_splitk_reduce
+// then sums the slices in z order (deterministic, unlike atomics). For
+// skinny problems — the MoE router (256 tokens x 2048 -> 256) and the
+// GDN alpha/beta projections (-> 32) give 8-16 tiles on a 60-CU card.
+// k_chunk is a multiple of GCN_F32_RB_BK.
+extern "C" __global__ __launch_bounds__(256) void gemm_f32_tn_splitk_vec_f32(
+        const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+        int M, int N, int K, int lda, int ldb, int ldc, int k_chunk, long long split_stride)
+{
+    const int kb = blockIdx.z * k_chunk;
+    gcn_f32_gemm_tn_rb<true>(A, B, C + (size_t)blockIdx.z * split_stride,
+                             M, N, min(K, kb + k_chunk), lda, ldb, ldc, kb);
+}
+
+extern "C" __global__ __launch_bounds__(256) void gemm_f32_tn_splitk_f32(
+        const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+        int M, int N, int K, int lda, int ldb, int ldc, int k_chunk, long long split_stride)
+{
+    const int kb = blockIdx.z * k_chunk;
+    gcn_f32_gemm_tn_rb<false>(A, B, C + (size_t)blockIdx.z * split_stride,
+                              M, N, min(K, kb + k_chunk), lda, ldb, ldc, kb);
+}
+
+// y[i] = sum_z part[z * n + i], z ascending.
+extern "C" __global__ __launch_bounds__(256) void gemm_f32_splitk_reduce(
+        const float* __restrict__ part, float* __restrict__ y, long long n, int splits)
+{
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) return;
+    float acc = part[i];
+    for (int z = 1; z < splits; z++) acc += part[(size_t)z * n + i];
+    y[i] = acc;
+}

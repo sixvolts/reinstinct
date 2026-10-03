@@ -41,6 +41,50 @@ pub(crate) fn launch_gemm_f32_tn(module: &Module, stream: &hip::Stream,
     let grid = (n_rows.div_ceil(64) as u32, out_dim.div_ceil(64) as u32, 1);
     unsafe { f.launch(grid, (256, 1, 1), 0, Some(stream), &mut args) }
 }
+/// K-split count for `launch_gemm_f32_tn_split`: enough slices that a
+/// skinny GEMM fills the card (~2 workgroups per CU on a 60-CU MI50),
+/// each slice at least 128 deep. 1 = no split.
+pub(crate) fn gemm_f32_splits(in_dim: usize, out_dim: usize, n_rows: usize) -> usize {
+    let tiles = n_rows.div_ceil(64) * out_dim.div_ceil(64);
+    let mut s = 1;
+    while tiles * s < 120 && in_dim / (2 * s) >= 128 { s *= 2; }
+    s
+}
+
+/// `launch_gemm_f32_tn` with K split `splits` ways: partial products go
+/// to `scratch` (`splits * n_rows * out_dim` floats) and a second launch
+/// sums them in fixed order into `y`.
+pub(crate) fn launch_gemm_f32_tn_split(module: &Module, stream: &hip::Stream,
+                                       w: *mut c_void, x: *mut c_void, y: *mut c_void,
+                                       in_dim: usize, out_dim: usize, n_rows: usize,
+                                       splits: usize, scratch: *mut c_void) -> Result<(), String> {
+    let vec = in_dim % 4 == 0 && (w as usize) % 16 == 0 && (x as usize) % 16 == 0;
+    let f = module.function(if vec { "gemm_f32_tn_splitk_vec_f32" } else { "gemm_f32_tn_splitk_f32" })?;
+    let (mut a, mut b, mut c) = (w, x, scratch);
+    let (mut m, mut n, mut k) = (out_dim as i32, n_rows as i32, in_dim as i32);
+    let (mut lda, mut ldb, mut ldc) = (in_dim as i32, in_dim as i32, out_dim as i32);
+    let mut kc = (in_dim.div_ceil(splits).div_ceil(16) * 16) as i32;
+    let mut ss = (n_rows * out_dim) as i64;
+    let mut args: [*mut c_void; 11] = [
+        &mut a as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void,
+        &mut c as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void, &mut k as *mut _ as *mut c_void,
+        &mut lda as *mut _ as *mut c_void, &mut ldb as *mut _ as *mut c_void,
+        &mut ldc as *mut _ as *mut c_void, &mut kc as *mut _ as *mut c_void,
+        &mut ss as *mut _ as *mut c_void];
+    let grid = (n_rows.div_ceil(64) as u32, out_dim.div_ceil(64) as u32, splits as u32);
+    unsafe { f.launch(grid, (256, 1, 1), 0, Some(stream), &mut args)?; }
+
+    let f = module.function("gemm_f32_splitk_reduce")?;
+    let (mut p, mut yy) = (scratch, y);
+    let mut nn = ss;
+    let mut sp = splits as i32;
+    let mut args: [*mut c_void; 4] = [
+        &mut p as *mut _ as *mut c_void, &mut yy as *mut _ as *mut c_void,
+        &mut nn as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void];
+    unsafe { f.launch(((ss as usize).div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, Some(stream), &mut args) }
+}
+
 /// Activation rows each `gemm_f16_rows_f32` block handles. Must match
 /// `NR_TILE` in `kernels/gemm_f16_rows.cpp`.
 const GEMM_F16_NR_TILE: usize = 8;
@@ -308,6 +352,7 @@ pub struct PrefillGemm {
     small: SmallBatchMatvec,   // K=1..8 small-batch matvecs for verify
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     xq8:    std::cell::RefCell<DeviceBuf<u8>>,    // int8 activations (MMQ path)
+    splitk: std::cell::RefCell<DeviceBuf<f32>>,   // F32 GEMM split-K partials
 }
 
 impl PrefillGemm {
@@ -365,6 +410,7 @@ impl PrefillGemm {
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             // int8 activations: one BlockQ8 (40 B) per 32-element sub-block.
             xq8:    std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
+            splitk: std::cell::RefCell::new(DeviceBuf::new(1)?),
         })
     }
 
@@ -458,6 +504,13 @@ impl PrefillGemm {
         // F32 weights (Gemma's per-layer-embedding projection, Unsloth's
         // unquantized small tensors): a tiled F32 GEMM off the weight.
         if dtype == GgmlType::F32 && !repacked && std::env::var_os("REINSTINCT_NO_F32_GEMM").is_none() {
+            let splits = gemm_f32_splits(in_dim, out_dim, n_rows);
+            if splits > 1 && std::env::var_os("REINSTINCT_NO_F32_SPLITK").is_none() {
+                Self::grow(&self.splitk, splits * n_rows * out_dim, stream)?;
+                return launch_gemm_f32_tn_split(&self.gemm_f32_tn, stream, w_dev.raw_ptr(), x, dst,
+                                                in_dim, out_dim, n_rows, splits,
+                                                self.splitk.borrow().raw_ptr());
+            }
             return launch_gemm_f32_tn(&self.gemm_f32_tn, stream, w_dev.raw_ptr(), x, dst,
                                       in_dim, out_dim, n_rows);
         }
@@ -517,7 +570,7 @@ impl PrefillGemm {
                              x, dst, in_dim, out_dim, n_rows)
     }
 
-    fn grow(buf: &std::cell::RefCell<DeviceBuf<u16>>, n: usize, stream: &hip::Stream)
+    fn grow<T: Copy>(buf: &std::cell::RefCell<DeviceBuf<T>>, n: usize, stream: &hip::Stream)
         -> Result<(), String>
     {
         if buf.borrow().len() < n {
@@ -853,5 +906,48 @@ mod tests {
         // fraction of the peak output. >2% would indicate a real bug.
         assert!(rel_to_peak < 0.02,
             "batched HGEMM error {rel_to_peak:.4} of peak — too large for fp16 noise");
+    }
+
+    /// The F32 GEMM, plain and split-K, against an f64 CPU reference.
+    /// Shapes: the GDN alpha/beta and MoE router (split 16 / 8), a K that
+    /// is not a multiple of the 16-wide slice, and an odd K (scalar path).
+    #[test]
+    fn gemm_f32_tn_split_matches_reference() {
+        let Some(cache) = crate::test_support::kernel_cache() else { return };
+        let _dev = hip::Device::set(0).unwrap();
+        let stream = hip::Stream::new().unwrap();
+        let module = Module::load(&cache.compile("gemm_f32_tn", GEMM_F32_TN_SOURCE).unwrap()).unwrap();
+        let mut xs: u64 = 0xF32_5EED;
+        let mut rng = || { xs = xs.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                           ((xs >> 33) as u32 as f32 / u32::MAX as f32) - 0.5 };
+        for (in_dim, out_dim, n_rows) in [(2048usize, 32usize, 512usize), (2048, 256, 256), (1000, 37, 70), (1001, 64, 9)] {
+            let w: Vec<f32> = (0..out_dim * in_dim).map(|_| rng()).collect();
+            let x: Vec<f32> = (0..n_rows * in_dim).map(|_| rng()).collect();
+            let (dw, dx) = (DeviceBuf::from_slice(&w).unwrap(), DeviceBuf::from_slice(&x).unwrap());
+            let dy: DeviceBuf<f32> = DeviceBuf::from_slice(&vec![f32::NAN; n_rows * out_dim]).unwrap();
+            let mut want = vec![0f64; n_rows * out_dim];
+            for r in 0..n_rows { for o in 0..out_dim {
+                want[r * out_dim + o] = (0..in_dim).map(|k| w[o * in_dim + k] as f64 * x[r * in_dim + k] as f64).sum();
+            }}
+            for splits in [1usize, 2, 8, 16] {
+                if splits == 1 {
+                    launch_gemm_f32_tn(&module, &stream, dw.raw_ptr(), dx.raw_ptr(), dy.raw_ptr(),
+                                       in_dim, out_dim, n_rows).unwrap();
+                } else {
+                    let scratch: DeviceBuf<f32> = DeviceBuf::new(splits * n_rows * out_dim).unwrap();
+                    launch_gemm_f32_tn_split(&module, &stream, dw.raw_ptr(), dx.raw_ptr(), dy.raw_ptr(),
+                                             in_dim, out_dim, n_rows, splits, scratch.raw_ptr()).unwrap();
+                }
+                stream.synchronize().unwrap();
+                let mut got = vec![0f32; n_rows * out_dim];
+                dy.copy_to_host(&mut got).unwrap();
+                let worst = got.iter().zip(&want).map(|(&g, &e)| (g as f64 - e).abs()).fold(0f64, f64::max);
+                assert!(worst < 1e-4 * (in_dim as f64).sqrt(),
+                        "{in_dim}x{out_dim} n={n_rows} splits={splits}: max abs err {worst}");
+            }
+        }
+        assert_eq!(gemm_f32_splits(2048, 32, 512), 16);
+        assert_eq!(gemm_f32_splits(2048, 256, 256), 8);
+        assert_eq!(gemm_f32_splits(2048, 4096, 512), 1);
     }
 }
