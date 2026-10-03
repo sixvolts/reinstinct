@@ -127,6 +127,8 @@ const MOE_SHEXP_GATE_SOURCE:  &str = include_str!("../../kernels/moe_shexp_gate.
 const MOE_EXPERT_SORT_SOURCE: &str = include_str!("../../kernels/moe_expert_sort.cpp");
 const MOE_MMQ_Q4K_GROUPED_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4k_grouped.cpp");
+const MOE_MMQ_Q4K_GROUPED_W1_SOURCE: &str =
+    include_str!("../../kernels/mmq_gemm_q4k_grouped_w1.cpp");
 const MOE_MMQ_Q5K_GROUPED_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q5k_grouped.cpp");
 const MOE_MMQ_Q6K_GROUPED_SOURCE: &str =
@@ -604,6 +606,8 @@ struct MoeRuntime {
     m_expert_sort: Module,
     /// Grouped-expert MMQ GEMM — repacked Q4_K/Q5_K/Q6_K (MoE prefill).
     m_grouped_q4k: Module,
+    /// One-wave 64x16 Q4_K grouped GEMM (the llama fork's id_w1 kernel).
+    m_grouped_q4k_w1: Module,
     m_grouped_q5k: Module,
     m_grouped_q6k: Module,
     m_grouped_q8_0: Module,
@@ -669,6 +673,8 @@ impl MoeRuntime {
                               "moe_expert_sort", MOE_EXPERT_SORT_SOURCE)?)?,
             m_grouped_q4k: Module::load(&cache.compile(
                               "mmq_gemm_q4k_grouped", &grouped_src(MOE_MMQ_Q4K_GROUPED_SOURCE))?)?,
+            m_grouped_q4k_w1: Module::load(&cache.compile(
+                              "mmq_gemm_q4k_grouped_w1", MOE_MMQ_Q4K_GROUPED_W1_SOURCE)?)?,
             m_grouped_q5k: Module::load(&cache.compile(
                               "mmq_gemm_q5k_grouped", &grouped_src(MOE_MMQ_Q5K_GROUPED_SOURCE))?)?,
             m_grouped_q6k: Module::load(&cache.compile(
@@ -2894,8 +2900,8 @@ impl GpuQwen35 {
         let nt = n as u32;
 
         // --- Router: GEMM over all rows → logits, then per-token top-k ---
-        self.bmm(&w.gate_inp, input_ptr, n, moe.logits.raw_ptr())?;
-        self.launch_moe_topk(moe, nt)?;
+        self.ptrace("M.router", || self.bmm(&w.gate_inp, input_ptr, n, moe.logits.raw_ptr()))?;
+        self.ptrace("M.topk", || self.launch_moe_topk(moe, nt))?;
 
         // Grouped-expert GEMM groundwork (M1): expert-routing sort. Not
         // yet consumed — the matvec path below still runs. Gated for now.
@@ -2908,7 +2914,7 @@ impl GpuQwen35 {
         // expert matvecs batch over tokens (grid.z). gate/up share the
         // token activation across the 8 experts (slot stride 0); down has
         // a distinct activation per (token, expert).
-        self.launch_quantize_q8_into(input_ptr, moe.xq8_in.raw_ptr(), h, nt)?;
+        self.ptrace("M.quant_in", || self.launch_quantize_q8_into(input_ptr, moe.xq8_in.raw_ptr(), h, nt))?;
         // Grouped-expert GEMM: sort tokens by expert, gather, one tiled
         // GEMM per expert (weight read once per expert, not once per
         // routed token). The whole FFN — gate, up, down — runs in
@@ -2921,22 +2927,22 @@ impl GpuQwen35 {
             && matches!(w.down_exps.dtype, GgmlType::Q5_K | GgmlType::Q6_K)
             && w.down_exps.repacked;
         if grouped {
-            self.launch_moe_sort(moe, nt)?;
-            self.launch_moe_gather_xq(moe, h / 32, nt)?;
-            self.launch_moe_grouped_gemm(moe, &w.gate_exps, moe.g_in.raw_ptr(),
-                                         moe.e_gate.raw_ptr(), h, ff, nt)?;
-            self.launch_moe_grouped_gemm(moe, &w.up_exps, moe.g_in.raw_ptr(),
-                                         moe.e_up.raw_ptr(), h, ff, nt)?;
+            self.ptrace("M.sort", || self.launch_moe_sort(moe, nt))?;
+            self.ptrace("M.gather", || self.launch_moe_gather_xq(moe, h / 32, nt))?;
+            self.ptrace("M.gemm_gate", || self.launch_moe_grouped_gemm(moe, &w.gate_exps, moe.g_in.raw_ptr(),
+                                         moe.e_gate.raw_ptr(), h, ff, nt))?;
+            self.ptrace("M.gemm_up", || self.launch_moe_grouped_gemm(moe, &w.up_exps, moe.g_in.raw_ptr(),
+                                         moe.e_up.raw_ptr(), h, ff, nt))?;
             // gate/up/swiglu/quantize all stay in expert-sorted order.
-            self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
-                               moe.e_gate.raw_ptr(), nt * n_used * ff)?;
-            self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
-                                         ff, nt * n_used)?;
-            self.launch_moe_grouped_gemm(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
-                                         moe.g_out.raw_ptr(), ff, h, nt)?;
+            self.ptrace("M.swiglu", || self.launch_swiglu(moe.e_gate.raw_ptr(), moe.e_up.raw_ptr(),
+                               moe.e_gate.raw_ptr(), nt * n_used * ff))?;
+            self.ptrace("M.quant_exp", || self.launch_quantize_q8_into(moe.e_gate.raw_ptr(), moe.xq8_exp.raw_ptr(),
+                                         ff, nt * n_used))?;
+            self.ptrace("M.gemm_down", || self.launch_moe_grouped_gemm(moe, &w.down_exps, moe.xq8_exp.raw_ptr(),
+                                         moe.g_out.raw_ptr(), ff, h, nt))?;
             // single scatter back to [token, slot] order for the combine.
-            self.launch_moe_scatter_rows(moe, moe.g_out.raw_ptr(),
-                                         moe.e_out.raw_ptr(), h, nt)?;
+            self.ptrace("M.scatter", || self.launch_moe_scatter_rows(moe, moe.g_out.raw_ptr(),
+                                         moe.e_out.raw_ptr(), h, nt))?;
         } else {
             self.launch_moe_expert_matvec(moe, &w.gate_exps, moe.xq8_in.raw_ptr(),
                                           moe.e_gate.raw_ptr(), h, ff, nt, h / 32, 0)?;
@@ -2952,16 +2958,16 @@ impl GpuQwen35 {
         }
 
         // --- Shared expert --- dense, shared weights → batched GEMMs ---
-        self.bmm(&w.gate_shexp, input_ptr, n, moe.sh_gate.raw_ptr())?;
-        self.bmm(&w.up_shexp,   input_ptr, n, moe.sh_up.raw_ptr())?;
+        self.ptrace("M.sh_gate", || self.bmm(&w.gate_shexp, input_ptr, n, moe.sh_gate.raw_ptr()))?;
+        self.ptrace("M.sh_up", || self.bmm(&w.up_shexp,   input_ptr, n, moe.sh_up.raw_ptr()))?;
         self.launch_swiglu(moe.sh_gate.raw_ptr(), moe.sh_up.raw_ptr(),
                            moe.sh_gate.raw_ptr(), nt * shff)?;
-        self.bmm(&w.down_shexp, moe.sh_gate.raw_ptr(), n, moe.sh_out.raw_ptr())?;
-        self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
-                                   w.gate_inp_shexp.raw_ptr(), nt)?;
+        self.ptrace("M.sh_down", || self.bmm(&w.down_shexp, moe.sh_gate.raw_ptr(), n, moe.sh_out.raw_ptr()))?;
+        self.ptrace("M.sh_gatefn", || self.launch_moe_shexp_gate(moe, moe.sh_out.raw_ptr(), input_ptr,
+                                   w.gate_inp_shexp.raw_ptr(), nt))?;
 
         // Combine routed experts into `output`, add the shared expert.
-        self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr, nt)?;
+        self.ptrace("M.combine", || self.launch_moe_combine(moe, moe.e_out.raw_ptr(), output_ptr, nt))?;
         self.launch_add_inplace(output_ptr, moe.sh_out.raw_ptr(), nt * h)?;
         Ok(())
     }
@@ -3140,9 +3146,13 @@ impl GpuQwen35 {
             GgmlType::Q6_K => (&moe.m_grouped_q6k, "mmq_gemm_q6k_grouped_f32"),
             GgmlType::Q8_0 => (&moe.m_grouped_q8_0, "mmq_gemm_q8_0_grouped_f32"),
             GgmlType::Q5_1 => (&moe.m_grouped_q5_1, "mmq_gemm_q5k_grouped_f32"),
+            // The one-wave kernel tiles 16 tokens: tile_off is built at MOE_GEMM_BN.
+            GgmlType::Q4_K if MOE_GEMM_BN == 16 && std::env::var_os("REINSTINCT_MOE_NO_W1").is_none() =>
+                (&moe.m_grouped_q4k_w1, "mmq_gemm_q4k_grouped_w1_f32"),
             GgmlType::Q4_K => (&moe.m_grouped_q4k, "mmq_gemm_q4k_grouped_f32"),
             other => return Err(format!("moe grouped GEMM: dtype {other:?}")),
         };
+        let block: u32 = if kname.ends_with("_w1_f32") { 64 } else { 256 };
         let f = module.function(kname)?;
         let n_entries = n_tok * moe.n_used as u32;
         let tile_ub = (n_entries + MOE_GEMM_BN - 1) / MOE_GEMM_BN + moe.n_expert as u32;
@@ -3156,7 +3166,7 @@ impl GpuQwen35 {
             &mut a4 as *mut _ as *mut c_void, &mut a5 as *mut _ as *mut c_void,
             &mut a6 as *mut _ as *mut c_void, &mut a7 as *mut _ as *mut c_void,
             &mut a8 as *mut _ as *mut c_void];
-        unsafe { f.launch(((out_dim + 63) / 64, tile_ub, 1), (256, 1, 1), 0,
+        unsafe { f.launch(((out_dim + 63) / 64, tile_ub, 1), (block, 1, 1), 0,
                           Some(&self.stream), &mut args) }
     }
 

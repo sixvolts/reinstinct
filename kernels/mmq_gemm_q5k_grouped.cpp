@@ -79,8 +79,11 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
               + (size_t)out_dim * nsp * 2);
 #endif
 
-    __shared__ uint4    sW  [BM][BK];
-    __shared__ uint32_t sWqh[BM][BK];
+    // int8 weights per (row, sub-block), 5th bit folded in once at
+    // staging (the llama fork's layout, crossport L8a): spreading qh per
+    // dp4a repeated the unpack for every token column and left the
+    // kernel ALU-bound.
+    __shared__ int      sW8 [BM][BK][8];
     __shared__ float2   sWs [BM][BK];
     __shared__ BlockQ8  sX  [BN][BK + 1];
 
@@ -96,8 +99,14 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
             const unsigned int wrow = row0 + lr;
             if (wrow < out_dim && sb0 + (unsigned int)lk < n_sub) {
                 const unsigned int sb = sb0 + lk;
-                sW  [lr][lk] = nib[(size_t)wrow * nsp + sb];
-                sWqh[lr][lk] = qhp[(size_t)wrow * nsp + sb];
+                const uint4    q  = nib[(size_t)wrow * nsp + sb];
+                const uint32_t qh = qhp[(size_t)wrow * nsp + sb];
+                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    sW8[lr][lk][j]     = (int)(( qa[j]       & 0x0F0F0F0Fu) | spread4((qh >> (8 * j))     & 0xFu));
+                    sW8[lr][lk][4 + j] = (int)(((qa[j] >> 4) & 0x0F0F0F0Fu) | spread4((qh >> (8 * j + 4)) & 0xFu));
+                }
 #ifdef Q5_1_SCALES
                 const uint32_t dm = dmp[(size_t)wrow * nsp + sb];
                 const uint16_t d_bits = (uint16_t)(dm & 0xFFFF);
@@ -117,6 +126,8 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
                         * (float)(sm >> 8));
 #endif
             } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) sW8[lr][lk][j] = 0;
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }
         }
@@ -134,12 +145,9 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk++) {
-            uint4 wq[TM]; uint32_t wqh[TM];
             float dsc[TM], deff[TM];
             #pragma unroll
             for (int r = 0; r < TM; r++) {
-                wq[r]  = sW  [ty + r * 16][kk];
-                wqh[r] = sWqh[ty + r * 16][kk];
                 const float2 s = sWs[ty + r * 16][kk];
                 dsc[r]  = s.x;
                 deff[r] = s.y;
@@ -152,17 +160,12 @@ void mmq_gemm_q5k_grouped_f32(const unsigned char* __restrict__ slab,
                 const float    xsum = xb->xsum;
                 #pragma unroll
                 for (int r = 0; r < TM; r++) {
-                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
-                    const uint32_t qh = wqh[r];
+                    const int* w8 = sW8[ty + r * 16][kk];
                     int idot = 0;
                     #pragma unroll
                     for (int j = 0; j < 4; j++) {
-                        const uint32_t lo2 = ( qa[j]       & 0x0F0F0F0Fu)
-                            | spread4((qh >> (8 * j))     & 0xFu);
-                        const uint32_t hi2 = ((qa[j] >> 4) & 0x0F0F0F0Fu)
-                            | spread4((qh >> (8 * j + 4)) & 0xFu);
-                        idot = __builtin_amdgcn_sdot4((int)lo2, xq32[j],     idot, false);
-                        idot = __builtin_amdgcn_sdot4((int)hi2, xq32[j + 4], idot, false);
+                        idot = __builtin_amdgcn_sdot4(w8[j],     xq32[j],     idot, false);
+                        idot = __builtin_amdgcn_sdot4(w8[j + 4], xq32[j + 4], idot, false);
                     }
                     acc[r][n] += dsc[r] * dx * (float)idot - deff[r] * xsum;
                 }
