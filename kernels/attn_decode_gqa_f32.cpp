@@ -61,18 +61,20 @@ __device__ __forceinline__ float slot_max(float x) {
     return x;
 }
 
-extern "C" __global__ __launch_bounds__(BS, OCC)
-void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
-                         const float* __restrict__ k_cache,    // [max_seq, n_kv, HD]
-                         const float* __restrict__ v_cache,
-                         float*       __restrict__ o_partial,  // [n_heads, n_splits, HD]
-                         float*       __restrict__ m_partial,  // [n_heads, n_splits]
-                         float*       __restrict__ l_partial,  // [n_heads, n_splits]
-                         unsigned int n_heads,
-                         unsigned int n_kv_heads,
-                         const unsigned int* __restrict__ pos_ptr,
-                         float        scaling,
-                         unsigned int n_splits)
+// One query row: q / o_partial / m_partial / l_partial already point at
+// that row's slices; it attends to cache positions [0, total_len).
+__device__ __forceinline__
+void attn_gqa_body(const float* __restrict__ q,          // [n_heads, HD]
+                   const float* __restrict__ k_cache,    // [max_seq, n_kv, HD]
+                   const float* __restrict__ v_cache,
+                   float*       __restrict__ o_partial,  // [n_heads, n_splits, HD]
+                   float*       __restrict__ m_partial,  // [n_heads, n_splits]
+                   float*       __restrict__ l_partial,  // [n_heads, n_splits]
+                   unsigned int n_heads,
+                   unsigned int n_kv_heads,
+                   int          total_len,
+                   float        scaling,
+                   unsigned int n_splits)
 {
     __shared__ float s_p[GH][TILE];        // tile probabilities
     __shared__ float s_red[NW][GH];        // per-wave max / sum exchange
@@ -90,7 +92,6 @@ void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
     const int tl    = lane / LPT;                     // token slot in the wave step
     const int dl    = lane % LPT;                     // dims dl*4 .. dl*4+3
     const bool red_lane = (dl == LPT - 1);            // holds the segment sums
-    const int total_len = (int)(*pos_ptr) + 1;
     const int chunk = (total_len + (int)n_splits - 1) / (int)n_splits;
     const int start = sp * chunk;
     const int end   = min(start + chunk, total_len);
@@ -263,4 +264,52 @@ void attn_decode_gqa_f32(const float* __restrict__ q,          // [n_heads, HD]
             }
         }
     }
+}
+
+// Decode: one query row at the live position (device-resident, so the
+// grid is fixed and the step graph-capturable).
+extern "C" __global__ __launch_bounds__(BS, OCC)
+void attn_decode_gqa_f32(const float* __restrict__ q,
+                         const float* __restrict__ k_cache,
+                         const float* __restrict__ v_cache,
+                         float*       __restrict__ o_partial,
+                         float*       __restrict__ m_partial,
+                         float*       __restrict__ l_partial,
+                         unsigned int n_heads,
+                         unsigned int n_kv_heads,
+                         const unsigned int* __restrict__ pos_ptr,
+                         float        scaling,
+                         unsigned int n_splits)
+{
+    attn_gqa_body(q, k_cache, v_cache, o_partial, m_partial, l_partial,
+                  n_heads, n_kv_heads, (int)(*pos_ptr) + 1, scaling, n_splits);
+}
+
+// A few causal query rows (spec-decode verify, crossport L3): row
+// z = blockIdx.z is the token at base_pos + z and sees [0, base_pos + z].
+// q is [n_rows, n_heads, HD]; the partials are [n_rows, n_heads, ...], so
+// attn_merge_f32 over n_rows * n_heads "heads" writes [n_rows, n_heads, HD].
+// Each row streams its own K/V: with 6 query heads per KV head the
+// register budget (GH <= 8 queries per workgroup) leaves nothing to share.
+// Replaces the prefill tile kernel for these rows, whose grid is one
+// workgroup per head for <= 32 rows: at 13.5K context, ~7.5 ms per layer.
+extern "C" __global__ __launch_bounds__(BS, OCC)
+void attn_decode_gqa_rows_f32(const float* __restrict__ q,
+                              const float* __restrict__ k_cache,
+                              const float* __restrict__ v_cache,
+                              float*       __restrict__ o_partial,
+                              float*       __restrict__ m_partial,
+                              float*       __restrict__ l_partial,
+                              unsigned int n_heads,
+                              unsigned int n_kv_heads,
+                              unsigned int base_pos,
+                              float        scaling,
+                              unsigned int n_splits)
+{
+    const size_t z = blockIdx.z;
+    attn_gqa_body(q + z * n_heads * HD, k_cache, v_cache,
+                  o_partial + z * n_heads * n_splits * HD,
+                  m_partial + z * n_heads * n_splits,
+                  l_partial + z * n_heads * n_splits,
+                  n_heads, n_kv_heads, (int)(base_pos + z) + 1, scaling, n_splits);
 }

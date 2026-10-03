@@ -55,6 +55,11 @@ const ATTN_PREFILL_TILED_SOURCE: &str = include_str!("../../kernels/attn_prefill
 const ATTN_MERGE_SOURCE:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
+
+/// Batched attention with at most this many query rows (spec-decode
+/// verify, MTP catch-up) runs per row through the decode flash-decoding
+/// kernel instead of the prefill tile kernels (`launch_attn_rows`).
+const VERIFY_ATTN_MAX_ROWS: usize = 16;
 const ADD_INPLACE_SOURCE:       &str = include_str!("../../kernels/add_inplace.cpp");
 const GDN_RECURRENT_STEP_FUSED_SOURCE: &str = include_str!("../../kernels/gdn_recurrent_step_v2.cpp");
 // Batched variants — one launch covers all `n_rows` of a prefill,
@@ -4440,11 +4445,63 @@ impl GpuQwen35 {
         Ok(())
     }
 
+    /// `n_rows` causal query rows at positions base_pos.. through the GQA
+    /// flash-decoding kernel (`attn_decode_gqa_rows_f32`, grid z = row)
+    /// and the decode merge over n_rows * n_heads.
+    fn launch_attn_rows(&self, q: *mut c_void, k_cache: *mut c_void, v_cache: *mut c_void,
+                        out: *mut c_void, base_pos: u32, n_rows: u32, scaling: f32)
+        -> Result<(), String>
+    {
+        let m = self.attn_gqa_module.as_ref().ok_or("attn rows: no GQA kernel")?;
+        let n_heads = self.n_heads as u32;
+        let n_kv = self.n_kv_heads as u32;
+        let head_dim = self.head_dim as u32;
+        // Same split count as decode (`launch_attn_step`), so each row's
+        // attention is bit-identical to decoding that token; splits past
+        // the live length exit early.
+        let n_splits = (self.max_seq as u32).div_ceil(256).clamp(1, ATTN_MAX_SPLITS);
+        let parts = (n_rows * n_heads * n_splits) as usize;
+        let o_part = self.pool_f32.take(parts * head_dim as usize)?;
+        let m_part = self.pool_f32.take(parts)?;
+        let l_part = self.pool_f32.take(parts)?;
+
+        let fg = m.function("attn_decode_gqa_rows_f32")?;
+        let groups = (n_heads / n_kv + self.attn_gh - 1) / self.attn_gh;
+        let (mut qa, mut ka, mut va) = (q, k_cache, v_cache);
+        let (mut op, mut mp, mut lp) = (o_part.raw_ptr(), m_part.raw_ptr(), l_part.raw_ptr());
+        let (mut nh, mut nkv, mut bp, mut sc, mut ns) = (n_heads, n_kv, base_pos, scaling, n_splits);
+        let mut gargs: [*mut c_void; 11] = [
+            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void, &mut lp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void];
+        unsafe { fg.launch((n_kv * groups, n_splits, n_rows), (256, 1, 1), 0, Some(&self.stream), &mut gargs)?; }
+
+        let fm = self.attn_merge_module.function("attn_merge_f32")?;
+        let (mut op2, mut mp2, mut lp2) = (o_part.raw_ptr(), m_part.raw_ptr(), l_part.raw_ptr());
+        let (mut oa, mut hd2, mut ns2) = (out, head_dim, n_splits);
+        let mut margs: [*mut c_void; 6] = [
+            &mut op2 as *mut _ as *mut c_void, &mut mp2 as *mut _ as *mut c_void,
+            &mut lp2 as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void, &mut ns2 as *mut _ as *mut c_void];
+        unsafe { fm.launch((n_rows * n_heads, 1, 1), (256, 1, 1), 0, Some(&self.stream), &mut margs) }
+    }
+
     fn launch_attn_step_batched(&self, q: *mut c_void, k_cache: *mut c_void,
                                 v_cache: *mut c_void, out: *mut c_void,
                                 base_pos: u32, n_rows: u32, scaling: f32)
         -> Result<(), String>
     {
+        // A few rows (spec-decode verify, MTP catch-up): flash-decoding
+        // per row. The tile kernels below give each head one workgroup
+        // for up to 32 rows, which streams the whole context serially
+        // (crossport L3).
+        if n_rows as usize <= VERIFY_ATTN_MAX_ROWS && self.attn_gqa_module.is_some()
+            && std::env::var_os("REINSTINCT_VERIFY_ATTN_TILED").is_none() {
+            return self.launch_attn_rows(q, k_cache, v_cache, out, base_pos, n_rows, scaling);
+        }
         const BQ: u32 = 8;
         const BK: u32 = 8;
         let head_dim = self.head_dim as u32;
