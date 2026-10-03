@@ -37,7 +37,7 @@ void moe_topk_f32(const float* __restrict__ logits,
                   int*   __restrict__ out_ids,
                   float* __restrict__ out_weights)
 {
-    extern __shared__ uint64_t keys[];       // n_expert keys
+    extern __shared__ __attribute__((aligned(16))) uint64_t keys[];   // n_expert keys (read 16 B at a time)
     __shared__ float chosen[64];             // n_used <= 64
     const int t  = threadIdx.x;
     const int nt = blockDim.x;

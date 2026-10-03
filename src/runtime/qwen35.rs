@@ -4299,7 +4299,9 @@ impl GpuQwen35 {
         use crate::runtime::prefill as pf;
         let splits = pf::gemm_f32_splits(in_d, out_d, n_rows);
         if splits > 1 && std::env::var_os("REINSTINCT_NO_F32_SPLITK").is_none() {
-            let scratch = self.pool_f32.take(splits * n_rows * out_d)?;
+            // Pool buffers are keyed by exact length: round up so prompts of
+            // different lengths (last MoE chunk) share one scratch buffer.
+            let scratch = self.pool_f32.take((splits * n_rows * out_d).next_power_of_two())?;
             return pf::launch_gemm_f32_tn_split(&self.gemm_f32_tn_module, &self.stream,
                                                 w, x, y, in_d, out_d, n_rows, splits, scratch.raw_ptr());
         }
