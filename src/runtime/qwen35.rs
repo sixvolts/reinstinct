@@ -4061,7 +4061,7 @@ impl GpuQwen35 {
         // compute on the compute-bound MI50; this kernel reads each weight
         // sub-block once and dots it against n_rows ≤ 8 activation rows,
         // staying near the HBM-bound cost of a 1-row decode matvec.
-        if w.repacked && n_rows <= crate::runtime::prefill::MAX_BATCHED_ROWS
+        if w.repacked && (1..=crate::runtime::prefill::MAX_BATCHED_ROWS).contains(&n_rows)
             && crate::runtime::prefill::SmallBatchMatvec::supports(w.dtype) {
             return self.bmm_small_batch(w, x_f32, n_rows, y_f32);
         }

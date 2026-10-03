@@ -24,6 +24,7 @@
 //   W::Raw  load(row, sb) const       the loads for one sub-block
 //   W::Dec  decode(const Raw&)        unpacked weights + scales
 //   float   dot(const Dec&, const XAct&)
+//   USES_XSUM                         dot reads XAct::s (staged only then)
 //   HALF_SUMS                         dot needs the int sums of each
 //                                     16-element half of the activation
 //
@@ -51,6 +52,14 @@ struct XAct {
 
 __device__ __forceinline__ float bnr_f16(uint16_t b) {
     return __half2float(*reinterpret_cast<const __half*>(&b));
+}
+
+// qs is only 8-byte aligned (BlockQ8 is packed, 40 bytes): load it as
+// four int2s.
+__device__ __forceinline__ void bnr_load_qs(const BlockQ8* xb, int w[8]) {
+    const int2* q2 = reinterpret_cast<const int2*>(xb->qs);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) { const int2 t = q2[i]; w[2 * i] = t.x; w[2 * i + 1] = t.y; }
 }
 
 __device__ __forceinline__ void bnr_half_sums(const int w[8], int& h0, int& h1) {
@@ -85,8 +94,7 @@ void mv_bnr(const uint8_t* __restrict__ wbase, const BlockQ8* __restrict__ xq,
         for (int b = 0; b < NR; b++) acc[r][b] = 0.0f;
 
     __shared__ int4  s_q[LDS ? NR : 1][2][64];
-    __shared__ float s_d[LDS ? NR : 1][64], s_s[LDS ? NR : 1][64];
-    __shared__ int2  s_h[LDS && W::HALF_SUMS ? NR : 1][64];
+    __shared__ float s_d[LDS ? NR : 1][64], s_s[LDS && W::USES_XSUM ? NR : 1][64];
 
     // Activation row b (clamped to the last present row), sub-block sb.
     auto fetch = [&](int b, unsigned int sb) {
@@ -95,16 +103,14 @@ void mv_bnr(const uint8_t* __restrict__ wbase, const BlockQ8* __restrict__ xq,
             const int4 a = s_q[b][0][lane], c = s_q[b][1][lane];
             x.w[0] = a.x; x.w[1] = a.y; x.w[2] = a.z; x.w[3] = a.w;
             x.w[4] = c.x; x.w[5] = c.y; x.w[6] = c.z; x.w[7] = c.w;
-            x.d = s_d[b][lane]; x.s = s_s[b][lane];
-            if constexpr (W::HALF_SUMS) { const int2 h = s_h[b][lane]; x.h0 = h.x; x.h1 = h.y; }
+            x.d = s_d[b][lane];
+            if constexpr (W::USES_XSUM) x.s = s_s[b][lane];
         } else {
             const unsigned int bb = EXACT ? (unsigned int)b : min((unsigned int)b, nr - 1u);
             const BlockQ8* xb = xq + (size_t)bb * n_sub + sb;
-            const int4* x4 = reinterpret_cast<const int4*>(xb->qs);
-            const int4 a = x4[0], c = x4[1];
-            x.w[0] = a.x; x.w[1] = a.y; x.w[2] = a.z; x.w[3] = a.w;
-            x.w[4] = c.x; x.w[5] = c.y; x.w[6] = c.z; x.w[7] = c.w;
-            x.d = xb->d; x.s = xb->xsum;
+            bnr_load_qs(xb, x.w);
+            x.d = xb->d;
+            if constexpr (W::USES_XSUM) x.s = xb->xsum;
         }
         return x;
     };
@@ -117,15 +123,12 @@ void mv_bnr(const uint8_t* __restrict__ wbase, const BlockQ8* __restrict__ xq,
                 const int b = e >> 6, l = e & 63;
                 const unsigned int bb = EXACT ? (unsigned int)b : min((unsigned int)b, nr - 1u);
                 const BlockQ8* xb = xq + (size_t)bb * n_sub + min(c0 + l, n_sub - 1u);
-                const int4* x4 = reinterpret_cast<const int4*>(xb->qs);
-                const int4 a = x4[0], c = x4[1];
-                s_q[b][0][l] = a; s_q[b][1][l] = c;
-                s_d[b][l] = xb->d; s_s[b][l] = xb->xsum;
-                if constexpr (W::HALF_SUMS) {
-                    const int t[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
-                    int h0, h1; bnr_half_sums(t, h0, h1);
-                    s_h[b][l] = make_int2(h0, h1);
-                }
+                int t[8];
+                bnr_load_qs(xb, t);
+                s_q[b][0][l] = make_int4(t[0], t[1], t[2], t[3]);
+                s_q[b][1][l] = make_int4(t[4], t[5], t[6], t[7]);
+                s_d[b][l] = xb->d;
+                if constexpr (W::USES_XSUM) s_s[b][l] = xb->xsum;
             }
             __syncthreads();
         }
@@ -142,7 +145,7 @@ void mv_bnr(const uint8_t* __restrict__ wbase, const BlockQ8* __restrict__ xq,
             __builtin_amdgcn_sched_barrier(0);
             #pragma unroll
             for (int b = 0; b < NR; b++)
-                if constexpr (W::HALF_SUMS && !LDS) bnr_half_sums(x[b].w, x[b].h0, x[b].h1);
+                if constexpr (W::HALF_SUMS) bnr_half_sums(x[b].w, x[b].h0, x[b].h1);
             #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 const typename W::Dec d = W::decode(raw[r]);
@@ -157,7 +160,7 @@ void mv_bnr(const uint8_t* __restrict__ wbase, const BlockQ8* __restrict__ xq,
             for (int b = 0; b < NR; b++) {
                 if (EXACT || (unsigned int)b < nr) {
                     XAct x = fetch(b, sb);
-                    if constexpr (W::HALF_SUMS && !LDS) bnr_half_sums(x.w, x.h0, x.h1);
+                    if constexpr (W::HALF_SUMS) bnr_half_sums(x.w, x.h0, x.h1);
                     #pragma unroll
                     for (int r = 0; r < ROWS; r++) acc[r][b] += W::dot(d[r], x);
                 }

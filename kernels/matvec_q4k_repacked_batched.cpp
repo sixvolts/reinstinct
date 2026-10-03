@@ -1,4 +1,4 @@
-// Q4_K small-batch matvec (spec-decode verify, 1..16 activation rows):
+// Q4_K small-batch matvec (spec-decode verify, 1..8 activation rows):
 // the shared matvec_batched_nr.h body over the repacked Q4_K layout of
 // matvec_q4k_repacked (q4_k::repack_for_matvec):
 //   * nibble plane — 16 bytes per sub-block, sub-block-major.
@@ -17,6 +17,7 @@ struct WQ4K {
           nsp(nsp_), n_super(n_super_) {}
     struct Raw { uint4 q; uint16_t sm; uint32_t dd; };
     struct Dec { uint32_t q[4]; float dsc, deff; };
+    static constexpr bool USES_XSUM = true;
     static constexpr bool HALF_SUMS = false;
     __device__ Raw load(int row, unsigned int sb) const {
         return { nib[(size_t)row * nsp + sb], smp[(size_t)row * nsp + sb],

@@ -13,6 +13,7 @@ struct WQ8_0 {
           dp(reinterpret_cast<const uint16_t*>(w + (size_t)out_dim * nsp_ * 32)), nsp(nsp_) {}
     struct Raw { uint4 a, b; uint16_t d; };
     struct Dec { uint32_t q[8]; float dw; };
+    static constexpr bool USES_XSUM = false;
     static constexpr bool HALF_SUMS = false;
     __device__ Raw load(int row, unsigned int sb) const {
         const size_t i = (size_t)row * nsp + sb;

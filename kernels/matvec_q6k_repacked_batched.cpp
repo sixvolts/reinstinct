@@ -24,6 +24,7 @@ struct WQ6K {
           nsp(nsp_), n_super(n_super_) {}
     struct Raw { uint4 q; uint2 h2; uint16_t sm; uint16_t d; };
     struct Dec { uint32_t lo[4], hi[4]; float dlo, dhi; };
+    static constexpr bool USES_XSUM = false;
     static constexpr bool HALF_SUMS = true;
     __device__ Raw load(int row, unsigned int sb) const {
         const size_t i = (size_t)row * nsp + sb;

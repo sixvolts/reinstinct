@@ -733,7 +733,11 @@ mod tests {
             let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
             let dst: DeviceBuf<f32> = DeviceBuf::new(max_rows * out_dim).unwrap();
 
+            let poison = vec![f32::NAN; max_rows * out_dim];
             for &n_rows in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 20] {
+                // Every row this call should write starts as NaN, so an
+                // unwritten one fails rather than passing on a stale copy.
+                dst.copy_from_host(&poison).unwrap();
                 gemm.matmul_into(&stream, &dst, &dw, dtype, true,
                                  in_dim, out_dim, &dx, n_rows).expect("matmul_into");
                 stream.synchronize().unwrap();

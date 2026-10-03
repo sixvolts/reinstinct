@@ -14,6 +14,7 @@ struct WQ4_0 {
           dp(reinterpret_cast<const uint16_t*>(w + (size_t)out_dim * nsp_ * 16)), nsp(nsp_) {}
     struct Raw { uint4 q; uint16_t d; };
     struct Dec { uint32_t q[4]; float dw; };
+    static constexpr bool USES_XSUM = true;
     static constexpr bool HALF_SUMS = false;
     __device__ Raw load(int row, unsigned int sb) const {
         const size_t i = (size_t)row * nsp + sb;

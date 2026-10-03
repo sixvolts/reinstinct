@@ -3,7 +3,7 @@
 // whether it stages activations in LDS; the defaults are the gfx906 tune
 // (prefill.rs bench_small_batch_matmul) and a kernel file may override
 // one before the include. The host sizes the grid from the same numbers
-// (prefill.rs bnr_entry) — keep the two in step.
+// (prefill.rs SmallBatchMatvec::entry) — keep the two in step.
 #ifndef BNR_R1
 #define BNR_R1 2
 #endif
