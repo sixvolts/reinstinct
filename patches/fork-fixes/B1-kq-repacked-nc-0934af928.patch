@@ -1,0 +1,229 @@
+From 0934af9285103905a73d6c6390499fc2db08687f Mon Sep 17 00:00:00 2001
+From: sixvolts <rigel@sixvolts.org>
+Date: Sat, 3 Oct 2026 03:55:12 +0000
+Subject: [PATCH] cuda: weight-once 2..16-column matvec for dense repacked
+ Q4_K/Q5_K/Q6_K
+
+ne11 >= 2 on dense repacked K-quants went straight to the int8 MMQ tile
+GEMM, whose N tile is 64, so a 2-token batch cost about a 64-token tile:
+on Qwen 3.8-27B Q4_K_XL pp2..pp16 took 250-370 ms against 41 ms for
+pp1, and MTP verify (3 tokens) ran 3x slower than plain decode. Only
+Q8_0 had multi-column matvecs.
+
+mul_mat_vec_kq_repacked_nc decodes each weight sub-block once per row
+and dots it against 2..8 activation columns (chunked up to 16); per
+column the lane sums match the ne11 == 1 kernels. 38-88 VGPRs, no
+spills. GGML_CUDA_NO_KQ_NC=1 restores the old path.
+
+Qwen3.5-4B UD-Q4_K_XL (qwen35, in-model MTP), 1x MI50: MTP depth 2
+31-34 -> 117-129 tok/s (plain 105-108), 11-14 token prompts 148-165 ->
+74-96 ms, ub3 KLD vs ub512 base 0.002932 -> 0.002906.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+---
+ ggml/src/ggml-cuda/repack-gcn.cu | 181 +++++++++++++++++++++++++++++++
+ 1 file changed, 181 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cu b/ggml/src/ggml-cuda/repack-gcn.cu
+index c65d03b5a..8c179f2f0 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cu
++++ b/ggml/src/ggml-cuda/repack-gcn.cu
+@@ -3278,6 +3278,176 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_multi_nc
+ #endif // defined(GGML_USE_HIP) && defined(GCN)
+ }
+ 
++// Dense repacked K-quant matvec for NC = 2..8 activation columns (spec-decode verify,
++// short prompt chunks). Before this, ne11 >= 2 went to the int8 MMQ tile GEMM, whose
++// 64-wide N tile made a 2-token batch cost about as much as a 64-token one (~6x a decode
++// step on dense Q4_K/Q5_K/Q6_K models). Each wave decodes its ROWS weight sub-blocks once
++// and dots them against every column; per (row, column) the lane sums run in the same
++// order as the ne11 == 1 kernels, so each column matches a single-column launch exactly.
++template <ggml_type type, int NC>
++static __global__ void __launch_bounds__(256) mul_mat_vec_kq_repacked_nc(
++        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
++        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
++#if defined(GGML_USE_HIP) && defined(GCN)
++    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K, "unsupported type");
++    constexpr int ROWS = 2;
++    const int wave = threadIdx.x >> 6;
++    const int lane = threadIdx.x & 63;
++    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
++    const uint32_t n_sub   = ne0 >> 5;
++    const uint32_t nsp     = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
++    const uint32_t n_super = n_sub >> 3;
++    const size_t   plane   = (size_t) ne1 * nsp;
++
++    // plane layout (see the per-type repack): nibbles, then
++    //   Q4_K: sm u16, dd u32/super      Q5_K: qh u32, sm u16, dd u32/super
++    //   Q6_K: h2 2xu32, sm u16, d u16/super
++    const uint4 * nib = reinterpret_cast<const uint4 *>(wbase);
++    const uint8_t * p1 = wbase + plane * 16;
++    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
++        type == GGML_TYPE_Q4_K ? p1 : type == GGML_TYPE_Q5_K ? p1 + plane * 4 : p1 + plane * 8);
++    const uint8_t * pdd = reinterpret_cast<const uint8_t *>(smp) + plane * 2;
++
++    float acc[ROWS][NC];
++#pragma unroll
++    for (int r = 0; r < ROWS; r++) {
++#pragma unroll
++        for (int c = 0; c < NC; c++) {
++            acc[r][c] = 0.0f;
++        }
++    }
++
++    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
++        int   wl[ROWS][4], wh[ROWS][4];
++        float s0[ROWS], s1[ROWS];
++#pragma unroll
++        for (int r = 0; r < ROWS; r++) {
++            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1); // clamped; not stored
++            const size_t   idx = (size_t) row * nsp + sb;
++            const uint4    q   = nib[idx];
++            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++            const uint16_t sm  = smp[idx];
++            if constexpr (type == GGML_TYPE_Q6_K) {
++                const uint32_t * h2p = reinterpret_cast<const uint32_t *>(p1);
++                const uint32_t h2lo = h2p[idx * 2];
++                const uint32_t h2hi = h2p[idx * 2 + 1];
++                const uint16_t d_bits = reinterpret_cast<const uint16_t *>(pdd)[(size_t) row * n_super + (sb >> 3)];
++                const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
++                s0[r] = d * (float)(int)(int8_t)(sm & 0xFFu);
++                s1[r] = d * (float)(int)(int8_t)(sm >> 8);
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t ge = 2 * j, go = 2 * j + 1;
++                    const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
++                    const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
++                    wl[r][j] = (int)(( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he));
++                    wh[r][j] = (int)(((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho));
++                }
++            } else {
++                const uint32_t dd = reinterpret_cast<const uint32_t *>(pdd)[(size_t) row * n_super + (sb >> 3)];
++                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
++                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
++                s0[r] = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm & 0xFFu);
++                s1[r] = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
++                uint32_t qh = 0;
++                if constexpr (type == GGML_TYPE_Q5_K) {
++                    qh = reinterpret_cast<const uint32_t *>(p1)[idx];
++                }
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu);
++                    uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu);
++                    if constexpr (type == GGML_TYPE_Q5_K) {
++                        lo |= repack_spread4((qh >> (8 * j))     & 0xFu);
++                        hi |= repack_spread4((qh >> (8 * j + 4)) & 0xFu);
++                    }
++                    wl[r][j] = (int) lo;
++                    wh[r][j] = (int) hi;
++                }
++            }
++        }
++#pragma unroll
++        for (int c = 0; c < NC; c++) {
++            const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
++            const float dx = __low2float(xb->ds);
++            const int * xq32 = reinterpret_cast<const int *>(xb->qs);
++            int x[8];
++#pragma unroll
++            for (int j = 0; j < 8; j++) {
++                x[j] = xq32[j];
++            }
++            if constexpr (type == GGML_TYPE_Q6_K) {
++                int xis0 = 0, xis1 = 0;
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    xis0 = ggml_cuda_dp4a(x[j],     0x01010101, xis0);
++                    xis1 = ggml_cuda_dp4a(x[j + 4], 0x01010101, xis1);
++                }
++#pragma unroll
++                for (int r = 0; r < ROWS; r++) {
++                    int idot0 = 0, idot1 = 0;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        idot0 = ggml_cuda_dp4a(wl[r][j], x[j],     idot0);
++                        idot1 = ggml_cuda_dp4a(wh[r][j], x[j + 4], idot1);
++                    }
++                    acc[r][c] += s0[r] * dx * (float)(idot0 - 32 * xis0)
++                               + s1[r] * dx * (float)(idot1 - 32 * xis1);
++                }
++            } else {
++                const float sx = __high2float(xb->ds);
++#pragma unroll
++                for (int r = 0; r < ROWS; r++) {
++                    int idot = 0;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        idot = ggml_cuda_dp4a(wl[r][j], x[j],     idot);
++                        idot = ggml_cuda_dp4a(wh[r][j], x[j + 4], idot);
++                    }
++                    acc[r][c] += s0[r] * dx * (float) idot - s1[r] * sx;
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int r = 0; r < ROWS; r++) {
++#pragma unroll
++        for (int c = 0; c < NC; c++) {
++            const float a = warp_reduce_sum<64>(acc[r][c]);
++            if (lane == 0 && (row0 + r) < (int) ne1) {
++                y[(size_t) c * ne1 + row0 + r] = a;
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_stride);
++    NO_DEVICE_CODE;
++#endif // defined(GGML_USE_HIP) && defined(GCN)
++}
++
++template <ggml_type type>
++static void launch_mul_mat_vec_kq_repacked_nc(const uint8_t * w, const block_q8_1 * xq, float * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne11, const int64_t x_stride, cudaStream_t stream) {
++    const dim3 grid((ne01 + 7) / 8, 1, 1);
++    // columns in chunks of up to 8: the weights are read once per chunk
++    for (int64_t c0 = 0; c0 < ne11; c0 += 8) {
++        const int nc = (int) std::min<int64_t>(8, ne11 - c0);
++        const block_q8_1 * x = xq + c0 * x_stride;
++        float * y = dst_d + c0 * ne01;
++        switch (nc) {
++            case 1: mul_mat_vec_kq_repacked_nc<type, 1><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 2: mul_mat_vec_kq_repacked_nc<type, 2><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 3: mul_mat_vec_kq_repacked_nc<type, 3><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 4: mul_mat_vec_kq_repacked_nc<type, 4><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 5: mul_mat_vec_kq_repacked_nc<type, 5><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 6: mul_mat_vec_kq_repacked_nc<type, 6><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            case 7: mul_mat_vec_kq_repacked_nc<type, 7><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++            default: mul_mat_vec_kq_repacked_nc<type, 8><<<grid, 256, 0, stream>>>(w, x, y, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
++        }
++    }
++}
++
+ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
+         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
+@@ -3377,6 +3547,17 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
+         }
+         return;
+     }
++    // dense K-quants, 2..16 columns: weight-once matvec instead of the 64-wide MMQ tile
++    static const bool no_kq_nc = getenv("GGML_CUDA_NO_KQ_NC") != nullptr;
++    if (!no_kq_nc && ne11 >= 2 && ne11 <= 16 &&
++        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K)) {
++        switch (src0->type) {
++            case GGML_TYPE_Q4_K: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q4_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
++            case GGML_TYPE_Q5_K: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q5_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
++            default:             launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q6_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
++        }
++        return;
++    }
+     if (ne11 == 1) {
+         // decode: dp4a matvec straight from the planes
+         switch (src0->type) {
+-- 
+2.53.0
+

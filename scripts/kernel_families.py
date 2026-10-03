@@ -17,13 +17,13 @@ FAMILIES = [
     ("GDN / linear attention",        r"gated_delta|delta_net|gdn|ssm_|conv1d|ssm_conv"),
     ("attention",                     r"fattn|flash_attn|attn_decode|attn_partial|attn_merge|softmax"),
     ("MoE router / top-k",            r"topk_moe|argsort|router|topk"),
-    ("MoE gate/up (decode matvec)",   r"glu16|mul_mat_vec_q_moe|moe.*gate|expert.*gate"),
+    ("MoE gate/up (decode matvec)",   r"_glu|glu16|mul_mat_vec_q_moe|moe.*gate|expert.*gate"),
     ("MoE down (decode matvec)",      r"q5_1_repacked_seg|moe.*down|expert.*down"),
-    ("MoE expert GEMM (prefill)",     r"_id_w|mmq.*_id|grouped|expert_gemm|mm_ids"),
+    ("MoE expert GEMM (prefill)",     r"_id_w|repacked<true|mmq.*_id|grouped|expert_gemm|mm_ids"),
     ("LM head",                       r"lm_head|output_proj|logits"),
     ("dense quant GEMM (MMQ)",        r"mmq|mul_mat_q|gemm_q|tile_gemm"),
-    ("dense quant matvec",            r"mul_mat_vec_q|matvec|_repacked|dmmv|vec_dot"),
-    ("f32/f16 matmul",                r"mul_mat_vec_f|gcn_f32_gemm|gemm_f|Cijk|rocblas"),
+    ("dense quant matvec",            r"mul_mat_vec_q|mul_mat_vec_kq|matvec|_repacked|dmmv|vec_dot"),
+    ("f32/f16 matmul",                r"mul_mat_vec_f|matvec_f32|gcn_f32_gemm|gemm_f16|gemm_f|Cijk|rocblas"),
     ("norm / elementwise / copies",   r"norm|bin_bcast|unary|silu|gelu|scale|cpy|concat|get_rows|quantize|rope|add|mul\b|hc_"),
 ]
 
