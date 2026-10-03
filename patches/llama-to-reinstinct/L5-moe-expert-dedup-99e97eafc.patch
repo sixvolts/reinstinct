@@ -1,0 +1,192 @@
+commit 99e97eafc7b094cd98eb9cfddc952b0feb0989ce
+Author: sixvolts <rigel@sixvolts.org>
+Date:   Wed Sep 30 16:10:06 2026 +0000
+
+    cuda: read each MoE expert once for all tokens routed to it (few-token gate/up)
+    
+    The few-token MoE path (speculative verify, a few decoding sequences) ran the
+    per-slot matvecs with one block row per (token, expert slot), so an expert
+    chosen by several tokens was read once per token. For the Q4_K gate/up GLU at
+    K = 2560 every such block now loads the whole routing (one wave-wide load and a
+    ballot); the first pair that picks an expert owns it and applies each weight
+    sub-block to every later token routed there, the others exit. No sort, scratch
+    or extra kernel, and no per-slot activation copies; each token's arithmetic is
+    the per-slot kernel's in the same order (ub3 KLD bit-identical on/off). Scheme
+    from the GLM build on rune. 2-6 tokens (n_used * n_tokens <= 64).
+    
+    3-token verify (llama-bench pp3, kernel trace): gate/up 91.4 -> 80.8 us per
+    call and the slot copies gone, few-token MoE time -9%; pp6 121.9 -> 126.9 t/s.
+    The same scheme on the K = 640 Q5_1 down projection was slower (96 vs 71 us)
+    and is not used. GGML_CUDA_NO_MOE_DEDUP=1 disables it.
+    
+    Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cu b/ggml/src/ggml-cuda/repack-gcn.cu
+index cbe93c917..c65d03b5a 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cu
++++ b/ggml/src/ggml-cuda/repack-gcn.cu
+@@ -730,6 +730,39 @@ static __global__ void mul_mat_vec_q5_1_repacked(
+ #endif // defined(GGML_USE_HIP) && defined(GCN)
+ }
+ 
++// Few-token MoE (speculative verify, a few decoding sequences): the per-slot kernels run one block row
++// per (token, slot) pair, so an expert that several tokens picked is read once per token. Every such
++// block reads the whole routing (one wave-wide load and a ballot); the first pair that picks an expert
++// owns it and applies each weight unit to every later token routed there, the others exit. No sort,
++// scratch memory or extra kernel, and each token's arithmetic is the per-slot kernel's in the same order.
++// (Scheme from the GLM build on rune.) Needs n_used*n_tok <= 64. GGML_CUDA_NO_MOE_DEDUP=1 disables it.
++// Used for the Q4_K gate/up GLU only: the K = 640 Q5_1 down projection measured slower deduplicated
++// (96 vs 71 us per call at 3 tokens), its per-slot blocks are short and parallel enough already.
++template <int NTMAX>
++static __device__ __forceinline__ bool moe_dedup_route(
++        const int32_t * __restrict__ ids, const int n_used, const int n_tok, int & e, int (&sl)[NTMAX]) {
++    const int lane = threadIdx.x % 64;
++    const int a    = blockIdx.y;
++    const int tok  = a / n_used;
++    const int idv  = lane < n_used*n_tok ? ids[lane] : -1;
++    e = __builtin_amdgcn_readlane(idv, a);
++    const uint64_t m = __ballot(idv == e);
++    if (m & ((uint64_t{1} << (tok*n_used)) - 1)) {
++        return false; // an earlier token owns e
++    }
++#pragma unroll
++    for (int t = 0; t < NTMAX; ++t) {
++        const uint64_t mt = t < n_tok ? (m >> (t*n_used)) & ((uint64_t{1} << n_used) - 1) : 0;
++        sl[t] = (t >= tok && mt) ? __builtin_ctzll(mt) : -1;
++    }
++    return true;
++}
++
++static bool moe_dedup_enabled() {
++    static const bool disabled = getenv("GGML_CUDA_NO_MOE_DEDUP") != nullptr;
++    return !disabled;
++}
++
+ // Q5_1 repacked matvec for short rows (ne0 <= 1024, e.g. qwen4exp ffn_down_exps with K = 640): one lane
+ // per sub-block, SEG lanes per row. The row-per-wave kernel above uses half-sub-block units that each
+ // load the whole 16-byte nibble chunk (twice the weight traffic) and leaves lanes idle at this K.
+@@ -1629,6 +1662,98 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked_glu16(
+ #endif // defined(GGML_USE_HIP) && defined(GCN)
+ }
+ 
++// Q4_K gate+up GLU for a few tokens with the expert dedup (see moe_dedup_route): the glu16 lane
++// mapping, each sub-block's weights and scales loaded once and applied to every routed token.
++// The activation is per token (xq + t*xs), shared by all of its slots.
++template <int ITERS, int NTMAX, int LANES = 16>
++static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked_glu16_dedup(
++        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
++        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
++        const uint32_t ne1, const int glu_op, const int32_t * __restrict__ ids,
++        const size_t expert_stride, const uint32_t xs, const uint32_t dst_s1, const int n_used, const int n_tok) {
++#if defined(GGML_USE_HIP) && defined(GCN)
++    int e, sl[NTMAX];
++    if (!moe_dedup_route<NTMAX>(ids, n_used, n_tok, e, sl)) {
++        return;
++    }
++    constexpr uint32_t n_sub   = LANES * ITERS;
++    constexpr uint32_t nsp     = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
++    constexpr uint32_t n_super = n_sub / 8;
++    const uint8_t * wb[2] = { wup + (size_t) e * expert_stride, wgate + (size_t) e * expert_stride };
++
++    const int l16 = threadIdx.x % LANES;
++    const uint32_t row = blockIdx.x * (256 / LANES) + threadIdx.x / LANES;
++    const bool valid = row < ne1;
++    const uint32_t rr = valid ? row : 0;
++
++    float acc[NTMAX][2];
++#pragma unroll
++    for (int t = 0; t < NTMAX; ++t) {
++        acc[t][0] = 0.0f;
++        acc[t][1] = 0.0f;
++    }
++#pragma unroll
++    for (int j = 0; j < ITERS; j++) {
++        const uint32_t sb = l16 + LANES * j;
++        uint4 q[2];
++        float dsc[2], deff[2];
++#pragma unroll
++        for (int w2 = 0; w2 < 2; w2++) {
++            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
++            const uint16_t * smp = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
++            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
++            q[w2] = nib[(size_t) rr * nsp + sb];
++            const uint16_t sm = smp[(size_t) rr * nsp + sb];
++            const uint32_t dd = ddp[(size_t) rr * n_super + (sb >> 3)];
++            const uint16_t d_bits = (uint16_t)(dd & 0xFFFF), dmin_bits = (uint16_t)(dd >> 16);
++            dsc[w2]  = __half2float(*reinterpret_cast<const __half *>(&d_bits)) * (float)(sm & 0xFFu);
++            deff[w2] = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
++        }
++#pragma unroll
++        for (int t = 0; t < NTMAX; ++t) {
++            if (sl[t] < 0) {
++                continue;
++            }
++            const block_q8_1 * xb = xq + (size_t) t * xs + sb;
++            const float dx = __low2float(xb->ds);
++            const float sx = __high2float(xb->ds);
++            const int4 xa = *reinterpret_cast<const int4 *>(xb->qs);
++            const int4 xc = *reinterpret_cast<const int4 *>(xb->qs + 16);
++#pragma unroll
++            for (int w2 = 0; w2 < 2; w2++) {
++                int idot = 0;
++                idot = ggml_cuda_dp4a((int)( q[w2].x       & 0x0F0F0F0Fu), xa.x, idot);
++                idot = ggml_cuda_dp4a((int)( q[w2].y       & 0x0F0F0F0Fu), xa.y, idot);
++                idot = ggml_cuda_dp4a((int)( q[w2].z       & 0x0F0F0F0Fu), xa.z, idot);
++                idot = ggml_cuda_dp4a((int)( q[w2].w       & 0x0F0F0F0Fu), xa.w, idot);
++                idot = ggml_cuda_dp4a((int)((q[w2].x >> 4) & 0x0F0F0F0Fu), xc.x, idot);
++                idot = ggml_cuda_dp4a((int)((q[w2].y >> 4) & 0x0F0F0F0Fu), xc.y, idot);
++                idot = ggml_cuda_dp4a((int)((q[w2].z >> 4) & 0x0F0F0F0Fu), xc.z, idot);
++                idot = ggml_cuda_dp4a((int)((q[w2].w >> 4) & 0x0F0F0F0Fu), xc.w, idot);
++                acc[t][w2] += dsc[w2] * dx * (float) idot - deff[w2] * sx;
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < NTMAX; ++t) {
++        acc[t][0] = warp_reduce_sum<LANES>(acc[t][0]);
++        acc[t][1] = warp_reduce_sum<LANES>(acc[t][1]);
++    }
++    if (l16 == 0 && valid) {
++#pragma unroll
++        for (int t = 0; t < NTMAX; ++t) {
++            if (sl[t] >= 0) {
++                const float g = glu_op == (int) GGML_GLU_OP_SWIGLU ? ggml_cuda_op_silu_single(acc[t][1]) : ggml_cuda_op_gelu_single(acc[t][1]);
++                y[(size_t) (t*n_used + sl[t]) * dst_s1 + row] = g * acc[t][0];
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(wup, wgate, xq, y, ne1, glu_op, ids, expert_stride, xs, dst_s1, n_used, n_tok);
++    NO_DEVICE_CODE;
++#endif // defined(GGML_USE_HIP) && defined(GCN)
++}
++
+ // int8 MMQ tile GEMM straight from the repacked planes (prefill path).
+ // Y[tok, row] = Xq8[tok, :] . W[row, :] without dequantizing W.
+ //
+@@ -3924,6 +4049,24 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
+     const int32_t * ids_d = (const int32_t *) ids->data;
+     ggml_cuda_pool_alloc<int32_t>    ids_flat(ctx.pool());
+     ggml_cuda_pool_alloc<block_q8_1> x_slots(ctx.pool());
++    if (n_tokens > 1 && n_tokens <= 6 && n_assign <= 64 && up_w->type == GGML_TYPE_Q4_K && ne00 == 2560 && moe_dedup_enabled()) {
++        // a few tokens: each expert read once for all tokens routed to it, per-token activations
++        if (ids->nb[1] != n_expert_used * sizeof(int32_t)) {
++            ids_flat.alloc(n_assign);
++            CUDA_CHECK(cudaMemcpy2DAsync(ids_flat.get(), n_expert_used * sizeof(int32_t), ids->data, ids->nb[1],
++                n_expert_used * sizeof(int32_t), n_tokens, cudaMemcpyDeviceToDevice, stream));
++            ids_d = ids_flat.get();
++        }
++        const dim3 grid16((ne01 + 15) / 16, n_assign, 1);
++        if (n_tokens <= 4) {
++            mul_mat_vec_q4k_repacked_glu16_dedup<5, 4><<<grid16, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne01, glu_op,
++                ids_d, expert_stride, (uint32_t) x_stride, dst_s1, (int) n_expert_used, (int) n_tokens);
++        } else {
++            mul_mat_vec_q4k_repacked_glu16_dedup<5, 6><<<grid16, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne01, glu_op,
++                ids_d, expert_stride, (uint32_t) x_stride, dst_s1, (int) n_expert_used, (int) n_tokens);
++        }
++        return;
++    }
+     if (n_tokens > 1) {
+         // a few tokens: flat ids, one activation column per (token, expert) slot
+         if (ids->nb[1] != n_expert_used * sizeof(int32_t)) {
