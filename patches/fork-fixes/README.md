@@ -14,6 +14,7 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 8. L6 (`L6-topk-rank-v3-bafaf7d73.patch`)
 9. R4 (`R4-moe-chain-q8-lds-nc-loads-first-69db7bf5d.patch`)
 10. R11/R12 (`R11-R12-q4_0-iq-family-q3k-relabel-7f70fff53.patch`)
+11. R10a (`R10a-kquant-loads-first-b8eb8050f.patch`)
 
 Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
 from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
@@ -27,6 +28,12 @@ numbers as "905021dba + B1..R8 + L6 + R4 + R11/R12".
   Q8_0 LDS-staged 4..8-column matvec (`GGML_CUDA_NO_Q8_LDS_NC`), 9..32-column chunking
   (`GGML_CUDA_NO_Q8_NC_CHUNK`), loads-first Q8_0 multi / shared-expert GLU (`GGML_CUDA_NO_Q8_MULTI_UNROLL`,
   `GGML_CUDA_NO_Q8_GLU_UNROLL`), `GGML_CUDA_REPACK_TRACE=1` shape log.
+- **R10a**: dense Q4_K/Q5_K/Q6_K/Q8_0 matvecs and the dense Q4_K GLU with clamped rows and hoisted
+  plane loads, `__launch_bounds__(256)` on the K-quant matvecs, Q4_K-only scheduling fence
+  (`GGML_CUDA_NO_Q4K_FENCE=1` drops it). Qwen3.5-4B, 1x MI50: Q6_K 63.5 -> 53.8 us, Q5_K 32.4 -> 25.8,
+  Q4_K GLU 51.9 -> 41.5; tg64 UD-Q4_K_XL 116 -> 131.5, Q5_K_M 101 -> 120. Rounding-close, not
+  bit-identical (contraction): KLD 0.0029 at ub1 on the 4B. Report fork numbers as
+  "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a".
 - **R11/R12**: Q4_0 repack end to end (`GGML_CUDA_REPACK_Q4_0=0` off), IQ4_NL / IQ4_XS / IQ3_S on the same
   planes (`GGML_CUDA_REPACK_IQ=0` off), Q3_K -> Q6_K relabel (`GGML_CUDA_Q3K_RELABEL=0` off), 16/32/48-wide
   prefill token tiles for <= 48 columns (`GGML_CUDA_NO_MMQ_NARROW=1` off), `tests/test-repack-host`

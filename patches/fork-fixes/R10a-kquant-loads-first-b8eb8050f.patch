@@ -1,0 +1,356 @@
+From 040735ddb1b61f501494e5bbc120ab7ad5a50db2 Mon Sep 17 00:00:00 2001
+From: sixvolts <rigel@sixvolts.org>
+Date: Sat, 3 Oct 2026 22:41:14 +0000
+Subject: [PATCH] cuda: loads-first dense K-quant / Q8_0 matvecs and Q4_K GLU
+ on GCN (crossport R10)
+
+Rows are clamped (min(row, ne1-1)) with a masked store instead of 'if (row >= ne1) continue', and
+both rows' planes are loaded before the first dot, so the memory system sees every row's stream at
+once (reinstinct 54eaa04): mul_mat_vec_q4k/q5k/q6k_repacked, the generic mul_mat_vec_q8_0_repacked
+and the dense Q4_K gate+up GLU. The K-quant kernels get __launch_bounds__(256). The dense Q4_K
+matvec and GLU add a scheduling barrier after the hoisted loads (crossport P1b: without it the
+compiler re-splits each trip into load / wait / dot); it stays Q4_K-only and GGML_CUDA_NO_Q4K_FENCE=1
+drops it. No spills in any touched kernel (Q4_K 38/47 VGPRs, Q5_K/Q6_K 64, GLU 56/61).
+
+Qwen3.5-4B on one MI50, per call at decode: Q6_K 63.5 -> 53.8 us, Q5_K 32.4 -> 25.8, Q4_K GLU
+51.9 -> 41.5 (50.9 without the fence); tg64 UD-Q4_K_XL 116.0 -> 131.5, Q5_K_M 100.8 -> 119.7;
+pp512 unchanged. test-repack-bench --check OK on the dense K-quant, Q8_0 and nibble shapes.
+The reordered code lets the compiler contract differently, so logits are rounding-close, not
+bit-identical: KLD vs the previous build 0.0029 at ub1 (same-top-p 97.8%; the 4B's reorder floor),
+PPL 9.501 vs 9.462 / 9.510 vs 9.527 on 2 chunks.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+(cherry picked from commit b8eb8050f95ad8f611b712fabe2133dfba3b1b02)
+---
+ ggml/src/ggml-cuda/repack-gcn.cu | 217 ++++++++++++++++++-------------
+ 1 file changed, 123 insertions(+), 94 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cu b/ggml/src/ggml-cuda/repack-gcn.cu
+index a93fdf24b..8e21957f5 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cu
++++ b/ggml/src/ggml-cuda/repack-gcn.cu
+@@ -611,6 +611,14 @@ static __global__ void __launch_bounds__(1024, 1) repack_tile_map(
+     }
+ }
+ 
++// GGML_CUDA_NO_Q4K_FENCE=1: drop the scheduling barrier after the hoisted loads in the dense Q4_K
++// matvec / GLU (crossport P1b: without it the scheduler splits each trip into load / wait / dot;
++// 78 -> 70 us on 17408x5120). Only Q4_K: it did nothing on Q8_0 and hurt Q6_K / Q4_0.
++static bool q4k_fence() {
++    static const bool f = getenv("GGML_CUDA_NO_Q4K_FENCE") == nullptr;
++    return f;
++}
++
+ // Repacked Q4_K matvec. Block = 256 threads = 4 wave64s; each wave
+ // computes ROWS=2 output rows; lane l streams sub-block l, l+64, ... —
+ // consecutive lanes read consecutive 16-byte chunks, a fully-coalesced
+@@ -621,8 +629,8 @@ static __global__ void __launch_bounds__(1024, 1) repack_tile_map(
+ // with (dx, sx) = block_q8_1.ds — sx is dx * sum(q8), which is exactly
+ // the dequantized sub-block sum the min-term needs (same contract as
+ // vec_dot_q4_K_q8_1).
+-template <bool HAS_IDS>
+-static __global__ void mul_mat_vec_q4k_repacked(
++template <bool HAS_IDS, bool FENCE = false>
++static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
+         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+@@ -671,24 +679,28 @@ static __global__ void mul_mat_vec_q4k_repacked(
+         const float sx = __high2float(xb->ds);
+         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+ 
++        // rows clamped (not branched) so both rows' planes are in flight before the first dot;
++        // the store below is masked (crossport R10)
++        uint4    q[ROWS];
++        uint16_t sm[ROWS];
++        uint32_t dd[ROWS];
+ #pragma unroll
+         for (int r = 0; r < ROWS; r++) {
+-            const int row = row0 + r;
+-            if (row >= (int) ne1) {
+-                continue;
+-            }
+-
+-            const uint4    q  = nib[(size_t) row * nsp + sb];
+-            const uint16_t sm = smp[(size_t) row * nsp + sb];
+-            const uint32_t dd = ddp[(size_t) row * n_super + (sb >> 3)];
+-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+-            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))
+-                               * (float)(sm & 0xFFu);
+-            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+-                               * (float)(sm >> 8);
+-
+-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
++            q[r]  = nib[(size_t) row * nsp + sb];
++            sm[r] = smp[(size_t) row * nsp + sb];
++            dd[r] = ddp[(size_t) row * n_super + (sb >> 3)];
++        }
++        if constexpr (FENCE) {
++            __builtin_amdgcn_sched_barrier(0);
++        }
++#pragma unroll
++        for (int r = 0; r < ROWS; r++) {
++            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
++            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
++            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm[r] & 0xFFu);
++            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[r] >> 8);
++            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+             const int j1 = HAS_IDS ? j0 + 2          : 4;
+             int idot = 0;
+@@ -747,7 +759,7 @@ static __device__ __forceinline__ uint32_t repack_spread1_hi(const uint32_t h) {
+ // Q5_K repacked matvec — Q4_K's shape plus the qh plane OR-ed onto the
+ // nibbles before each dp4a.
+ template <bool HAS_IDS>
+-static __global__ void mul_mat_vec_q5k_repacked(
++static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
+         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+@@ -794,34 +806,33 @@ static __global__ void mul_mat_vec_q5k_repacked(
+         const float sx = __high2float(xb->ds);
+         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+ 
++        uint4    q[ROWS];
++        uint32_t qh[ROWS];
++        uint16_t sm[ROWS];
++        uint32_t dd[ROWS];
+ #pragma unroll
+-        for (int r = 0; r < ROWS; r++) {
+-            const int row = row0 + r;
+-            if (row >= (int) ne1) {
+-                continue;
+-            }
++        for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
++            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+             const size_t   idx = (size_t) row * nsp + sb;
+-            const uint4    q   = nib[idx];
+-            const uint32_t qh  = qhp[idx];
+-            const uint16_t sm  = smp[idx];
+-            const uint32_t dd  = ddp[(size_t) row * n_super + (sb >> 3)];
+-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+-            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))
+-                               * (float)(sm & 0xFFu);
+-            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+-                               * (float)(sm >> 8);
+-
+-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++            q[r]  = nib[idx];
++            qh[r] = qhp[idx];
++            sm[r] = smp[idx];
++            dd[r] = ddp[(size_t) row * n_super + (sb >> 3)];
++        }
++#pragma unroll
++        for (int r = 0; r < ROWS; r++) {
++            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
++            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
++            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm[r] & 0xFFu);
++            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[r] >> 8);
++            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+             const int j1 = HAS_IDS ? j0 + 2          : 4;
+             int idot = 0;
+ #pragma unroll
+             for (int j = j0; j < j1; j++) {
+-                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu)
+-                    | repack_spread4((qh >> (8 * j))     & 0xFu);
+-                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu)
+-                    | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
++                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j))     & 0xFu);
++                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j + 4)) & 0xFu);
+                 idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
+                 idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+             }
+@@ -1366,7 +1377,7 @@ static void launch_mul_mat_vec_q5_1_repacked_seg(
+ // folded out via activation half-sums: sum (q-32)x = sum qx - 32 sum x.
+ // Two signed scales per sub-block, one per 16 weights.
+ template <bool HAS_IDS>
+-static __global__ void mul_mat_vec_q6k_repacked(
++static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
+         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+@@ -1422,23 +1433,28 @@ static __global__ void mul_mat_vec_q6k_repacked(
+             xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
+         }
+ 
++        uint4    q[ROWS];
++        uint2    h2[ROWS];
++        uint16_t sm[ROWS];
++        uint16_t db[ROWS];
++#pragma unroll
++        for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
++            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
++            const size_t   idx = (size_t) row * nsp + sb;
++            q[r]  = nib[idx];
++            h2[r] = reinterpret_cast<const uint2 *>(h2p)[idx];
++            sm[r] = smp[idx];
++            db[r] = ddp[(size_t) row * n_super + (sb >> 3)];
++        }
+ #pragma unroll
+         for (int r = 0; r < ROWS; r++) {
+-            const int row = row0 + r;
+-            if (row >= (int) ne1) {
+-                continue;
+-            }
+-            const size_t   idx  = (size_t) row * nsp + sb;
+-            const uint4    q    = nib[idx];
+-            const uint32_t h2lo = h2p[idx * 2];
+-            const uint32_t h2hi = h2p[idx * 2 + 1];
+-            const uint16_t sm     = smp[idx];
+-            const uint16_t d_bits = ddp[(size_t) row * n_super + (sb >> 3)];
+-            const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+-            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
+-            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
++            const uint32_t h2lo = h2[r].x;
++            const uint32_t h2hi = h2[r].y;
++            const float d = __half2float(*reinterpret_cast<const __half *>(&db[r]));
++            const float dsc_lo = d * (float)(int)(int8_t)(sm[r] & 0xFFu);
++            const float dsc_hi = d * (float)(int)(int8_t)(sm[r] >> 8);
+ 
+-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++            const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+             int idot0 = 0, idot1 = 0;
+ #pragma unroll
+             for (int j = hj0; j < hj1; j++) {
+@@ -1961,21 +1977,22 @@ static __global__ void mul_mat_vec_q8_0_repacked(
+         const float dx = __low2float(xb->ds);
+         const int * xq32 = reinterpret_cast<const int *>(xb->qs) + half * 4;
+ 
++        int4     w[ROWS];
++        uint16_t db[ROWS];
++#pragma unroll
++        for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
++            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
++            w[r]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
++            db[r] = d_plane[(size_t) row * nsp + sb];
++        }
+ #pragma unroll
+         for (int r = 0; r < ROWS; r++) {
+-            const int row = row0 + r;
+-            if (row >= (int) ne1) {
+-                continue;
+-            }
+-            const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
+-            const uint16_t   db    = d_plane[(size_t) row * nsp + sb];
+-            const float      dw    = __half2float(*reinterpret_cast<const __half *>(&db));
+-
++            const float dw = __half2float(*reinterpret_cast<const __half *>(&db[r]));
+             int idot = 0;
+-#pragma unroll
+-            for (int g = 0; g < 4; g++) {
+-                idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
+-            }
++            idot = ggml_cuda_dp4a(w[r].x, xq32[0], idot);
++            idot = ggml_cuda_dp4a(w[r].y, xq32[1], idot);
++            idot = ggml_cuda_dp4a(w[r].z, xq32[2], idot);
++            idot = ggml_cuda_dp4a(w[r].w, xq32[3], idot);
+             acc[r] += dw * dx * (float) idot;
+         }
+     }
+@@ -2002,7 +2019,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
+ // 35B-A3B). Used for both dense MUL_MAT (ids == nullptr) and
+ // MUL_MAT_ID decode. ID path uses half-sub-block units (small-K expert
+ // tensors; min term on the even half).
+-template <bool HAS_IDS, int ROWS = 2, int MIN_BLOCKS = 1>
++template <bool HAS_IDS, int ROWS = 2, int MIN_BLOCKS = 1, bool FENCE = false>
+ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repacked_glu(
+         const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+         const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+@@ -2042,30 +2059,35 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
+         const float sx = __high2float(xb->ds);
+         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+ 
++        // both slabs' rows loaded before the first dot; rows clamped, store masked (crossport R10)
++        uint4    q[2][ROWS];
++        uint16_t sm[2][ROWS];
++        uint32_t dd[2][ROWS];
+ #pragma unroll
+         for (int w2 = 0; w2 < 2; w2++) {
+             const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
+-            const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+-                wb[w2] + (size_t) ne1 * nsp * 16);
+-            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
+-                wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
++            const uint16_t * smp = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
++            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
+ #pragma unroll
+             for (int r = 0; r < ROWS; r++) {
+-                const int row = row0 + r;
+-                if (row >= (int) ne1) {
+-                    continue;
+-                }
+-                const uint4    q  = nib[(size_t) row * nsp + sb];
+-                const uint16_t sm = smp[(size_t) row * nsp + sb];
+-                const uint32_t dd = ddp[(size_t) row * n_super + (sb >> 3)];
+-                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+-                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+-                const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))
+-                                   * (float)(sm & 0xFFu);
+-                const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+-                                   * (float)(sm >> 8);
+-
+-                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
++                const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
++                q[w2][r]  = nib[(size_t) row * nsp + sb];
++                sm[w2][r] = smp[(size_t) row * nsp + sb];
++                dd[w2][r] = ddp[(size_t) row * n_super + (sb >> 3)];
++            }
++        }
++        if constexpr (FENCE) {
++            __builtin_amdgcn_sched_barrier(0);
++        }
++#pragma unroll
++        for (int w2 = 0; w2 < 2; w2++) {
++#pragma unroll
++            for (int r = 0; r < ROWS; r++) {
++                const uint16_t d_bits    = (uint16_t)(dd[w2][r] & 0xFFFF);
++                const uint16_t dmin_bits = (uint16_t)(dd[w2][r] >> 16);
++                const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm[w2][r] & 0xFFu);
++                const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[w2][r] >> 8);
++                const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
+                 const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+                 const int j1 = HAS_IDS ? j0 + 2          : 4;
+                 int idot = 0;
+@@ -4500,9 +4522,13 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
+             } break;
+             case GGML_TYPE_Q4_K: {
+                 const dim3 grid((ne01 + 7) / 8, 1, 1);
+-                mul_mat_vec_q4k_repacked<false><<<grid, 256, 0, stream>>>(
+-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
++                if (q4k_fence()) {
++                    mul_mat_vec_q4k_repacked<false, true><<<grid, 256, 0, stream>>>(
++                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
++                } else {
++                    mul_mat_vec_q4k_repacked<false, false><<<grid, 256, 0, stream>>>(
++                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
++                }
+             } break;
+             case GGML_TYPE_Q5_K: {
+                 const dim3 grid((ne01 + 7) / 8, 1, 1);
+@@ -5274,10 +5300,13 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
+             return;
+         }
+         const dim3 grid((ne01 + 7) / 8, 1, 1);
+-        mul_mat_vec_q4k_repacked_glu<false><<<grid, 256, 0, stream>>>(
+-            wu, wg, xq, dst_d,
+-            (uint32_t) ne00, (uint32_t) ne01, glu_op,
+-            nullptr, nullptr, nullptr, 0, 0, 0, 0);
++        if (q4k_fence()) {
++            mul_mat_vec_q4k_repacked_glu<false, 2, 1, true><<<grid, 256, 0, stream>>>(
++                wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op, nullptr, nullptr, nullptr, 0, 0, 0, 0);
++        } else {
++            mul_mat_vec_q4k_repacked_glu<false><<<grid, 256, 0, stream>>>(
++                wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op, nullptr, nullptr, nullptr, 0, 0, 0, 0);
++        }
+         return;
+     }
+ 
+-- 
+2.53.0
+
