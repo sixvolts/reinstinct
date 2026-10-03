@@ -21,8 +21,16 @@
 // distinct banks at any kk (the pad had the same effect at 8.3 KB, which
 // rounds to a 19th LDS granule and loses the 7th workgroup).
 //
-// `ckpt` / `ckpt_rows`: the state after each of the first ckpt_rows
-// rows is also written to ckpt (null / 0 when unused).
+// Registers: the per-row loops address the slice through 8 per-lane
+// bases plus immediate offsets (see the row loop) instead of 32 hoisted
+// swizzled addresses, and the checkpoint store has its own entry. That
+// took the kernel from 157 VGPRs (one wave per SIMD: 256 workgroups on
+// 240 SIMDs ran in two rounds) to 111; Qwen 3.6-35B shape 1.96 -> 1.24 ms
+// per layer at 512 rows.
+//
+// gdn_recurrent_batched_v2_ckpt_f32 also writes the state after each of
+// the first ckpt_rows rows to ckpt (spec-decode verify); the plain entry
+// takes the same arguments and ignores those two.
 //
 // Compiled with `#define GDN_HEAD_DIM <head_dim>` (a multiple of 64).
 #include <hip/hip_runtime.h>
@@ -52,27 +60,32 @@ __device__ __forceinline__ float softplus_stable_r(float x) {
                       :     __logf(1.0f + __expf(x));
 }
 
-extern "C" __global__ __launch_bounds__(64)
-void gdn_recurrent_batched_v2_f32(
-    const float* __restrict__ q_in_batch,
-    const float* __restrict__ k_in_batch,
-    const float* __restrict__ v_in_batch,
-    const float* __restrict__ a_in_batch,
-    const float* __restrict__ b_in_batch,
-    const float* __restrict__ ssm_a,
-    const float* __restrict__ dt_bias,
-    float*       __restrict__ state,
-    float*       __restrict__ out_batch,
-    unsigned int n_heads,
-    unsigned int head_dim,      // == GDN_HEAD_DIM; ABI parity with the general kernel
-    unsigned int n_k_heads,
-    unsigned int n_rows,
-    unsigned int qk_row_stride,
-    unsigned int v_row_stride,
-    unsigned int ab_row_stride,
-    unsigned int out_row_stride,
-    float*       __restrict__ ckpt,     // [ckpt_rows][n_heads * HD * HD] or null
-    unsigned int ckpt_rows)
+#define GDN_V2_PARAMS                                                     \
+    const float* __restrict__ q_in_batch,                                 \
+    const float* __restrict__ k_in_batch,                                 \
+    const float* __restrict__ v_in_batch,                                 \
+    const float* __restrict__ a_in_batch,                                 \
+    const float* __restrict__ b_in_batch,                                 \
+    const float* __restrict__ ssm_a,                                      \
+    const float* __restrict__ dt_bias,                                    \
+    float*       __restrict__ state,                                      \
+    float*       __restrict__ out_batch,                                  \
+    unsigned int n_heads,                                                 \
+    unsigned int head_dim,  /* == GDN_HEAD_DIM; ABI parity */             \
+    unsigned int n_k_heads,                                               \
+    unsigned int n_rows,                                                  \
+    unsigned int qk_row_stride,                                           \
+    unsigned int v_row_stride,                                            \
+    unsigned int ab_row_stride,                                           \
+    unsigned int out_row_stride,                                          \
+    float*       __restrict__ ckpt,  /* [ckpt_rows][n_heads*HD*HD] */     \
+    unsigned int ckpt_rows
+#define GDN_V2_ARGS q_in_batch, k_in_batch, v_in_batch, a_in_batch, b_in_batch, ssm_a, \
+    dt_bias, state, out_batch, n_heads, head_dim, n_k_heads, n_rows, qk_row_stride,   \
+    v_row_stride, ab_row_stride, out_row_stride, ckpt, ckpt_rows
+
+template <bool CKPT>
+__device__ __forceinline__ void gdn_batched_v2(GDN_V2_PARAMS)
 {
     (void)head_dim;
     __shared__ float state_lds[COLS * HD];
@@ -137,14 +150,18 @@ void gdn_recurrent_batched_v2_f32(
         const float dec = __expf(ssm_a_h * softplus_stable_r(a_r + dt_bias_h));
         const float bet = 1.0f / (1.0f + __expf(-b_r));
 
-        float s_arr[QUARTER];
+        // kk = local*4 + grp and the swizzle xors 2*lvv into it, which only
+        // touches the low 3 bits of `local`: with local = 8*hi + lo the
+        // physical word is sw_lo[lo] + 32*hi, so 8 per-lane bases plus
+        // immediate offsets cover all 32 (not 32 hoisted addresses).
         float pkv = 0.0f;
+        float s_arr[QUARTER];
         #pragma unroll
-        for (int local = 0; local < QUARTER; local++) {
-            const int kk = local * 4 + grp;
-            const float s = lds_vv[kk ^ swz] * dec;
-            s_arr[local] = s;
-            pkv += s * k_lds[kk];
+        for (int lo = 0; lo < 8; lo++) {
+            const float* sp = lds_vv + ((((lo ^ (lvv >> 1)) << 2)) | ((grp ^ swz) & 3));
+            const float* kp = k_lds + lo * 4 + grp;
+            #pragma unroll
+            for (int hi = 0; hi < QUARTER / 8; hi++) { const float sv = sp[32 * hi] * dec; s_arr[lo * 4 + hi] = sv; pkv += sv * kp[32 * hi]; }
         }
         pkv += __shfl_xor(pkv, 16);
         const float kv = pkv + __shfl_xor(pkv, 32);
@@ -152,22 +169,29 @@ void gdn_recurrent_batched_v2_f32(
 
         float pout = 0.0f;
         #pragma unroll
-        for (int local = 0; local < QUARTER; local++) {
-            const int kk = local * 4 + grp;
-            const float s = s_arr[local] + k_lds[kk] * delta;
-            lds_vv[kk ^ swz] = s;
-            pout += s * q_lds[kk];
+        for (int lo = 0; lo < 8; lo++) {
+            float* sp = lds_vv + ((((lo ^ (lvv >> 1)) << 2)) | ((grp ^ swz) & 3));
+            const float* kp = k_lds + lo * 4 + grp;
+            const float* qp = q_lds + lo * 4 + grp;
+            #pragma unroll
+            for (int hi = 0; hi < QUARTER / 8; hi++) {
+                const float sv = s_arr[lo * 4 + hi] + kp[32 * hi] * delta;
+                sp[32 * hi] = sv;
+                pout += sv * qp[32 * hi];
+            }
         }
         // Spec-decode verify: the state after row r, in `state`'s layout,
         // so a partial accept restores it with one copy. Outside the loop
         // above (a branch in it cost prefill 2x); each lane re-reads the
         // LDS words it just wrote.
-        if (r < ckpt_rows) {
+        if (CKPT && r < ckpt_rows) {
             float* ck = ckpt + (size_t)r * n_heads * HD * HD + head_base + vv;
-            #pragma unroll 4
-            for (int local = 0; local < QUARTER; local++) {
-                const int kk = local * 4 + grp;
-                ck[(size_t)kk * HD] = lds_vv[kk ^ swz];
+            #pragma unroll 1
+            for (int lo = 0; lo < 8; lo++) {
+                const float* sp = lds_vv + ((((lo ^ (lvv >> 1)) << 2)) | ((grp ^ swz) & 3));
+                float* cp = ck + (size_t)(lo * 4 + grp) * HD;
+                #pragma unroll
+                for (int hi = 0; hi < QUARTER / 8; hi++) cp[(size_t)32 * hi * HD] = sp[32 * hi];
             }
         }
         pout += __shfl_xor(pout, 16);
@@ -182,3 +206,16 @@ void gdn_recurrent_batched_v2_f32(
         state[head_base + (size_t)kk * HD + tile_base + c] = state_lds[c * HD + (kk ^ (2 * c))];
     }
 }
+
+// Prefill: no checkpoints (ckpt / ckpt_rows ignored). The checkpoint
+// store costs ~10% even when skipped (registers and code around the row
+// loop), so it gets its own entry.
+extern "C" __global__ __launch_bounds__(64)
+void gdn_recurrent_batched_v2_f32(GDN_V2_PARAMS)
+{ gdn_batched_v2<false>(GDN_V2_ARGS); }
+
+// Spec-decode verify: also writes the state after each of the first
+// ckpt_rows rows to ckpt.
+extern "C" __global__ __launch_bounds__(64)
+void gdn_recurrent_batched_v2_ckpt_f32(GDN_V2_PARAMS)
+{ gdn_batched_v2<true>(GDN_V2_ARGS); }

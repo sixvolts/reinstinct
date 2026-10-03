@@ -2512,7 +2512,8 @@ mod tests {
         }
     }
 
-    /// The batched (prefill) GDN recurrent step at the 27B's shape over
+    /// The batched (prefill) GDN recurrent step at the 27B's shape (or
+    /// REINSTINCT_GDN_HEADS) over
     /// 512 rows: us per row is the number that matters (48 layers x
     /// n_rows of it per prefill). Runs the LDS-resident kernel from disk
     /// (`REINSTINCT_MMQ_BENCH_SRC_DIR` for variants) and checks it against
@@ -2521,7 +2522,11 @@ mod tests {
     #[ignore = "benchmark — run explicitly with --ignored"]
     fn bench_gdn_batched_recurrent() {
         let Some(cache) = skip_if_no_gpu() else { return };
-        let (n_heads, n_k_heads, head_dim) = (48usize, 16usize, 128usize);
+        // REINSTINCT_GDN_HEADS="v,k" for other models (Qwen 3.6-35B-A3B: 32,16).
+        let (n_heads, n_k_heads): (usize, usize) = std::env::var("REINSTINCT_GDN_HEADS").ok()
+            .map(|v| { let p: Vec<usize> = v.split(',').map(|x| x.trim().parse().unwrap()).collect(); (p[0], p[1]) })
+            .unwrap_or((48, 16));
+        let head_dim = 128usize;
         let n_rows: usize = std::env::var("REINSTINCT_GDN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         let dir = std::env::var("REINSTINCT_MMQ_BENCH_SRC_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/kernels").to_string());

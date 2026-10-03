@@ -2019,8 +2019,9 @@ impl GpuQwen35 {
             && std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none();
         let v2 = if std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none() {
             self.gdn_recurrent_batched_v2_module.as_ref() } else { None };
+        let with_ckpt = ckpt.is_some_and(|(_, rows)| rows > 0);
         let f = if let Some(m) = v2 {
-            m.function("gdn_recurrent_batched_v2_f32")?
+            m.function(if with_ckpt { "gdn_recurrent_batched_v2_ckpt_f32" } else { "gdn_recurrent_batched_v2_f32" })?
         } else if use_lds128 {
             self.gdn_recurrent_step_fused_batched_lds128_module
                 .function("gdn_recurrent_step_fused_batched_lds128_f32")?
