@@ -120,7 +120,13 @@ file1: ri_pp_kernel_trace.csv  steps 1
        0.221     41x  add_inplace_f32
 ```
 
-## Reading
+## Reading (from the top-kernel lists; the family buckets misfile some ggml MoE kernels - see last bullet)
 
-- **R6 (reinstinct decode +34%)**: kernel time per step is the same (~12.6 ms both). The fork spends 3.16 ms/step in norm/elementwise/copies vs 1.26 for reinstinct (fused add+rmsnorm+quantize, sigmoid_mul_q8, swiglu_q8), and its untraced step also carries ~150+ more launches. The fork's MoE matvecs land in "dense quant matvec" (family regexes don't match ggml MoE names - glu16 etc. need an entry), so the matvec split is not comparable yet: fork 8.0 vs reinstinct 6.8 + 1.6 + 0.8 = 9.1 ms. Router/top-k: reinstinct 0.84 vs fork 0.47.
-- **L8 (fork MoE prefill +79%)**: the MoE expert GEMM is 4x: fork 62.6 ms vs reinstinct 250.7 ms per pp512. GDN prefill 2x: 44.9 vs 95.2 ms. F32 GEMMs (router 2048x256, alpha/beta 2048x32) 2x: 30.6 vs 59.0. Dense quant GEMM is level (fork MMQ 134.8; reinstinct 90.6 MMQ + 32.4 small-batch). Reinstinct's grouped MoE GEMM, its GDN recurrence and its F32 path are the three ports to take from the fork, in that order.
+- **L8, prefill pp512, per forward** (fork vs reinstinct):
+  - MoE experts 2.2x: fork ~129 ms (q4k_repacked_id_w1 gate+up 60.8, q5k_repacked<true,1> down 53.9, q6k 14.6) vs reinstinct ~282 ms (q5k_grouped down 140.9, q4k_grouped gate+up 97.9, q6k_grouped 11.9, plus 31.7 of moe_matvec fallback on 6 layers).
+  - GDN recurrence 2.2x: gated_delta_net_lds_wave64<16> 40.3 vs gdn_recurrent_batched_v2 87.0.
+  - F32 GEMMs (router 2048x256, alpha/beta) 2x: gcn_f32_gemm_tn_rb 29.7 vs gemm_f16_rows 59.0.
+  - Dense Q8_0 GEMM 1.4x: mmq_gemm_q8_0_repacked<false,4> 66.3 vs ours 90.6.
+  - Reinstinct to take, in order: the fork's MoE id-GEMM (q4k_id_w1 / q5k repacked down), its GDN prefill kernel, its F32 GEMM, its Q8_0 MMQ tile.
+- **R6, decode**: summed kernel time per step is level (~12.6 ms both, traced). Reinstinct's untraced lead comes from fewer, fused small kernels: norm/elementwise/copies 1.26 vs 3.16 ms/step (add_rmsnorm_q8, sigmoid_mul_q8, swiglu_q8 fused vs rms_norm + bin_bcast + quantize_q8_1 + concat), and fewer launches. Kernel by kernel the fork is ahead in places: dense Q8_0 matvec 4.18 ms (131 launches) vs ours 5.88 (251: matvec_q8_0_repacked_r1 + _f32), top-k 0.47 vs 0.84, F32 matvec 0.76 vs 0.86. Ours ahead: MoE down 0.70 vs 1.40 (q5k), GDN step 0.39 vs 0.32+ (gated_delta_net_cpw) about level.
+- Family regexes: ggml's MoE kernels (`*_id_w*`, `mul_mat_vec_*_glu`, `mmq_gemm_q5k_repacked<true,...>` used for ids) and reinstinct's `matvec_f32_b256`/`gemm_f16_rows` need entries in kernel_families.py for the bucket view to be right.
