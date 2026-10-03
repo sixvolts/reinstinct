@@ -11,6 +11,8 @@ Owner: who does the port/evaluation. See README for status values.
 | R2 | small-batch matvec n=1..8: exact row counts n1..n4 + masked n8, loads behind `sched_barrier(0)`, 4 output rows/wave, activations staged in LDS per 64-sub-block chunk; Q8_0 batched path | reinstinct 1d23621, f000b64 (branch `review-fixes`): `kernels/matvec_batched_nr.h` (shared body), `kernels/matvec_batched_nr_entries.h` (rows/LDS per entry), `kernels/matvec_*_repacked_batched.cpp` (per-format decoders), host table `src/runtime/prefill.rs` `SmallBatchMatvec` | Furnace | proposed | Reinstinct: Q4_K n4 21504x5376 0.228->0.114 ms, Q6_K n4 0.438->0.199, Q8_0 n4 0.516->0.185; Qwen3.8-27B MTP K=2 17.0->38.4 tok/s. Compare against fork's dense Q8_0 nc/broadcast matvec and repacked glu16 first. |
 | R3 | int8-KV GQA flash-decoding: scores-pass lane mapping with 16-32 B loads, device-side split count (graph-safe), 32 splits for long full-attention layers | reinstinct 1e11d8f, 7344c46: `kernels/attn_decode_gqa_q8.cpp`, defines per layer kind `src/runtime/gemma4.rs` `gqa_q8_defs` | Furnace | proposed | Gemma 31B global layer @32K 1.07->0.61 ms. Fork runs F16 KV today; evaluate against fattn_dec_chunk/combine. |
 | R4 | MoE down-proj, 2 rows per group | reinstinct (earlier) | Furnace | proposed | 35B MoE +7.9%. Fork's down path is repacked Q5_1 seg kernel (Flash-Next); our dedup attempt on down was slower (96 vs 71 us). |
+| R5 | Dense decode gap (S1): reinstinct ahead on Qwen 3.8-27B tg +27%, Gemma 31B QAT Q4_0 +24%, Gemma 31B Q4_K_XL +7% | attribution first: per-kernel-family time per token for both engines on the same card | Furnace (analysis), Reinstinct (traces) | proposed | Likely R2/R3-class kernels; a Q4_0 gap points at the matvec itself. |
+| R6 | GDN + MoE decode gap (S1): Qwen 3.6-35B-A3B tg 88.6 (fork) vs 118.6 (reinstinct), +34% | attribution as R5 | Furnace | proposed | Highest value for the fork: production Flash-Next is also GDN + MoE. |
 
 ## L->R
 
@@ -23,6 +25,13 @@ Owner: who does the port/evaluation. See README for status values.
 | L5 | MoE expert dedup for few-token gate/up (wave-wide ids + ballot, first (token,slot) owns the expert) | fork 99e97eafc (scheme from Rune Prod) | Reinstinct | proposed | glu16 91.4->80.8 us/call, bit-identical; MTP 1 user +0.9%, 2 users +1.7%. Matters for 35B-A3B / 26B-A4B verify. |
 | L6 | topk_moe rank kernel | fork 4a8dee414 | Reinstinct | proposed | 18 -> ~4 us per call. |
 | L7 | MoE dispatch rejection logging: one-time log of why a fast kernel did not dispatch | Rune Prod tip | both | proposed | Rune found a dedup kernel silently not dispatching for months. |
+| L8 | MoE and small-model prefill (S1): fork ahead 1.54x Gemma 26B-A4B, 1.79x Qwen 3.6-35B-A3B, 1.42x Gemma E4B | fork: expert-grouped repacked int8 MMQ for MUL_MAT_ID (tokens sorted per expert by the mm_ids helper, repacked tiles) 4a43c2afe, e8e9db9da, 60dfa7c0c, 5672fe65a; dense repacked MMQ tiles | Reinstinct | proposed | Attribute with the same per-family traces before porting. |
+
+## Bugs found by cross-testing
+
+| id | bug | owner | status | notes |
+|---|---|---|---|---|
+| B1 | fork: `--spec-type draft-mtp` on dense Qwen 3.8-27B (qwen35, in-model nextn, no --model-draft) runs ~3x slower than plain decode (8.8-9.6 vs 27.5 tok/s) with 71-82% acceptance (S1) | Furnace | in-progress | Not seen on Flash-Next (qwen4exp, separate draft GGUF). Needs podcast logs with GGML_SCHED_TIME / LLAMA_DECODE_TIME / LLAMA_SPEC_TIME. |
 
 ## S
 
