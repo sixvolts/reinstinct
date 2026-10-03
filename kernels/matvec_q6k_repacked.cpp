@@ -37,7 +37,7 @@ __device__ __forceinline__ uint32_t spread2(uint32_t h) {
          | ((((h >> 2) & 0x33u) * 0x01001000u) & 0x30003000u);
 }
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(256)
 void matvec_q6k_repacked_f32(const uint8_t* __restrict__ wbase,
                              const BlockQ8* __restrict__ xq,
                              float*         __restrict__ y,

@@ -33,7 +33,7 @@ __device__ __forceinline__ uint32_t spread4(uint32_t h) {
     return ((h & 0xFu) * 0x02040810u) & 0x10101010u;
 }
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(256)
 void matvec_q5k_repacked_f32(const uint8_t* __restrict__ wbase,
                              const BlockQ8* __restrict__ xq,
                              float*         __restrict__ y,

@@ -158,7 +158,7 @@ void attn_prefill_flash_impl(const float* __restrict__ q,
     }
 }
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(512)
 void attn_prefill_flash_f32(const float* __restrict__ q,
                             const float* __restrict__ k,
                             const float* __restrict__ v,
@@ -177,7 +177,7 @@ void attn_prefill_flash_f32(const float* __restrict__ q,
 
 // Unmasked variant — see the header note. `window` is accepted for a
 // uniform call signature and ignored.
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(512)
 void attn_prefill_flash_nc_f32(const float* __restrict__ q,
                                const float* __restrict__ k,
                                const float* __restrict__ v,

@@ -30,7 +30,7 @@ struct __attribute__((packed)) BlockQ6_K {
 };
 static_assert(sizeof(BlockQ6_K) == 210, "BlockQ6_K must be 210 bytes");
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(64)
 void matvec_q6_k_wave64_f32(const BlockQ6_K* __restrict__ w_blocks,
                             const float*     __restrict__ x,
                             float*           __restrict__ y,
