@@ -57,6 +57,29 @@ const ROTATE_Q_RHT_SRC:      &str = include_str!("../../kernels/rotate_q_rht.cpp
 const ATTN_MERGE_SRC:        &str = include_str!("../../kernels/attn_merge.cpp");
 /// Max split-K splits per KV head — bounds the partial-attention scratch.
 const ATTN_MAX_SPLITS: u32 = 16;
+/// Splits the int8 GQA decode kernel launches on full-attention layers
+/// when max_seq >= GQA_LONG_MIN_SEQ; the kernel uses as many as give
+/// each >= 512 positions (at least 16), deciding from the device-side
+/// position, so short contexts in a long-context config stay at 16.
+const GQA_LONG_SPLITS: u32 = 32;
+const GQA_LONG_MIN_SEQ: usize = 16384;
+/// Partial-buffer capacity: the largest split count any kernel launches.
+const ATTN_BUF_SPLITS: u32 = if GQA_LONG_SPLITS > ATTN_MAX_SPLITS { GQA_LONG_SPLITS } else { ATTN_MAX_SPLITS };
+
+/// Compile-time mapping of the int8 GQA decode kernel per layer kind.
+/// Full attention: the scores pass reads KEPL = 32 bytes per lane
+/// (KLPT = HD/32 lanes per K row, 4 rows unrolled) — at HD 512 the old
+/// 64-lane rows cost a 6-step reduction per head per row (32K: 1.07 ->
+/// 0.73 ms per layer on the 31B's global geometry; Qwen-like 256: 0.46
+/// -> 0.33). Sliding windows keep the original 8-byte-per-lane mapping,
+/// faster for a 1024-position window.
+fn gqa_q8_defs(hd: u32, sliding: bool) -> String {
+    if sliding {
+        format!("#define HD {hd}\n#define KLPT {}\n#define KUNR 4\n", hd / 8)
+    } else {
+        format!("#define HD {hd}\n#define KLPT {}\n#define KUNR 4\n#define MIN_CHUNK 512\n", (hd / 32).max(2))
+    }
+}
 
 /// Max K (drafted tokens per round) supported by `verify_forward`'s
 /// preallocated scratch.
@@ -918,7 +941,7 @@ pub struct GpuGemma4 {
     /// GQA flash-decoding over the int8 cache (attn_decode_gqa_q8.cpp),
     /// one module per (head_dim, query heads per group) the model's
     /// layers need; empty under REINSTINCT_ATTN=partial.
-    m_attn_gqa_q8:  std::collections::HashMap<(u32, u32), Module>,
+    m_attn_gqa_q8:  std::collections::HashMap<(u32, u32, bool), Module>,
     /// Tiled prefill attention (attn_prefill_tiled_f32.cpp) per head_dim
     /// of the layers; empty under REINSTINCT_PREFILL_ATTN=flash.
     m_attn_prefill_tiled: std::collections::HashMap<u32, Module>,
@@ -1194,17 +1217,18 @@ impl GpuGemma4 {
                 attn_prefill_tiled_modules.insert(hd, m);
             }
         }
-        let mut attn_gqa_q8_modules: std::collections::HashMap<(u32, u32), Module> =
+        let mut attn_gqa_q8_modules: std::collections::HashMap<(u32, u32, bool), Module> =
             std::collections::HashMap::new();
         if std::env::var("REINSTINCT_ATTN").map(|v| v != "partial").unwrap_or(true) {
             for b in &blocks {
                 let (hd, nkv) = (b.head_dim as u32, b.n_kv.max(1) as u32);
                 let g = (n_heads as u32 / nkv).max(1);
                 let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
-                if hd % 64 != 0 || hd > 512 || attn_gqa_q8_modules.contains_key(&(hd, gh)) { continue; }
-                let m = ld(&format!("attn_decode_gqa_q8_hd{hd}_gh{gh}"),
-                           &format!("#define HD {hd}\n#define GH {gh}\n{ATTN_DECODE_GQA_Q8_SRC}"))?;
-                attn_gqa_q8_modules.insert((hd, gh), m);
+                let sliding = b.kind == AttnKind::Sliding;
+                if hd % 64 != 0 || hd > 512 || attn_gqa_q8_modules.contains_key(&(hd, gh, sliding)) { continue; }
+                let m = ld(&format!("attn_decode_gqa_q8_hd{hd}_gh{gh}_{}", if sliding { "swa" } else { "full" }),
+                           &format!("{}#define GH {gh}\n{ATTN_DECODE_GQA_Q8_SRC}", gqa_q8_defs(hd, sliding)))?;
+                attn_gqa_q8_modules.insert((hd, gh, sliding), m);
             }
         }
 
@@ -1293,9 +1317,9 @@ impl GpuGemma4 {
             m_rotate_q_rht:    ld("rotate_q_rht", ROTATE_Q_RHT_SRC)?,
             q_rot_scratch:     DeviceBuf::new(n_heads * hd_max)?,
             m_attn_merge:   ld("attn_merge", ATTN_MERGE_SRC)?,
-            attn_o_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize * hd_max)?,
-            attn_m_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?,
-            attn_l_partial: DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?,
+            attn_o_partial: DeviceBuf::new(n_heads * ATTN_BUF_SPLITS as usize * hd_max)?,
+            attn_m_partial: DeviceBuf::new(n_heads * ATTN_BUF_SPLITS as usize)?,
+            attn_l_partial: DeviceBuf::new(n_heads * ATTN_BUF_SPLITS as usize)?,
             use_old_attn:   std::env::var_os("REINSTINCT_OLD_ATTN").is_some(),
             moe_prof_on:    std::env::var_os("REINSTINCT_MOE_PROFILE").is_some(),
             prof_mark:      std::cell::Cell::new(std::time::Instant::now()),
@@ -2636,7 +2660,11 @@ impl GpuGemma4 {
 
         let g = n_heads / n_kv.max(1);
         let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
-        if let Some(m) = self.m_attn_gqa_q8.get(&(head_dim, gh)) {
+        let gqa = self.m_attn_gqa_q8.get(&(head_dim, gh, window > 0));
+        // (also what the merge below reads)
+        let n_splits = if gqa.is_some() && window == 0 && self.max_seq >= GQA_LONG_MIN_SEQ {
+            GQA_LONG_SPLITS } else { n_splits };
+        if let Some(m) = gqa {
             // GQA flash-decoding: one workgroup per (kv head, group of gh
             // query heads, split); static LDS; same partial buffers.
             let fg = m.function("attn_decode_gqa_q8_f32")?;

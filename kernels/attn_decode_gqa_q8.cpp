@@ -45,7 +45,33 @@
 #define UNR  4
 #endif
 
+// The score (Q.K) pass has its own lane mapping: KLPT lanes per K row,
+// KEPL = HD / KLPT int8 each, read as uint4s. The P.V pass needs no
+// per-row reduction and keeps LPT lanes per row; the scores pass does,
+// and at HD 512 a 64-lane row cost a 6-step DPP reduction per head per
+// row with 8-byte loads — the kernel ran at ~125 GB/s.
+#ifndef KLPT
+#define KLPT (HD >= 512 ? 16 : 8)
+#endif
+#define KEPL (HD / KLPT)            // int8 per lane in the scores pass
+#define KWPL (KEPL / 4)
+#define KTPW (64 / KLPT)            // K rows per wave step
+#define KTPB (NW * KTPW)
+#ifndef KUNR
+#define KUNR 2
+#endif
+#ifndef MIN_CHUNK
+#define MIN_CHUNK 1024
+#endif
+#ifndef MIN_SPLITS
+#define MIN_SPLITS 16
+#endif
+
 static_assert(EPL == 8 || EPL == 16, "EPL is 8 or 16");
+static_assert((KEPL % 16 == 0 || KEPL == 8) && KLPT >= 2 && KLPT <= 64, "scores pass: KEPL 8 or a multiple of 16");
+#define KVEC (KEPL >= 16 ? 16 : 8)  // bytes per load: uint4, or uint2 at KEPL 8
+typedef unsigned int kvec_t __attribute__((ext_vector_type(KVEC / 4)));
+static_assert(TILE % (KTPB * KUNR) == 0, "tile must be a whole number of unrolled K steps");
 static_assert(HD % 64 == 0 && LPT >= 4 && LPT <= 64, "head_dim must be 64..512, a multiple of 64");
 static_assert(TILE == BS, "the exp pass maps one thread to one tile token");
 static_assert(TILE % (TPB * UNR) == 0, "tile must be a whole number of unrolled block steps");
@@ -53,6 +79,10 @@ static_assert(GH >= 1 && GH <= 8, "GH <= 8");
 
 __device__ __forceinline__ float slot_sum(float x) {
     for (int o = LPT; o < 64; o <<= 1) x += __shfl_xor(x, o);
+    return x;
+}
+__device__ __forceinline__ float kslot_max(float x) {
+    for (int o = KLPT; o < 64; o <<= 1) x = fmaxf(x, __shfl_xor(x, o));
     return x;
 }
 __device__ __forceinline__ float slot_max(float x) {
@@ -119,7 +149,13 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
     const int total_len = (int)(*pos_ptr) + 1;
     const int lo = (window > 0 && total_len > (int)window) ? total_len - (int)window : 0;
     const int win_len = total_len - lo;
-    const int chunk = (win_len + (int)n_splits - 1) / (int)n_splits;
+    // Splits in use: as many as give each at least MIN_CHUNK positions,
+    // up to the n_splits launched. Decided from the device-side position,
+    // so one captured graph launches enough splits for long contexts and
+    // a short context leaves the extra workgroups empty (they write an
+    // empty partial the merge ignores).
+    const int eff = min((int)n_splits, max(MIN_SPLITS, (win_len + MIN_CHUNK - 1) / MIN_CHUNK));
+    const int chunk = (win_len + eff - 1) / eff;
     const int start = lo + sp * chunk;
     const int end   = min(start + chunk, total_len);
     const size_t kv_row = (size_t)n_kv_heads * HD;
@@ -169,6 +205,23 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
         }
     }
 
+    // The same per-head int8 Q, laid out for the scores pass: this lane's
+    // KEPL dims of each head.
+    const int ktl = lane / KLPT;
+    const int kdl = lane % KLPT;
+    const bool kred_lane = (kdl == KLPT - 1);
+    unsigned int qk[GH][KWPL];
+    #pragma unroll
+    for (int g = 0; g < GH; g++) {
+        const float inv = dq[g] > 0.0f ? scaling / dq[g] : 0.0f;   // = 127 / amax
+        #pragma unroll
+        for (int c = 0; c < KWPL; c++) {
+            float4 t = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (g < gh_n) t = *reinterpret_cast<const float4*>(q + (size_t)(h0 + g) * HD + kdl * KEPL + c * 4);
+            qk[g][c] = pack4(t.x, t.y, t.z, t.w, inv);
+        }
+    }
+
     float m[GH], l[GH], acc[GH][EPL];
     #pragma unroll
     for (int g = 0; g < GH; g++) {
@@ -176,7 +229,7 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
         #pragma unroll
         for (int j = 0; j < EPL; j++) acc[g][j] = 0.0f;
     }
-    const signed char* kbase = k_cache + (size_t)kvh * HD + dl * EPL;
+    const signed char* kbaseK = k_cache + (size_t)kvh * HD + kdl * KEPL;
     const signed char* vbase = v_cache + (size_t)kvh * HD + dl * EPL;
     const float* ks = k_scale + kvh;
     const float* vs = v_scale + kvh;
@@ -187,29 +240,33 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
         #pragma unroll
         for (int g = 0; g < GH; g++) tmax[g] = -INFINITY;
         const int n_st = (tn + TPB * UNR - 1) / (TPB * UNR) * UNR;
-        for (int st = 0; st < n_st; st += UNR) {
-            Row kk[UNR]; float dk[UNR];
+        const int kn_st = (tn + KTPB * KUNR - 1) / (KTPB * KUNR) * KUNR;
+        for (int st = 0; st < kn_st; st += KUNR) {
+            kvec_t kk[KUNR][KEPL / KVEC]; float dk[KUNR];
             #pragma unroll
-            for (int u = 0; u < UNR; u++) {
-                const int i = (st + u) * TPB + wave * TPW + tl;
+            for (int u = 0; u < KUNR; u++) {
+                const int i = (st + u) * KTPB + wave * KTPW + ktl;
                 const int t = (int)((unsigned)(t0 + min(i, tn - 1)) & ring_mask);
-                kk[u] = load_row(kbase + (size_t)t * kv_row);
+                const kvec_t* kp = reinterpret_cast<const kvec_t*>(kbaseK + (size_t)t * kv_row);
+                #pragma unroll
+                for (int c = 0; c < KEPL / KVEC; c++) kk[u][c] = kp[c];
                 dk[u] = ks[(size_t)t * n_kv_heads];
             }
             #pragma unroll
-            for (int u = 0; u < UNR; u++) {
-                const int i = (st + u) * TPB + wave * TPW + tl;
-                const bool live = red_lane && (i < tn);
+            for (int u = 0; u < KUNR; u++) {
+                const int i = (st + u) * KTPB + wave * KTPW + ktl;
+                const bool live = kred_lane && (i < tn);
+                const unsigned int* kw = reinterpret_cast<const unsigned int*>(kk[u]);
                 float x[GH];
                 #pragma unroll
                 for (int g = 0; g < GH; g++) {
                     int idot = 0;
                     #pragma unroll
-                    for (int c = 0; c < WPL; c++)
-                        idot = __builtin_amdgcn_sdot4((int)qi[g][c], (int)kk[u].w[c], idot, false);
+                    for (int c = 0; c < KWPL; c++)
+                        idot = __builtin_amdgcn_sdot4((int)qk[g][c], (int)kw[c], idot, false);
                     x[g] = (float)idot * dq[g] * dk[u];
                 }
-                seg_sum_multi<GH, LPT>(x);
+                seg_sum_multi<GH, KLPT>(x);
                 #pragma unroll
                 for (int g = 0; g < GH; g++) {
                     if (live) { s_p[g][i] = x[g]; tmax[g] = fmaxf(tmax[g], x[g]); }
@@ -218,8 +275,8 @@ void attn_decode_gqa_q8_f32(const float*       __restrict__ q,          // [n_he
         }
         #pragma unroll
         for (int g = 0; g < GH; g++) {
-            const float v = slot_max(tmax[g]);
-            if (lane == LPT - 1) s_red[wave][g] = v;
+            const float v = kslot_max(tmax[g]);
+            if (lane == KLPT - 1) s_red[wave][g] = v;
         }
         __syncthreads();
         #pragma unroll

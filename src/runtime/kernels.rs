@@ -2778,7 +2778,8 @@ mod tests {
         };
         for (n_heads, n_kv, head_dim, window) in geoms {
             let g = (n_heads / n_kv) as u32;
-            let gh = (1..=4u32).rev().find(|d| g % d == 0).unwrap_or(1);
+            let gh_max: u32 = std::env::var("REINSTINCT_ATTN_GH").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+            let gh = (1..=gh_max).rev().find(|d| g % d == 0).unwrap_or(1);
             let defs = std::env::var("REINSTINCT_ATTN_DEFS").unwrap_or_default().replace("\\n", "\n");
             let gsrc = format!("#define HD {head_dim}\n#define GH {gh}\n{defs}{}", read("attn_decode_gqa_q8"));
             let mg = Module::load(&cache.compile(&format!("attn_decode_gqa_q8_bench_hd{head_dim}_gh{gh}_{}", defs.len()), &gsrc).unwrap()).unwrap();
@@ -2878,7 +2879,10 @@ mod tests {
                 let bytes = 2.0 * attended * kv_dim as f64;
                 eprintln!("  len {:>5}: old {:.4} ms ({:>4.0} GB/s)  gqa {:.4} ms ({:>4.0} GB/s)  rel_l2 {err:.2e}",
                           pos + 1, ms, bytes / (ms * 1e-3) / 1e9, ms2, bytes / (ms2 * 1e-3) / 1e9);
-                assert!(err < 1e-4, "gqa q8 attention diverges: rel_l2 {err:.2e}");
+                // REINSTINCT_ATTN_NOCHECK: time ablated variants (e.g. a pass skipped).
+                if std::env::var_os("REINSTINCT_ATTN_NOCHECK").is_none() {
+                    assert!(err < 1e-4, "gqa q8 attention diverges: rel_l2 {err:.2e}");
+                }
             }
         }
     }
