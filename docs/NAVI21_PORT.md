@@ -139,7 +139,8 @@ phase-3 polish.
 
 ### 5. Performance constants
 
-- `N_ROWS_MAX=4` batched-matvec cap, MMQ `BM=64/BN=64/BK=4` tiles,
+- small-batch matvec rows-per-wave / LDS table (`BNR_R*`/`BNR_L*` in
+  `kernels/matvec_batched_nr_entries.h`, 8-row cap), MMQ `BM=64/BN=64/BK=4` tiles,
   `n_splits = ceil(seq/256), cap 16` in split-K attention, block=256
   everywhere — all tuned on 60-CU/wave64/HBM. They will *run* on
   gfx1030; they will not be optimal. Phase 3 sweeps, same methodology

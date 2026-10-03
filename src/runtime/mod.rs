@@ -119,6 +119,8 @@ impl KernelCache {
         const HEADERS: &[(&str, &str)] = &[
             ("gfx906_dpp.h", include_str!("../../kernels/gfx906_dpp.h")),
             ("attn_gqa_common.h", include_str!("../../kernels/attn_gqa_common.h")),
+            ("matvec_batched_nr.h", include_str!("../../kernels/matvec_batched_nr.h")),
+            ("matvec_batched_nr_entries.h", include_str!("../../kernels/matvec_batched_nr_entries.h")),
         ];
         HEADERS
     }

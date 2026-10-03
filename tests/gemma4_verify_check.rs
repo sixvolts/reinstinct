@@ -42,7 +42,8 @@ fn verify_forward_matches_decode() {
                 the tallest man-made structures for many centuries.";
     let mut ids = vec![tok.bos_id];
     ids.extend(tok.encode(text));
-    let k = 4usize;
+    // REINSTINCT_VERIFY_K: rows per verify (default 4).
+    let k: usize = std::env::var("REINSTINCT_VERIFY_K").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     let (pre, rest) = ids.split_at(ids.len() - k);
     state.reset();
     gm.prefill_forward(pre, &mut state).unwrap();
@@ -70,7 +71,7 @@ fn verify_forward_matches_decode() {
     let mut t = rest[0];
     for _ in 0..600 { let l = gm.forward_token(t, &mut state).unwrap(); t = argmax(&l) as u32; }
     let far = state.snapshot().unwrap();
-    let probe = [t, 1000, 2000, 3000];
+    let probe: Vec<u32> = std::iter::once(t).chain((1..k as u32).map(|i| 1000 * i)).collect();
     let inline = gm.verify_forward(&probe, &mut state).unwrap();
     state.restore(&far).unwrap();
     let graph = gm.forward_verify_via_graph(&exec, k, &probe, &mut state).unwrap();

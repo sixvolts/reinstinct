@@ -1,152 +1,57 @@
-// Q5_K matvec for K=2..8 activation rows. Same idea as
-// matvec_q4k_repacked_batched but with Q5_K's extra qh (5th-bit)
-// plane. See matvec_q4k_repacked_batched.cpp for the batching
-// rationale and matvec_q5k_repacked.cpp for the layout details.
-//
-// Two instantiations, differing only in (ROWS, N_ROWS_MAX):
-//   `_f32`          — ROWS=2, N_ROWS_MAX=4.  grid = ceil(out_dim/8).
-//   `batched16_f32` — ROWS=1, N_ROWS_MAX=16. grid = ceil(out_dim/4). For
-//     DFlash, whose block size is 16. Dropping ROWS holds the per-thread
-//     accumulator count at 16 rather than 32 while still streaming each
-//     weight sub-block once for all 16 activation rows.
-// 256-thread workgroup either way; the caller must match grid to the variant.
+// Q5_K small-batch matvec (spec-decode verify, 1..8 activation rows):
+// the shared matvec_batched_nr.h body over the repacked Q5_K layout of
+// matvec_q5k_repacked (q5_k::repack_for_matvec): 16-byte nibble plane,
+// 4-byte qh (5th bit) plane, 2-byte scale plane per sub-block, 4-byte
+// (fp16 d, dmin) superblock plane.
 
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <stdint.h>
-#include "gfx906_dpp.h"
+#include "matvec_batched_nr.h"
 
-
-struct __attribute__((packed)) BlockQ8 {
-    float  d;
-    float  xsum;
-    int8_t qs[32];
-};
-static_assert(sizeof(BlockQ8) == 40, "BlockQ8 must be 40 bytes");
-
+// Spread 4 bits to bit 4 of each byte.
 __device__ __forceinline__ uint32_t spread4(uint32_t h) {
     return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
 }
 
-template<int ROWS, int N_ROWS_MAX>
-__device__ __forceinline__
-void mv_q5k_batched_impl(const uint8_t* __restrict__ wbase,
-                                     const BlockQ8* __restrict__ xq,
-                                     float*         __restrict__ y,
-                                     unsigned int in_dim,
-                                     unsigned int out_dim,
-                                     unsigned int n_rows)
-{
-    const int wave = threadIdx.x >> 6;
-    const int lane = threadIdx.x & 63;
-    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
-    const unsigned int n_sub = in_dim >> 5;
-    const unsigned int nsp = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
-    const unsigned int n_super = n_sub >> 3;
-
-    const uint4*    nib = reinterpret_cast<const uint4*>(wbase);
-    const uint32_t* qhp = reinterpret_cast<const uint32_t*>(
-        wbase + (size_t)out_dim * nsp * 16);
-    const uint16_t* smp = reinterpret_cast<const uint16_t*>(
-        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4);
-    const uint32_t* ddp = reinterpret_cast<const uint32_t*>(
-        wbase + (size_t)out_dim * nsp * 16 + (size_t)out_dim * nsp * 4
-              + (size_t)out_dim * nsp * 2);
-
-    float acc[ROWS][N_ROWS_MAX];
-    #pragma unroll
-    for (int r = 0; r < ROWS; r++)
-        #pragma unroll
-        for (int b = 0; b < N_ROWS_MAX; b++) acc[r][b] = 0.0f;
-
-    for (unsigned int sb = lane; sb < n_sub; sb += 64) {
-        // Load per-(sb, r) weight + scales up front so the dp4a phase
-        // loops b outermost (each activation row read once per sb).
-        uint32_t lo_all[ROWS][4], hi_all[ROWS][4];
-        float    dsc_all[ROWS], deff_all[ROWS];
-        bool     row_valid[ROWS];
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            row_valid[r] = (row < (int)out_dim);
-            if (!row_valid[r]) continue;
-
-            const uint4    q  = nib[(size_t)row * nsp + sb];
-            const uint32_t qh = qhp[(size_t)row * nsp + sb];
-            const uint16_t sm = smp[(size_t)row * nsp + sb];
-            const uint32_t dd = ddp[(size_t)row * n_super + (sb >> 3)];
-            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
-            dsc_all[r]  = __half2float(*reinterpret_cast<const __half*>(&d_bits))
-                          * (float)(sm & 0xFFu);
-            deff_all[r] = __half2float(*reinterpret_cast<const __half*>(&dmin_bits))
-                          * (float)(sm >> 8);
-
-            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                lo_all[r][j] = ( qa[j]       & 0x0F0F0F0Fu)
-                    | spread4((qh >> (4 * (2 * j)))     & 0xFu);
-                hi_all[r][j] = ((qa[j] >> 4) & 0x0F0F0F0Fu)
-                    | spread4((qh >> (4 * (2 * j + 1))) & 0xFu);
-            }
-        }
-
-        for (unsigned int b = 0; b < n_rows; b++) {
-            const BlockQ8* xb   = xq + (size_t)b * n_sub + sb;
-            const float    dx   = xb->d;
-            const float    xsum = xb->xsum;
-            const int*     xq32 = reinterpret_cast<const int*>(xb->qs);
-
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                if (!row_valid[r]) continue;
-                int idot = 0;
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    idot = __builtin_amdgcn_sdot4((int)lo_all[r][j], xq32[j],     idot, false);
-                    idot = __builtin_amdgcn_sdot4((int)hi_all[r][j], xq32[j + 4], idot, false);
-                }
-                acc[r][b] += dsc_all[r] * dx * (float)idot - deff_all[r] * xsum;
-            }
-        }
+struct WQ5K {
+    const uint4* nib; const uint32_t* qhp; const uint16_t* smp; const uint32_t* ddp;
+    unsigned int nsp, n_super;
+    __device__ WQ5K(const uint8_t* w, unsigned int out_dim, unsigned int nsp_, unsigned int n_super_)
+        : nib(reinterpret_cast<const uint4*>(w)),
+          qhp(reinterpret_cast<const uint32_t*>(w + (size_t)out_dim * nsp_ * 16)),
+          smp(reinterpret_cast<const uint16_t*>(w + (size_t)out_dim * nsp_ * 20)),
+          ddp(reinterpret_cast<const uint32_t*>(w + (size_t)out_dim * nsp_ * 22)),
+          nsp(nsp_), n_super(n_super_) {}
+    struct Raw { uint4 q; uint32_t qh; uint16_t sm; uint32_t dd; };
+    struct Dec { uint32_t lo[4], hi[4]; float dsc, deff; };
+    static constexpr bool HALF_SUMS = false;
+    __device__ Raw load(int row, unsigned int sb) const {
+        const size_t i = (size_t)row * nsp + sb;
+        return { nib[i], qhp[i], smp[i], ddp[(size_t)row * n_super + (sb >> 3)] };
     }
-
-    #pragma unroll
-    for (int r = 0; r < ROWS; r++) {
-        for (unsigned int b = 0; b < n_rows; b++) {
-            float a = acc[r][b];
-            a = wave64_reduce_add_f32(a);
-            if (lane == 0 && (row0 + r) < (int)out_dim) {
-                y[(size_t)b * out_dim + (row0 + r)] = a;
-            }
+    __device__ static Dec decode(const Raw& r) {
+        Dec d;
+        const uint32_t qa[4] = { r.q.x, r.q.y, r.q.z, r.q.w };
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            d.lo[j] = ( qa[j]       & 0x0F0F0F0Fu) | spread4((r.qh >> (8 * j))     & 0xFu);
+            d.hi[j] = ((qa[j] >> 4) & 0x0F0F0F0Fu) | spread4((r.qh >> (8 * j + 4)) & 0xFu);
         }
+        d.dsc  = bnr_f16((uint16_t)(r.dd & 0xFFFF)) * (float)(r.sm & 0xFFu);
+        d.deff = bnr_f16((uint16_t)(r.dd >> 16)) * (float)(r.sm >> 8);
+        return d;
     }
-}
+    __device__ static float dot(const Dec& d, const XAct& x) {
+        int idot = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            idot = __builtin_amdgcn_sdot4((int)d.lo[j], x.w[j],     idot, false);
+            idot = __builtin_amdgcn_sdot4((int)d.hi[j], x.w[j + 4], idot, false);
+        }
+        return d.dsc * x.d * (float)idot - d.deff * x.s;
+    }
+};
 
-extern "C" __global__
-void matvec_q5k_repacked_batched_f32(const uint8_t* __restrict__ wbase,
-                                     const BlockQ8* __restrict__ xq,
-                                     float*         __restrict__ y,
-                                     unsigned int in_dim,
-                                     unsigned int out_dim,
-                                     unsigned int n_rows)
-{
-    mv_q5k_batched_impl<2, 4>(wbase, xq, y, in_dim, out_dim, n_rows);
-}
-
-// Wide variant for DFlash, whose block size is 16. ROWS drops to 1 so a
-// thread carries ROWS*N_ROWS_MAX = 16 accumulators rather than 32, keeping
-// register pressure near the 4-row kernel's while reading each weight
-// sub-block once for all 16 activation rows. Weight traffic is then
-// out_dim*in_dim total, the same as a single matvec.
-extern "C" __global__
-void matvec_q5k_repacked_batched16_f32(const uint8_t* __restrict__ wbase,
-                                     const BlockQ8* __restrict__ xq,
-                                     float*         __restrict__ y,
-                                     unsigned int in_dim,
-                                     unsigned int out_dim,
-                                     unsigned int n_rows)
-{
-    mv_q5k_batched_impl<1, 16>(wbase, xq, y, in_dim, out_dim, n_rows);
-}
+// The decoded Q5_K sub-block is 8 words: 4 rows of it at 4 activation
+// rows needs ~140 VGPRs (1 wave/SIMD), so n4 takes 2 rows per wave.
+#define BNR_R4 2
+#include "matvec_batched_nr_entries.h"
+BNR_ENTRIES(matvec_q5k_repacked_batched, WQ5K)

@@ -34,12 +34,85 @@ const NARROW_MMQ_ROWS: usize = 16;
 /// what sets LDS reads per sdot4.
 const NARROW_MMQ_THREADS: u32 = 64;
 
-/// Largest activation-row count the batched K-quant matvecs handle.
-/// Above this the MMQ GEMM takes over, and its BN=64 token tile wastes
-/// (64 - n_rows)/64 of every workgroup — at 16 rows that was the single
-/// biggest cost in a DFlash round (424 ms of verify). Matches
-/// `N_ROWS_MAX` in the `batched16` kernel instantiations.
-const MAX_BATCHED_ROWS: usize = 16;
+/// Largest activation-row count the small-batch matvecs handle (the
+/// `w8` entry of kernels/matvec_batched_nr_entries.h). Above this the
+/// narrow MMQ tile takes over: at 16 rows it beats a 16-row matvec, whose
+/// per-lane dot work and 16 x ROWS wave reductions outgrow the saved
+/// weight traffic; at 8 the matvec is 1.4-2.5x faster.
+pub(crate) const MAX_BATCHED_ROWS: usize = 8;
+
+/// The small-batch matvecs (kernels/matvec_batched_nr.h), one module per
+/// repacked weight format: `y[n, out] = x[n, in] · Wᵀ` for 1..=
+/// MAX_BATCHED_ROWS activation rows, already quantised to BlockQ8. Shared
+/// by PrefillGemm and the Qwen 3.5 runtime.
+pub(crate) struct SmallBatchMatvec {
+    q4_0: Module, iq4xs: Module, iq3s: Module, q4k: Module, q5k: Module, q6k: Module, q8_0: Module,
+}
+
+impl SmallBatchMatvec {
+    pub(crate) fn new(cache: &KernelCache) -> Result<Self, String> {
+        let ld = |name: &str, src: &str| -> Result<Module, String> { Module::load(&cache.compile(name, src)?) };
+        Ok(Self {
+            q4_0:  ld("matvec_q4_0_repacked_batched", MV_Q4_0_REPACKED_BATCHED_SOURCE)?,
+            iq4xs: ld("matvec_iq4xs_repacked_batched", MV_IQ4XS_REPACKED_BATCHED_SOURCE)?,
+            iq3s:  ld("matvec_iq3s_repacked_batched",
+                      &crate::quant::iq3_s::kernel_source(MV_IQ4XS_REPACKED_BATCHED_SOURCE))?,
+            q4k:   ld("matvec_q4k_repacked_batched", MV_Q4K_REPACKED_BATCHED_SOURCE)?,
+            q5k:   ld("matvec_q5k_repacked_batched", MV_Q5K_REPACKED_BATCHED_SOURCE)?,
+            q6k:   ld("matvec_q6k_repacked_batched", MV_Q6K_REPACKED_BATCHED_SOURCE)?,
+            q8_0:  ld("matvec_q8_0_repacked_batched", MV_Q8_0_REPACKED_BATCHED_SOURCE)?,
+        })
+    }
+
+    pub(crate) fn supports(dtype: GgmlType) -> bool {
+        matches!(dtype, GgmlType::Q4_0 | GgmlType::IQ4_XS | GgmlType::IQ3_S | GgmlType::Q4_K
+                      | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0)
+    }
+
+    /// Entry for `n_rows` and its rows per wave — BNR_R* in
+    /// kernels/matvec_batched_nr_entries.h and the per-dtype overrides in
+    /// the kernel files. A workgroup is 4 waves.
+    fn entry(dtype: GgmlType, n_rows: usize) -> (&'static str, u32) {
+        let (entry, rows) = match n_rows { 1 => ("n1", 2), 2 => ("n2", 4), 3 => ("n3", 4),
+                                           4 => ("n4", 4), _ => ("w8", 2) };
+        let rows = match (dtype, entry) {
+            (GgmlType::Q5_K, "n4") | (GgmlType::Q6_K, "n3" | "n4") => 2,
+            _ => rows,
+        };
+        (entry, rows)
+    }
+
+    /// `w`: the repacked weight; `xq`: BlockQ8 [n_rows, in_dim / 32];
+    /// `y`: f32 [n_rows, out_dim].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch(&self, stream: &hip::Stream, w: *mut c_void, dtype: GgmlType,
+                         xq: *mut c_void, y: *mut c_void,
+                         in_dim: usize, out_dim: usize, n_rows: usize) -> Result<(), String> {
+        if !(1..=MAX_BATCHED_ROWS).contains(&n_rows) {
+            return Err(format!("SmallBatchMatvec: n_rows {n_rows} not in 1..={MAX_BATCHED_ROWS}"));
+        }
+        let (module, prefix) = match dtype {
+            GgmlType::Q4_K   => (&self.q4k,   "matvec_q4k_repacked_batched"),
+            GgmlType::Q5_K   => (&self.q5k,   "matvec_q5k_repacked_batched"),
+            GgmlType::Q6_K   => (&self.q6k,   "matvec_q6k_repacked_batched"),
+            GgmlType::Q4_0   => (&self.q4_0,  "matvec_q4_0_repacked_batched"),
+            GgmlType::Q8_0   => (&self.q8_0,  "matvec_q8_0_repacked_batched"),
+            GgmlType::IQ4_XS => (&self.iq4xs, "matvec_iq4xs_repacked_batched"),
+            GgmlType::IQ3_S  => (&self.iq3s,  "matvec_iq4xs_repacked_batched"),
+            other => return Err(format!("SmallBatchMatvec: unsupported {other:?}")),
+        };
+        let (entry, rows) = Self::entry(dtype, n_rows);
+        let f = module.function(&format!("{prefix}_{entry}_f32"))?;
+        let (mut wp, mut xp, mut yp) = (w, xq, y);
+        let (mut ia, mut oa, mut nr) = (in_dim as u32, out_dim as u32, n_rows as u32);
+        let mut args: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
+        let grid_x = (out_dim as u32).div_ceil(4 * rows);
+        unsafe { f.launch((grid_x, 1, 1), (256, 1, 1), 0, Some(stream), &mut args) }
+    }
+}
 const QUANTIZE_Q8_SOURCE: &str = include_str!("../../kernels/quantize_q8.cpp");
 const MMQ_GEMM_Q4K_SOURCE: &str =
     include_str!("../../kernels/mmq_gemm_q4k_repacked.cpp");
@@ -63,6 +136,8 @@ const MV_Q5K_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q5k_repacked_batched.cpp");
 const MV_Q6K_REPACKED_BATCHED_SOURCE: &str =
     include_str!("../../kernels/matvec_q6k_repacked_batched.cpp");
+const MV_Q8_0_REPACKED_BATCHED_SOURCE: &str =
+    include_str!("../../kernels/matvec_q8_0_repacked_batched.cpp");
 
 /// Dequantize a quantized weight already resident on device to fp16.
 /// Same kernels as `dequant_to_f16`, but the input bytes are not
@@ -206,12 +281,7 @@ pub struct PrefillGemm {
     mmq_q5k:     Module,
     mmq_q6k:     Module,
     mmq_q8_0:    Module,
-    mv_q4_0_batched: Module,   // K=2..4 batched Q4_0 matvec for verify
-    mv_iq4xs_batched: Module,  // same, IQ4_XS
-    mv_iq3s_batched: Module,   // same, IQ3_S
-    mv_q4k_batched: Module,    // K=2..8 batched K-quant matvec for verify
-    mv_q5k_batched: Module,
-    mv_q6k_batched: Module,
+    small: SmallBatchMatvec,   // K=1..8 small-batch matvecs for verify
     w_f16:  std::cell::RefCell<DeviceBuf<u16>>,   // dequantised weight
     xq8:    std::cell::RefCell<DeviceBuf<u8>>,    // int8 activations (MMQ path)
 }
@@ -266,18 +336,7 @@ impl PrefillGemm {
                                                      MMQ_GEMM_Q6K_SOURCE)?)?,
             mmq_q8_0:    Module::load(&cache.compile("mmq_gemm_q8_0_repacked",
                                                      MMQ_GEMM_Q8_0_SOURCE)?)?,
-            mv_q4_0_batched: Module::load(&cache.compile("matvec_q4_0_repacked_batched",
-                                          MV_Q4_0_REPACKED_BATCHED_SOURCE)?)?,
-            mv_iq4xs_batched: Module::load(&cache.compile("matvec_iq4xs_repacked_batched",
-                                          MV_IQ4XS_REPACKED_BATCHED_SOURCE)?)?,
-            mv_iq3s_batched: Module::load(&cache.compile("matvec_iq3s_repacked_batched",
-                    &crate::quant::iq3_s::kernel_source(MV_IQ4XS_REPACKED_BATCHED_SOURCE))?)?,
-            mv_q4k_batched: Module::load(&cache.compile("matvec_q4k_repacked_batched",
-                                                     MV_Q4K_REPACKED_BATCHED_SOURCE)?)?,
-            mv_q5k_batched: Module::load(&cache.compile("matvec_q5k_repacked_batched",
-                                                     MV_Q5K_REPACKED_BATCHED_SOURCE)?)?,
-            mv_q6k_batched: Module::load(&cache.compile("matvec_q6k_repacked_batched",
-                                                     MV_Q6K_REPACKED_BATCHED_SOURCE)?)?,
+            small: SmallBatchMatvec::new(cache)?,
             w_f16:  std::cell::RefCell::new(DeviceBuf::new(max_w.max(1))?),
             // int8 activations: one BlockQ8 (40 B) per 32-element sub-block.
             xq8:    std::cell::RefCell::new(DeviceBuf::new((max_x.max(32) / 32) * 40)?),
@@ -347,27 +406,15 @@ impl PrefillGemm {
                            x: *mut c_void, n_rows: usize)
         -> Result<(), String>
     {
-        // Repacked Q8_0: no batched-matvec variant exists, so MMQ for
-        // every K — still far beats the dequant→HGEMM fallback.
-        if repacked && dtype == GgmlType::Q8_0 {
-            return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
-        }
-        if repacked && matches!(dtype,
-            GgmlType::Q4_0 | GgmlType::IQ4_XS | GgmlType::IQ3_S
-            | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K) {
-            if n_rows >= 1 && n_rows <= 4 {
-                // K=1..4 small-batch: a per-dtype batched matvec that reads
-                // each weight sub-block once and dots against all n_rows
-                // activation rows. Cap at 4 to bound per-thread accumulator
-                // pressure (= ROWS*N_ROWS_MAX VGPRs); higher K falls back
-                // to MMQ. K=4 is the empirical sweet spot for accept × tok/s.
+        if repacked && SmallBatchMatvec::supports(dtype) {
+            if n_rows >= 1 && n_rows <= MAX_BATCHED_ROWS {
+                // K=1..8 small-batch: a per-dtype matvec that reads each
+                // weight sub-block once and dots it against all n_rows
+                // activation rows (kernels/matvec_batched_nr.h); above
+                // MAX_BATCHED_ROWS the narrow MMQ tile wins.
                 //
                 // K=1 used to fall through to MMQ (BN=64 row tile wastes
                 // 98% of each workgroup → 390 ms verify(K=1) on 31B).
-                // Letting the batched kernel handle K=1 drops it to the
-                // ~50 ms range. The kernel always reserves N_ROWS_MAX=4
-                // per-thread accumulator slots regardless of actual K, but
-                // the wasted slots cost a few VGPRs, not bandwidth.
                 //
                 // A/B history on this path at K=4 (env-gated paths since
                 // removed): MMQ was ~3.3x slower because BN=64 wastes 94%
@@ -377,7 +424,7 @@ impl PrefillGemm {
                 // tensor cores, so fp16 GEMM has no compute advantage —
                 // dp4a does 4 int8 multiplies per cycle vs fp16's 2, and
                 // reads ¼ the weight bytes. dp4a wins both axes.
-                return self.matmul_kquant_batched_into(stream, dst, w_dev, dtype,
+                return self.matmul_small_batch_into(stream, dst, w_dev, dtype,
                                                        in_dim, out_dim, x, n_rows);
             }
             return self.matmul_mmq_into(stream, dst, w_dev, dtype, in_dim, out_dim, x, n_rows);
@@ -445,37 +492,12 @@ impl PrefillGemm {
         }
         Ok(())
     }
-    fn matmul_kquant_batched_into(&self, stream: &hip::Stream, dst: *mut c_void,
+    fn matmul_small_batch_into(&self, stream: &hip::Stream, dst: *mut c_void,
                                   w_dev: &DeviceBuf<u8>, dtype: GgmlType,
                                   in_dim: usize, out_dim: usize,
                                   x: *mut c_void, n_rows: usize)
         -> Result<(), String>
     {
-        debug_assert!(n_rows >= 1 && n_rows <= MAX_BATCHED_ROWS,
-                      "matmul_kquant_batched_into: n_rows must be 1..={MAX_BATCHED_ROWS}");
-        // Two instantiations per dtype. Up to 4 rows the tuned
-        // (ROWS=2, N_ROWS_MAX=4) kernel puts 8 output rows in a workgroup;
-        // beyond that the wide (ROWS=1, N_ROWS_MAX=16) one puts 4 there,
-        // trading output rows per workgroup for accumulator headroom so
-        // the weight is still streamed once for every activation row.
-        let wide = n_rows > 4;
-        let (module, kname) = match (dtype, wide) {
-            (GgmlType::Q5_K, false) => (&self.mv_q5k_batched, "matvec_q5k_repacked_batched_f32"),
-            (GgmlType::Q5_K, true)  => (&self.mv_q5k_batched, "matvec_q5k_repacked_batched16_f32"),
-            (GgmlType::Q6_K, false) => (&self.mv_q6k_batched, "matvec_q6k_repacked_batched_f32"),
-            (GgmlType::Q6_K, true)  => (&self.mv_q6k_batched, "matvec_q6k_repacked_batched16_f32"),
-            (GgmlType::Q4_K, false) => (&self.mv_q4k_batched, "matvec_q4k_repacked_batched_f32"),
-            (GgmlType::Q4_K, true)  => (&self.mv_q4k_batched, "matvec_q4k_repacked_batched16_f32"),
-            (GgmlType::Q4_0, false) => (&self.mv_q4_0_batched, "matvec_q4_0_repacked_batched_f32"),
-            (GgmlType::Q4_0, true)  => (&self.mv_q4_0_batched, "matvec_q4_0_repacked_batched16_f32"),
-            (GgmlType::IQ4_XS, false) => (&self.mv_iq4xs_batched, "matvec_iq4xs_repacked_batched_f32"),
-            (GgmlType::IQ4_XS, true)  => (&self.mv_iq4xs_batched, "matvec_iq4xs_repacked_batched16_f32"),
-            (GgmlType::IQ3_S, false) => (&self.mv_iq3s_batched, "matvec_iq4xs_repacked_batched_f32"),
-            (GgmlType::IQ3_S, true)  => (&self.mv_iq3s_batched, "matvec_iq4xs_repacked_batched16_f32"),
-            (other, _) => return Err(format!("matmul_kquant_batched_into: unsupported {other:?}")),
-        };
-        let rows_per_wg: u32 = if wide { 4 } else { 8 };
-
         // Reuse the MMQ path's int8 activation scratch.
         let n_xq8 = (n_rows * in_dim / 32) * 40;
         if self.xq8.borrow().len() < n_xq8 {
@@ -494,17 +516,8 @@ impl PrefillGemm {
         unsafe { qf.launch((((in_dim as u32) + 255) / 256, n_rows as u32, 1),
                            (256, 1, 1), 0, Some(stream), &mut qa)?; }
 
-        // 2. Batched matvec — grid = ceil(out_dim / rows_per_wg).
-        let gf = module.function(kname)?;
-        let mut wp = w_dev.raw_ptr(); let mut xqp = xq8.raw_ptr(); let mut yp = dst;
-        let mut ia = in_dim as u32; let mut oa = out_dim as u32; let mut nr = n_rows as u32;
-        let mut ga: [*mut c_void; 6] = [
-            &mut wp as *mut _ as *mut c_void, &mut xqp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void,
-            &mut oa as *mut _ as *mut c_void, &mut nr as *mut _ as *mut c_void];
-        let grid_x = (out_dim as u32 + rows_per_wg - 1) / rows_per_wg;
-        unsafe { gf.launch((grid_x, 1, 1), (256, 1, 1), 0, Some(stream), &mut ga)?; }
-        Ok(())
+        // 2. Small-batch matvec.
+        self.small.launch(stream, w_dev.raw_ptr(), dtype, xq8.raw_ptr(), dst, in_dim, out_dim, n_rows)
     }
 
     /// Caller-owned-output sibling of [`matmul_mmq`].
@@ -571,19 +584,89 @@ impl PrefillGemm {
 mod tests {
     use super::*;
 
+    /// Small-batch (spec-decode verify) matmul cost: per dtype, at the
+    /// 31B's FFN shapes, time of `matmul_into_raw` with n activation rows
+    /// (quantize + batched matvec / MMQ, as verify runs it) and its ratio
+    /// to n = 1. An HBM-bound weight stream would keep r(n) near 1.
+    /// REINSTINCT_BMM_BENCH_SHAPES="in x out,..." overrides the shapes.
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_small_batch_matmul() {
+        let Some(()) = crate::test_support::gpu() else { return };
+        let _dev = hip::Device::set(0).unwrap();
+        let cache = crate::runtime::KernelCache::new().unwrap();
+        let shapes: Vec<(usize, usize)> = std::env::var("REINSTINCT_BMM_BENCH_SHAPES").ok()
+            .map(|g| g.split(',').map(|p| { let v: Vec<usize> = p.split('x').map(|x| x.trim().parse().unwrap()).collect(); (v[0], v[1]) }).collect())
+            .unwrap_or(vec![(5376, 21504), (21504, 5376), (5376, 8192)]);
+        let max_rows = 16usize;
+        let stream = hip::Stream::new().unwrap();
+        let mut seed: u64 = 0x5BA7_C4ED;
+        let mut rng_u8 = || -> u8 { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 56) as u8 };
+        for &(in_dim, out_dim) in &shapes {
+            let x: Vec<f32> = (0..max_rows * in_dim).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+            let dx = DeviceBuf::from_slice(&x).unwrap();
+            let dy: DeviceBuf<f32> = DeviceBuf::new(max_rows * out_dim).unwrap();
+            let gemm = PrefillGemm::new(&cache, out_dim * in_dim, max_rows * in_dim, max_rows * out_dim).unwrap();
+            for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+                if let Ok(only) = std::env::var("REINSTINCT_BMM_BENCH_DTYPES") {
+                    if !only.split(',').any(|d| d.eq_ignore_ascii_case(&format!("{dtype:?}"))) { continue; }
+                }
+                let (bs, bpb) = (dtype.block_size_elements() as usize, dtype.bytes_per_block() as usize);
+                let n_blocks = out_dim * (in_dim / bs);
+                let mut w = vec![0u8; n_blocks * bpb];
+                for b in &mut w { *b = rng_u8(); }
+                for blk in 0..n_blocks {
+                    let off = blk * bpb;
+                    let d_off = if dtype == GgmlType::Q6_K { off + bpb - 2 } else { off };
+                    w[d_off..d_off + 2].copy_from_slice(&crate::quant::half::f32_to_f16(0.001).to_le_bytes());
+                    if matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K) {
+                        w[off + 2..off + 4].copy_from_slice(&crate::quant::half::f32_to_f16(0.001).to_le_bytes());
+                    }
+                }
+                let t = crate::runtime::qwen35::GpuMatvecTensor::from_bytes_matvec(&w, dtype, in_dim as u32, out_dim as u32).unwrap();
+                let mut line = format!("{in_dim}x{out_dim} {dtype:?}:");
+                let mut t1 = 0f64;
+                for n in [1usize, 2, 3, 4, 8, 16] {
+                    let run = || gemm.matmul_into_raw(&stream, dy.raw_ptr(), &t.data, t.dtype, t.repacked,
+                                                      in_dim, out_dim, dx.raw_ptr(), n).unwrap();
+                    for _ in 0..10 { run(); }
+                    stream.synchronize().unwrap();
+                    // Median of 7 timed batches of 40.
+                    let (e0, e1) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
+                    let mut reps: Vec<f64> = (0..7).map(|_| {
+                        e0.record(&stream).unwrap();
+                        for _ in 0..40 { run(); }
+                        e1.record(&stream).unwrap(); e1.synchronize().unwrap();
+                        hip::Event::elapsed_time(&e0, &e1).unwrap() as f64 / 40.0
+                    }).collect();
+                    reps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let ms = reps[3];
+                    if n == 1 { t1 = ms; }
+                    line += &format!("  n{n} {ms:.3}ms (r {:.2})", ms / t1);
+                }
+                eprintln!("{line}");
+            }
+        }
+    }
+
     /// `matmul_into` must agree with the CPU dequant oracle at every row
-    /// count that changes which kernel runs: 1..4 take the tuned batched
-    /// matvec, 5..16 the wide (ROWS=1, N_ROWS_MAX=16) one, and >16 falls
-    /// through to the MMQ GEMM. The 5..16 band is new and is what DFlash's
-    /// 16-token block depends on.
+    /// count that changes which kernel runs: 1..4 the exact-row small-batch
+    /// matvecs, 5..8 the masked 8-row one, 9..16 the narrow MMQ tile and
+    /// >16 the wide one. Two shapes: a power-of-two n_sub below one 64-sub-
+    /// block chunk, and n_sub = 136 (a chunk tail) with out_dim = 100 (a
+    /// partial workgroup of clamped rows at every ROWS).
     #[test]
     fn matmul_into_matches_oracle_across_row_counts() {
         let Some(cache) = crate::test_support::kernel_cache() else { return };
+        for (in_dim, out_dim) in [(1024usize, 256usize), (4352, 100)] {
+            check_matmul_into_oracle(&cache, in_dim, out_dim);
+        }
+    }
+
+    fn check_matmul_into_oracle(cache: &crate::runtime::KernelCache, in_dim: usize, out_dim: usize) {
         let _dev = hip::Device::set(0).unwrap();
         let stream = hip::Stream::new().expect("stream");
-
-        let in_dim = 1024usize;
-        let out_dim = 256usize;
         let max_rows = 20usize;
 
         let mut seed: u64 = 0xB47C_4ED0;
@@ -598,13 +681,10 @@ mod tests {
         let x: Vec<f32> = (0..max_rows * in_dim).map(|_| x_rng()).collect();
         let dx: DeviceBuf<f32> = DeviceBuf::from_slice(&x).unwrap();
 
-        let gemm = PrefillGemm::new(&cache, out_dim * in_dim,
+        let gemm = PrefillGemm::new(cache, out_dim * in_dim,
                                     max_rows * in_dim, max_rows * out_dim).unwrap();
 
-        // Every repacked dtype the GEMM dispatch can see. Q8_0 has no
-        // batched matvec and goes straight to MMQ at every row count, so
-        // it is the only dtype that exercises the narrow tile at 1..4 too —
-        // and it is what a DFlash drafter is made of.
+        // Every repacked dtype the GEMM dispatch can see.
         for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K,
                       GgmlType::Q6_K, GgmlType::Q8_0, GgmlType::IQ4_XS,
                       GgmlType::IQ3_S] {
@@ -653,7 +733,7 @@ mod tests {
             let dw: DeviceBuf<u8> = DeviceBuf::from_slice(&packed).unwrap();
             let dst: DeviceBuf<f32> = DeviceBuf::new(max_rows * out_dim).unwrap();
 
-            for &n_rows in &[1usize, 4, 5, 8, 15, 16, 20] {
+            for &n_rows in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 20] {
                 gemm.matmul_into(&stream, &dst, &dw, dtype, true,
                                  in_dim, out_dim, &dx, n_rows).expect("matmul_into");
                 stream.synchronize().unwrap();
@@ -674,7 +754,7 @@ mod tests {
                     den += (want[i] as f64).powi(2);
                 }
                 let e = (num / den.max(1e-30)).sqrt() as f32;
-                eprintln!("matmul_into {dtype:?} rows={n_rows}: rel_l2={e:.3e}");
+                eprintln!("matmul_into {in_dim}x{out_dim} {dtype:?} rows={n_rows}: rel_l2={e:.3e}");
                 assert!(e < 1.5e-2,
                     "{dtype:?} at {n_rows} rows: rel_l2 {e:.3e} too large");
             }
