@@ -2556,7 +2556,10 @@ mod tests {
                 let mut nh = n_heads as u32; let mut hd = head_dim as u32; let mut nkh = n_k_heads as u32;
                 let mut nr = n_rows as u32; let mut qrs = kdim as u32; let mut vrs = vdim as u32;
                 let mut abs_ = n_heads as u32; let mut ors = vdim as u32;
-                let mut args: [*mut c_void; 17] = [
+                let mut ck: *mut c_void = std::ptr::null_mut(); let mut ckr = 0u32;
+                // 19 for gdn_recurrent_batched_v2 (null checkpoint); the
+                // 17-parameter kernels ignore the trailing two.
+                let mut args: [*mut c_void; 19] = [
                     &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
                     &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
                     &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
@@ -2565,7 +2568,8 @@ mod tests {
                     &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void,
                     &mut nr as *mut _ as *mut c_void, &mut qrs as *mut _ as *mut c_void,
                     &mut vrs as *mut _ as *mut c_void, &mut abs_ as *mut _ as *mut c_void,
-                    &mut ors as *mut _ as *mut c_void];
+                    &mut ors as *mut _ as *mut c_void,
+                    &mut ck as *mut _ as *mut c_void, &mut ckr as *mut _ as *mut c_void];
                 unsafe { f.launch((n_heads as u32, grid_y, 1), (block, 1, 1), smem, Some(&stream), &mut args).unwrap(); }
             };
             launch(); stream.synchronize().unwrap();

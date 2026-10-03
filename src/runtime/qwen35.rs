@@ -1003,6 +1003,10 @@ pub struct Qwen35Snapshot {
     /// Per Linear block (block order): (recurrent copy, conv_hist copy).
     /// `None` for Full blocks — their rollback is just the KV `len`.
     gdn:    Vec<Option<(DeviceBuf<f32>, DeviceBuf<f32>)>>,
+    /// Per Linear block: per-row verify checkpoints (`ckpt_rows` x the
+    /// recurrent / conv_hist sizes), written by the verify kernels.
+    ckpt:   Vec<Option<(DeviceBuf<f32>, DeviceBuf<f32>)>>,
+    ckpt_rows: usize,
     kv_len: Vec<usize>,   // per block (block order); meaningful for Full
     pos:    usize,
 }
@@ -1019,7 +1023,62 @@ impl Qwen35Snapshot {
                 )),
             });
         }
-        Ok(Self { gdn, kv_len: vec![0; state.block_states.len()], pos: state.pos })
+        let n = state.block_states.len();
+        Ok(Self { gdn, ckpt: (0..n).map(|_| None).collect(), ckpt_rows: 0,
+                  kv_len: vec![0; n], pos: state.pos })
+    }
+
+    /// A snapshot that also holds per-row GDN checkpoints for verify
+    /// batches of up to `rows + 1` tokens (the last row's state is the
+    /// live one). `rows` = the draft depth k.
+    pub fn with_verify_rows(state: &Qwen35GpuState, rows: usize) -> Result<Self, String> {
+        let mut s = Self::new(state)?;
+        for (i, bs) in state.block_states.iter().enumerate() {
+            if let GpuBlockState::Linear(l) = bs {
+                s.ckpt[i] = Some((DeviceBuf::new(rows * l.recurrent.len())?,
+                                  DeviceBuf::new(rows * l.conv_hist.len())?));
+            }
+        }
+        s.ckpt_rows = rows;
+        Ok(s)
+    }
+
+    /// Record the KV lengths and position only — enough for
+    /// `restore_to_row` after a checkpointed verify.
+    pub fn mark(&mut self, state: &Qwen35GpuState) {
+        self.pos = state.pos;
+        for (i, bs) in state.block_states.iter().enumerate() {
+            if let GpuBlockState::Full(kv) = bs { self.kv_len[i] = kv.len; }
+        }
+    }
+
+    /// Checkpoint pointers for Linear block `i` in a verify of `n` rows.
+    fn verify_ckpt(&self, i: usize, n: usize) -> Option<(*mut c_void, *mut c_void, u32)> {
+        self.ckpt[i].as_ref().map(|(r, c)|
+            (r.raw_ptr(), c.raw_ptr(), self.ckpt_rows.min(n) as u32))
+    }
+
+    /// After a checkpointed verify from the `mark`ed state, keep only its
+    /// first `row + 1` tokens: GDN state from checkpoint `row`, KV
+    /// lengths and position advanced by `row + 1`.
+    pub fn restore_to_row(&self, state: &mut Qwen35GpuState, row: usize, stream: &Stream)
+        -> Result<(), String>
+    {
+        if row >= self.ckpt_rows { return Err(format!("restore_to_row {row}: {} checkpoints", self.ckpt_rows)); }
+        state.pos = self.pos + row + 1;
+        for (i, bs) in state.block_states.iter_mut().enumerate() {
+            match bs {
+                GpuBlockState::Full(kv)  => kv.len = self.kv_len[i] + row + 1,
+                GpuBlockState::Linear(s) => {
+                    let (r, c) = self.ckpt[i].as_ref()
+                        .ok_or("restore_to_row: snapshot has no verify checkpoints")?;
+                    let (nr, nc) = (s.recurrent.len(), s.conv_hist.len());
+                    s.recurrent.copy_range_from_device_async(r, row * nr, 0, nr, stream)?;
+                    s.conv_hist.copy_range_from_device_async(c, row * nc, 0, nc, stream)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Capture `state` into this snapshot (reuses the allocated buffers).
@@ -1881,19 +1940,22 @@ impl GpuQwen35 {
     #[allow(clippy::too_many_arguments)]
     fn launch_conv1d_step_silu_batched(&self,
         x_new_batch: *mut c_void, w: *mut c_void, history: *mut c_void,
-        y_batch: *mut c_void, n_channels: u32, kernel_size: u32, n_rows: u32)
+        y_batch: *mut c_void, n_channels: u32, kernel_size: u32, n_rows: u32,
+        ckpt: Option<(*mut c_void, u32)>)
         -> Result<(), String>
     {
         let f = self.conv1d_step_silu_batched_module.function("conv1d_step_silu_batched_f32")?;
+        let (mut ck, mut ckr) = ckpt.unwrap_or((std::ptr::null_mut(), 0));
         let block: u32 = 256;
         let grid = (n_channels + block - 1) / block;
         let mut xa=x_new_batch; let mut wa=w; let mut ha=history; let mut ya=y_batch;
         let mut nc=n_channels; let mut ks=kernel_size; let mut nr=n_rows;
-        let mut args: [*mut c_void; 7] = [
+        let mut args: [*mut c_void; 9] = [
             &mut xa as *mut _ as *mut c_void, &mut wa as *mut _ as *mut c_void,
             &mut ha as *mut _ as *mut c_void, &mut ya as *mut _ as *mut c_void,
             &mut nc as *mut _ as *mut c_void, &mut ks as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void];
+            &mut nr as *mut _ as *mut c_void,
+            &mut ck as *mut _ as *mut c_void, &mut ckr as *mut _ as *mut c_void];
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
@@ -1935,7 +1997,7 @@ impl GpuQwen35 {
         state: *mut c_void, out: *mut c_void,
         n_heads: u32, head_dim: u32, n_k_heads: u32, n_rows: u32,
         qk_row_stride: u32, v_row_stride: u32, ab_row_stride: u32,
-        out_row_stride: u32) -> Result<(), String>
+        out_row_stride: u32, ckpt: Option<(*mut c_void, u32)>) -> Result<(), String>
     {
         // head_dim=128 hits the LDS-resident-state variant — stages the
         // 8 KB per-WG state slice into LDS once per call so per-row
@@ -1975,7 +2037,12 @@ impl GpuQwen35 {
         let mut nh=n_heads; let mut hd=head_dim; let mut nkh=n_k_heads; let mut nr=n_rows;
         let mut qrs=qk_row_stride; let mut vrs=v_row_stride;
         let mut abs_=ab_row_stride; let mut ors=out_row_stride;
-        let mut args: [*mut c_void; 17] = [
+        // Per-row state checkpoints are a v2-only feature.
+        if ckpt.is_some() && v2.is_none() {
+            return Err("GDN verify checkpoints need gdn_recurrent_batched_v2".into());
+        }
+        let (mut ck, mut ckr) = ckpt.unwrap_or((std::ptr::null_mut(), 0));
+        let mut args: [*mut c_void; 19] = [
             &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
             &mut ba as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void,
@@ -1984,7 +2051,9 @@ impl GpuQwen35 {
             &mut hd as *mut _ as *mut c_void, &mut nkh as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void, &mut qrs as *mut _ as *mut c_void,
             &mut vrs as *mut _ as *mut c_void, &mut abs_ as *mut _ as *mut c_void,
-            &mut ors as *mut _ as *mut c_void];
+            &mut ors as *mut _ as *mut c_void,
+            // v2 only; the 17-parameter kernels ignore the trailing two.
+            &mut ck as *mut _ as *mut c_void, &mut ckr as *mut _ as *mut c_void];
         unsafe { f.launch((n_heads, head_dim / COLS, 1), (block, 1, 1), smem,
                           Some(&self.stream), &mut args) }
     }
@@ -3392,13 +3461,6 @@ impl GpuQwen35 {
         Ok((rate, matches, total))
     }
 
-    /// Device pointer to row `r` of the hidden states stashed by the
-    /// most recent `forward_tokens_verify`.
-    fn verify_hidden_row(&self, r: usize) -> *mut c_void {
-        unsafe { (self.verify_hidden.raw_ptr() as *mut f32)
-            .add(r * self.hidden) as *mut c_void }
-    }
-
     /// Chain the MTP head `k` times to produce `k` speculative drafts.
     /// Link 0 drafts from `(prev_hidden, first_embed)`; each later link
     /// feeds the previous link's block-hidden and drafted token. The MTP
@@ -3470,22 +3532,79 @@ impl GpuQwen35 {
         }
     }
 
+    /// Batched prefill that also returns the per-position hidden states
+    /// (pre output-norm, `[n, hidden]`) — the MTP head's catch-up input.
+    pub fn forward_tokens_batched_hidden(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+        -> Result<(Vec<f32>, PooledBuf<'_, f32>), String>
+    {
+        assert!(self.stage.is_first() && self.stage.is_last(),
+                "forward_tokens_batched_hidden drives a whole-model engine");
+        let (act, _out, logits) = self.prefill_stage(tokens, state, None, true)?;
+        Ok((logits.expect("last stage returns logits"), act))
+    }
+
+    /// MTP catch-up: run committed `tokens` through the MTP layer with
+    /// TARGET hidden states, writing its KV at positions
+    /// `mtp_kv.len ..` (overwriting whatever drafting left there). Row r
+    /// pairs `tokens[r]` with the target hidden of the position before
+    /// it: `first` for row 0, rows `rest_row0 ..` of `rest` after that.
+    /// Only the KV matters; the block output is discarded.
+    fn mtp_catchup(&self, mtp: &GpuMtpHead, tokens: &[u32],
+                   first: &DeviceBuf<f32>, rest: &DeviceBuf<f32>, rest_row0: usize,
+                   mtp_kv: &mut GpuKvCache) -> Result<(), String>
+    {
+        let n = tokens.len();
+        if n == 0 { return Ok(()); }
+        let h = self.hidden;
+        let hid = self.pool_f32.take(n * h)?;
+        hid.copy_range_from_device_async(first, 0, 0, h, &self.stream)?;
+        if n > 1 {
+            hid.copy_range_from_device_async(rest, rest_row0 * h, h, (n - 1) * h, &self.stream)?;
+        }
+        // concat row r = [rmsnorm(embed(tokens[r])) * enorm, rmsnorm(hid[r]) * hnorm]
+        let emb    = self.pool_f32.take(n * h)?;
+        let concat = self.pool_f32.take(n * 2 * h)?;
+        let row = |b: &DeviceBuf<f32>, r: usize, w: usize| unsafe {
+            (b.raw_ptr() as *mut f32).add(r * w) } as *mut c_void;
+        for (r, &t) in tokens.iter().enumerate() {
+            self.launch_embed_lookup_dispatch(self.token_embd(), row(&emb, r, h), t)?;
+            self.launch_rmsnorm(row(&emb, r, h), mtp.enorm.raw_ptr(),
+                                row(&concat, 2 * r, h), h as u32, self.rms_eps)?;
+            self.launch_rmsnorm(row(&hid, r, h), mtp.hnorm.raw_ptr(),
+                                row(&concat, 2 * r + 1, h), h as u32, self.rms_eps)?;
+        }
+        let ba    = self.pool_f32.take(n * h)?;
+        let bb    = self.pool_f32.take(n * h)?;
+        let bnorm = self.pool_f32.take(n * h)?;
+        self.bmm(&mtp.eh_proj, concat.raw_ptr(), n, ba.raw_ptr())?;
+        let scaling = (self.head_dim as f32).powf(-0.5);
+        self.batched_full_block(&ba, &bb, &bnorm, &mtp.block, mtp_kv, n, scaling)
+    }
+
     /// QMTP-3 — MTP speculative-decode generation loop.
     ///
-    /// `state` must be prefilled; `first_token` is the first token to
-    /// emit (typically the argmax of the prefill logits). It is
-    /// committed with a normal decode to bootstrap, then each round:
-    /// chain `k` MTP drafts, batch-verify `[t, d1..dk]` in one forward,
-    /// and accept all-or-nothing — on any mismatch the round is rolled
-    /// back via `snapshot` and the certain token `t` re-decoded.
+    /// Prefills `prompt`, then each round drafts `k` tokens by chaining
+    /// the MTP head, batch-verifies `[t, d1..dk]` in one forward, and
+    /// keeps the longest matching prefix `d1..dn` plus the target's own
+    /// next token. The draft loop follows the trained-head recipe (the
+    /// llama fork's `common_speculative` MTP path):
+    ///   * the MTP layer's KV holds every committed position, built from
+    ///     TARGET hidden states (catch-up after the prompt and after every
+    ///     verify), at the true sequence positions;
+    ///   * MTP input at position p is (token x[p], target hidden at p-1);
+    ///     chained draft steps feed the head's own output hidden back.
+    /// On a partial accept the GDN state comes from the verify's per-row
+    /// checkpoint when `snapshot` was made `with_verify_rows(k)`;
+    /// otherwise the state is rolled back and the accepted prefix re-run.
     ///
-    /// Returns the generated tokens (stopping at `eos` or `max_tokens`)
-    /// and per-call stats.
+    /// `mtp_kv` must hold `max_seq` positions. Returns the generated
+    /// tokens (stopping at `eos` or `max_tokens`) and per-call stats.
+    #[allow(clippy::too_many_arguments)]
     pub fn mtp_spec_generate(&self,
+        prompt: &[u32],
         state: &mut Qwen35GpuState,
         mtp_kv: &mut GpuKvCache,
         snapshot: &mut Qwen35Snapshot,
-        first_token: u32,
         eos: u32, max_tokens: usize, k: usize,
     ) -> Result<(Vec<u32>, QwenSpecStats), String>
     {
@@ -3493,65 +3612,101 @@ impl GpuQwen35 {
             return Err("model has no MTP (nextn) head".into());
         }
         assert!(k >= 1 && k + 1 <= VERIFY_MAX_TOKENS, "mtp_spec_generate: bad k");
+        assert!(!prompt.is_empty(), "mtp_spec_generate: empty prompt");
         let mtp = &self.mtp[0];
+        let h = self.hidden;
         let mut stats = QwenSpecStats::default();
-        let mut mtp_pos = 0usize;
 
-        // Bootstrap: commit `first_token` with a normal decode so the
-        // loop starts with its logits + hidden state.
-        let mut verify_logits = self.forward_token(first_token, state)?;
-        let mut prev_hidden = self.hidden_a.raw_ptr();
-        let mut generated: Vec<u32> = vec![first_token];
-        if first_token == eos {
-            stats.hit_eos = true;
-            return Ok((generated, stats));
-        }
+        // Prefill + catch-up over the prompt. Position 0 has no previous
+        // hidden; it pairs with zeros.
+        let zeros = DeviceBuf::from_slice(&vec![0.0f32; h])?;
+        let pending = DeviceBuf::<f32>::new(h)?;   // target hidden of the last committed position
+        let (logits, hid) = self.forward_tokens_batched_hidden(prompt, state)?;
+        mtp_kv.len = 0;
+        self.mtp_catchup(mtp, prompt, &zeros, &hid, 0, mtp_kv)?;
+        pending.copy_range_from_device_async(&hid, (prompt.len() - 1) * h, 0, h, &self.stream)?;
+        drop(hid);
+        let mut t = crate::sampling::argmax(&logits);
+        let mut generated: Vec<u32> = Vec::new();
+        let checkpointed = snapshot.ckpt_rows >= k && self.gdn_recurrent_batched_v2_module.is_some()
+            && std::env::var_os("REINSTINCT_GDN_NO_LDS128").is_none();
+        // REINSTINCT_MTP_PROF=1: per-phase round timing (syncs at each
+        // phase, so only for diagnosis); with REINSTINCT_PREFILL_TRACE=3
+        // also the per-kernel split of the batched forwards.
+        let prof = std::env::var_os("REINSTINCT_MTP_PROF").is_some();
+        let mut tp = [0f64; 5];   // draft, verify, rollback, catch-up, other
+        let mut lap = std::time::Instant::now();
+        let mut mark = |i: usize, st: &Stream| if prof {
+            st.synchronize().ok();
+            tp[i] += lap.elapsed().as_secs_f64() * 1e3;
+            lap = std::time::Instant::now();
+        };
 
         while generated.len() < max_tokens {
-            let t = crate::sampling::argmax(&verify_logits);
-            snapshot.save(state)?;
+            let p = state.pos;          // position of t
+            if checkpointed { snapshot.mark(state) } else { snapshot.save(state)? }
 
-            // Chain k MTP drafts, then batch-verify [t, d1..dk].
-            let drafts = self.mtp_draft_chain(mtp, prev_hidden, t, mtp_kv, k, mtp_pos)?;
-            mtp_pos += k;
+            // Draft k tokens at positions p .. p+k-1 of the MTP layer.
+            mtp_kv.len = p;
+            mark(4, &self.stream);
+            let drafts = self.mtp_draft_chain(mtp, pending.raw_ptr(), t, mtp_kv, k, p)?;
+            mark(0, &self.stream);
             let mut batch = Vec::with_capacity(k + 1);
             batch.push(t);
             batch.extend_from_slice(&drafts);
-            let verify_out = self.forward_tokens_verify(&batch, state)?;
+            let verify_out = self.forward_tokens_verify(&batch, state,
+                                                        checkpointed.then_some(&*snapshot))?;
 
-            // All-or-nothing: draft[i] must equal the main model's
-            // prediction for the slot immediately after batch[i].
-            let all_ok = (0..k).all(|i|
-                crate::sampling::argmax(&verify_out[i]) == drafts[i]);
-
+            // Longest prefix of drafts the target agrees with.
+            mark(1, &self.stream);
+            let n = (0..k).take_while(|&i|
+                crate::sampling::argmax(&verify_out[i]) == drafts[i]).count();
             stats.rounds  += 1;
             stats.drafted += k;
-
-            if all_ok {
-                stats.accepted += k;
-                generated.push(t);
-                generated.extend_from_slice(&drafts);
-                verify_logits = verify_out[k].clone();
-                prev_hidden   = self.verify_hidden_row(k);
-            } else {
-                // Reject every draft: roll the verify back and commit
-                // only `t` with a normal single-token decode.
-                snapshot.restore(state)?;
-                verify_logits = self.forward_token(t, state)?;
-                generated.push(t);
-                prev_hidden = self.hidden_a.raw_ptr();
+            stats.accepted += n;
+            let next = crate::sampling::argmax(&verify_out[n]);
+            if n < k {
+                // Keep only the committed rows: GDN state from the verify's
+                // row-n checkpoint (or, without checkpoints, roll back and
+                // re-run them), full-attention KV and position at p + n + 1.
+                if checkpointed {
+                    snapshot.restore_to_row(state, n, &self.stream)?;
+                } else {
+                    snapshot.restore(state)?;
+                    self.forward_tokens_verify(&batch[..=n], state, None)?;
+                }
             }
+            mark(2, &self.stream);
 
-            if let Some(p) = generated.iter().position(|&g| g == eos) {
-                generated.truncate(p + 1);
+            // Catch-up: committed t, d1..dn at p .. p+n with target hiddens
+            // (pending, then verify rows 0..n-1); the new pending is row n.
+            mtp_kv.len = p;
+            self.mtp_catchup(mtp, &batch[..=n], &pending, &self.verify_hidden, 0, mtp_kv)?;
+            pending.copy_range_from_device_async(&self.verify_hidden, n * h, 0, h, &self.stream)?;
+            mark(3, &self.stream);
+
+            generated.extend_from_slice(&batch[..=n]);
+            t = next;
+            if let Some(q) = generated.iter().position(|&g| g == eos) {
+                generated.truncate(q + 1);
                 stats.hit_eos = true;
                 break;
             }
-            if generated.len() >= max_tokens {
-                generated.truncate(max_tokens);
-                break;
+        }
+        if prof {
+            let r = stats.rounds.max(1) as f64;
+            eprintln!("[mtp-prof] {} rounds: draft {:.1} verify {:.1} rollback {:.1} catchup {:.1} other {:.1} ms/round",
+                      stats.rounds, tp[0] / r, tp[1] / r, tp[2] / r, tp[3] / r, tp[4] / r);
+            if prefill_ptrace_enabled() {
+                let m = PREFILL_PTRACE.lock().unwrap();
+                let mut rows: Vec<_> = m.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+                rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                for (name, ms, c) in rows.iter().take(25) {
+                    eprintln!("[mtp-prof]   {name:<22} {:>7.2} ms/round {c:>6} launches", ms / r);
+                }
             }
         }
+        generated.truncate(max_tokens);
         Ok((generated, stats))
     }
 
@@ -4355,7 +4510,7 @@ impl GpuQwen35 {
                     kind = 'F';
                 }
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
-                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?;
+                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n, None)?;
                     kind = 'L';
                 }
                 _ => return Err("block kind mismatch".into()),
@@ -4440,7 +4595,12 @@ impl GpuQwen35 {
     /// caller (QMTP-3) is responsible for rolling back rejected tail
     /// positions. Works from any mid-sequence state: full-attn blocks
     /// append at `kv.len`, GDN blocks thread their state forward.
-    pub fn forward_tokens_verify(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+    ///
+    /// `ckpt`: a snapshot allocated `with_verify_rows` keeps the GDN state
+    /// after each row, so a partial accept can `restore_to_row` instead
+    /// of re-running the accepted prefix.
+    pub fn forward_tokens_verify(&self, tokens: &[u32], state: &mut Qwen35GpuState,
+                                 ckpt: Option<&Qwen35Snapshot>)
         -> Result<Vec<Vec<f32>>, String>
     {
         assert!(!tokens.is_empty(), "forward_tokens_verify needs ≥1 token");
@@ -4458,12 +4618,18 @@ impl GpuQwen35 {
             let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
             self.launch_embed_lookup_dispatch(self.token_embd(), row_ptr, tok)?;
         }
-        for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
+        if let Some(c) = ckpt {
+            if n > c.ckpt_rows + 1 {
+                return Err(format!("forward_tokens_verify: {n} rows, checkpoints for {}", c.ckpt_rows + 1));
+            }
+        }
+        for (i, (block, st)) in self.blocks.iter().zip(state.block_states.iter_mut()).enumerate() {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) =>
                     self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?,
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) =>
-                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?,
+                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n,
+                        ckpt.and_then(|c| c.verify_ckpt(i, n)))?,
                 _ => return Err("block kind mismatch".into()),
             }
         }
@@ -4596,9 +4762,13 @@ impl GpuQwen35 {
     /// One GDN block over a batch of `n` rows: projections batched, the
     /// conv1d + recurrent state updates looped sequentially per row
     /// (inherent recurrence — position r depends on r-1).
+    /// `ckpt`: (recurrent, conv) checkpoint buffers and their row count —
+    /// the spec-decode verify keeps the state after each of the first
+    /// rows (`Qwen35Snapshot::restore_to_row`).
     fn batched_linear_block(&self, ba: &DeviceBuf<f32>, bb: &DeviceBuf<f32>,
                             bnorm: &DeviceBuf<f32>, w: &GpuLinAttnBlock,
-                            st: &mut GpuLinAttnState, n: usize)
+                            st: &mut GpuLinAttnState, n: usize,
+                            ckpt: Option<(*mut c_void, *mut c_void, u32)>)
         -> Result<(), String>
     {
         let h = self.hidden;
@@ -4630,7 +4800,8 @@ impl GpuQwen35 {
         self.ptrace("L.conv1d", || self.launch_conv1d_step_silu_batched(
             qkv.raw_ptr(), w.attn.ssm_conv1d.raw_ptr(),
             st.conv_hist.raw_ptr(), conv_out.raw_ptr(),
-            cdim as u32, self.gdn_conv_kernel as u32, n as u32))?;
+            cdim as u32, self.gdn_conv_kernel as u32, n as u32,
+            ckpt.map(|(_, c, r)| (c, r))))?;
 
         // L2-norm Q/K → q_all/k_all [n, kdim]. The conv output is
         // [n, cdim] with layout (q | k | v) per row; the batched kernel
@@ -4662,7 +4833,8 @@ impl GpuQwen35 {
             kdim as u32,                                // qk_row_stride
             cdim as u32,                                // v_row_stride (conv layout)
             self.gdn_n_heads as u32,                    // ab_row_stride
-            vdim as u32))?;                              // out_row_stride
+            vdim as u32,
+            ckpt.map(|(rc, _, r)| (rc, r))))?;                              // out_row_stride
 
         // Gated RMSNorm with z = attn_gate output (already [n, vdim]).
         self.ptrace("L.gated_norm", || self.launch_rmsnorm_gated_multihead_batched(

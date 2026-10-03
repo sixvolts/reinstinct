@@ -23,7 +23,9 @@ void conv1d_step_silu_batched_f32(const float* __restrict__ x_new_batch, // [n_r
                                   float*       __restrict__ y_batch,     // [n_rows, n_channels]
                                   unsigned int n_channels,
                                   unsigned int kernel_size,
-                                  unsigned int n_rows)
+                                  unsigned int n_rows,
+                                  float*       __restrict__ ckpt,      // [ckpt_rows][n_channels, K-1] or null
+                                  unsigned int ckpt_rows)
 {
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= n_channels) return;
@@ -63,6 +65,13 @@ void conv1d_step_silu_batched_f32(const float* __restrict__ x_new_batch, // [n_r
             if (k + 1 < (int)hist_w) hist[k] = hist[k + 1];
         }
         if (hist_w >= 1) hist[hist_w - 1] = x;
+        // Spec-decode verify: the history after row r, in `history`'s layout.
+        if (r < ckpt_rows) {
+            #pragma unroll
+            for (int k = 0; k < MAX_HIST_W; k++)
+                if (k < (int)hist_w)
+                    ckpt[(size_t)r * n_channels * hist_w + (size_t)ch * hist_w + k] = hist[k];
+        }
     }
 
     // Write the final history back to global memory for the next call.

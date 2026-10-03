@@ -1901,7 +1901,7 @@ fn qwen_verify_check_cli(path: &std::path::Path, prompt: Option<String>,
     // Run B — batched verify over the same token sequence, fresh state.
     let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
     let _ = prefill(&mut state_b)?;
-    let verify = gpu.forward_tokens_verify(&inputs, &mut state_b)
+    let verify = gpu.forward_tokens_verify(&inputs, &mut state_b, None)
         .map_err(anyhow::Error::msg)?;
 
     // Compare per position.
@@ -1978,29 +1978,35 @@ fn qwen_mtp_gen_cli(path: &std::path::Path, prompt: Option<String>,
 
     // --- MTP spec-decode run ---
     let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
-    let pre = prefill(&mut state)?;
-    let first = argmax(&pre);
     let mut mtp_kv = GpuKvCache::new(
-        k * n_tokens + 16,
+        max_seq,
         model.config.attn_n_kv_heads as usize,
         model.config.attn_head_dim as usize,
     ).map_err(anyhow::Error::msg)?;
-    let mut snapshot = Qwen35Snapshot::new(&state).map_err(anyhow::Error::msg)?;
+    let mut snapshot = Qwen35Snapshot::with_verify_rows(&state, k).map_err(anyhow::Error::msg)?;
     let t_spec = std::time::Instant::now();
-    let (out, stats) = gpu.mtp_spec_generate(&mut state, &mut mtp_kv, &mut snapshot,
-        first, eos, n_tokens, k).map_err(anyhow::Error::msg)?;
+    let (out, stats) = gpu.mtp_spec_generate(&prompt_ids, &mut state, &mut mtp_kv, &mut snapshot,
+        eos, n_tokens, k).map_err(anyhow::Error::msg)?;
     let spec_el = t_spec.elapsed().as_secs_f64();
 
     // --- plain-decode baseline, same token count ---
+    // Both timings include the prompt prefill (mtp_spec_generate
+    // prefills itself, to keep the hidden states for the MTP catch-up).
     let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
-    let pre_b = prefill(&mut state_b)?;
     let t_plain = std::time::Instant::now();
+    let pre_b = prefill(&mut state_b)?;
     let mut cur = argmax(&pre_b);
+    let mut plain_out = Vec::with_capacity(out.len());
     for _ in 0..out.len() {
+        plain_out.push(cur);
         let lg = gpu.forward_token(cur, &mut state_b).map_err(anyhow::Error::msg)?;
         cur = argmax(&lg);
     }
     let plain_el = t_plain.elapsed().as_secs_f64();
+    match out.iter().zip(&plain_out).position(|(a, b)| a != b) {
+        None    => println!("spec output == plain greedy output ({} tokens)", out.len()),
+        Some(i) => println!("spec output diverges from plain greedy at token {i} of {}", out.len()),
+    }
 
     let text = tok.decode(&out);
     println!("\n--- generated ({} tokens) ---\n{text}", out.len());

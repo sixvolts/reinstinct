@@ -21,6 +21,9 @@
 // distinct banks at any kk (the pad had the same effect at 8.3 KB, which
 // rounds to a 19th LDS granule and loses the 7th workgroup).
 //
+// `ckpt` / `ckpt_rows`: the state after each of the first ckpt_rows
+// rows is also written to ckpt (null / 0 when unused).
+//
 // Compiled with `#define GDN_HEAD_DIM <head_dim>` (a multiple of 64).
 #include <hip/hip_runtime.h>
 
@@ -57,7 +60,9 @@ void gdn_recurrent_batched_v2_f32(
     unsigned int qk_row_stride,
     unsigned int v_row_stride,
     unsigned int ab_row_stride,
-    unsigned int out_row_stride)
+    unsigned int out_row_stride,
+    float*       __restrict__ ckpt,     // [ckpt_rows][n_heads * HD * HD] or null
+    unsigned int ckpt_rows)
 {
     (void)head_dim;
     __shared__ float state_lds[COLS * HD];
@@ -142,6 +147,10 @@ void gdn_recurrent_batched_v2_f32(
             const float s = s_arr[local] + k_lds[kk] * delta;
             lds_vv[kk ^ swz] = s;
             pout += s * q_lds[kk];
+            // Spec-decode verify: the state after row r, in `state`'s
+            // layout, so a partial accept restores it with one copy.
+            if (r < ckpt_rows)
+                ckpt[(size_t)r * n_heads * HD * HD + head_base + (size_t)kk * HD + vv] = s;
         }
         pout += __shfl_xor(pout, 16);
         const float acc = pout + __shfl_xor(pout, 32);
