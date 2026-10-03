@@ -1,0 +1,32 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9611fc3cf..ecf3e9507 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5791,7 +5791,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
+         // Launch graph
+-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
++        static const bool gt = getenv("GGML_GRAPH_TIMER") != nullptr;
++        if (gt) {
++            // local attribution aid (not for upstream): GPU time per replay vs host time between replays
++            static hipEvent_t e0, e1; static bool init = false; static double gpu = 0, wall = 0; static int n = 0;
++            static auto last = std::chrono::steady_clock::now();
++            if (!init) { (void) hipEventCreate(&e0); (void) hipEventCreate(&e1); init = true; }
++            auto now = std::chrono::steady_clock::now();
++            (void) hipEventRecord(e0, cuda_ctx->stream());
++            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
++            (void) hipEventRecord(e1, cuda_ctx->stream());
++            (void) hipEventSynchronize(e1);
++            float ms = 0; (void) hipEventElapsedTime(&ms, e0, e1);
++            if (n > 0) { gpu += ms; wall += std::chrono::duration<double, std::milli>(now - last).count(); }
++            last = now;
++            if (++n % 16 == 1 && n > 1) {
++                fprintf(stderr, "graph_timer: %d replays, gpu %.3f ms, launch-to-launch %.3f ms\n", n - 1, gpu / (n - 1), wall / (n - 1));
++            }
++        } else {
++            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
++        }
+ #else
+         GGML_UNUSED(graph_key);
+         graph_evaluated_or_captured = true;

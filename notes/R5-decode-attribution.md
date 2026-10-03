@@ -5,11 +5,11 @@ Podcast GPU 1 (MI50), 2026-10-03. Qwen 3.8-27B Q4_K_XL (dense GDN), Gemma 4 31B 
 ## Method
 
 1. **Untraced GPU time per token.** A local-only, env-gated timer around the graph launch in each engine records events around `hipGraphLaunch` (GPU time per replay) and the host time from one launch to the next. 128 tokens from an empty context. The timer is not committed to either repo.
-2. **Kernel traces.** rocprofv3 kernel trace, 17 forwards (fork: `llama-bench -p 0 -n 16 -r 1`, which includes the warm-up; reinstinct: `generate-text --tokens 1000 -n 16`). Both run with graphs off (`GGML_CUDA_DISABLE_GRAPHS=1` / `REINSTINCT_NO_GRAPH=1`) because both engines crash in graph replay under rocprofv3 on these models. Kernel durations don't depend on graphs.
+2. **Kernel traces.** rocprofv3 kernel trace, 17 forwards (fork: `llama-bench -p 0 -n 16 -r 1`, which includes the warm-up; reinstinct: `generate-text --tokens 1000 -n 16`). Both run with graphs off (`GGML_CUDA_DISABLE_GRAPHS=1` / `REINSTINCT_NO_GRAPH=1`). The fork crashes in graph compute under rocprofv3 on the 27B (E4B traced fine), and reinstinct's Gemma graph segfaults. Reinstinct's Qwen graphs do run under the profiler, but they idle between kernels (item 4). Kernel durations don't depend on graphs.
 3. **Profiler bias.** rocprofv3 records each kernel's isolated latency. A no-op kernel reads 5.0-5.8 us traced but costs 1.47 us back-to-back in a graph; a 10 us memory sweep reads 10.4 vs 10.2. So traced time is good for big kernels and inflated for small ones. In traces where the engine keeps the GPU fed, traced busy per token runs 1.1-1.5 us per kernel above the untraced GPU time (fork 27B 36.9 vs 35.1 ms, 35B 12.0 vs 10.5; reinstinct 27B 28.3 vs 28.1, 35B 8.5 vs 7.7).
-4. **Avoid traces with idle gaps.** The earlier traces with reinstinct graphs on ran at 49 ms/token under the profiler (8 ms untraced). The GPU idled between kernels and durations inflated by about 5 us per kernel. That is why `R6-L8-attribution-qwen36-35B.md` showed kernel time "level" at ~12.6 ms. The reinstinct side of that note is wrong, and so is its conclusion that the decode gap is all glue.
+4. **Avoid traces with idle gaps.** Reinstinct's Qwen traces with graphs on run at 49 ms/token under the profiler (8 ms untraced), with no crash. The GPU idled between kernels and durations inflated by about 5 us per kernel. That is why `R6-L8-attribution-qwen36-35B.md` showed kernel time "level" at ~12.6 ms. The reinstinct side of that note is wrong, and so is its conclusion that the decode gap is all glue.
 
-Scripts: `cmp_fmt.py` (kernel time per token by weight format and role, traced) and the timer diffs. Both are in the reinstinct session scratchpad; ask if you want them in scripts/.
+Scripts: `scripts/decode_cmp_fmt.py` (`fork.csv ri.csv steps fork_gpu_ms ri_gpu_ms`: kernel time per token by weight format/role, kernels with median >= 15 us; set BIG = 0 to compare everything) and `scripts/graph-timer/` (the two local timer diffs; env `GGML_GRAPH_TIMER=1` / `REINSTINCT_GRAPH_TIMER=1`).
 
 ## Host vs GPU
 
@@ -38,7 +38,7 @@ Q5_K per launch shape: 2176 WGs (ffn gate/up, ~61 MB) 111 vs 81 us = 552 vs 757 
 - rows are clamped (`min(row, out_dim-1)`) with a masked store, not `if (row >= ne1) continue`. The guard puts an execz branch between the two rows' loads and a waitcnt behind each, so only one row's planes are in flight at a time;
 - Q5_K `spread4` is one multiply by `0x02040810` plus a mask, not four shift/mask/or chains; Q6_K `spread2` is two multiplies.
 
-Measured then on the 27B: Q5_K 540 -> 700 GB/s, Q6_K 590 -> 690, IQ4_XS 560 -> 605, Q4_K flat. The fork's `mul_mat_vec_q5k_repacked`, `q6k`, `q4k`, `q3k` and the `HAS_IDS` variants still have the guarded loads (repack-gcn.cu ~565).
+Measured then on the 27B: Q5_K 540 -> 700 GB/s, Q6_K 590 -> 690, IQ4_XS 560 -> 605, Q4_K flat. The fork still has the guarded loads (`if (row >= (int) ne1) continue;` inside the row loop) in `mul_mat_vec_q4k_repacked`, `q5k`, `q5_1`, `q6k`, `q3k`, `q8_0_repacked`, `q4k_repacked_glu` and `q8_0_repacked_glu` (repack-gcn.cu lines 492-1534), template-shared with their `HAS_IDS` variants.
 
 ### Gemma 31B QAT (Q4_0): 8.09 ms
 
@@ -48,7 +48,7 @@ Measured then on the 27B: Q5_K 540 -> 700 GB/s, Q6_K 590 -> 690, IQ4_XS 560 -> 6
 | attention (big kernels) | 1.57 (60 calls) | 0.07 | +1.50 |
 | small kernels + dispatch | 3.69 (1015) | 3.83 (1162) | -0.14 |
 
-The fork has no repacked Q4_0 decode path (`GGML_CUDA_REPACK_*` covers Q8_0 and Q5_1), so every Q4_0 weight goes through the generic MMVQ. Reinstinct's repacked Q4_0 matvec runs at ~690 GB/s (the kernel-read ceiling on this card is ~720-830). Attention: the fork's decode runs `flash_attn_tile` on Gemma's 256/512-dim heads (60 big calls/token); reinstinct uses GQA flash-decoding (R3 class).
+The fork has no Q4_0 repack at all: repack-gcn.cu repacks Q4_K/Q5_K/Q6_K/Q3_K always and Q8_0/Q5_1 behind `GGML_CUDA_REPACK_*`, and nothing in ggml-cuda handles Q4_0 (checked, so this is not an unset flag), so every Q4_0 weight goes through the generic MMVQ. Reinstinct's repacked Q4_0 matvec runs at ~690 GB/s (the kernel-read ceiling on this card is ~720-830). Attention: the fork's decode runs `flash_attn_tile` on Gemma's 256/512-dim heads (60 big calls/token); reinstinct uses GQA flash-decoding (R3 class).
 
 ### Qwen 3.6-35B-A3B: 2.88 ms (traced delta 3.5)
 
@@ -56,7 +56,7 @@ The fork has no repacked Q4_0 decode path (`GGML_CUDA_REPACK_*` covers Q8_0 and 
 |---|---:|---:|---:|
 | glue (norm/elementwise/copy/quantize) | 2.80 (581 kernels) | 1.34 (264) | **+1.46** |
 | MoE down Q5_K | 1.42 (37 us/call) | 0.52 (`moe_matvec_q5k_down`, 13.4 us/call) | +0.90 |
-| dense Q8_0 matvec (attn/GDN/shared expert) | 4.49 (repacked, one 32 B block per lane) | 3.59 (two-plane layout, 54eaa04) | +0.90 |
+| dense Q8_0 matvec (attn/GDN/shared expert) | 4.49 (131 calls at 32 us + glu/seg) | 3.59 (71 at 29 us + 180 at 8.6 us; two-plane layout, 54eaa04) | +0.90 (upper bound) |
 | f32 matvec | 0.93 (100x `gcn_f32_matvec_rows` with 8 WGs + 40x fewrows with 1 WG) | 0.78 (70x `matvec_f32_b256`, 256 WGs) | +0.15 |
 | router + shared-expert gate | 0.47 | 0.72 | -0.26 |
 | GDN, attention, Q4_K gate/up, Q6_K | 1.71 | 1.53 | +0.18 |
@@ -67,7 +67,7 @@ Kernels per token: fork 1133, reinstinct 867.
 
 1. **Dense matvec load order + spread multiplies** (reinstinct 54eaa04 -> proposed R10): about 4.3 ms of the 27B's 7.05 (Q5_K 3.4, Q4_K/Q3_K 0.9); the MoE `HAS_IDS` variants share the guarded loads. A small, mechanical diff on the fork's existing repacked matvecs.
 2. **Repacked Q4_0 decode matvec** (proposed R11): 6.7 of the 31B QAT's 8.1 ms. Reinstinct's `kernels/matvec_q4_0_repacked.cpp` + `quant::q4_0` repack; it also affects any Q4_0 QAT GGUF.
-3. **Two-plane Q8_0 layout** (54eaa04, part of R10): 0.9 ms on the 35B; it touches every Q8_0 kernel (MMQ, grouped, MoE, dequant), so it is the larger change.
+3. **Two-plane Q8_0 layout** (54eaa04, part of R10): up to 0.9 ms on the 35B. The call structure differs (row grouping, splits), so the delta is consistent with the layout change but not isolated to it; it touches every Q8_0 kernel (MMQ, grouped, MoE, dequant), so it is the larger change.
 4. **MoE down kernel** (R4): 0.9 ms on the 35B.
 5. **Glue fusion, rest of R6**: 1.5 ms on the 35B, ~1.5 ms on the 27B (1025 vs 479 small kernels).
 6. **Gemma decode attention** (R3 class): 1.5 ms on the 31B.

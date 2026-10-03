@@ -1,0 +1,36 @@
+diff --git a/src/hip/mod.rs b/src/hip/mod.rs
+index dbe2732..519eea1 100644
+--- a/src/hip/mod.rs
++++ b/src/hip/mod.rs
+@@ -421,6 +421,31 @@ impl GraphExec {
+     /// caller must sync the stream (or the device) before reading results.
+     pub fn launch(&self, stream: &Stream) -> Result<()> {
+         let api = hip().map_err(|s| s.to_string())?;
++        if std::env::var_os("REINSTINCT_GRAPH_TIMER").is_some() {
++            // local attribution aid: GPU time per replay vs host time between replays
++            thread_local! {
++                static T: std::cell::RefCell<Option<(Event, Event, std::time::Instant, f64, f64, u32)>> =
++                    std::cell::RefCell::new(None);
++            }
++            return T.with(|t| {
++                let mut t = t.borrow_mut();
++                if t.is_none() { *t = Some((Event::new()?, Event::new()?, std::time::Instant::now(), 0.0, 0.0, 0)); }
++                let (e0, e1, last, gpu, wall, n) = t.as_mut().unwrap();
++                let now = std::time::Instant::now();
++                e0.record(stream)?;
++                unsafe { ck(api, (api.graph_launch)(self.raw, stream.raw), "hipGraphLaunch")?; }
++                e1.record(stream)?;
++                e1.synchronize()?;
++                let ms = Event::elapsed_time(e0, e1)? as f64;
++                if *n > 0 { *gpu += ms; *wall += (now - *last).as_secs_f64() * 1e3; }
++                *last = now; *n += 1;
++                if *n > 1 && *n % 16 == 1 {
++                    eprintln!("graph_timer: {} replays, gpu {:.3} ms, launch-to-launch {:.3} ms",
++                              *n - 1, *gpu / (*n - 1) as f64, *wall / (*n - 1) as f64);
++                }
++                Ok(())
++            });
++        }
+         unsafe { ck(api, (api.graph_launch)(self.raw, stream.raw), "hipGraphLaunch") }
+     }
+ }

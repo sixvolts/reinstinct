@@ -1,3 +1,5 @@
+> **Decode section superseded by R5-decode-attribution.md.** The reinstinct decode trace here ran with idle gaps under the profiler (graphs on, 49 ms/token traced vs 8 untraced), which inflated its small kernels by ~5 us each, so "kernel time level, the lead is glue" is wrong: fork dense/MoE matvecs are slower too. The prefill section stands.
+
 # R6 / L8 attribution: Qwen 3.6-35B-A3B Q4_K_XL, podcast GPU 1
 
 Kernel traces via rocprofv3 (AMD rocprofiler-sdk 7.1 + AMD HIP/HSA runtime libs unpacked under ~/opt on podcast; the distro runtimes have no rocprofiler-register hook). Fork 905021dba (`GGML_CUDA_DISABLE_GRAPHS=1` for the decode trace - the fork crashes in graph compute under the profiler), reinstinct 3a46560+. Aggregated with scripts/kernel_families.py. file0 = fork, file1 = reinstinct. Profiled kernel times run above untraced wall time (tg: fork 11.3 ms, reinstinct 8.4 ms per token untraced); compare families, not totals against tok/s.
