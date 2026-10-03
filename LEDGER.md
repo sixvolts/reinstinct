@@ -26,6 +26,10 @@ Owner: who does the port/evaluation. See README for status values.
 | L6 | topk_moe rank kernel | fork 4a8dee414 | Reinstinct | proposed | 18 -> ~4 us per call. |
 | L7 | MoE dispatch rejection logging: one-time log of why a fast kernel did not dispatch | Rune Prod tip | both | proposed | Rune found a dedup kernel silently not dispatching for months. |
 | L8 | MoE and small-model prefill (S1): fork ahead 1.54x Gemma 26B-A4B, 1.79x Qwen 3.6-35B-A3B, 1.42x Gemma E4B | fork: expert-grouped repacked int8 MMQ for MUL_MAT_ID (tokens sorted per expert by the mm_ids helper, repacked tiles) 4a43c2afe, e8e9db9da, 60dfa7c0c, 5672fe65a; dense repacked MMQ tiles | Reinstinct | proposed | Attribute with the same per-family traces before porting. |
+| L8a | L8 part: MoE expert id-GEMM (fork `mmq_gemm_q4k_repacked_id_w1` gate/up, `mmq_gemm_q5k_repacked<true,..>` down, mm_ids compaction + repack_tile_map) | fork repack-gcn.cu:3549/1820/1969, mmid.cu:152 | Reinstinct | in-progress | Qwen 3.6-35B-A3B pp512: fork ~129 ms vs reinstinct ~282 ms per forward (notes/R6-L8-attribution-qwen36-35B.md). |
+| L8b | L8 part: GDN prefill recurrence (`gated_delta_net_lds_wave64`) | fork gated_delta_net.cu:192 | Reinstinct | proposed | 40.3 vs 87.0 ms per pp512 (35B-A3B). Mind the L4 gather-elision rule. |
+| L8c | L8 part: F32 GEMM (`gcn_f32_gemm_tn_rb`, `gcn_f32_gemm_skinny` M<=16) for router / alpha-beta | fork ggml-cuda.cu:1787/1875, routing ~2105 | Reinstinct | proposed | 29.7 vs 59.0 ms per pp512 (35B-A3B). |
+| L8d | L8 part: Q8_0 MMQ tile (`mmq_gemm_q8_0_repacked<false,4>`) | fork repack-gcn.cu:2620 | Reinstinct | proposed | 66.3 vs 90.6 ms per pp512 (35B-A3B). |
 
 ## Bugs found by cross-testing
 
