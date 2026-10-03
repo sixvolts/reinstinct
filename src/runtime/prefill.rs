@@ -544,7 +544,7 @@ impl PrefillGemm {
             (GgmlType::Q5_K, true)  => (&self.mmq_q5k,  "mmq_gemm_q5k_repacked_narrow_f32"),
             (GgmlType::Q6_K, false) => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_f32"),
             (GgmlType::Q6_K, true)  => (&self.mmq_q6k,  "mmq_gemm_q6k_repacked_narrow_f32"),
-            (GgmlType::Q8_0, false) => (&self.mmq_q8_0, "mmq_gemm_q8_0_repacked_f32"),
+            (GgmlType::Q8_0, false) => (&self.mmq_q8_0, "mmq_gemm_q8_0_rp_f32"),
             (GgmlType::Q8_0, true)  => (&self.mmq_q8_0, "mmq_gemm_q8_0_repacked_narrow_f32"),
             (_, false)              => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_f32"),
             (_, true)               => (&self.mmq_q4k,  "mmq_gemm_q4k_repacked_narrow_f32"),

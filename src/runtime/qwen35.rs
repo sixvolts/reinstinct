@@ -4355,7 +4355,7 @@ impl GpuQwen35 {
         let (module, kname) = match w.dtype {
             GgmlType::Q5_K => (&self.mmq_q5k_module, "mmq_gemm_q5k_repacked_f32"),
             GgmlType::Q6_K => (&self.mmq_q6k_module, "mmq_gemm_q6k_repacked_f32"),
-            GgmlType::Q8_0 => (&self.mmq_q8_0_module, "mmq_gemm_q8_0_repacked_f32"),
+            GgmlType::Q8_0 => (&self.mmq_q8_0_module, "mmq_gemm_q8_0_rp_f32"),
             GgmlType::Q4_0 => (&self.mmq_q4_0_module, "mmq_gemm_q4_0_repacked_f32"),
             GgmlType::IQ4_XS => (&self.mmq_iq4xs_module, "mmq_gemm_iq4xs_repacked_f32"),
             GgmlType::IQ3_S => (&self.mmq_iq3s_module, "mmq_gemm_iq4xs_repacked_f32"),

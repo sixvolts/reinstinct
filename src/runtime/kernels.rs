@@ -3191,6 +3191,8 @@ mod tests {
              q6_k::repack_for_matvec(&synth(256, q6_k::BYTES_PER_BLOCK, 208, false, &mut rng_u8), in_dim, out_dim)),
             ("q8_0", "mmq_gemm_q8_0_repacked", "mmq_gemm_q8_0_repacked_f32",
              q8_0::repack_for_matvec(&synth(32, q8_0::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
+            ("q8_0rp", "mmq_gemm_q8_0_repacked", "mmq_gemm_q8_0_rp_f32",
+             q8_0::repack_for_matvec(&synth(32, q8_0::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
             ("iq4xs", "mmq_gemm_iq4xs_repacked", "mmq_gemm_iq4xs_repacked_f32",
              iq4_xs::repack_for_matvec(&synth(256, iq4_xs::BYTES_PER_BLOCK, 0, false, &mut rng_u8), in_dim, out_dim)),
         ];
