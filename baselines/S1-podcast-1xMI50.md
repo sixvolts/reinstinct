@@ -35,3 +35,16 @@ Reinstinct: `qwen-mtp-gen M --k 2 -n 256 --prompt P`, decode-only tok/s (prefill
 | refrigerator | 27.5 | **9.0** | 74.1% | 34.7 | 48.1 | 70.1% |
 
 **The fork's MTP on this dense GDN model runs ~3x slower than its own plain decode** despite 71-82% acceptance - something on that path is not on the fast kernels here (draft context placement, the dense verify shape, or the GDN snapshot path at n_rs_seq 2?). Reinstinct spec output equals plain greedy on 2 of 3 prompts; the lighthouse prompt diverges at token 74 (a batched-vs-single numerics near-tie), which also explains its lower acceptance.
+
+## Update 2026-10-03: reinstinct after L8a-d (review-fixes @ 96c4223), same card and method
+
+| Model | fork pp512 | reinstinct pp512 (S1 -> now) | fork tg256 | reinstinct tg256 (now) |
+|---|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 255.3 | 292.2 -> **300.3** ± 0.2 | 27.83 | **35.28** ± 0.08 |
+| Gemma 4 31B Q4_K_XL | 218.9 | **254.0** ± 0.1 | 27.35 | **29.16** ± 0.11 |
+| Gemma 4 31B QAT (Q4_0) | 263.4 | **319.7** ± 0.5 | 25.58 | **31.78** ± 0.08 |
+| Gemma 4 26B-A4B Q4_K_XL | **1691.7** | 1098.3 -> 1361.1 ± 0.8 | **96.14** | 91.56 ± 0.41 |
+| Gemma 4 E4B Q4_K_XL | **1303.0** | 918.6 ± 0.5 | 98.16 | **101.38** ± 0.43 |
+| Qwen 3.6-35B-A3B Q4_K_XL | **1576.3** | 881.3 -> 1286.0 ± 1.1 | 88.55 | **118.22** ± 0.45 |
+
+Decode unchanged (no regression). MoE prefill gap: 35B-A3B 1.79x -> 1.23x, 26B-A4B 1.54x -> 1.24x. E4B prefill (dense, 1.42x) is untouched by L8a-d and still open.
