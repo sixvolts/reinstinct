@@ -1,0 +1,215 @@
+From 8a8f443639666bfb59d21303a9e517a8e3bd5adc Mon Sep 17 00:00:00 2001
+From: sixvolts <rigel@sixvolts.org>
+Date: Sat, 3 Oct 2026 12:40:24 +0000
+Subject: [PATCH] cuda: fuse the residual ADD into RMS_NORM -> MUL (+q8_1)
+
+qwen35/qwen35moe decode runs two residual adds per layer, each followed by
+the next RMS_NORM -> MUL. One kernel now adds, writes the sum (the
+residual stream, read again later) and the normed activation with its
+q8_1 copy. The generic fusion check rejects the ADD because the sum has a
+second consumer, so it gets its own matcher; outputs may alias inputs
+exactly, not partially. GGML_CUDA_NO_ADD_NORM_FUSION=1 disables it.
+
+Fused groups now keep the q8_1 entry their last node emitted when the
+graph loop invalidates the group's elided intermediates: an in-place MUL
+over the RMS_NORM output otherwise threw it away and every consumer
+re-quantized.
+
+Qwen3.5-4B decode, per step: 745 -> 682 launches, adds 88 -> 25
+(280 -> 93 us) while the fused kernel costs 6.38 us vs 6.20 for the
+norm alone; PPL identical at ub1 and ub512. Flash-Next has no such
+pattern (hyper-connections) and is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 19 +++++++-
+ ggml/src/ggml-cuda/norm.cu        | 74 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cuh       |  4 ++
+ ggml/src/ggml-cuda/repack-gcn.cu  |  6 ++-
+ ggml/src/ggml-cuda/repack-gcn.cuh |  5 ++-
+ 5 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7aa42f022..667e23428 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5232,6 +5232,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // residual ADD -> RMS_NORM -> MUL: the sum stays live (next residual add reads it), so the generic
++    // single-use check cannot cover the ADD; the norm/mul pair still goes through it
++    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM &&
++            cgraph->nodes[i + 1]->src[0] == node && ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
++        static const bool no_add_norm = getenv("GGML_CUDA_NO_ADD_NORM_FUSION") != nullptr;
++        if (!no_add_norm) {
++            ggml_tensor * mul_node = cgraph->nodes[i + 2];
++            void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, mul_node);
++            if (ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], mul_node, yq)) {
++                return 2;
++            }
++            if (yq != nullptr) {
++                ggml_cuda_repack_xq_invalidate(*cuda_ctx, mul_node, true);
++            }
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+@@ -5596,7 +5613,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 if (nodes_to_skip != 0) {
+                     for (int j = 1; j <= nodes_to_skip; ++j) {
+-                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j]);
++                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j], false, cgraph->nodes[i + nodes_to_skip]);
+                     }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 57122bc56..00b937a68 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -215,6 +215,40 @@ static __global__ void rms_norm_mul_q8_f32(const float * x, float * dst, const i
+     }
+ }
+ 
++// residual ADD -> RMS_NORM -> MUL in one kernel: writes the sum (the residual stream, still read later)
++// and the normed activation, plus q8_1 blocks when yq != nullptr. Each thread reads a, b at a column
++// before writing sum there, and the block reduction separates the two passes, so sum may alias a or b
++// and dst may alias a or b exactly. Same operation order as the three ops, so results are identical.
++template <int block_size>
++static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum, float * dst,
++        const int ncols, const float eps, const float * mul, block_q8_1 * yq) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int64_t off = (int64_t) row * ncols;
++    a += off; b += off; sum += off; dst += off;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = a[col] + b[col];
++        sum[col] = xi;
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        const float v = scale * sum[col] * mul[col];
++        dst[col] = v;
++        if (yq != nullptr) {
++            rms_emit_q8_1(yq, off + col, v);
++        }
++    }
++}
++
+ // RMS_NORM -> SCALE (the GDN l2 norm): same rounding as the two ops
+ template <int block_size>
+ static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+@@ -676,6 +710,46 @@ bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+     return true;
+ }
+ 
++bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm,
++        ggml_tensor * mul_tensor, void * yq) {
++    const ggml_tensor * a = add->src[0];
++    const ggml_tensor * b = add->src[1];
++    const ggml_tensor * w = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
++    const int64_t ncols = add->ne[0];
++    const int64_t nrows = ggml_nrows(add);
++    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
++            w->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
++            !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(add, mul_tensor) ||
++            !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) ||
++            !ggml_is_contiguous(mul_tensor) || !ggml_is_contiguous(w) || ggml_nelements(w) != ncols ||
++            norm->src[0] != add || ncols < 1024 || (yq != nullptr && ncols % QK8_1 != 0)) {
++        return false;
++    }
++    // outputs may equal an input exactly (in place) but must not partially overlap one
++    auto partial = [](const ggml_tensor * x, const ggml_tensor * y) {
++        const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
++        const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
++        return x0 < y1 && y0 < x1 && !(x0 == y0 && x1 == y1);
++    };
++    const ggml_tensor * outs[2] = { add, mul_tensor };
++    for (const ggml_tensor * o : outs) {
++        if (partial(o, a) || partial(o, b) || partial(o, w)) {
++            return false;
++        }
++    }
++    const char * s0 = (const char *) add->data;        const char * s1 = s0 + ggml_nbytes(add);
++    const char * d0 = (const char *) mul_tensor->data; const char * d1 = d0 + ggml_nbytes(mul_tensor);
++    if (s0 < d1 && d0 < s1) {
++        return false; // sum and dst both live after the kernel
++    }
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(float));
++    add_rms_norm_mul_f32<1024><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
++        (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
++        (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
++    return true;
++}
++
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index cf50a5343..d046e0d56 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -22,3 +22,7 @@ void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+ // RMS_NORM -> MUL that also writes q8_1 blocks of the result into yq; false: not applicable, nothing launched
+ bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * yq);
++
++// residual ADD -> RMS_NORM -> MUL (yq: optional q8_1 copy of the MUL output); false = not applicable
++bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm,
++        ggml_tensor * mul_tensor, void * yq);
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cu b/ggml/src/ggml-cuda/repack-gcn.cu
+index 8598ee2e7..b4f9627ad 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cu
++++ b/ggml/src/ggml-cuda/repack-gcn.cu
+@@ -3735,14 +3735,16 @@ static bool repack_rc_reserve(ggml_cuda_repack_route_cache & rc, void ** buf, si
+     return true;
+ }
+ 
+-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force) {
++void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force,
++        const ggml_tensor * keep) {
+     if (node->data == nullptr) {
+         return;
+     }
+     const char * lo = (const char *) node->data;
+     const char * hi = lo + ggml_nbytes(node);
+     for (auto & e : ctx.repack_rc.xqc) {
+-        if (e.gen == ctx.graph_gen && (force || e.producer != node) && lo < e.hi && e.lo < hi) {
++        if (e.gen == ctx.graph_gen && (force || (e.producer != node && (keep == nullptr || e.producer != keep))) &&
++                lo < e.hi && e.lo < hi) {
+             e.gen = 0;
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/repack-gcn.cuh b/ggml/src/ggml-cuda/repack-gcn.cuh
+index 9d8b87d78..bd72862b6 100644
+--- a/ggml/src/ggml-cuda/repack-gcn.cuh
++++ b/ggml/src/ggml-cuda/repack-gcn.cuh
+@@ -56,7 +56,10 @@ void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const gg
+ 
+ // drop cached q8_1 activations whose source range node writes
+ // (force: also entries this node produced itself)
+-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false);
++// keep: also spare entries produced by this node (the last node of a fused group, whose q8_1 copy the
++// fused kernel wrote from final values; the group's elided intermediates may share its memory)
++void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false,
++        const ggml_tensor * keep = nullptr);
+ 
+ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
+     const ggml_tensor * glu);
+-- 
+2.53.0
+

@@ -1,0 +1,146 @@
+From a2207dd89617bec17a37e4425e9170037f0b00c6 Mon Sep 17 00:00:00 2001
+From: sixvolts <rigel@sixvolts.org>
+Date: Sat, 3 Oct 2026 13:22:39 +0000
+Subject: [PATCH] cuda: one launch for the GDN q and k l2 norms
+
+Each recurrent layer runs two same-shape RMS_NORM -> SCALE pairs back to
+back (q and k heads, views in between). rms_norm_scale2_f32 runs both,
+blockIdx.z picking the pair, with rms_norm_scale_f32's body. The pairs
+must be independent and match in shape, strides, eps and scale.
+GGML_CUDA_NO_NORM_PAIR_FUSION=1 disables it.
+
+Qwen3.5-4B decode with the add-norm and gate fusions: launches per step
+745 -> 610, kernel time 8.81 -> 8.32 ms, tg256 115.1 -> 119.7 tok/s (3
+interleaved runs); PPL identical. Flash-Next tg64 50.1 -> 51.1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DTjwwGh3znQpq4Yoxunx6b
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 14 +++++++
+ ggml/src/ggml-cuda/norm.cu      | 66 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cuh     |  3 ++
+ 3 files changed, 83 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7be699fcf..9bfbc1536 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4504,6 +4504,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     }
+ 
+     // RMS_NORM -> SCALE (GDN l2 norm)
++    // the GDN q and k l2 norms: two RMS_NORM -> SCALE pairs back to back (views between) in one launch
++    if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
++        static const bool no_norm_pair = getenv("GGML_CUDA_NO_NORM_PAIR_FUSION") != nullptr;
++        int j = i + 2;
++        while (!no_norm_pair && j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++            j++;
++        }
++        if (!no_norm_pair && j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM &&
++                ggml_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
++                ggml_cuda_op_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
++            return j + 1 - i;
++        }
++    }
++
+     if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
+             ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
+         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 00b937a68..296f7e70a 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -284,6 +284,43 @@ static __global__ void rms_norm_scale_f32(const float * x, float * dst, const in
+     }
+ }
+ 
++// two independent RMS_NORM -> SCALE pairs of the same shape in one launch (the GDN q and k l2 norms):
++// blockIdx.z selects the pair (z / nsamples); the body is rms_norm_scale_f32's
++template <int block_size>
++static __global__ void rms_norm_scale2_f32(const float * x0, float * dst0, const float * x1, float * dst1, const int ncols,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const int nsamples,
++        const float eps, const float s, const float b) {
++    const int nrows     = gridDim.x;
++    const int nchannels = gridDim.y;
++
++    const int row       = blockIdx.x;
++    const int channel   = blockIdx.y;
++    const int pair      = blockIdx.z / nsamples;
++    const int sample    = blockIdx.z % nsamples;
++    const int tid       = threadIdx.x;
++
++    const float * x   = pair == 0 ? x0 : x1;
++    float *       dst = pair == 0 ? dst0 : dst1;
++    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
++    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        dst[col] = s * (scale * x[col]) + b;
++    }
++}
++
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+@@ -888,6 +925,35 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
+ 
++bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor * n0, ggml_tensor * sc0, ggml_tensor * n1, ggml_tensor * sc1) {
++    const ggml_tensor * x0 = n0->src[0];
++    const ggml_tensor * x1 = n1->src[0];
++    if (x0->type != GGML_TYPE_F32 || x1->type != GGML_TYPE_F32 || sc0->type != GGML_TYPE_F32 || sc1->type != GGML_TYPE_F32 ||
++            !ggml_is_contiguous(sc0) || !ggml_is_contiguous(sc1) || !ggml_are_same_shape(x0, x1) ||
++            !ggml_are_same_shape(sc0, sc1) || x0->nb[0] != sizeof(float) ||
++            x0->nb[1] != x1->nb[1] || x0->nb[2] != x1->nb[2] || x0->nb[3] != x1->nb[3] || x0->ne[0] >= 1024 ||
++            memcmp(n0->op_params, n1->op_params, sizeof(float)) != 0 || memcmp(sc0->op_params, sc1->op_params, 2 * sizeof(float)) != 0) {
++        return false;
++    }
++    // the second pair must not read the first pair's output, and the outputs must not overlap
++    const char * a0 = (const char *) sc0->data; const char * a1 = a0 + ggml_nbytes(sc0);
++    const char * b0 = (const char *) sc1->data; const char * b1 = b0 + ggml_nbytes(sc1);
++    const char * r0 = (const char *) x1->data;  const char * r1 = r0 + ggml_nbytes(x1);
++    if ((a0 < b1 && b0 < a1) || (a0 < r1 && r0 < a1)) {
++        return false;
++    }
++    float eps, sv, bv;
++    memcpy(&eps, n0->op_params, sizeof(float));
++    memcpy(&sv, (const float *) sc0->op_params + 0, sizeof(float));
++    memcpy(&bv, (const float *) sc0->op_params + 1, sizeof(float));
++    const int64_t ts = sizeof(float);
++    const dim3 blocks_num(x0->ne[1], x0->ne[2], x0->ne[3] * 2);
++    rms_norm_scale2_f32<256><<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
++        (const float *) x0->data, (float *) sc0->data, (const float *) x1->data, (float *) sc1->data, (int) x0->ne[0],
++        x0->nb[1] / ts, x0->nb[2] / ts, x0->nb[3] / ts, (int) x0->ne[3], eps, sv, bv);
++    return true;
++}
++
+ void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_node) {
+     const ggml_tensor * src0 = dst->src[0];
+     cudaStream_t stream = ctx.stream();
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index d046e0d56..d62994533 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -26,3 +26,6 @@ bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+ // residual ADD -> RMS_NORM -> MUL (yq: optional q8_1 copy of the MUL output); false = not applicable
+ bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm,
+         ggml_tensor * mul_tensor, void * yq);
++
++// two independent same-shape RMS_NORM -> SCALE pairs in one launch; false = not applicable
++bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor * n0, ggml_tensor * sc0, ggml_tensor * n1, ggml_tensor * sc1);
+-- 
+2.53.0
+
