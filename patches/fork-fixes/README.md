@@ -21,4 +21,15 @@ Acceptance is about 70% on both paths. Greedy MTP output diverges from plain dec
 
 Still to confirm on podcast: Qwen 3.8-27B `llama-bench -p 1,2,3,4,8,16`, MTP tok/s, and Gemma 31B.
 
-Known, unrelated, pre-existing on furnace's build with this model: `llama-perplexity -ub 1` and `llama-bench -p N` abort with a memory aperture violation; `llama-server` and `llama-bench -n` work. Under investigation.
+Confirmed on podcast by Reinstinct: Qwen 3.8-27B pp2 8.3 -> 38.1 tok/s, MTP 8.8-9.6 -> 37.6-42.2 tok/s (plain 27.6); Gemma 31B pp2 5.5 -> 47.5.
+
+## B2: `B2-gdn-gather-elision-058d97848.patch`
+
+The bug: the fused GDN state gather read the skipped gather's index tensor after the allocator had reused it. A single-token first ubatch on qwen35 aborted with a memory aperture violation.
+
+The fix: elide only when nothing from the gather to the GDN output overlaps the indices (fork commit 058d97848).
+
+Results:
+- Qwen3.5-4B `-ub 1` perplexity now runs and equals the unfused result.
+- Flash-Next keeps the elision: tg32 48.3, against 47.3 with the elision off.
+- Independent of B1; apply both.
