@@ -17,6 +17,7 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 11. R10a (`R10a-kquant-loads-first-b8eb8050f.patch`)
 12. R13a (`R13a-bench-26b-shapes-746887a5c.patch`) — test-repack-bench shapes only
 13. R13b (`R13b-mmq-staging-padding-r10-followups-ae7fdb2d7.patch`)
+14. R14 (`R14-kq-expert-pack-q8-mapping-q8hoist-optin-7bac8169e.patch`)
 
 Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
 from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
@@ -44,6 +45,15 @@ numbers as "905021dba + B1..R8 + L6 + R4 + R11/R12".
   K-gated to ne00 <= 3072; A/B switches `GGML_CUDA_NO_KQ_HOIST=1` (dense K-quant matvecs + GLU
   back to the pre-R10a loop) and `GGML_CUDA_NO_Q8_HOIST=1`. Report fork numbers as
   "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a + R13".
+- **R14** (= fork 7bac8169e, the production build): (a) P3: thread-packed Q4_K/Q5_K/Q6_K expert
+  matvec for K <= 2048 (`mul_mat_vec_kq_repacked_pack`, `GGML_CUDA_KQ_DOWN_R`, 0 = old): 35B-class
+  768x2048x128 per call Q5_K 60.8 -> 34.6 us, Q6_K 63.4 -> 48.5, Q4_K 51.6 -> 44.3 (1x MI50 bench).
+  (b) dense Q8_0 at >= 512 rows: K = 4096 -> 2 rows per 64-thread block (4096x2048: 67 -> 29.7 us,
+  = canonical; 4096x2816 41 -> 34), K = 6144 keeps rowu; `GGML_CUDA_Q8_ROWU=all|r2|old` for A/B.
+  (c) generic Q8_0 hoist opt-in (`GGML_CUDA_Q8_HOIST=1`; your 26B A/B). (d) MMQ scale rows: float2
+  padded, the nib tile's float rows unpadded (your ISA diff): Q4_0 tile 9.9 -> 11.27 TMAC/s in the
+  bench, Q5_1 MoE down tile back at 4.54. Report as "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a +
+  R13 + R14".
 - **R11/R12**: Q4_0 repack end to end (`GGML_CUDA_REPACK_Q4_0=0` off), IQ4_NL / IQ4_XS / IQ3_S on the same
   planes (`GGML_CUDA_REPACK_IQ=0` off), Q3_K -> Q6_K relabel (`GGML_CUDA_Q3K_RELABEL=0` off), 16/32/48-wide
   prefill token tiles for <= 48 columns (`GGML_CUDA_NO_MMQ_NARROW=1` off), `tests/test-repack-host`
