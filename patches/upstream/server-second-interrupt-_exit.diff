@@ -1,0 +1,25 @@
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 049bdcebb..f56498013 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -16,6 +16,9 @@
+ #include <clocale>
+ #include <exception>
+ #include <signal.h>
++#if !defined(_WIN32)
++#include <unistd.h>
++#endif
+ #include <thread> // for std::thread::hardware_concurrency
+ 
+ #if defined(_WIN32)
+@@ -30,7 +33,9 @@ static inline void signal_handler(int signal) {
+         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
+         // this is for better developer experience, we can remove when the server is stable enough
+         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
+-        exit(1);
++        // _exit, not exit: this runs inside a signal handler, and exit() would run TLS/atexit destructors
++        // (HIP's among them) that can block forever on a runtime lock held by the interrupted cleanup
++        _exit(1);
+     }
+ 
+     shutdown_handler(signal);
