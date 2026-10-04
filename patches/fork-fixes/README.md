@@ -1,7 +1,9 @@
 # Fork fixes found by cross-testing
 
-> 2026-10-04: everything in patches 1-14 is on the fork's public branches `qwen4exp-mtp` (7bac8169e)
-> and `gfx906-perf-upstream` (e05405047). The series remains for A/Bs against the 905021dba base.
+> 2026-10-04: the fork is now a single branch, `gfx906-perf` (fc353a5ac), carrying everything in
+> patches 1-16 (it equals the furnace production build 47f6e5b8a plus the README). The former
+> `qwen4exp-mtp` / `gfx906-perf-upstream` branches were merged and removed. The series remains for A/Bs
+> against the 905021dba base.
 
 Patches against the fork's public `gfx906-perf` branch (905021dba), for testing on podcast before they reach the fork's GitHub.
 
