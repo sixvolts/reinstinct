@@ -141,3 +141,24 @@ On build (a), `GGML_CUDA_Q3K_RELABEL=0` gave 288.2 / 28.70 on the 27B (relabel: 
 | 13.5K-token prompt | 29.1 | 44.1 (1.52x) | 73.8% | 30.3 | **45.8** | 81.1% |
 
 MTP is roughly level with reinstinct now. Fork acceptance moved with the R10a numerics (not bit-identical to the previous build).
+
+## Update 2026-10-04 (fork + R13): vs reinstinct @ ee7cbd5, same card and method
+
+Fork: the previous build plus patches/fork-fixes 12-13 (R13a bench shapes, R13b MMQ staging/padding + R10 follow-ups), i.e. "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a + R13". Same flags and env. The NO_Q8_HOIST column is the planned patch-14 default (generic Q8_0 hoist opt-in).
+
+| Model | fork pp512 (R10a -> R13) | reinstinct pp512 | fork tg256 (R10a -> R13) | fork tg256, `GGML_CUDA_NO_Q8_HOIST=1` | reinstinct tg256 | prefill | decode (patch-14 behaviour) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 291.9 -> **334.1** ± 1.2 | 306.3 | 32.27 -> 32.13 ± 0.03 | - | **35.20** | -8% | +10% |
+| Gemma 4 31B Q4_K_XL | 243.1 -> **255.4** ± 0.7 | 253.9 | 30.09 -> **30.09** ± 0.01 | - | 29.04 | -1% | -3% |
+| Gemma 4 31B QAT (Q4_0) | 268.0 -> 295.0 ± 1.2 | **319.8** | 32.18 -> **32.03** ± 0.01 | - | 31.76 | +8% | -1% |
+| Gemma 4 26B-A4B Q4_K_XL | 1725.0 -> **1843.2** ± 38.5 | 1641.8 | 83.00 -> 82.94 ± 0.07 | **95.33** ± 0.31 | 94.40 | -11% | -1% |
+| Gemma 4 E4B Q4_K_XL | 1472.2 -> **1548.3** ± 16.5 | 1507.6 | 111.16 -> **111.02** ± 0.15 | 110.11 ± 0.10 | 101.48 | -3% | -8% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1729.4 -> **1792.2** ± 48.1 | 1741.0 | 94.97 -> 93.10 ± 0.09 | 93.61 ± 0.09 | **124.36** | -3% | +33% |
+
+(prefill / decode columns: reinstinct vs fork; negative = fork ahead. Decode uses the NO_Q8_HOIST column where measured.) `GGML_CUDA_REPACK_Q4_0=0` on the QAT: 263.3 / 25.53.
+
+- R13b's 8 B-aligned activation staging and padded LDS weight rows lift fork prefill on every model (+4-14%). The fork now leads prefill everywhere except the 31B QAT, which is still 8% behind (1736 vs 1601 ms per pp512) although the Q4_0 tile matches reinstinct's standalone; the remainder is outside the tile and not yet attributed.
+- Decode: the fork leads or is level on all three Gemmas and E4B. The open gaps are the 35B-A3B (+33%) and the 27B (+10%).
+- 26B-A4B decode with graphs on (tg128, two passes): R13 default 90.7 / 90.5, pre-R10a 97.1 / 96.5, `NO_KQ_HOIST=1` 90.1 / 90.7, `NO_Q8_HOIST=1` 96.9 / 97.2, both 97.2 / 97.3. The whole R10a regression is the generic Q8_0 hoist on the K <= 3072 shapes, invisible in test-repack-bench (every 26B Q8_0 shape within 0.3 us either way). Furnace makes it opt-in (`GGML_CUDA_Q8_HOIST=1`) in patch 14.
+
+MTP on the 27B (depth 2) is unchanged from the R10a build: 55.3 / 47.4 / 50.6 / 44.1 tok/s (no spec 31.8-31.9, 29.0 at 13.5K) vs reinstinct 54.5 / 48.0 / 51.0 / 45.8.
