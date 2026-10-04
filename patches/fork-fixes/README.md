@@ -15,6 +15,8 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 9. R4 (`R4-moe-chain-q8-lds-nc-loads-first-69db7bf5d.patch`)
 10. R11/R12 (`R11-R12-q4_0-iq-family-q3k-relabel-7f70fff53.patch`)
 11. R10a (`R10a-kquant-loads-first-b8eb8050f.patch`)
+12. R13a (`R13a-bench-26b-shapes-746887a5c.patch`) — test-repack-bench shapes only
+13. R13b (`R13b-mmq-staging-padding-r10-followups-ae7fdb2d7.patch`)
 
 Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
 from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
@@ -34,6 +36,14 @@ numbers as "905021dba + B1..R8 + L6 + R4 + R11/R12".
   Q4_K GLU 51.9 -> 41.5; tg64 UD-Q4_K_XL 116 -> 131.5, Q5_K_M 101 -> 120. Rounding-close, not
   bit-identical (contraction): KLD 0.0029 at ub1 on the 4B. Report fork numbers as
   "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a".
+- **R13b**: (a) every repacked MMQ tile stages activations as a 40 B 8 B-aligned block with widened
+  scales and pads its LDS weight/scale rows (the reinstinct ISA finding + the bank-conflict fix): the
+  Q4_0 tile goes 8.8 -> 11.25 TMAC/s standalone, identical to reinstinct's; q5_K 7.75 -> 9.4,
+  q6_K 6.95 -> 8.3, IQ 8.8 -> 9.7, MoE Q5_1 down 3.3 -> 4.6; bit-identical results. (b) R10a
+  follow-ups: expert (HAS_IDS) matvec/GLU paths back on the guarded loop; generic Q8_0 hoist
+  K-gated to ne00 <= 3072; A/B switches `GGML_CUDA_NO_KQ_HOIST=1` (dense K-quant matvecs + GLU
+  back to the pre-R10a loop) and `GGML_CUDA_NO_Q8_HOIST=1`. Report fork numbers as
+  "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a + R13".
 - **R11/R12**: Q4_0 repack end to end (`GGML_CUDA_REPACK_Q4_0=0` off), IQ4_NL / IQ4_XS / IQ3_S on the same
   planes (`GGML_CUDA_REPACK_IQ=0` off), Q3_K -> Q6_K relabel (`GGML_CUDA_Q3K_RELABEL=0` off), 16/32/48-wide
   prefill token tiles for <= 48 columns (`GGML_CUDA_NO_MMQ_NARROW=1` off), `tests/test-repack-host`
