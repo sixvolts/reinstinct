@@ -184,3 +184,24 @@ Fork: the R13 build plus patches/fork-fixes 14 (R14: P3 thread-packed K-quant ex
 - Open: 27B decode (+10%: small kernels ~1.5 ms, Q5_K ~0.46, IQ nib matvec ~0.46, attention ~0.38) and the 35B glue (~0.4 ms). Furnace takes the glue next from the R6 table.
 
 MTP on the 27B (depth 2) is unchanged: 55.3 / 47.4 / 50.5 / 44.1 tok/s (no spec 31.8, 29.0 at 13.5K) vs reinstinct 54.5 / 48.0 / 51.0 / 45.8.
+
+## Update 2026-10-04 (fork + R15, final fork state for now): vs reinstinct @ ee7cbd5, same card and method
+
+Fork: the R14 build plus patches/fork-fixes 15 (R15: the GDN conv step runs as one launch, with the conv-cache GET_ROWS elided and CONCAT + state-tail CPYs fused into `conv_step_concat_f32`; fork 3a30ac2c2, production), i.e. "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a + R13 + R14 + R15". Same flags and env; test-repack-bench --check OK. The fork owner has paused fork improvement work, so this is the last fork row until that changes.
+
+| Model | fork pp512 (R14 -> R15) | reinstinct pp512 | fork tg256 (R14 -> R15) | reinstinct tg256 | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 333.9 -> **333.4** ± 1.0 | 306.3 | 32.13 -> 32.41 ± 0.01 | **35.20** | -8% | +9% |
+| Gemma 4 31B Q4_K_XL | 255.4 -> **255.4** ± 0.7 | 253.9 | 30.15 -> **30.11** ± 0.01 | 29.04 | -1% | -4% |
+| Gemma 4 31B QAT (Q4_0) | 319.2 -> 319.0 ± 1.3 | 319.8 | 32.03 -> **32.01** ± 0.01 | 31.76 | 0% | -1% |
+| Gemma 4 26B-A4B Q4_K_XL | 1843.5 -> **1842.7** ± 41.9 | 1641.8 | 96.18 -> **96.95** ± 0.09 | 94.40 | -11% | -3% |
+| Gemma 4 E4B Q4_K_XL | 1541.7 -> **1545.4** ± 27.8 | 1507.6 | 110.29 -> **110.74** ± 0.15 | 101.48 | -2% | -8% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1789.3 -> **1789.7** ± 57.5 | 1741.0 | 118.44 -> 121.88 ± 0.17 | **124.36** | -3% | +2% |
+
+(prefill / decode columns: reinstinct vs fork; negative = fork ahead.) A/Bs: `GGML_CUDA_NO_CONV_STEP_FUSION=1` gives tg256 118.47 on the 35B and 32.12 on the 27B; `GGML_CUDA_Q8_ROWU=old` on the 35B 1798.5 / 105.73; `GGML_CUDA_REPACK_Q4_0=0` on the QAT 263.2 / 25.54.
+
+- Kernels per token with graphs off: 35B 1133 -> 1073 (reinstinct 867), 27B 1370 -> 1274. In every GDN layer, `k_get_rows_float`, `concat_cont` and two of the three state-tail `cpy_scalar` launches become one `conv_step_concat_f32<3>`. Decode gains 0.24 ms/token on the 35B (+2.9%) and 0.28 ms/token on the 27B (+0.9%).
+- Greedy output on the 35B (2 prompts x 128 tokens) is byte-identical with fusion on and off.
+- Remaining decode gaps: the 35B is 0.16 ms/token (+2%) behind. The 27B is 2.45 ms/token (+9%) behind: about 1.2 ms from small kernels after R15, plus Q5_K 0.46, the IQ nib matvec 0.46 and attention 0.38, per notes/R13-attribution.md. The remaining glue rows (norm+quantize pairs, gated norm, q/k norm+rope, split-K placement) are not done.
+- MTP on the 27B (depth 2): 57.2 / 49.0 / 52.3 / 45.5 tok/s (no spec 32.1, 29.2 at 13.5K) vs reinstinct 54.5 / 48.0 / 51.0 / 45.8. The fork leads on the three short prompts and is level at 13.5K.
+- Harness note: llama-server serving the 35B with `-c 4096` hung twice on shutdown after SIGTERM, R15 fused and unfused alike. It printed "cleaning up before exit" / "Received second interrupt, terminating immediately" and then sat in futex_wait with 4 threads until SIGKILL. The 27B servers in the MTP section shut down cleanly. This is not attributed and is not specific to R15. The S1 server helper now SIGKILLs after 60 s.
