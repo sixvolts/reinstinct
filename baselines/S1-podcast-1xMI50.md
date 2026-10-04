@@ -162,3 +162,25 @@ Fork: the previous build plus patches/fork-fixes 12-13 (R13a bench shapes, R13b 
 - 26B-A4B decode with graphs on (tg128, two passes): R13 default 90.7 / 90.5, pre-R10a 97.1 / 96.5, `NO_KQ_HOIST=1` 90.1 / 90.7, `NO_Q8_HOIST=1` 96.9 / 97.2, both 97.2 / 97.3. The whole R10a regression is the generic Q8_0 hoist on the K <= 3072 shapes, invisible in test-repack-bench (every 26B Q8_0 shape within 0.3 us either way). Furnace makes it opt-in (`GGML_CUDA_Q8_HOIST=1`) in patch 14.
 
 MTP on the 27B (depth 2) is unchanged from the R10a build: 55.3 / 47.4 / 50.6 / 44.1 tok/s (no spec 31.8-31.9, 29.0 at 13.5K) vs reinstinct 54.5 / 48.0 / 51.0 / 45.8.
+
+## Update 2026-10-04 (fork + R14): vs reinstinct @ ee7cbd5, same card and method
+
+Fork: the R13 build plus patches/fork-fixes 14 (R14: P3 thread-packed K-quant expert matvec for short K, Q8_0 dense K=4096 at 2 rows per 64-thread block, Q8_0 hoist opt-in, MMQ scale rows unpadded), i.e. "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a + R13 + R14". Same flags and env; the default build is now the patch-14 behaviour, so there is no separate NO_Q8_HOIST column. test-repack-bench --check OK.
+
+| Model | fork pp512 (R13 -> R14) | reinstinct pp512 | fork tg256 (R13 -> R14) | reinstinct tg256 | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.8-27B Q4_K_XL | 334.1 -> **333.9** ± 1.5 | 306.3 | 32.13 -> 32.13 ± 0.03 | **35.20** | -8% | +10% |
+| Gemma 4 31B Q4_K_XL | 255.4 -> **255.4** ± 0.6 | 253.9 | 30.09 -> **30.15** ± 0.01 | 29.04 | -1% | -4% |
+| Gemma 4 31B QAT (Q4_0) | 295.0 -> 319.2 ± 0.8 | 319.8 | 32.03 -> **32.03** ± 0.01 | 31.76 | 0% | -1% |
+| Gemma 4 26B-A4B Q4_K_XL | 1843.2 -> **1843.5** ± 34.4 | 1641.8 | 95.33 (NO_Q8_HOIST) -> **96.18** ± 0.14 | 94.40 | -11% | -2% |
+| Gemma 4 E4B Q4_K_XL | 1548.3 -> **1541.7** ± 27.4 | 1507.6 | 110.11 (NO_Q8_HOIST) -> **110.29** ± 0.14 | 101.48 | -2% | -8% |
+| Qwen 3.6-35B-A3B Q4_K_XL | 1792.2 -> **1789.3** ± 52.3 | 1741.0 | 93.61 (NO_Q8_HOIST) -> 118.44 ± 0.12 | **124.36** | -3% | +5% |
+
+(prefill / decode columns: reinstinct vs fork; negative = fork ahead.) A/Bs: `GGML_CUDA_REPACK_Q4_0=0` on the QAT 263.3 / 25.53; `GGML_CUDA_Q8_ROWU=old` on the 35B 1798.7 / 103.27.
+
+- 35B-A3B decode 93.6 -> 118.4 (+27%); the gap to reinstinct falls from 2.7 to 0.40 ms/token. Separate tg256 A/B run: default 118.69, `GGML_CUDA_Q8_ROWU=old` 102.62, `GGML_CUDA_KQ_DOWN_R=0` 106.69. In a rocprof trace (graphs off, 17 forwards) the Q8_0 4096x2048 calls take 14.7 us median on the 2-rows kernel (one-wave was 48.6, reinstinct 11.4 traced), the other Q8_0 calls 23.8 -> 17.3 us, the Q5_K expert down 37.6 -> 13.9 us (`mul_mat_vec_kq_repacked_pack`), and the traced matvec total 95.5 -> 58.2 ms (about 2.2 ms/token). The rest of the gap is glue: 1133 vs 867 kernels per token.
+- 26B-A4B decode: the patch-14 default reaches 96.2 and stays ahead of reinstinct; `Q8_ROWU=old` reads 95.75 against 96.72 in the A/B run, so the 2-rows mapping adds about 1% here as well.
+- 31B QAT prefill reaches parity: 1604 vs 1601 ms per pp512. The shipped `mmq_gemm_nib_repacked<0,4>` now has the same LDS instruction mix as the harness variant x8p (36 ds_read_b128, 8 ds_read2_b32, 32 ds_read2_b64, 62 s_waitcnt; R13 had 32 / 16 / 32 / 65). In-model the tile drops 8.8%, to about 1399 ms per forward vs reinstinct's 1407. The R13 note's "remainder outside the tile" was wrong: it was the padded scale rows breaking the b128 scale loads (notes/R13-attribution.md).
+- Open: 27B decode (+10%: small kernels ~1.5 ms, Q5_K ~0.46, IQ nib matvec ~0.46, attention ~0.38) and the 35B glue (~0.4 ms). Furnace takes the glue next from the R6 table.
+
+MTP on the 27B (depth 2) is unchanged: 55.3 / 47.4 / 50.5 / 44.1 tok/s (no spec 31.8, 29.0 at 13.5K) vs reinstinct 54.5 / 48.0 / 51.0 / 45.8.
