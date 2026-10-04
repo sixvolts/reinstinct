@@ -22,6 +22,7 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 13. R13b (`R13b-mmq-staging-padding-r10-followups-ae7fdb2d7.patch`)
 14. R14 (`R14-kq-expert-pack-q8-mapping-q8hoist-optin-7bac8169e.patch`)
 15. R15 (`R15-gdn-conv-step-fusion-3a30ac2c2.patch`)
+16. `../upstream/server-second-interrupt-_exit.diff` (reinstinct's shutdown-hang fix; in the fork as 47f6e5b8a with the message sent via write(2))
 
 Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
 from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
