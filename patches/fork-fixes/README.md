@@ -21,6 +21,7 @@ Patches against the fork's public `gfx906-perf` branch (905021dba), for testing 
 12. R13a (`R13a-bench-26b-shapes-746887a5c.patch`) — test-repack-bench shapes only
 13. R13b (`R13b-mmq-staging-padding-r10-followups-ae7fdb2d7.patch`)
 14. R14 (`R14-kq-expert-pack-q8-mapping-q8hoist-optin-7bac8169e.patch`)
+15. R15 (`R15-gdn-conv-step-fusion-3a30ac2c2.patch`)
 
 Items 8-10 were generated from a 905021dba + B1..R8 checkout on furnace (the fork commits they come
 from sit on top of other fork work, so the MoE-chain patch's conflict with the missing few-token
@@ -57,6 +58,12 @@ numbers as "905021dba + B1..R8 + L6 + R4 + R11/R12".
   padded, the nib tile's float rows unpadded (your ISA diff): Q4_0 tile 9.9 -> 11.27 TMAC/s in the
   bench, Q5_1 MoE down tile back at 4.54. Report as "905021dba + B1..R8 + L6 + R4 + R11/R12 + R10a +
   R13 + R14".
+- **R15** (= fork 3a30ac2c2, production since 2026-10-04 05:55, 45-min soak clean): the GDN conv step
+  for decode/verify in one launch — GET_ROWS(conv cache) elided, CONCAT(state, x^T) and the state-tail
+  CPYs (one per rollback slot) fused into `conv_step_concat_f32` (ssm-conv.cu). One thread per channel
+  reads every sequence before writing any. Bit-exact (KLD 0 on Qwen3.5-4B and Flash-Next).
+  Flash-Next 1724 -> 1652 launches/token; Qwen3.5-4B tg64 136 -> 139.5. `GGML_CUDA_NO_CONV_STEP_FUSION=1`
+  disables. This is only the conv-step part of R6/P4; the other glue rows are not done.
 - **R11/R12**: Q4_0 repack end to end (`GGML_CUDA_REPACK_Q4_0=0` off), IQ4_NL / IQ4_XS / IQ3_S on the same
   planes (`GGML_CUDA_REPACK_IQ=0` off), Q3_K -> Q6_K relabel (`GGML_CUDA_Q3K_RELABEL=0` off), 16/32/48-wide
   prefill token tiles for <= 48 columns (`GGML_CUDA_NO_MMQ_NARROW=1` off), `tests/test-repack-host`
