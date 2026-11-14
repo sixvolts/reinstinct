@@ -1,4 +1,7 @@
 # reinstinct
+
+FYI - I will be updating this for Qwen4 when it drops, but after that it will be in long-term maintenance mode. It was an experiment to see how far I could push things, but future work for gfx906/MI50 will be carried over in my llama fork: https://github.com/sixvolts/llamacpp-gfx906-furnace --sixvolts
+
 Reinstinct is a custom inference engine for AMD Radeon Instinct MI50/MI60 GPUs for local AI inference. Reinstinct outperforms llama.cpp on the same hardware, runs models up to 31B dense on a single $500 card, and delivers throughput competitive with hardware costing significantly more. Reinstinct is built/tuned specifically for two model families: Gemma-4 and Qwen-3.x. Other models might work, need some patches, etc. The goal was to make a few good models work on this hardware well, not account for every model or use case. 
 
 Note - this was developed an experiment for these older Vega20/gfx906 GPUs to see how far we can push performance. The majority of the kernel-level improvements here have been back-ported to a version of llama-cpp in this repo: https://github.com/sixvolts/llama-cpp-vega-retune.
